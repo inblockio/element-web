@@ -118,6 +118,26 @@ async function dumpWholeDb(): Promise<string> {
 /** Base64 of an HMAC-SHA256 tag: 32 bytes, so 43 base64 characters and one pad. */
 const HMAC_B64 = /^[A-Za-z0-9+/]{43}=$/;
 
+/**
+ * Slow every `crypto.subtle.decrypt` call down by `ms`, so a hydration restore of even a handful of
+ * events takes long enough for a test to reliably observe it mid-flight -- real decrypt is far too
+ * fast otherwise for a poll loop on a real timer to land inside the window. Real implementation
+ * still runs underneath; this only delays it. Returns a restore function.
+ */
+function slowDownDecrypt(ms: number): () => void {
+    const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+    const spy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+        await new Promise<void>((resolve) => setTimeout(resolve, ms));
+        return realDecrypt(...(args as Parameters<typeof realDecrypt>));
+    });
+    return () => spy.mockRestore();
+}
+
+/** A short real-timer pause, for polling loops that wait on a background hydration run. */
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 describe("BrowserEventIndex helpers", () => {
     it("tokenizes case-insensitively, folds accents, and drops punctuation", () => {
         expect(tokenize("Hello, WORLD! 42")).toEqual(["hello", "world", "42"]);
@@ -276,6 +296,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("prefixes every token of length >= 2", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$p", "invoice payment received"), {});
         const hit = await manager.searchEventIndex({
             search_term: "inv pay",
@@ -290,6 +311,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("folds accents so cafe matches café", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$c", "Meet at Café Zürich"), {});
         const hit = await manager.searchEventIndex({
             search_term: "cafe zurich",
@@ -303,6 +325,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("finds a file by filename even when body is just the short name", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(
             msg("$file", "image.jpg", {
                 content: { filename: "quarterly-report.pdf", url: "mxc://s/a", msgtype: "m.file" },
@@ -321,6 +344,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("falls back to mid-word substring when token AND misses (query length >= 3)", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$s", "please send the invoice"), {});
         const hit = await manager.searchEventIndex({
             search_term: "oice",
@@ -342,6 +366,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("indexes a live event and finds it via the stock search shape", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$a", "unique token zebra-42"), { displayname: "Alice" });
         await manager.commitLiveEvents();
 
@@ -361,6 +386,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("search after m.replace finds the new body and not the old one", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$orig", "old wording xyz"), {});
         await manager.addEventToIndex(
             msg("$edit", "* new wording abc", {
@@ -396,6 +422,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("addHistoricEvents returns true only when every event was already present", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         const ev = { event: msg("$h", "historic"), profile: {} };
         expect(await manager.addHistoricEvents([ev], null, null)).toBe(false);
         expect(await manager.addHistoricEvents([ev], null, null)).toBe(true);
@@ -403,6 +430,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("scopes search to a room and paginates with next_batch", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         const inA = msg("$1", "needle", { origin_server_ts: 1 });
         inA.room_id = "!a:hs";
         const inB = msg("$2", "needle", { origin_server_ts: 2 });
@@ -445,6 +473,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("stores checkpoints and reports stats", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         expect(await manager.isEventIndexEmpty()).toBe(true);
         await manager.addEventToIndex(msg("$s", "stats"), {});
         const cp = { roomId: "!room:example.org", token: "t1", direction: Direction.Backward };
@@ -460,6 +489,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("deleteEventIndex drops in-memory hits", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$gone", "vanishing secret"), {});
         await manager.deleteEventIndex();
         const result = await manager.searchEventIndex({
@@ -474,9 +504,11 @@ describe("BrowserEventIndexManager", () => {
 
     it("does not share hits across user ids in the same manager lifecycle", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$a", "alice-only-token"), {});
         await manager.closeEventIndex();
         await manager.initEventIndex("@bob:example.org", "DEVICE2");
+        await manager.waitForHydration();
         const result = await manager.searchEventIndex({
             search_term: "alice-only-token",
             before_limit: 0,
@@ -489,6 +521,7 @@ describe("BrowserEventIndexManager", () => {
 
     it("does not persist megolm session keys — only the Seshat event classes", async () => {
         await manager.initEventIndex("@alice:example.org", "DEVICE1");
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$m", "hello"), {});
         const result = await manager.searchEventIndex({
             search_term: "hello",
@@ -570,6 +603,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("reloads events, checkpoints and the user version from IndexedDB", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$p", "persisted needle"), { displayname: "Alice" });
         const cp = { roomId: "!room:example.org", token: "tok", direction: Direction.Backward };
         await manager.addCrawlerCheckpoint(cp);
@@ -579,6 +613,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             const hit = await reloaded.searchEventIndex(search("needle"));
             expect(hit.count).toBe(1);
@@ -594,6 +629,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("wipes leftover ciphertext it can no longer decrypt", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$w", "old-key secret"), {});
         await manager.setUserVersion(1);
         await manager.commitLiveEvents();
@@ -603,6 +639,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         pickleKey = "a-completely-different-pickle-key";
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect(await reloaded.isEventIndexEmpty()).toBe(true);
             expect(await reloaded.getUserVersion()).toBe(0);
@@ -614,6 +651,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("deleteEventIndex drops the stored records, not just the memory index", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$d", "doomed"), {});
         await manager.addCrawlerCheckpoint({ roomId: "!room:example.org", token: "t", direction: Direction.Backward });
         await manager.commitLiveEvents();
@@ -621,6 +659,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect(await reloaded.isEventIndexEmpty()).toBe(true);
             expect(await reloaded.loadCheckpoints()).toEqual([]);
@@ -631,6 +670,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("deleteEvent removes the event once, and reports whether it existed", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$x", "removable"), {});
         await manager.commitLiveEvents();
 
@@ -641,6 +681,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect((await reloaded.searchEventIndex(search("removable"))).count).toBe(0);
         } finally {
@@ -650,6 +691,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("removeCrawlerCheckpoint deletes the persisted checkpoint", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const cp = { roomId: "!room:example.org", token: "tok", direction: Direction.Backward };
         await manager.addCrawlerCheckpoint(cp);
         // Adding the same checkpoint twice must not duplicate it.
@@ -661,6 +703,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect(await reloaded.loadCheckpoints()).toEqual([]);
         } finally {
@@ -671,6 +714,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
     it("does not persist anything when there is no pickle key", async () => {
         pickleKey = null;
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$e", "ephemeral wording"), {});
         await manager.commitLiveEvents();
         // Memory-only sessions have no ciphertext to measure, so stats fall back to an estimate.
@@ -680,6 +724,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect(await reloaded.isEventIndexEmpty()).toBe(true);
         } finally {
@@ -704,6 +749,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             },
         });
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$m", "memory only"), {});
         await manager.commitLiveEvents();
         expect((await manager.searchEventIndex(search("memory"))).count).toBe(1);
@@ -714,6 +760,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("returns surrounding events and profiles as search context", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$1", "before", { origin_server_ts: 1 }), { displayname: "Alice" });
         await manager.addEventToIndex(msg("$2", "context needle", { origin_server_ts: 2 }), { displayname: "Alice" });
         await manager.addEventToIndex(msg("$3", "after", { origin_server_ts: 3 }), { displayname: "Alice" });
@@ -728,6 +775,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("lists file events newest-first, and forwards from a given event", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const file = (id: string, ts: number): any =>
             msg(id, "file", { origin_server_ts: ts, content: { url: "mxc://s/a", msgtype: "m.file" } });
         await manager.addEventToIndex(file("$f1", 1), {});
@@ -757,6 +805,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("returns an empty result for an empty term, and once closed", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$s", "something"), {});
         expect((await manager.searchEventIndex(search(""))).count).toBe(0);
 
@@ -769,6 +818,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("strips a null state_key from results", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$sk", "stateless", { state_key: null }), {});
         const result = await manager.searchEventIndex(search("stateless"));
         expect(result.results![0].result).not.toHaveProperty("state_key");
@@ -776,6 +826,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("addHistoricEvents refreshes a stale body and rotates the crawler checkpoints", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const stale = msg("$hist", "stale wording");
         expect(await manager.addHistoricEvents([{ event: stale, profile: {} }], null, null)).toBe(false);
 
@@ -793,6 +844,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("keeps the edited body when the original arrives afterwards", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(
             msg("$edit", "* edited wording", {
                 origin_server_ts: 2000,
@@ -813,6 +865,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("writes no room id, token or direction into the checkpoints store", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const cp = {
             roomId: "!zqxsecretroom:example.org",
             token: "zqxsecrettoken",
@@ -847,6 +900,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("gives unrelated keys to checkpoints that differ only by direction or token", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const roomId = "!same:example.org";
         await manager.addCrawlerCheckpoint({ roomId, token: "tok", direction: Direction.Backward });
         await manager.addCrawlerCheckpoint({ roomId, token: "tok", direction: Direction.Forward });
@@ -861,6 +915,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("round-trips every checkpoint field through the encrypted store", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const back = {
             roomId: "!alpha:example.org",
             token: "tok-alpha",
@@ -875,6 +930,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             // Order follows the (hashed) primary key, so assert on the set, not the sequence.
             const loaded = await reloaded.loadCheckpoints();
@@ -887,6 +943,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("removes only the addressed checkpoint, not a sibling differing by direction or token", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const roomId = "!sibling:example.org";
         const back = { roomId, token: "tok", direction: Direction.Backward };
         const forward = { roomId, token: "tok", direction: Direction.Forward };
@@ -903,6 +960,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             const loaded = await reloaded.loadCheckpoints();
             expect(loaded).toHaveLength(2);
@@ -914,6 +972,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("de-duplicates an equal checkpoint, in memory and on disk", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const cp = { roomId: "!dedupe:example.org", token: "tok", direction: Direction.Backward };
         await manager.addCrawlerCheckpoint(cp);
         // A distinct object with equal fields: de-duplication is by value, not by identity.
@@ -927,6 +986,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("writes nothing but the record key and the ciphertext in the clear", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(
             msg("$plain", "top secret wording", {
                 origin_server_ts: 1234567890123,
@@ -1018,6 +1078,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         });
 
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
 
         const raw = await inspectRawDb();
         expect(raw.version).toBe(2);
@@ -1051,6 +1112,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("redacting an edit removes the redacted body, in memory and on disk", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$orig", "original wording"), {});
         await manager.addEventToIndex(edit("$edit", "$orig", "edited wording"), {});
         await manager.commitLiveEvents();
@@ -1072,6 +1134,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("still resolves a redacted edit after a reload", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$orig", "original wording"), {});
         await manager.addEventToIndex(edit("$edit", "$orig", "edited wording"), {});
         await manager.commitLiveEvents();
@@ -1079,6 +1142,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect(await reloaded.deleteEvent("$edit")).toBe(true);
             expect((await reloaded.searchEventIndex(search("edited"))).count).toBe(0);
@@ -1091,6 +1155,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("drops the rows it already loaded when a later row cannot be decrypted", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$a", "first wording"), {});
         await manager.addEventToIndex(msg("$b", "second wording"), {});
         await manager.commitLiveEvents();
@@ -1106,6 +1171,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             expect((await reloaded.searchEventIndex(search("first"))).count).toBe(0);
             expect(await reloaded.isRoomIndexed("!room:example.org")).toBe(false);
@@ -1119,17 +1185,21 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("closes the previous connection when re-initialising", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const close = vi.spyOn(IDBDatabase.prototype, "close");
         // The settings panel re-inits without closing first.
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         expect(close).toHaveBeenCalled();
     });
 
     it("leaves the database deletable after re-initialising", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$r", "first session"), {});
         await manager.commitLiveEvents();
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.commitLiveEvents();
         await manager.closeEventIndex();
 
@@ -1145,6 +1215,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("drops the whole database on the logout sequence (close, then delete)", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$logout", "logout secret"), {});
         await manager.commitLiveEvents();
         // EventIndexPeg.deleteEventIndex() closes the index before deleting it, which is
@@ -1158,6 +1229,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("probes the same database the manager writes to", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         // EVENTINDEX_DB_NAME is not exported, so these tests carry their own copy of the name.
         // This is what keeps the copy honest: rename the constant in the source and this fails
         // here, loudly, instead of every other test quietly inspecting a database nobody wrote.
@@ -1221,12 +1293,14 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         // A warm index for a second account, left by an earlier session.
         const other = `${userId}-other`;
         await manager.initEventIndex(other, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$warm", "warm body"), {});
         await manager.commitLiveEvents();
         await manager.closeEventIndex();
 
         // This account signs in, in the same manager object.
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$first", "first body"), {});
         await manager.commitLiveEvents();
 
@@ -1247,6 +1321,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         });
 
         await manager.initEventIndex(other, DEVICE);
+        await manager.waitForHydration();
         await manager.commitLiveEvents();
         expect(landed).toBe(true);
 
@@ -1258,6 +1333,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("does not report a batch of edit repairs as already added", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         // The edit arrives first, so the record is filed under the original's id, carries the
         // edit's envelope, and is marked edited.
         await manager.addEventToIndex(edit("$repairedit", "$repairorig", "edited wording"), {});
@@ -1272,6 +1348,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("ends a file listing when the cursor is no longer indexed", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         const file = (id: string, ts: number): any =>
             msg(id, "file", { origin_server_ts: ts, content: { url: "mxc://s/a", msgtype: "m.file" } });
         await manager.addEventToIndex(file("$c1", 1), {});
@@ -1291,6 +1368,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("reports a size that tracks the records, not the number of writes", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$size", "first body"), {});
         await manager.commitLiveEvents();
         const one = (await manager.getStats()).size;
@@ -1324,6 +1402,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("keeps a room's events in timestamp order however they arrive", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         // Out of order and with ties, which is the normal case: the crawler pages backwards
         // while the live timeline appends forwards.
         const timestamps = [50, 10, 30, 10, 90, 20, 30, 5, 70, 10];
@@ -1352,6 +1431,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("re-places a record whose timestamp a late original corrects", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$oearly", "early needle", { origin_server_ts: 10 }), {});
         // The edit arrives before its original and is filed under the original's id, carrying
         // the edit's own, much later timestamp ...
@@ -1374,6 +1454,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("keeps the substring fallback in step with an edited body", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$fold", "originalwording"), {});
         // A mid-word fragment only the substring fallback can match, which is what fills the
         // folded-text memo.
@@ -1387,6 +1468,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
     it("removes a checkpoint that a previous session wrote", async () => {
         const cp = { roomId: "!crawl:example.org", token: "crawltoken", direction: Direction.Backward };
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addCrawlerCheckpoint(cp);
         await manager.commitLiveEvents();
         await manager.closeEventIndex();
@@ -1399,6 +1481,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         const reloaded = new BrowserEventIndexManager();
         try {
             await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
             expect(await reloaded.loadCheckpoints()).toEqual([cp]);
             await reloaded.removeCrawlerCheckpoint({ ...cp });
             await reloaded.commitLiveEvents();
@@ -1411,10 +1494,183 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
     it("does not let an in-flight write resurrect a record after the wipe", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$race", "racing secret"), {});
         // No commitLiveEvents(): the encrypt-and-put is still queued.
         await manager.deleteEventIndex();
         expect((await inspectRawDb()).events).toEqual([]);
+    });
+
+    describe("non-blocking load", () => {
+        const room = "!nonblocking:example.org";
+
+        /** Persists `count` events under `userId`, closes the manager, and returns their ids. */
+        async function seed(count: number): Promise<string[]> {
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            const ids: string[] = [];
+            for (let i = 0; i < count; i++) {
+                const id = `$nb${i}`;
+                ids.push(id);
+                await manager.addEventToIndex(
+                    msg(id, `zqnbmarker body ${i}`, { room_id: room, origin_server_ts: i }),
+                    {},
+                );
+            }
+            await manager.commitLiveEvents();
+            await manager.closeEventIndex();
+            return ids;
+        }
+
+        it("returns from initEventIndex before hydration finishes", async () => {
+            await seed(8);
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                // initEventIndex has resolved. With 8 records at 15ms/decrypt each, hydration
+                // cannot possibly be done yet -- if it were, this method was still awaiting the
+                // full restore, which is the regression this test exists to catch.
+                expect((await reloaded.getStats()).loading).toBe(true);
+                expect((await reloaded.getStats()).eventCount).toBeLessThan(8);
+                await reloaded.waitForHydration();
+                expect((await reloaded.getStats()).eventCount).toBe(8);
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("getStats().loading is true throughout hydration and flips to false exactly once", async () => {
+            await seed(8);
+            const restore = slowDownDecrypt(10);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+
+                const samples: boolean[] = [(await reloaded.getStats()).loading ?? false];
+                const hydrationDone = reloaded.waitForHydration().then((): "done" => "done");
+                let finished = false;
+                while (!finished) {
+                    const outcome = await Promise.race([hydrationDone, sleep(4).then((): "tick" => "tick")]);
+                    finished = outcome === "done";
+                    samples.push((await reloaded.getStats()).loading ?? false);
+                }
+
+                expect(samples[0]).toBe(true);
+                expect(samples[samples.length - 1]).toBe(false);
+                let trueToFalse = 0;
+                let falseToTrue = 0;
+                for (let i = 1; i < samples.length; i++) {
+                    if (samples[i - 1] && !samples[i]) trueToFalse++;
+                    if (!samples[i - 1] && samples[i]) falseToTrue++;
+                }
+                expect(trueToFalse).toBe(1);
+                expect(falseToTrue).toBe(0);
+
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("search during hydration returns what is resident so far, and never throws", async () => {
+            const ids = await seed(8);
+            const lastId = ids[ids.length - 1]; // highest eventId; hydrated last (ascending order)
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+
+                while (true) {
+                    const stats = await reloaded.getStats();
+                    if (stats.eventCount > 0 && stats.eventCount < ids.length) break;
+                    await sleep(4);
+                }
+                // Not yet reached: no throw, just nothing found for it yet.
+                await expect(
+                    reloaded.searchEventIndex(search(`zqnbmarker body ${ids.length - 1}`)),
+                ).resolves.toMatchObject({ count: 0 });
+                // What has loaded so far is already searchable.
+                const partial = await reloaded.searchEventIndex(search("zqnbmarker"));
+                expect(partial.count).toBeGreaterThan(0);
+                expect(partial.count).toBeLessThan(ids.length);
+
+                await reloaded.waitForHydration();
+                const full = await reloaded.searchEventIndex(search("zqnbmarker"));
+                expect(full.count).toBe(ids.length);
+                expect((await reloaded.searchEventIndex(search(lastId.replace("$", "")))).count).toBe(0); // sanity: id itself isn't indexed text
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("a live re-delivery during hydration does not duplicate the record once hydration reaches it", async () => {
+            const ids = await seed(3);
+            const lastId = ids[ids.length - 1];
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+
+                // Wait until at least the first record has hydrated, so the live add below races a
+                // hydration run that is genuinely still in flight rather than one that never started.
+                while ((await reloaded.getStats()).eventCount === 0) await sleep(4);
+
+                // Re-deliver the *last* (ascending-order, so hydrated last) event live, exactly as the
+                // timeline might redeliver a message the crawler has already indexed.
+                await reloaded.addEventToIndex(
+                    msg(lastId, `zqnbmarker body ${ids.length - 1}`, {
+                        room_id: room,
+                        origin_server_ts: ids.length - 1,
+                    }),
+                    {},
+                );
+                await reloaded.waitForHydration();
+                await reloaded.commitLiveEvents();
+
+                expect((await reloaded.getStats()).eventCount).toBe(ids.length);
+                const order = await roomTimelineOrder(reloaded, "zqnbmarker", room, ids.length + 5);
+                expect(order).toEqual(ids);
+                expect(new Set(order).size).toBe(order.length);
+
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("teardown mid-hydration stops the loop cleanly, without a dangling transaction", async () => {
+            await seed(8);
+            const restore = slowDownDecrypt(20);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+
+                while (true) {
+                    const count = (await reloaded.getStats()).eventCount;
+                    if (count > 0 && count < 8) break;
+                    await sleep(4);
+                }
+
+                const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction");
+                const callsAtClose = txSpy.mock.calls.length;
+
+                await reloaded.closeEventIndex();
+                // A promise that never settles here is the loop failing to notice the teardown.
+                await expect(reloaded.waitForHydration()).resolves.toBeUndefined();
+
+                // Give a stray timer or transaction callback a chance to fire before checking it did not.
+                await sleep(80);
+                expect(txSpy.mock.calls.length).toBe(callsAtClose);
+                expect((await reloaded.getStats()).eventCount).toBe(0);
+
+                txSpy.mockRestore();
+            } finally {
+                restore();
+            }
+        });
     });
 });
 
@@ -1452,6 +1708,7 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
         // Enable button reaches this with the feature gated off. It must not put a fresh
         // encrypted index on disk.
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         expect(await indexedDB.databases()).toEqual([]);
 
         await manager.addEventToIndex(msg("$gated", "gated body"), {});
@@ -1462,6 +1719,7 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
 
     it("stops indexing when the flag goes off mid-session", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$before", "before the flag"), {});
         await manager.commitLiveEvents();
         expect(await dumpRawStore("events")).toHaveLength(1);
@@ -1489,6 +1747,7 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
 
     it("still removes and tears down with the flag off", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await manager.addEventToIndex(msg("$keep", "keep body"), {});
         await manager.addEventToIndex(msg("$drop", "drop body"), {});
         const cp = { roomId: "!crawl:example.org", token: "crawltoken", direction: Direction.Backward };
@@ -1683,6 +1942,7 @@ describe("BrowserEventIndexManager (at scale)", () => {
         mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue(null) });
         manager = new BrowserEventIndexManager();
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         await indexScaleCorpus(manager);
     });
 
@@ -1926,6 +2186,7 @@ describe("BrowserEventIndexManager (a persisted index at scale)", () => {
 
     it("rebuilds the same search results and the same room order from stored ciphertext", async () => {
         await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
         for (const ev of RELOAD_CORPUS) await manager.addEventToIndex(ev, {});
         await manager.commitLiveEvents();
         await manager.closeEventIndex();
@@ -1940,6 +2201,7 @@ describe("BrowserEventIndexManager (a persisted index at scale)", () => {
 
         const reloaded = new BrowserEventIndexManager();
         await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
         try {
             const stats = await reloaded.getStats();
             expect(stats.eventCount).toBe(RELOAD_EVENT_COUNT);
