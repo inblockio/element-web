@@ -39,7 +39,10 @@ Please see LICENSE files in the repository root for full details.
  * Every record is additionally bound by AAD to its own key, so an attacker with write access cannot re-file a record
  * under another user or event id and have it decrypt -- though that is no defence against deleting records or rolling
  * the database back. And all of this is strictly about data **at rest**: once {@link
- * BrowserEventIndexManager.initEventIndex} has run, the whole index is held decrypted in memory for the session.
+ * BrowserEventIndexManager.initEventIndex} has run, every record it decrypts is held that way in memory for the rest
+ * of the session -- which, since {@link BrowserEventIndexManager.hydrate} restores everything in the background
+ * rather than all at once before `initEventIndex` returns, is initially just this user's checkpoints and the set of
+ * ids on disk, growing to the whole index over the following seconds as hydration proceeds.
  */
 
 import { logger } from "matrix-js-sdk/src/logger";
@@ -583,6 +586,87 @@ function idbReq<T>(req: IDBRequest<T>): Promise<T> {
 }
 
 /**
+ * Rows read per IndexedDB page during hydration ({@link BrowserEventIndexManager.hydrate}), each
+ * fetched by one `getAll()` call in its own read-only transaction. Sized to keep that one call --
+ * IndexedDB read plus structured-clone deserialisation, which can land in a single main-thread task
+ * -- comfortably under the 50 ms long-task ceiling: measured at ~20 µs/event for `getAll` on this
+ * schema at 200k rows (`research/measurements-v1.md` §3.2), so 1,000 rows is ~20 ms, leaving margin
+ * for slower hardware. Revisit alongside a future chunked schema, which changes what a page reads.
+ */
+const HYDRATION_PAGE_SIZE = 1000;
+
+/**
+ * How long one hydration slice may run before {@link yieldToEventLoop} hands control back to the
+ * event loop; see SYNTHESIS.md §3.4/§3.7 (`SLICE_DEADLINE_MS`). Comfortably under the 50 ms
+ * long-task threshold that {@link BrowserEventIndexManager.hydrate} must never exceed.
+ */
+const HYDRATION_SLICE_DEADLINE_MS = 30;
+
+/**
+ * Traversal order for {@link BrowserEventIndexManager.hydrate}'s paged reads over the *current*
+ * (v2, unchunked) schema: ascending primary key, i.e. ascending `eventId` for one user, which is
+ * what `IDBObjectStore.getAll()` over a key range returns for free, one page-sized read at a time.
+ *
+ * This is **not** recency order, and deliberately does not pretend to be. Matrix event ids are
+ * opaque, server-assigned strings with no guaranteed relationship to `origin_server_ts`, and schema
+ * v2 keeps no plaintext timestamp column to sort by at all -- it was removed as metadata leakage
+ * (see the class threat model). Genuine newest-first hydration needs a schema whose on-disk key
+ * already reflects recency; reversing this constant would not get there, because without such a
+ * key, "the last N rows by key" can only be read by stepping a cursor one row at a time, which
+ * reintroduces exactly the per-record-transaction cost this file's write path already had to be
+ * fixed to avoid. It is kept as its own named constant, rather than inlined into {@link
+ * userEventKeyRange}, so that the day a recency-ordered key exists -- a chunked schema keyed by
+ * `maxTs`, per SYNTHESIS.md §3.4/§3.6 -- this is the one line that changes.
+ */
+const HYDRATION_KEY_ORDER = "ascending" as const;
+
+/**
+ * Current time in milliseconds, monotonic where available. A one-line wrapper purely so every
+ * hydration timing call site reads the same way; `performance` is present in every environment this
+ * file runs in (every real browser, and happy-dom in the unit tests), so there is no fallback to
+ * maintain.
+ */
+function now(): number {
+    return performance.now();
+}
+
+/**
+ * The primary-key range covering one user's rows in the `events` store, optionally resuming after a
+ * specific `eventId`; see {@link HYDRATION_KEY_ORDER}. Built on an IndexedDB rule worth spelling
+ * out: array keys compare element by element, and where one array is a prefix of the other the
+ * *shorter* one sorts first. So `[userId]` (length 1) sorts before every `[userId, eventId]` (length
+ * 2) whatever `eventId` is, and appending any single character to `userId` -- a plain space is used
+ * below, nothing about the choice matters -- makes an array holding only that longer string sort
+ * after every `[userId, eventId]`, for the same reason: the comparison is decided at element 0 (the
+ * bare `userId` is a proper prefix of, and so sorts before, `userId` plus anything appended to it)
+ * before `eventId` is ever considered, so both bounds hold for literally *any* `eventId` string --
+ * unlike a fixed sentinel character, which some real event id could in principle sort after.
+ *
+ * @param afterEventId - When given, the range starts strictly after this id, to resume a paged read;
+ *     the row at this id itself is excluded, on the assumption the caller already has it.
+ */
+function userEventKeyRange(userId: string, afterEventId?: string): IDBKeyRange {
+    const lower = afterEventId !== undefined ? [userId, afterEventId] : [userId];
+    const upper = [userId + " "];
+    return IDBKeyRange.bound(lower, upper, afterEventId !== undefined, true);
+}
+
+/**
+ * Yield to the event loop between hydration slices ({@link BrowserEventIndexManager.hydrate}).
+ * Prefers `scheduler.yield()` (Chrome 129+), which resumes at the browser's next opportunity,
+ * because a plain timer is subject to HTML's nested-timer clamp; falls back to `setTimeout(0)` --
+ * Safari, older Chrome, and every environment these unit tests run in all lack `scheduler.yield`.
+ */
+async function yieldToEventLoop(): Promise<void> {
+    const sched = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+    if (sched?.yield) {
+        await sched.yield();
+        return;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+/**
  * The bytes a base64 ciphertext stands for on disk. One function produces every number feeding {@link
  * BrowserEventIndexManager.ciphertextBytes}, so the total and its parts cannot disagree about how a record is measured.
  */
@@ -713,6 +797,64 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private db: IDBDatabase | null = null;
 
     /**
+     * Every id known to exist for this user as of the most recent {@link initEventIndex}, loaded
+     * eagerly (see {@link loadIdentityAndCheckpoints}) and never mutated to reflect ordinary hydration
+     * progress: it answers "was there ever a disk row for this id", not "is {@link events} missing
+     * it right now" (that second question is just `!this.events.has(id)`). {@link
+     * materializeIfPending} and {@link deleteEvent} use the two together to tell a genuinely new id
+     * apart from one that exists on disk but has not been decrypted into memory yet -- the whole
+     * reason a `has()`-style check can be exact immediately after `initEventIndex` returns, long
+     * before {@link hydrate} has finished. Entries are removed only when a record is actually deleted
+     * ({@link removeFromIndex}) or found to be corrupt ({@link materializeIfPending}'s catch), never
+     * as a side effect of successful hydration.
+     */
+    private readonly identity = new Set<string>();
+
+    /**
+     * True from the point {@link initEventIndex} starts a hydration run until {@link hydrate}
+     * finishes it (successfully, aborted by teardown, or by wiping a corrupt index) -- or never true
+     * at all, if there was nothing to hydrate. Surfaced on {@link getStats}' `loading` so {@link
+     * SearchWarning}'s `useIsIndexIncomplete` can keep showing the existing "results may be
+     * incomplete" line while it is set.
+     */
+    private hydrating = false;
+
+    /**
+     * Bumped by {@link resetMemory}. {@link hydrate} captures the value in effect when it starts and
+     * compares it against this on every resumption point (after each transaction settles, after each
+     * yield); the two differing is what tells a hydration run left over from a previous session, or
+     * from a re-initialisation that did not go through {@link closeEventIndex} first, to stop without
+     * touching {@link db} rather than racing whatever now owns it.
+     */
+    private hydrationEpoch = 0;
+
+    /**
+     * Settles when the hydration run started by the most recent {@link initEventIndex} finishes, is
+     * aborted, or -- if nothing was ever started -- immediately. Production code never awaits this;
+     * the entire point of {@link initEventIndex} returning early is that nothing on the app-start
+     * path should wait for it. It exists so tests, which do need a fully-warmed index to assert
+     * against, have a deterministic point to resume at instead of racing a background loop; see the
+     * public {@link waitForHydration} wrapper.
+     */
+    private hydrationPromise: Promise<void> = Promise.resolve();
+
+    /**
+     * Redactions naming an `m.replace` event whose original has not been hydrated yet. An edit is
+     * never filed under its own id (see {@link upsertEvent}), so there is no {@link identity} entry
+     * to resolve it through, and {@link editTargets} for that original cannot exist until the row
+     * that would populate it has been decrypted. Parked here by {@link deleteEvent}, and drained by
+     * {@link materializeRow} as each row's own `editIds` is checked against this set while it
+     * streams in from disk.
+     */
+    private readonly pendingRedactions = new Set<string>();
+
+    /**
+     * Id -> the in-flight {@link materializeRow} attempt for it, if any; see {@link materializeOnce},
+     * the only thing that reads or writes this. Entries live only for the duration of one decrypt.
+     */
+    private readonly materializing = new Map<string, Promise<void>>();
+
+    /**
      * Whether this session may use the index; see {@link BaseEventIndexManager.supportsEventIndexing}. Re-reads the
      * live gate on every call, but do not mistake that for the feature being re-checked: `EventIndexPeg.init()` asks
      * once and caches the answer. Enforcing the gate is {@link featureEnabled}'s job; this is the honest report, not
@@ -723,19 +865,33 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Open the index for a user and restore whatever was persisted for them; see {@link
-     * BaseEventIndexManager.initEventIndex}. The order is load-bearing: discard any previous state, connection and key
-     * material (the settings panel can re-initialise without closing first, and a leaked handle would later block
-     * deleting the database); read this user's `meta` row, whose salt yields the same DEK as last time; derive the DEK
-     * and checkpoint MAC subkey from the pickle key; then write `meta` if this is a first run and decrypt everything
-     * stored for the user back into memory. Three fallbacks, all deliberate. Unavailable IndexedDB means carrying on
-     * memory-only. No pickle key means deriving both keys from fresh random material and disabling persistence, so
-     * leftover ciphertext stays unopenable -- the safe failure rather than the convenient one. And a record that fails
-     * to decrypt means deleting every record for this user and resetting `userVersion` to 0, the expected response to a
-     * rotated pickle key or a new device id rather than an error path. Does nothing at all while the labs gate is off
-     * ({@link featureEnabled}): this is the path that would otherwise *create* the database, so a session that has
-     * turned the feature off must not be able to put a fresh encrypted index on disk from the settings panel's Enable
-     * button.
+     * Open the index for a user and make it usable; see {@link BaseEventIndexManager.initEventIndex}. The order up to
+     * that point is load-bearing: discard any previous state, connection and key material (the settings panel can
+     * re-initialise without closing first, and a leaked handle would later block deleting the database); read this
+     * user's `meta` row, whose salt yields the same DEK as last time; derive the DEK and checkpoint MAC subkey from the
+     * pickle key; then write `meta` if this is a first run.
+     *
+     * What happens next is **not** a full restore, and that is the point: this resolves once {@link
+     * loadIdentityAndCheckpoints} has loaded this user's checkpoints (needed synchronously -- `EventIndex.init()` calls
+     * {@link loadCheckpoints} immediately after this returns, and an empty answer here would read as "nothing left to
+     * crawl" on an index that is, in fact, most of the way through restoring one) and every event id this user has on
+     * disk (cheap: primary keys only, via `getAllKeys`, never the records themselves). Decrypting those records into
+     * {@link events} is {@link hydrate}'s job, started here but deliberately never awaited, in slices bounded by
+     * {@link HYDRATION_SLICE_DEADLINE_MS} so it never produces one long main-thread task regardless of index size --
+     * this method's own cost is now independent of how much has been indexed. `has()`-style checks the crawler and the
+     * live timeline depend on stay exact throughout, because {@link identity} already knows every id that is pending;
+     * see {@link materializeIfPending}. {@link getStats}' `loading` is true for as long as this takes.
+     *
+     * Three fallbacks, all deliberate, are unchanged from before this method stopped awaiting the restore. Unavailable
+     * IndexedDB means carrying on memory-only. No pickle key means deriving both keys from fresh random material and
+     * disabling persistence, so leftover ciphertext stays unopenable -- the safe failure rather than the convenient
+     * one. And a checkpoint, or later a hydrated row, that fails to decrypt means deleting every record for this user
+     * and resetting `userVersion` to 0, the expected response to a rotated pickle key or a new device id rather than an
+     * error path -- for a checkpoint this still happens here, synchronously; for an event row it happens inside {@link
+     * hydrate}, since by the time hydration reaches a bad row this method has already returned. Does nothing at all
+     * while the labs gate is off ({@link featureEnabled}): this is the path that would otherwise *create* the database,
+     * so a session that has turned the feature off must not be able to put a fresh encrypted index on disk from the
+     * settings panel's Enable button.
      */
     public async initEventIndex(userId: string, deviceId: string): Promise<void> {
         if (!this.featureEnabled("initEventIndex")) return;
@@ -812,12 +968,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userVersion: this.userVersion,
                 });
             }
-            const loaded = await this.loadAllForUser(userId);
+            const loaded = await this.loadIdentityAndCheckpoints(userId);
             if (!loaded) {
-                log.warn("EventIndex: stored ciphertext could not be decrypted; wiping leftover for this user");
-                // Rows before the undecryptable one are already in memory. Drop them too, or isEventIndexEmpty() would
-                // lie to the crawler about what is indexed.
-                await this.resetMemory();
+                log.warn("EventIndex: a stored checkpoint could not be decrypted; wiping leftover for this user");
+                // Nothing has been hydrated yet at this point, only identity keys and checkpoints, so there is
+                // nothing in `events` to lose here -- unlike hydrate()'s own failure path, which has to undo
+                // however much of a restore it had already completed.
+                this.clearIndexMaps();
                 await this.deleteUserRecords(userId);
                 await this.saveMeta({
                     userId,
@@ -825,8 +982,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userVersion: 0,
                 });
                 this.userVersion = 0;
+            } else {
+                // Deliberately not awaited -- see the docstring above. hydrationPromise exists only so tests
+                // (and, per §6 of the increment this implements, field instrumentation) have something to
+                // observe; production code must never depend on it settling.
+                const epoch = this.hydrationEpoch;
+                this.hydrationPromise = this.hydrate(userId, salt, epoch);
             }
         }
+    }
+
+    /**
+     * Resolve once the hydration run started by the most recent {@link initEventIndex} has finished, aborted, or --
+     * if nothing needed hydrating -- immediately. Production code must never call this: the entire point of {@link
+     * initEventIndex} returning early is that nothing on the app-start path waits for a restore. It exists for tests
+     * that need a fully-warmed index to assert against, as a deterministic point to resume at instead of racing
+     * {@link hydrate}'s background loop.
+     * @knipignore - exported for tests
+     */
+    public async waitForHydration(): Promise<void> {
+        await this.hydrationPromise;
     }
 
     /**
@@ -835,11 +1010,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * searchable immediately; only the encrypted write is deferred. Note that the record written is the one for {@link
      * targetId}: when `ev` is an edit it is the *original* message's record that changed.
      *
+     * Pulls the target record in from disk first if {@link hydrate} has not reached it yet ({@link
+     * materializeIfPending}): without that, an id {@link identity} already knows about would look brand new to {@link
+     * upsertEvent} merely because hydration has not decrypted it yet, and upserting it as new would both duplicate its
+     * entry in {@link roomOrder} once hydration *does* reach it, and persist a version missing whatever the disk copy
+     * already held (a prior edit's `editIds`, say).
+     *
      * @param profile - The sender's display name and avatar *at the time of this event*, so a result can be rendered
      *     without the room being loaded.
      */
     public async addEventToIndex(ev: IMatrixEvent, profile: IMatrixProfile): Promise<void> {
         if (this.closed || !this.userId || !this.featureEnabled()) return;
+        await this.materializeIfPending(this.targetId(ev));
         this.upsertEvent(ev, profile);
         this.schedulePersistEvent(this.targetId(ev));
     }
@@ -850,24 +1032,31 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * through {@link editTargets} first or the redacted text stays searchable under the original's id. The whole record
      * is then dropped rather than reverted, the pre-edit body having been overwritten in place.
      *
-     * @returns True if a record was removed; false when nothing matched and also when the index is closed, which
-     *     callers do not need to distinguish.
+     * Three cases, in order: a record already resident resolves as before. One {@link identity} knows about but {@link
+     * hydrate} has not reached is pulled in first ({@link materializeIfPending}) so there is something here to remove.
+     * And one that resolves to neither -- which, while hydration is running, can mean "this is an edit's id, and its
+     * original is a disk row not hydrated yet, so {@link editTargets} cannot know about it" -- is parked in {@link
+     * pendingRedactions} for {@link materializeRow} to drain as rows stream in, rather than being dropped as a no-op.
+     *
+     * @returns True if a record was removed; false when nothing matched (including a redaction just parked for later,
+     *     which has removed nothing *yet*) and also when the index is closed, which callers do not need to distinguish.
      */
     public async deleteEvent(eventId: string): Promise<boolean> {
         if (this.closed) return false;
         // Resolve an edit's id to the record its content was folded into; see the doc above.
-        const targetId = this.events.has(eventId) ? eventId : (this.editTargets.get(eventId) ?? eventId);
+        let targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
+        if (targetId === undefined && this.identity.has(eventId)) {
+            await this.materializeIfPending(eventId);
+            targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
+        }
+        if (targetId === undefined) {
+            if (this.hydrating) this.pendingRedactions.add(eventId);
+            return false;
+        }
         const existed = this.events.has(targetId);
         this.removeFromIndex(targetId);
         if (existed && this.persistEnabled && this.db && this.userId) {
-            const userId = this.userId;
-            this.enqueuePersist(async () => {
-                const tx = this.db!.transaction("events", "readwrite");
-                tx.objectStore("events").delete([userId, targetId]);
-                await txDone(tx);
-                this.ciphertextBytes -= this.recordBytes.get(targetId) ?? 0;
-                this.recordBytes.delete(targetId);
-            });
+            this.enqueueDeleteRecord(this.userId, targetId);
         }
         return existed;
     }
@@ -877,9 +1066,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * weight than its size suggests: `EventIndex.init` asks exactly once at start-up, and an empty answer is what makes
      * it seed a backward and a forward crawler checkpoint for every encrypted room on the next sync -- see {@link
      * migrateV1ToV2}.
+     *
+     * Answered from IndexedDB directly with `IDBIndex.getKey()`, which returns the primary key of the first matching
+     * row without reading its value and was measured at ~0.5 ms even at 50k rows -- never `IDBIndex.count()`, which
+     * walks the whole index and was measured at 0.4-0.5 s at the same size (`research/measurements-v1.md`). This
+     * matters more than it once did: since {@link initEventIndex} no longer awaits {@link hydrate}, {@link events} can
+     * be near-empty on a database that holds hundreds of thousands of rows, and the caller above needs the honest
+     * answer the moment this resolves, not the eventual one. Falls back to the in-memory check when there is nothing
+     * persisted to ask, which is also the one case {@link events} cannot disagree with reality about.
      */
     public async isEventIndexEmpty(): Promise<boolean> {
-        return this.events.size === 0;
+        if (!this.persistEnabled || !this.db || !this.userId) return this.events.size === 0;
+        const tx = this.db.transaction("events", "readonly");
+        const key = await idbReq(tx.objectStore("events").index("byUser").getKey(this.userId));
+        return key === undefined;
     }
 
     /**
@@ -896,7 +1096,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * Index statistics for the settings UI; see {@link BaseEventIndexManager.getStats}. `size` is best-effort,
      * IndexedDB offering no per-database measurement: it reports {@link ciphertextBytes}, excluding store overhead,
      * keys and checkpoints, and falls back to {@link estimatePlainSize} where nothing has been persisted, since 0 bytes
-     * for a populated index would read as a bug. `eventCount` and `roomCount` are exact.
+     * for a populated index would read as a bug.
+     *
+     * `eventCount` and `roomCount` are exact for what is resident *right now*, which while {@link loading} is true is
+     * not yet the eventual total: both climb as {@link hydrate} decrypts more of the disk store, rather than reporting
+     * the final numbers before they are true. `loading` is what tells a caller these are still climbing.
      */
     public async getStats(): Promise<IIndexStats> {
         const rooms = new Set<string>();
@@ -905,6 +1109,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             size: this.ciphertextBytes || this.estimatePlainSize(),
             eventCount: this.events.size,
             roomCount: rooms.size,
+            loading: this.hydrating,
         };
     }
 
@@ -1050,6 +1255,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * two re-fetches a batch rather than skipping it. Either checkpoint may be null; no new one means the crawl has
      * reached the end of that room's history.
      *
+     * Each event is pulled in from disk first if {@link hydrate} has not reached it yet ({@link
+     * materializeIfPending}), so `existing` below reflects reality -- including a rotated hasFile flag or an already-
+     * folded edit history the crawler's own copy would not carry -- rather than looking new merely because hydration
+     * has not decrypted it yet. Without that, this method would both duplicate {@link roomOrder}'s entry for the id
+     * once hydration does reach it and persist a version regressing whatever the disk copy already held.
+     *
      * @returns True only if every event in the batch was already indexed *and* nothing about it changed. The crawler
      *     uses this to stop crawling backwards through a room it has covered, so a false negative costs a redundant
      *     page while a false positive would silently truncate history. An empty batch returns false, as does one
@@ -1072,6 +1283,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // 3. Anything else -- a new event, or an edit for a record we hold -- is a plain upsert.
         for (const { event, profile } of events) {
             const id = this.targetId(event);
+            await this.materializeIfPending(id);
             const existing = this.events.get(id);
             const isReplace = replacedEventId(event) !== null;
             if (existing && !isReplace && existing.edited === false) {
@@ -1199,6 +1411,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * flushed first, then the keys are dropped, memory cleared and the connection closed; a failed flush is logged and
      * teardown continues, since refusing to close would leave the keys in memory. The records stay on disk -- the point
      * of the distinction from {@link deleteEventIndex} -- inert without the pickle key.
+     *
+     * If {@link hydrate} is still running, {@link resetMemory} below moves {@link hydrationEpoch} on and clears what
+     * that run has built so far; the loop notices at its next resumption point and returns without touching {@link db}
+     * (already closed by then) or leaving a transaction or a pending timer behind. Not awaited here -- see {@link
+     * waitForHydration} for why that would be a contradiction for tests that need to observe the stop, and why
+     * production code has no such need.
      */
     public async closeEventIndex(): Promise<void> {
         try {
@@ -1420,10 +1638,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
     /**
      * Remove a record from every in-memory structure at once, because they have to stay consistent or later reads break
-     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link foldedSearchText}, {@link editTargets}
-     * and {@link roomOrder} (whose entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed}
-     * need not check for emptiness). {@link recordBytes} is the exception, describing what is on *disk*, where the row
-     * survives until the delete this caller queues has committed.
+     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link foldedSearchText}, {@link editTargets},
+     * {@link identity} (the record no longer exists at all, not merely pending hydration) and {@link roomOrder} (whose
+     * entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed} need not check for emptiness).
+     * {@link recordBytes} is the exception, describing what is on *disk*, where the row survives until the delete this
+     * caller queues has committed.
      *
      * @param eventId - A record id, not an edit's id; resolve that through {@link editTargets} first. Unknown ids are a
      *     no-op, and nothing here touches the database.
@@ -1434,6 +1653,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.unindexTokens(eventId, existing.searchText);
         this.events.delete(eventId);
         this.foldedSearchText.delete(eventId);
+        this.identity.delete(eventId);
         for (const editId of existing.editIds ?? []) this.editTargets.delete(editId);
         const list = this.roomOrder.get(existing.roomId);
         if (list) {
@@ -1581,6 +1801,22 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * Queue the removal of one record's disk row and its accounting, shared by {@link deleteEvent}'s ordinary path and
+     * by {@link materializeRow}'s "redacted before it was even hydrated" path -- both end up wanting exactly the same
+     * thing done to a row that may or may not still be in {@link recordBytes} (the second caller's row was never
+     * added there, having never been materialized, so the `?? 0` matters for it specifically).
+     */
+    private enqueueDeleteRecord(userId: string, targetId: string): void {
+        this.enqueuePersist(async () => {
+            const tx = this.db!.transaction("events", "readwrite");
+            tx.objectStore("events").delete([userId, targetId]);
+            await txDone(tx);
+            this.ciphertextBytes -= this.recordBytes.get(targetId) ?? 0;
+            this.recordBytes.delete(targetId);
+        });
+    }
+
+    /**
      * Queue an encrypted write of one record onto the persistence chain. The record is captured by reference and
      * serialised only when its turn comes, so a message edited twice in quick succession is written once, in its final
      * state; `userId` and the DEK are captured by value instead, so a write scheduled just before a logout cannot be
@@ -1669,50 +1905,22 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Decrypt everything stored for a user and rebuild the in-memory index from it, once, from {@link initEventIndex}.
-     * Events and checkpoints are read in two separate transactions, each closed before its records are decrypted:
-     * decryption is asynchronous and not an IndexedDB operation, so doing it inside a live transaction would let the
-     * transaction auto-close underneath the loop.
+     * The cheap half of a restore, awaited by {@link initEventIndex}: every checkpoint (decrypted -- there are few of
+     * these, one per in-progress crawl position, so the cost is negligible) and every event id this user has on disk
+     * (cleartext primary keys only, via `getAllKeys`, so this is proportional to id count, never to decrypted content).
+     * Decrypting the events themselves into {@link events} is {@link hydrate}'s job, not this one.
      *
-     * @returns True when everything loaded, including the vacuous cases of no records, no database or no key. False on
-     *     the *first* record that will not decrypt -- deliberately without cleaning up, because the caller's contract
-     *     is to reset memory and delete every record for the user. Such a failure is expected rather than exceptional:
-     *     it is what a rotated pickle key or a new device id looks like from the inside.
+     * Checkpoints are read first not because order matters between the two -- it does not -- but because {@link
+     * EventIndex.init} needs them the moment {@link initEventIndex} returns, and putting the cheaper, correctness-
+     * critical read first keeps that dependency visible at the call site.
+     *
+     * @returns True when everything loaded, including the vacuous case of nothing persisted. False if a checkpoint
+     *     fails to decrypt, which {@link initEventIndex} responds to exactly as {@link hydrate} responds to a bad
+     *     event row: wipe this user's whole index. Event ids need no such check, being cleartext keys, not ciphertext.
      */
-    private async loadAllForUser(userId: string): Promise<boolean> {
+    private async loadIdentityAndCheckpoints(userId: string): Promise<boolean> {
         if (!this.db || !this.dek) return true;
         const dek = this.dek;
-        const evTx = this.db.transaction("events", "readonly");
-        const evIdx = evTx.objectStore("events").index("byUser");
-        const evRows = (await idbReq(evIdx.getAll(userId))) as EventRecord[];
-        await txDone(evTx);
-
-        this.ciphertextBytes = 0;
-        this.recordBytes.clear();
-        for (const row of evRows) {
-            try {
-                const stored = await decryptJson<StoredEvent>(dek, row.blob, `${userId}|${row.eventId}`);
-                this.events.set(stored.eventId, stored);
-                for (const editId of stored.editIds ?? []) this.editTargets.set(editId, stored.eventId);
-                this.indexTokens(stored.eventId, stored.searchText);
-                // Appended now and ordered once below, rather than placed per row: paying an ordering step per record
-                // is what made start-up quadratic in the size of a room. Rows arrive in key order, not timestamp order,
-                // so the sort below is what makes these the ascending lists insertRoomOrder promises.
-                const list = this.roomOrder.get(stored.roomId);
-                if (list) list.push(stored.eventId);
-                else this.roomOrder.set(stored.roomId, [stored.eventId]);
-                const bytes = ciphertextByteLength(row.blob.ct);
-                this.recordBytes.set(stored.eventId, bytes);
-                this.ciphertextBytes += bytes;
-            } catch {
-                return false;
-            }
-        }
-        // One sort per room. `sort` is stable and every id was pushed in row order, so this produces exactly the list
-        // repeated stable insertion would have.
-        for (const list of this.roomOrder.values()) {
-            list.sort((a, b) => (this.events.get(a)?.originServerTs ?? 0) - (this.events.get(b)?.originServerTs ?? 0));
-        }
 
         const cpTx = this.db.transaction("checkpoints", "readonly");
         const cpIdx = cpTx.objectStore("checkpoints").index("byUser");
@@ -1727,7 +1935,230 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 return false;
             }
         }
+
+        const evTx = this.db.transaction("events", "readonly");
+        const keys = (await idbReq(evTx.objectStore("events").index("byUser").getAllKeys(userId))) as Array<
+            [string, string]
+        >;
+        await txDone(evTx);
+        for (const [, eventId] of keys) this.identity.add(eventId);
+
         return true;
+    }
+
+    /**
+     * Decrypt everything this user has on disk into memory, in the background, without ever awaiting anything but an
+     * IndexedDB request or {@link yieldToEventLoop} between two decrypts -- see {@link initEventIndex}, which starts
+     * this without awaiting it, and the class threat model's note on why a non-IndexedDB `await` inside a live
+     * transaction is the one mistake to avoid here above all others.
+     *
+     * Paged: each page is read with one `getAll()` over {@link userEventKeyRange} in its own read-only transaction,
+     * which is allowed to settle ({@link txDone}) *before* anything in it is decrypted, because decryption is not an
+     * IndexedDB operation and awaiting one inside a live transaction lets it auto-close out from underneath the rest
+     * of the page. Sliced: work inside a page is further cut at {@link HYDRATION_SLICE_DEADLINE_MS}, yielding between
+     * slices, so a large restore never produces one long main-thread task regardless of how many pages it takes.
+     *
+     * Every resumption point -- the top of the loop, after each transaction settles, after each row, after each yield
+     * -- re-checks {@link closed} and the epoch this run was started with, and returns without touching {@link db} the
+     * moment either has moved on. That is what makes teardown and re-initialisation safe against a hydration run left
+     * over from a previous session: see {@link resetMemory}, which is what moves the epoch on.
+     *
+     * A row whose id is already in {@link events} is skipped rather than overwritten: a live event or a crawler batch
+     * that named this id got there first and is authoritative (see {@link materializeIfPending}, which is what a write
+     * path calls to pull a not-yet-hydrated row in early instead of racing this loop for it), so the disk copy this
+     * loop is holding is superseded and must not regress it or duplicate its entry in {@link roomOrder}.
+     *
+     * A row that fails to decrypt reproduces the old, fully-synchronous {@link initEventIndex}'s failure response --
+     * wipe this user's index, in memory and on disk, and reset to `userVersion` 0 -- because that is what a rotated
+     * pickle key or a new device id looks like from the inside, and both remain possible mid-hydration. Whatever this
+     * run had already hydrated is included in the wipe, which is why it is a caller-visible reset ({@link
+     * clearIndexMaps}) rather than something the caller has to notice and clean up after.
+     *
+     * @param userId - Captured at the call site rather than read from `this.userId`, so a logout or a re-
+     *     initialisation for a different user cannot redirect a page this loop already has in flight.
+     * @param salt - Needed only by the failure path, to re-save a `meta` row with the same salt after wiping the rest.
+     * @param epoch - This run's stamp; see {@link resetMemory} and {@link hydrationEpoch}.
+     */
+    private async hydrate(userId: string, salt: Uint8Array<ArrayBuffer>, epoch: number): Promise<void> {
+        const started = now();
+        let longestSliceMs = 0;
+        let hydratedCount = 0;
+
+        if (this.identity.size === 0) {
+            this.hydrating = false;
+            return;
+        }
+        this.hydrating = true;
+
+        try {
+            let afterEventId: string | undefined;
+            for (;;) {
+                if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
+                const dek = this.dek;
+                const db = this.db;
+
+                const tx = db.transaction("events", "readonly");
+                const range = userEventKeyRange(userId, afterEventId);
+                const rows = (await idbReq(
+                    tx.objectStore("events").getAll(range, HYDRATION_PAGE_SIZE),
+                )) as EventRecord[];
+                await txDone(tx);
+                if (this.closed || epoch !== this.hydrationEpoch) return;
+                if (rows.length === 0) break;
+                afterEventId = rows[rows.length - 1].eventId;
+
+                let sliceStart = now();
+                for (const row of rows) {
+                    if (this.closed || epoch !== this.hydrationEpoch) return;
+
+                    if (!this.events.has(row.eventId)) {
+                        try {
+                            await this.materializeOnce(userId, dek, row, epoch);
+                            if (this.closed || epoch !== this.hydrationEpoch) return;
+                            hydratedCount++;
+                        } catch {
+                            log.warn(
+                                "EventIndex: stored ciphertext could not be decrypted; wiping leftover for this user",
+                            );
+                            this.clearIndexMaps();
+                            await this.deleteUserRecords(userId);
+                            await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                            this.userVersion = 0;
+                            return;
+                        }
+                    }
+
+                    const elapsedInSlice = now() - sliceStart;
+                    if (elapsedInSlice >= HYDRATION_SLICE_DEADLINE_MS) {
+                        longestSliceMs = Math.max(longestSliceMs, elapsedInSlice);
+                        await yieldToEventLoop();
+                        if (this.closed || epoch !== this.hydrationEpoch) return;
+                        sliceStart = now();
+                    }
+                }
+                longestSliceMs = Math.max(longestSliceMs, now() - sliceStart);
+
+                if (rows.length < HYDRATION_PAGE_SIZE) break;
+            }
+        } finally {
+            if (epoch === this.hydrationEpoch) this.hydrating = false;
+        }
+
+        log.info(
+            `EventIndex: hydration finished in ${(now() - started).toFixed(1)}ms, ${hydratedCount} events, ` +
+                `longest slice ${longestSliceMs.toFixed(1)}ms, key order ${HYDRATION_KEY_ORDER}`,
+        );
+    }
+
+    /**
+     * Decrypt one disk row and fold it into every in-memory structure exactly as the old, fully-synchronous restore
+     * did: build the {@link StoredEvent}, index its tokens, record its ciphertext size, and insert it into its room's
+     * ordered list. Binary-search insertion ({@link insertRoomOrder}), rather than the old bulk "push everything, then
+     * sort each room once", because hydration now happens in slices that can be interrupted between any two rows, so
+     * the ordering invariant has to hold after every single row instead of only once a whole room's rows have all
+     * arrived. Fed rows in ascending primary-key order -- what every caller here does -- the two produce identical
+     * output, ties included, because both are stable with respect to that arrival order.
+     *
+     * Also drains {@link pendingRedactions}: if this row's own `editIds` names an id a redaction already arrived for
+     * (necessarily before this row could be hydrated to resolve it, an edit never being filed under its own id), the
+     * record this row would have created is redacted on arrival instead of being inserted at all, and its disk row is
+     * queued for deletion. This is the one path through which a redaction that raced hydration still ends up removing
+     * content in memory and on disk, which is the invariant this exists to not regress.
+     *
+     * @param epoch - The caller's {@link hydrationEpoch} snapshot, taken before this row's decrypt started. Re-checked
+     *     the moment decrypt resolves, against both this and {@link closed}, because decrypt is the one genuinely slow
+     *     await in this method and the only point at which a teardown or a re-initialisation that lands mid-decrypt
+     *     could otherwise write a freshly-decrypted row into maps {@link resetMemory} has *already* cleared by the time
+     *     this resumes -- resurrecting exactly one record into what teardown promised would be empty.
+     * @throws Whatever {@link decryptJson} throws on ciphertext that will not decrypt. Both callers -- this method's
+     *     own {@link hydrate} loop and {@link materializeIfPending} -- treat that as expected, not exceptional, but
+     *     respond to it differently; see each.
+     */
+    private async materializeRow(userId: string, dek: CryptoKey, row: EventRecord, epoch: number): Promise<void> {
+        const stored = await decryptJson<StoredEvent>(dek, row.blob, `${userId}|${row.eventId}`);
+        if (this.closed || epoch !== this.hydrationEpoch) return;
+
+        const redactedByPendingEdit = (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id));
+        if (redactedByPendingEdit) {
+            for (const id of stored.editIds ?? []) this.pendingRedactions.delete(id);
+            this.identity.delete(stored.eventId);
+            this.enqueueDeleteRecord(userId, stored.eventId);
+            return;
+        }
+
+        this.events.set(stored.eventId, stored);
+        for (const editId of stored.editIds ?? []) this.editTargets.set(editId, stored.eventId);
+        this.indexTokens(stored.eventId, stored.searchText);
+        this.insertRoomOrder(stored);
+        const bytes = ciphertextByteLength(row.blob.ct);
+        this.recordBytes.set(stored.eventId, bytes);
+        this.ciphertextBytes += bytes;
+    }
+
+    /**
+     * Materialize one row at most once, however many callers want it at the same time. {@link hydrate}'s loop and
+     * {@link materializeIfPending} each decide whether an id needs materializing from a synchronous check of {@link
+     * events} taken *before* either starts decrypting -- so if a live write names an id hydration has already started
+     * decrypting, but not yet finished, both checks can pass before either's decrypt resolves. Without this, both
+     * would go on to call {@link materializeRow}, and both would then insert into {@link roomOrder}, which has no
+     * "already present?" check of its own and so duplicates the id in it. A caller that finds an id already being
+     * materialized awaits that attempt instead of starting a second one; the map entry is removed once the attempt
+     * settles (successfully or not), so a later, genuinely new request for the same id is never permanently blocked by
+     * one that has already finished.
+     */
+    private async materializeOnce(userId: string, dek: CryptoKey, row: EventRecord, epoch: number): Promise<void> {
+        const inFlight = this.materializing.get(row.eventId);
+        if (inFlight) {
+            await inFlight;
+            return;
+        }
+        const attempt = this.materializeRow(userId, dek, row, epoch);
+        this.materializing.set(row.eventId, attempt);
+        try {
+            await attempt;
+        } finally {
+            this.materializing.delete(row.eventId);
+        }
+    }
+
+    /**
+     * Pull one not-yet-hydrated row into memory immediately, if there is one, so a write path about to consult {@link
+     * events} for `targetId` sees the disk copy instead of treating a record that already exists as brand new; see
+     * {@link addEventToIndex}, {@link addHistoricEvents} and {@link deleteEvent}, all of which call this before
+     * touching {@link events} for an id that came from outside. Without it, a live event or a crawler batch naming an
+     * id {@link identity} already knows about, but {@link hydrate} has not reached yet, would be folded into the index
+     * as if new -- silently dropping whatever the disk copy already held (an `editIds` list, a `hasFile` flag from a
+     * later edit) the moment the resulting persist overwrites it.
+     *
+     * A no-op whenever there is nothing to pull in: the id is not known at all (genuinely new), it is already
+     * resident, or this session has nothing persisted to read from. Not itself sliced -- unlike {@link hydrate}'s own
+     * paging, this is one record, and the cost is paid once per id, only during the hydration window.
+     */
+    private async materializeIfPending(targetId: string): Promise<void> {
+        if (this.events.has(targetId)) return;
+        if (!this.identity.has(targetId)) return;
+        if (!this.persistEnabled || !this.db || !this.dek || !this.userId) return;
+        const userId = this.userId;
+        const dek = this.dek;
+        const epoch = this.hydrationEpoch;
+        const tx = this.db.transaction("events", "readonly");
+        const row = (await idbReq(tx.objectStore("events").get([userId, targetId]))) as EventRecord | undefined;
+        await txDone(tx);
+        // A teardown or re-initialisation could have landed while the get() above was in flight;
+        // re-check rather than resurrect a record into an index that has moved on. materializeRow()
+        // repeats this same check of its own after its (slower) decrypt await, for the same reason.
+        if (this.closed || epoch !== this.hydrationEpoch) return;
+        if (!row) return; // Raced with a delete; nothing left to pull in.
+        try {
+            await this.materializeOnce(userId, dek, row, epoch);
+        } catch {
+            // Corrupt row. hydrate() responds to this by wiping the whole index, which is right for a bulk restore
+            // hitting a rotated key; one row hit this way, off the hot path of a session that is otherwise working,
+            // does not carry the same implication and is not worth tearing a whole session down over. Drop it from
+            // identity so later checks stop treating it as pending, and let the caller's own upsert treat targetId as
+            // new -- the same outcome as for any id that never had a disk copy at all.
+            this.identity.delete(targetId);
+        }
     }
 
     /**
@@ -1776,22 +2207,44 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Discard all in-memory state and start the persistence chain over. Resetting {@link persistChain} to a resolved
-     * promise is the part with teeth: it detaches any operations still queued from anything that awaits the chain
-     * afterwards. That is why both teardown paths await the *old* chain before calling this, and why {@link
-     * deleteEventIndex} clears {@link persistEnabled} first.
+     * Clear every structure {@link hydrate}/{@link materializeRow} populate, without touching {@link checkpoints},
+     * {@link userVersion}, {@link persistChain} or {@link hydrationEpoch}. Split out from {@link resetMemory}
+     * specifically for {@link hydrate}'s own decrypt-failure path: that path runs *inside* a hydration run and has to
+     * wipe what it has built so far without invalidating its own epoch, which the epoch-bumping {@link resetMemory}
+     * would do to itself if called mid-run (a hydration loop that just wiped everything would then see its own epoch
+     * as stale on its very next check and abort before finishing the wipe it was in the middle of).
      */
-    private async resetMemory(): Promise<void> {
+    private clearIndexMaps(): void {
         this.events.clear();
         this.editTargets.clear();
         this.foldedSearchText.clear();
         this.inverted.clear();
         this.roomOrder.clear();
-        this.checkpoints = [];
-        this.userVersion = 0;
         this.ciphertextBytes = 0;
         this.recordBytes.clear();
+        this.identity.clear();
+        this.pendingRedactions.clear();
+    }
+
+    /**
+     * Discard all in-memory state and start the persistence chain over. Resetting {@link persistChain} to a resolved
+     * promise is the part with teeth: it detaches any operations still queued from anything that awaits the chain
+     * afterwards. That is why both teardown paths await the *old* chain before calling this, and why {@link
+     * deleteEventIndex} clears {@link persistEnabled} first.
+     *
+     * Also bumps {@link hydrationEpoch}, which is what tells a hydration run left over from before this call -- a
+     * previous session's, or one from a re-initialisation that skipped {@link closeEventIndex} -- to stop at its next
+     * resumption point instead of writing into the state this method is about to hand to a new one. Every caller of
+     * this method (this class's own {@link initEventIndex}, {@link closeEventIndex}, {@link deleteEventIndex}) is
+     * exactly a point where the previous hydration run, if any, must be treated as no longer owning anything.
+     */
+    private async resetMemory(): Promise<void> {
+        this.clearIndexMaps();
+        this.checkpoints = [];
+        this.userVersion = 0;
         this.persistChain = Promise.resolve();
+        this.hydrating = false;
+        this.hydrationEpoch++;
     }
 
     /**
