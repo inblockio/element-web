@@ -56,6 +56,13 @@ interface IProps {
  *
  * An all-rooms search cannot ask the per-room question, so it uses the checkpoint set alone.
  *
+ * A third signal, `getStats().loading`, answers a question neither checkpoint check can: the
+ * browser index backend hydrates its on-disk store into memory in the background after start-up
+ * (see `BrowserEventIndexManager.initEventIndex`), and a query issued before that finishes can
+ * silently return only what has loaded so far, even with no checkpoints outstanding at all. Unlike
+ * the two questions above, this one is not scoped by room: while it is true, every search is
+ * potentially incomplete.
+ *
  * The `changedCheckpoint` payload carries only the globally-current room and so cannot answer a
  * per-room question: we re-read the index on each event rather than trust it.
  *
@@ -105,6 +112,18 @@ function useIsIndexIncomplete(index: EventIndex | null, scope?: SearchScope, roo
                 setIncomplete(true);
                 return;
             }
+
+            // The index can still be hydrating from disk with no checkpoints outstanding at all --
+            // a fresh session, before the crawler has run this pass -- in which case a query can
+            // silently return only what has been decrypted so far. This applies regardless of scope
+            // or room, unlike the checkpoint checks above and below.
+            const stats = await index.getStats();
+            if (current !== generation) return;
+            if (stats?.loading) {
+                setIncomplete(true);
+                return;
+            }
+
             if (!anyOutstanding || scope !== SearchScope.Room || roomId === undefined) {
                 setIncomplete(false);
                 return;
