@@ -66,6 +66,8 @@ export default {
             project: [
                 "**/*.{js,cjs,mjs,jsx,ts,cts,mts,tsx,pcss}!",
                 "!scripts/**!",
+                // Standalone perf harness: developer tooling, not built, bundled or imported by the app
+                "!perf/**",
                 "!src/test/**!",
                 "!recorder-worklet-loader.cjs!",
                 "!src/**/*-{mock,mocks,snapshot,actions}.*!",
