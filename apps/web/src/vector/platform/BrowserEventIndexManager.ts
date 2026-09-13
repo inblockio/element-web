@@ -77,6 +77,7 @@ import BaseEventIndexManager, {
 } from "../../indexing/BaseEventIndexManager";
 import PlatformPeg from "../../PlatformPeg";
 import SettingsStore from "../../settings/SettingsStore";
+import { DAY_MS, getEventIndexBounds } from "./eventIndexBounds";
 
 const log = logger.getChild("BrowserEventIndex");
 
@@ -165,6 +166,25 @@ interface MetaRecord {
     salt: string;
     /** Schema version owned by the caller (EventIndex), not by this file. See {@link BrowserEventIndexManager.setUserVersion}. */
     userVersion: number;
+    /**
+     * Total ciphertext bytes of every `events` row on disk for this user, exact, updated in the
+     * same transaction as every write and delete that changes it. Restored into {@link
+     * BrowserEventIndexManager.ciphertextBytes} at {@link BrowserEventIndexManager.initEventIndex}
+     * so `DISK_BUDGET_BYTES` accounting (`research/SYNTHESIS.md` §3.6/§4) is exact from the moment
+     * the index opens rather than only once hydration has re-visited every row -- which, since
+     * hydration is now itself bounded by the resident budget, may never happen at all. This is
+     * additional cleartext, but not a new disclosure: the same total is already recoverable by an
+     * attacker with database read access simply by summing every row's own ciphertext length (see
+     * the class threat model's "Shape" bullet), which this field only saves them the arithmetic for.
+     */
+    diskBytes?: number;
+    /**
+     * The oldest event timestamp (`origin_server_ts`) this session or a previous one has ever
+     * confirmed is on disk for this user, restored into {@link
+     * BrowserEventIndexManager.oldestIndexedTs} at open. See that field's own docstring for the
+     * exact semantics (a guarantee floor, not necessarily the literal minimum surviving row).
+     */
+    oldestIndexedTs?: number;
 }
 
 /**
@@ -653,6 +673,32 @@ export const HYDRATION_PAGE_SIZE = 1000;
 const HYDRATION_SLICE_DEADLINE_MS = 30;
 
 /**
+ * The resident cost of one indexed event, for checking {@link
+ * BrowserEventIndexManager.hydrate}/{@link BrowserEventIndexManager.enforceResidentBudget} against
+ * `HOT_WINDOW_BYTES`. **Deliberately not** {@link BrowserEventIndexManager.plainTextByteEstimate}
+ * (`searchText.length + 64`): that field is calibrated for a different job -- a plausible non-zero
+ * number for the settings UI's `size` stat on a memory-only session -- and measures only the
+ * search text, which real-Chromium measurement shows is a small, near-constant fraction of what a
+ * `StoredEvent` actually costs on the JS heap (the event envelope, profile, room-order array entry
+ * and inverted-index Set entries dominate). Using the text-only estimate as the budget gate was
+ * tried and measured wrong: at 200k real-shaped events on the small tier it let ~181k stay
+ * resident against a 48 MiB budget, because the text-only estimate for that many events looked
+ * nowhere near 48 MiB while the real JS heap had already grown past 178 MiB.
+ *
+ * `research/SYNTHESIS.md` §1.6/§3.7 cites 869-914 B/event measured across corpus sizes and even
+ * across a 5x change in accented-Latin share (`research/measurements-pr-b.md` §6.4), i.e. the
+ * real cost is close to a *per-event constant*, not proportional to text length -- which is why a
+ * flat per-event figure, not a text-length-weighted one, is the right shape for this estimate.
+ * 1024 rounds that measured range up for headroom rather than down. `events.size` (a `Map`'s own
+ * count, already read for `getStats()`'s `eventCount`) is what this is multiplied by, so no new
+ * per-event bookkeeping is needed to use it: {@link BrowserEventIndexManager.residentByteEstimate}.
+ *
+ * @knipignore - exported so a test can construct an exact `hotWindowBytes` override (an exact
+ *     multiple of this constant) instead of reverse-engineering it.
+ */
+export const RESIDENT_BYTES_PER_EVENT_ESTIMATE = 1024;
+
+/**
  * Traversal order for {@link BrowserEventIndexManager.hydrate}'s paged reads over the *current*
  * (v2, unchunked) schema: ascending primary key, i.e. ascending `eventId` for one user, which is
  * what `IDBObjectStore.getAll()` over a key range returns for free, one page-sized read at a time.
@@ -765,6 +811,58 @@ async function yieldToEventLoop(): Promise<void> {
  */
 function ciphertextByteLength(ct: string): number {
     return Math.ceil((ct.length * 3) / 4);
+}
+
+/**
+ * One candidate for eviction/deletion by age: a record id and the `originServerTs` it was pushed
+ * onto a heap with. Kept as the *value pushed*, not a live reference, because both heaps below
+ * tolerate staleness by design -- see {@link heapPushTs}.
+ */
+interface TsEntry {
+    ts: number;
+    id: string;
+}
+
+/**
+ * Push `entry` onto a plain binary min-heap ordered by `ts`, array-backed, no external library:
+ * both {@link BrowserEventIndexManager.residentHeap} (oldest-resident-first, for the hot-window
+ * budget) and {@link BrowserEventIndexManager.diskTsHeap} (oldest-on-disk-first, for the disk
+ * budget) are exactly this shape. Neither heap is kept free of stale entries eagerly -- a record
+ * whose id is redacted, evicted, or re-timed leaves its old heap entry in place -- because IDs are
+ * cheap to push and a heap has no efficient arbitrary-removal operation; {@link heapPopMinTs}'s
+ * caller is the one place that has to notice and skip a stale entry, once, when it is popped.
+ */
+function heapPushTs(heap: TsEntry[], entry: TsEntry): void {
+    heap.push(entry);
+    let i = heap.length - 1;
+    while (i > 0) {
+        const parent = (i - 1) >> 1;
+        if (heap[parent].ts <= heap[i].ts) break;
+        [heap[parent], heap[i]] = [heap[i], heap[parent]];
+        i = parent;
+    }
+}
+
+/** Pop and return the entry with the smallest `ts`, or `undefined` if `heap` is empty. */
+function heapPopMinTs(heap: TsEntry[]): TsEntry | undefined {
+    if (heap.length === 0) return undefined;
+    const top = heap[0];
+    const last = heap.pop()!;
+    if (heap.length > 0) {
+        heap[0] = last;
+        let i = 0;
+        for (;;) {
+            const l = i * 2 + 1;
+            const r = i * 2 + 2;
+            let smallest = i;
+            if (l < heap.length && heap[l].ts < heap[smallest].ts) smallest = l;
+            if (r < heap.length && heap[r].ts < heap[smallest].ts) smallest = r;
+            if (smallest === i) break;
+            [heap[i], heap[smallest]] = [heap[smallest], heap[i]];
+            i = smallest;
+        }
+    }
+    return top;
 }
 
 /**
@@ -911,12 +1009,129 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private readonly foldedSearchText = new Map<string, { src: string; folded: string }>();
     /**
-     * Ciphertext size of each event record *as it currently sits on disk*, which is what makes {@link ciphertextBytes}
-     * a sum rather than a tally of everything ever written. Maintained only from inside the persistence chain, since a
-     * record's size is not known until it has been encrypted, so it is empty in a memory-only session where {@link
-     * getStats} falls back to {@link estimatePlainSize}.
+     * Ciphertext size of each event record *as it currently sits on disk*, updated from inside the
+     * persistence chain when a write commits (a record's size is not known until it has been
+     * encrypted) and from {@link materializeRow} when hydration or an on-demand pull decrypts a
+     * pre-existing row (its `EventRecord.blob.ct` is already the on-disk length, no re-encryption
+     * needed to learn it). Empty in a memory-only session, where {@link getStats} falls back to
+     * {@link estimatePlainSize}. Also what makes a record durable enough to grant it eviction
+     * candidacy at all -- see {@link residentHeap}'s docstring for why that gate lives at the
+     * *push* site now (only {@link flushLiveWrites} and {@link materializeRow} ever push), not as
+     * a check inside {@link enforceResidentBudget} any more.
      */
     private readonly recordBytes = new Map<string, number>();
+    /**
+     * `originServerTs` for every id in {@link recordBytes}, i.e. every record this session knows is
+     * on disk, whether or not it is currently resident. Maintained alongside {@link recordBytes}
+     * everywhere that is (never independently), and read only by {@link diskTsHeap}'s staleness
+     * check: a popped heap entry is stale exactly when this map no longer agrees with the `ts` it
+     * was pushed with, which covers both "deleted since" and "re-timed since" (see {@link
+     * upsertEvent} case 2) in one comparison.
+     */
+    private readonly recordTs = new Map<string, number>();
+    /**
+     * Min-heap of every *durable* resident record by `originServerTs`, the eviction candidate list
+     * for {@link enforceResidentBudget} (`HOT_WINDOW_BYTES`, `research/SYNTHESIS.md` §3.6/§3.7).
+     * Never cleaned up eagerly on removal -- see {@link heapPushTs}'s docstring -- so a popped
+     * entry must be checked against {@link events} before being trusted.
+     *
+     * Populated *only* once a record's write has actually committed -- {@link flushLiveWrites} (a
+     * batch or the live buffer, once `put()` succeeds) and {@link materializeRow} (a pre-existing
+     * disk row, durable by definition the moment it is decrypted) -- **never** at the moment a
+     * record becomes resident ({@link upsertEvent} case 4) or is merely re-timed while resident
+     * ({@link upsertEvent} case 2, which relies on its own fresh persist eventually reaching this
+     * heap the same way). This was not the original design and the reason it changed is worth
+     * recording: an earlier version pushed at case 4 and called {@link enforceResidentBudget}
+     * synchronously on every insert, deferring any entry not yet in {@link recordBytes}. Measured
+     * on a real 200k-event crawler ingest, that made every eviction attempt walk (and re-push) most
+     * of the heap for nothing, for two compounding reasons: `enqueueBatchedWrite` never awaits, so
+     * the entire ~2.5s ingest loop runs to completion (all 200k heap pushes) before the persist
+     * chain has committed almost anything; and this class's backward-crawl delivery order (newest
+     * first, progressively *older* content batch over batch) means the not-yet-durable tail is also
+     * usually the current heap *minimum* -- precisely what eviction pops first. The result was
+     * effectively quadratic in event count, and a 200k-event ingest did not finish inside a
+     * 15-minute harness timeout. Granting candidacy only at the write-commit site removes the
+     * "not yet durable" case from {@link enforceResidentBudget} entirely -- every entry popped from
+     * this heap either evicts or is stale, never deferred for durability -- at the cost of eviction
+     * lagging insertion by up to one flush's worth (a live buffer: {@link LIVE_WRITE_BUFFER_MAX}
+     * events or {@link LIVE_WRITE_FLUSH_INTERVAL_MS}; a crawler batch: ~100 events), never
+     * unboundedly.
+     */
+    private readonly residentHeap: TsEntry[] = [];
+    /**
+     * Min-heap of every record this session knows is on disk (resident or not) by `originServerTs`,
+     * the deletion candidate list for {@link enforceDiskBudget} (`DISK_BUDGET_BYTES`). Populated
+     * wherever {@link recordBytes} is (see that field's docstring); a popped entry is checked
+     * against {@link recordTs} before being trusted, for the same reason {@link residentHeap} is
+     * checked against {@link events}.
+     *
+     * A known limitation, named rather than silently accepted: this heap, like {@link recordBytes},
+     * only ever contains records this *session* has written or decrypted at least once. A disk row
+     * from a previous session that this session's hydration has not reached yet (because {@link
+     * residentBudgetExceeded} stopped it early) is invisible to {@link enforceDiskBudget} until
+     * something -- a live write for that id, or hydration reaching it -- makes it visible. This is
+     * the same "no full scan" constraint that bounds hydration itself (see `HYDRATION_KEY_ORDER`'s
+     * docstring); resolving it properly needs the chunked, recency-keyed schema of increment D.
+     */
+    private readonly diskTsHeap: TsEntry[] = [];
+    /**
+     * A floor on the oldest `originServerTs` currently resident, or `undefined` while nothing is
+     * (or the concept has never been touched, e.g. a memory-only session): "nothing older than this
+     * is promised resident", the same guarantee-floor reading as {@link oldestIndexedTs}, not a
+     * promise that this is the literal minimum -- {@link events} has no blind spot the way disk
+     * does, so it is *usually* exact, but {@link enforceResidentBudget}'s own docstring on
+     * `deferredMinTs` explains the one case (a deferred entry popped ahead of a later-evicted one in
+     * the same call) where it would otherwise overstate coverage without that correction. Maintained
+     * as a simple running bound either way: {@link upsertEvent}/{@link materializeRow} pull it
+     * *backward* (older) with `Math.min` when an older record becomes resident, and {@link
+     * enforceResidentBudget} pushes it *forward* (newer, never past the true floor) as records are
+     * evicted, since eviction is always oldest-first and so can only ever raise this floor.
+     */
+    private oldestResidentTs: number | undefined;
+    /**
+     * The oldest `originServerTs` this session (or a previous one, via {@link MetaRecord.oldestIndexedTs})
+     * has confirmed is on disk. Read this as a *guarantee floor* -- "nothing older than this is
+     * promised findable" -- not as the literal timestamp of the single oldest surviving row, and the
+     * two are allowed to diverge: {@link enforceDiskBudget} raises this to at least the newest
+     * record it just deleted, which is exact for what it deleted but says nothing about whether some
+     * other, untouched-this-session row happens to be even older (see {@link diskTsHeap}'s
+     * docstring for why that can happen under the current schema). The floor can only move forward
+     * from a deliberate drop, or backward from genuinely discovering an older record still exists
+     * ({@link Math.min} on write or on {@link materializeRow}); it is never guessed at.
+     */
+    private oldestIndexedTs: number | undefined;
+    /**
+     * True once {@link hydrate} has stopped early because the resident set reached
+     * `HOT_WINDOW_BYTES` (leaving rows un-hydrated on disk), or {@link enforceResidentBudget} has
+     * evicted at least one record to make room for a live/crawler write. Sticky for the life of the
+     * in-memory session (reset only by {@link clearIndexMaps}): once true, {@link
+     * materializeIfPending} must keep consulting disk for ids it cannot find resident even after
+     * {@link hydrating} itself goes false, because "hydration finished" no longer implies "every row
+     * was visited" the way it did before this increment. Feeds {@link getStats}' `windowed`.
+     */
+    private residentBudgetExceeded = false;
+    /**
+     * True once {@link enforceDiskBudget} has deleted at least one row this session. Feeds {@link
+     * getStats}' `windowed`, alongside {@link residentBudgetExceeded} and {@link crawlBoundDeclined}.
+     */
+    private diskBudgetDropped = false;
+    /**
+     * True once {@link shouldCrawl} has declined at least one checkpoint this session (a room
+     * outside `CRAWL_ROOM_CAP`, or a crawl that has passed `CRAWL_WINDOW_DAYS` back in some room).
+     * Feeds {@link getStats}' `windowed`. Unlike {@link oldestIndexedTs}, a declined room-cap
+     * checkpoint carries no timestamp of its own, which is why `windowed` and "a date is known"
+     * ({@link IIndexStats.oldestIndexedTs}) are two separate conditions rather than one.
+     */
+    private crawlBoundDeclined = false;
+    /**
+     * The answer from the one-time {@link navigator.storage.persist} request made when this user's
+     * index is first created (never on a later re-open of an existing one; see {@link
+     * initEventIndex}), or `undefined` before that has ever run, is not applicable (no `navigator.storage`),
+     * or on a session that opened an *existing* index and so never asked. Surfaced on {@link
+     * getStats} purely for the settings UI; nothing in this class changes behaviour based on it,
+     * `initEventIndex` never fails because of it, and a denial is not retried.
+     */
+    private storagePersisted: boolean | undefined;
     /**
      * Record ids whose current in-memory state has not yet been written to disk, for live writes; see {@link
      * schedulePersistEvent}. Never holds a crawler-batch id: {@link addHistoricEvents} writes its whole batch as one
@@ -1068,6 +1283,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             if (existingMeta?.salt) {
                 salt = decodeBase64(existingMeta.salt);
                 this.userVersion = existingMeta.userVersion ?? 0;
+                // Exact disk-budget accounting from the moment the index opens, not only once
+                // hydration has re-visited every row -- which it may never do now that hydration
+                // itself is bounded; see MetaRecord.diskBytes and ciphertextBytes' own docstring.
+                this.ciphertextBytes = existingMeta.diskBytes ?? 0;
+                this.oldestIndexedTs = existingMeta.oldestIndexedTs;
             }
         } catch (e) {
             log.warn("IndexedDB unavailable; index will be memory-only this session", e);
@@ -1120,6 +1340,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     salt: encodeBase64(salt),
                     userVersion: this.userVersion,
                 });
+                // Asked once, right here at creation, never again on a later re-open of this same
+                // index (see storagePersisted's docstring). Fire-and-forget: some browsers show a
+                // permission prompt for this, and awaiting it here would defeat the fast, bounded
+                // return increment A specifically exists to guarantee.
+                this.requestStoragePersistenceOnce();
             }
             const loaded = await this.loadCrawlerCheckpoints(userId);
             if (!loaded) {
@@ -1198,12 +1423,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * is then dropped rather than reverted, the pre-edit body having been overwritten in place.
      *
      * Three cases, in order: a record already resident resolves as before. One that is not, but hydration is still
-     * running, is worth a direct look at the disk row for `eventId` itself ({@link materializeIfPending}, which pulls
-     * it in if there is one) so there is something here to remove rather than treating "not decrypted yet" as "does
-     * not exist". And one that resolves to neither -- which, while hydration is running, can mean "this is an edit's
-     * id, and its original is a disk row not hydrated yet, so {@link editTargets} cannot know about it" -- is parked
-     * in {@link pendingRedactions} for {@link materializeRow} to drain as rows stream in, rather than being dropped as
-     * a no-op.
+     * running -- or has stopped early at the resident budget, leaving rows behind it un-hydrated; see {@link
+     * residentBudgetExceeded} -- is worth a direct look at the disk row for `eventId` itself ({@link
+     * materializeIfPending}, which pulls it in if there is one) so there is something here to remove rather than
+     * treating "not decrypted yet" as "does not exist". And one that resolves to neither -- which, in either of
+     * those states, can mean "this is an edit's id, and its original is a disk row not hydrated yet, so {@link
+     * editTargets} cannot know about it" -- is parked in {@link pendingRedactions} for {@link materializeRow} to
+     * drain as rows stream in, rather than being dropped as a no-op.
+     *
+     * `!this.hydrating` alone used to be reason enough to skip {@link materializeIfPending} outright (as an
+     * optimisation -- that method's own guard makes the skip correct either way): once hydration is bounded, that
+     * reasoning no longer holds on its own, since `hydrating` going false no longer implies every disk row has been
+     * visited. `materializeIfPending` gates on the same {@link residentBudgetExceeded} condition internally, so this
+     * check is only ever an optimisation, never a correctness gate of its own.
      *
      * @returns True if a record was removed; false when nothing matched (including a redaction just parked for later,
      *     which has removed nothing *yet*) and also when the index is closed, which callers do not need to distinguish.
@@ -1212,12 +1444,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (this.closed) return false;
         // Resolve an edit's id to the record its content was folded into; see the doc above.
         let targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
-        if (targetId === undefined && this.hydrating) {
+        if (targetId === undefined && (this.hydrating || this.residentBudgetExceeded)) {
             await this.materializeIfPending(eventId);
             targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
         }
         if (targetId === undefined) {
-            if (this.hydrating) this.pendingRedactions.add(eventId);
+            if (this.hydrating || this.residentBudgetExceeded) this.pendingRedactions.add(eventId);
             return false;
         }
         const existed = this.events.has(targetId);
@@ -1289,6 +1521,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * re-deriving it by visiting every event was measured at 8.9-15.3 ms at 200k resident events, synchronous and
      * uninterruptible; `size` is {@link ciphertextBytes} or the incrementally-maintained {@link estimatePlainSize},
      * neither of which scan anything either.
+     *
+     * `windowed`, `oldestIndexedTs` and `oldestResidentTs` are every one of them plain scalar field
+     * reads too -- see {@link residentBudgetExceeded}, {@link diskBudgetDropped}, {@link
+     * crawlBoundDeclined}, {@link oldestIndexedTs} and {@link oldestResidentTs} for how each is
+     * maintained -- so none of the three costs this method anything it did not already cost.
      */
     public async getStats(): Promise<IIndexStats> {
         return {
@@ -1296,6 +1533,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             eventCount: this.events.size,
             roomCount: this.roomOrder.size,
             loading: this.hydrating,
+            windowed: this.residentBudgetExceeded || this.diskBudgetDropped || this.crawlBoundDeclined,
+            oldestIndexedTs: this.oldestIndexedTs,
+            oldestResidentTs: this.oldestResidentTs,
+            storagePersisted: this.storagePersisted,
         };
     }
 
@@ -1593,6 +1834,53 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * The crawl bound; see {@link BaseEventIndexManager.shouldCrawl}. Two independent reasons to
+     * decline, either sufficient on its own (`research/SYNTHESIS.md` §3.5): the checkpoint's room
+     * has fallen out of the top `CRAWL_ROOM_CAP` rooms by most recent indexed activity, or this
+     * room's crawl has already reached `CRAWL_WINDOW_DAYS` back.
+     *
+     * Both questions are answered from {@link roomOrder}/{@link events} alone -- this session's own
+     * indexed activity, live and crawled -- never from `MatrixClientPeg`: a room with nothing
+     * indexed for it yet cannot be ranked or windowed, so it is let through rather than guessed at,
+     * and gets a real answer the next time its checkpoint comes up for a room that by then has at
+     * least one indexed event (its own live traffic, most commonly, arriving well before the
+     * crawler gets to it).
+     */
+    public async shouldCrawl(checkpoint: ICrawlerCheckpoint): Promise<boolean> {
+        const list = this.roomOrder.get(checkpoint.roomId);
+        if (!list || list.length === 0) return true;
+
+        const bounds = getEventIndexBounds();
+        const oldestTs = this.events.get(list[0])?.originServerTs ?? 0;
+        if (oldestTs > 0 && Date.now() - oldestTs > bounds.crawlWindowDays * DAY_MS) {
+            this.crawlBoundDeclined = true;
+            return false;
+        }
+
+        if (this.roomsByRecency().indexOf(checkpoint.roomId) >= bounds.crawlRoomCap) {
+            this.crawlBoundDeclined = true;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Every room with at least one resident event, ordered by that room's most recently indexed
+     * event first. The ranking {@link shouldCrawl} enforces `CRAWL_ROOM_CAP` against. `O(R log R)`
+     * in the number of *rooms*, not events -- {@link roomOrder}'s per-room lists are already sorted,
+     * so this only ever reads each list's last element -- and is only ever called once per
+     * checkpoint the crawler is about to spend a request on, never per event.
+     */
+    private roomsByRecency(): string[] {
+        const withTs: Array<[roomId: string, ts: number]> = [];
+        for (const [roomId, ids] of this.roomOrder) {
+            withTs.push([roomId, this.events.get(ids[ids.length - 1])?.originServerTs ?? 0]);
+        }
+        withTs.sort((a, b) => b[1] - a[1]);
+        return withTs.map(([roomId]) => roomId);
+    }
+
+    /**
      * Page through a room's attachments, for the room file panel; see {@link BaseEventIndexManager.loadFileEvents}.
      * Keeps the records whose {@link StoredEvent.hasFile} was set when indexed, and sorts ascending then reverses for a
      * backward read rather than sorting by direction, so both directions derive from the same total order.
@@ -1798,8 +2086,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             const previousTs = existing.originServerTs;
             existing.originServerTs = incoming.origin_server_ts ?? existing.originServerTs;
             existing.profile = profile ?? existing.profile;
-            // The record has moved in time, so its place in the room's ordered list has to move with it.
-            if (existing.originServerTs !== previousTs) this.reindexRoomOrder(existing);
+            // The record has moved in time, so its place in the room's ordered list has to move with
+            // it. Deliberately NOT pushed to residentHeap here -- see that field's own docstring for
+            // why it is populated only once a write actually commits, never at the moment a record
+            // becomes resident or re-timed: this case already schedules a fresh persist for the
+            // record (whichever caller reaches here goes on to call schedulePersistEvent or
+            // enqueueBatchedWrite), and that write's own flush will push a heap entry carrying the
+            // *current* ts once it lands, which is both correct and one call site's worth of code
+            // rather than two.
+            if (existing.originServerTs !== previousTs) {
+                this.reindexRoomOrder(existing);
+                this.oldestResidentTs =
+                    this.oldestResidentTs === undefined
+                        ? existing.originServerTs
+                        : Math.min(this.oldestResidentTs, existing.originServerTs);
+            }
             return;
         }
 
@@ -1826,6 +2127,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (origId) this.rememberEdit(stored, ev.event_id);
         this.indexTokens(targetId, stored.searchText);
         this.insertRoomOrder(stored);
+        this.oldestResidentTs =
+            this.oldestResidentTs === undefined
+                ? stored.originServerTs
+                : Math.min(this.oldestResidentTs, stored.originServerTs);
+        // Deliberately NOT pushed to residentHeap and NOT running enforceResidentBudget here --
+        // see residentHeap's own docstring for why eviction candidacy is granted only once a write
+        // actually commits ({@link flushLiveWrites}), never at the moment of insertion. Measured,
+        // not assumed: an earlier version did both here, and a fast crawler ingest (every one of a
+        // batch's ~100 events inserted before that batch's own write has committed, let alone any
+        // later batch's -- `enqueueBatchedWrite` never awaits) meant residentHeap held up to the
+        // entire remaining corpus as "not yet durable" for most of the run, and this class's
+        // backward-crawl delivery order (progressively *older* content, batch over batch) means
+        // those not-yet-durable entries are also usually the current heap minimum -- exactly what
+        // eviction pops first. Every attempted eviction therefore walked (and re-pushed) most of
+        // the heap to find nothing durable to evict, on every one of 200k inserts: O(heap size) per
+        // call, on every call, quadratic overall, and it turned a ~2.5s ingest loop into one that
+        // did not finish inside a 15-minute harness timeout.
     }
 
     /**
@@ -2242,11 +2560,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private enqueueDeleteRecord(userId: string, targetId: string): void {
         this.enqueuePersist(async () => {
-            const tx = this.db!.transaction("events", "readwrite");
+            const newTotal = this.ciphertextBytes - (this.recordBytes.get(targetId) ?? 0);
+            // oldestIndexedTs is deliberately NOT touched here: it is a *cutoff* from a deliberate,
+            // contiguous, oldest-first drop (enforceDiskBudget), not a promise about any arbitrary
+            // single record's age, and an ordinary redaction is neither of those things -- see
+            // oldestIndexedTs's own docstring, and deleteRecordsForDiskBudget's for the case that
+            // *does* update it.
+            const meta = await this.loadMeta(userId);
+            const tx = this.db!.transaction(["events", "meta"], "readwrite");
             tx.objectStore("events").delete([userId, targetId]);
+            if (meta) tx.objectStore("meta").put({ ...meta, diskBytes: newTotal });
             await txDone(tx);
-            this.ciphertextBytes -= this.recordBytes.get(targetId) ?? 0;
+            this.ciphertextBytes = newTotal;
             this.recordBytes.delete(targetId);
+            this.recordTs.delete(targetId);
         });
     }
 
@@ -2363,25 +2690,49 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // afterwards -- however it got queued -- writes nothing rather than reviving a session that has moved on.
         if (this.closed || !this.db) return;
         const records: EventRecord[] = [];
-        const sizes: Array<[string, number]> = [];
+        const sizes: Array<[string, number, number]> = []; // [id, ciphertext bytes, originServerTs]
         for (const id of ids) {
             const stored = this.events.get(id);
             if (!stored) continue; // Deleted since being buffered; nothing left to write.
             const blob = await encryptJson(dek, stored, `${userId}|${id}`);
             records.push({ userId, eventId: id, blob });
-            sizes.push([id, ciphertextByteLength(blob.ct)]);
+            sizes.push([id, ciphertextByteLength(blob.ct), stored.originServerTs]);
         }
         if (records.length === 0) return;
-        const tx = this.db.transaction("events", "readwrite");
+
+        // Computed before the transaction opens, same discipline as the encrypt calls above: this is a
+        // plain object read/arithmetic (loadMeta is cleartext, cheap), never an await once the tx is live.
+        let newTotal = this.ciphertextBytes;
+        let newOldest = this.oldestIndexedTs;
+        for (const [id, bytes, ts] of sizes) {
+            newTotal += bytes - (this.recordBytes.get(id) ?? 0);
+            newOldest = newOldest === undefined ? ts : Math.min(newOldest, ts);
+        }
+        const meta = await this.loadMeta(userId);
+
+        const tx = this.db.transaction(["events", "meta"], "readwrite");
         const store = tx.objectStore("events");
         for (const rec of records) store.put(rec);
+        if (meta) tx.objectStore("meta").put({ ...meta, diskBytes: newTotal, oldestIndexedTs: newOldest });
         await txDone(tx);
+
         // Only once the whole batch has committed, and replacing each record's previous contribution rather than
         // adding to it: these are puts, so a rewrite leaves one row per id, not two.
-        for (const [id, bytes] of sizes) {
-            this.ciphertextBytes += bytes - (this.recordBytes.get(id) ?? 0);
+        this.ciphertextBytes = newTotal;
+        this.oldestIndexedTs = newOldest;
+        for (const [id, bytes, ts] of sizes) {
             this.recordBytes.set(id, bytes);
+            this.recordTs.set(id, ts);
+            heapPushTs(this.diskTsHeap, { ts, id });
+            // Only now, once the write has actually committed, does this id become an eviction
+            // candidate -- see residentHeap's own docstring for why granting candidacy any earlier
+            // (at insertion) made every eviction attempt during a fast crawler ingest walk most of
+            // the heap for nothing. A record deleted since being buffered was already skipped above
+            // (`if (!stored) continue`), so everything reaching this loop is still resident.
+            heapPushTs(this.residentHeap, { ts, id });
         }
+        this.enforceResidentBudget();
+        await this.enforceDiskBudget(userId);
     }
 
     /**
@@ -2525,6 +2876,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const started = now();
         let longestSliceMs = 0;
         let hydratedCount = 0;
+        // Read once per run, not per row: an override set mid-run by a test is not a case this needs
+        // to react to, and re-reading it 1000 times per page would be pure waste in production.
+        const bounds = getEventIndexBounds();
 
         // No up-front "is there anything to hydrate?" check: the first page read below answers that on its own
         // (an empty result ends the loop immediately, at the cost of one bounded getAll() call, never proportional
@@ -2554,6 +2908,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     if (this.closed || epoch !== this.hydrationEpoch) return;
 
                     if (!this.events.has(row.eventId)) {
+                        // Newest-first hydration stops here, at the moment adding another row would
+                        // breach HOT_WINDOW_BYTES: everything from this row onward for the rest of
+                        // this run stays on disk, un-hydrated -- never deleted, still reachable via
+                        // materializeIfPending on demand or the streamed cold scan increment E adds.
+                        // A hard stop rather than "decrypt then immediately evict", so a row this
+                        // run was never going to keep resident is never needlessly decrypted at all.
+                        if (this.residentByteEstimate() >= bounds.hotWindowBytes) {
+                            this.residentBudgetExceeded = true;
+                            log.info(
+                                `EventIndex: hydration stopped at the resident budget after ${hydratedCount} events`,
+                            );
+                            return;
+                        }
                         try {
                             await this.materializeOnce(userId, dek, row, epoch);
                             if (this.closed || epoch !== this.hydrationEpoch) return;
@@ -2588,6 +2955,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // live write happens to come along next -- see flushVocabularyMergeIfDue's own caller in
                 // indexTokens, which only re-checks when *something* is indexed, not on a timer.
                 this.flushVocabularyMergeIfDue();
+
+                // Once per page, not once per row: cheap in the common case (one scalar comparison),
+                // and disk usage only ever grows from writes, never from hydration itself decrypting
+                // pre-existing rows -- see enforceDiskBudget's own docstring -- so this exists purely
+                // to let a disk that was *already* over budget when this session started (restored
+                // from meta) self-correct as hydration's own decrypts populate diskTsHeap with
+                // candidates, rather than waiting for an unrelated future write to trigger it.
+                if (this.persistEnabled) await this.enforceDiskBudget(userId);
+                if (this.closed || epoch !== this.hydrationEpoch) return;
 
                 if (rows.length < HYDRATION_PAGE_SIZE) break;
             }
@@ -2671,9 +3047,27 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // at its next safe point (a page boundary or a slice yield), never inside this row's own task.
         this.indexTokens(stored.eventId, stored.searchText, true);
         this.insertRoomOrder(stored);
+
+        // Learn this row's disk size and age, but -- deliberately -- do not add its bytes to
+        // ciphertextBytes here. That total is sourced from MetaRecord.diskBytes at initEventIndex
+        // and kept exact by every write/delete path since; a row this method is *decrypting back*
+        // was necessarily already counted, either by this session's own earlier write or by a
+        // previous session's, so adding it again here would double-count it. recordBytes/recordTs
+        // still need populating regardless, both for enqueueDeleteRecord's accounting on a later
+        // redaction and for enforceResidentBudget's "is this durable" check.
         const bytes = ciphertextByteLength(row.blob.ct);
         this.recordBytes.set(stored.eventId, bytes);
-        this.ciphertextBytes += bytes;
+        this.recordTs.set(stored.eventId, stored.originServerTs);
+        heapPushTs(this.diskTsHeap, { ts: stored.originServerTs, id: stored.eventId });
+        heapPushTs(this.residentHeap, { ts: stored.originServerTs, id: stored.eventId });
+        this.oldestIndexedTs =
+            this.oldestIndexedTs === undefined
+                ? stored.originServerTs
+                : Math.min(this.oldestIndexedTs, stored.originServerTs);
+        this.oldestResidentTs =
+            this.oldestResidentTs === undefined
+                ? stored.originServerTs
+                : Math.min(this.oldestResidentTs, stored.originServerTs);
     }
 
     /**
@@ -2743,7 +3137,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private async materializeIfPending(targetId: string): Promise<void> {
         if (this.events.has(targetId)) return;
-        if (!this.hydrating) return;
+        // Ordinarily "hydration is not running" means "hydration has visited every row, so nothing
+        // can be pending" -- but not once residentBudgetExceeded is true: hydrate() may have
+        // stopped early, on purpose, leaving rows un-hydrated behind the resident budget, so this
+        // must keep consulting disk for them even after hydrating itself goes false. See
+        // residentBudgetExceeded's own docstring.
+        if (!this.hydrating && !this.residentBudgetExceeded) return;
         if (!this.persistEnabled || !this.db || !this.dek || !this.userId) return;
         const userId = this.userId;
         const dek = this.dek;
@@ -2771,11 +3170,147 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (!row) return; // Genuinely new, or raced with a delete; nothing left to pull in.
         try {
             await this.materializeOnce(userId, dek, row, epoch);
+            // Pulling in an old row on demand must not let the resident set grow past budget
+            // unboundedly (this increment's rule for the on-demand path; see this method's own
+            // docstring and enforceResidentBudget's). `targetId` is protected from being evicted by
+            // this very call, so whichever caller asked for it (addEventToIndex, addHistoricEvents,
+            // deleteEvent) still finds it resident immediately afterwards.
+            this.enforceResidentBudget(targetId);
         } catch {
             // Corrupt row. hydrate()'s own loop will reach this same row later in its pass and respond by wiping
             // the whole index, which is right for a rotated key; until then, this is a bounded, self-limiting cost
             // (a repeated failed get()+decrypt for this one id, only if it is written to again before hydrate()
             // gets there), not worth tearing a session down over on its own.
+        }
+    }
+
+    /**
+     * Evict resident records, oldest `originServerTs` first, until {@link residentByteEstimate} is
+     * back under `HOT_WINDOW_BYTES` -- the hot-window half of `research/SYNTHESIS.md` §3.6.
+     * Eviction only ever removes a record from memory ({@link removeFromIndex}); it never touches
+     * the record's disk row, which is the whole point (rows beyond the resident budget stay
+     * findable later, via the streamed cold scan increment E adds).
+     *
+     * Every candidate this pops from {@link residentHeap} is durable by construction -- see that
+     * field's own docstring for why entries are pushed only from {@link flushLiveWrites} and {@link
+     * materializeRow}, never at the moment a record becomes resident -- so, unlike an earlier
+     * version of this method, there is no "not yet durable, defer it" case to handle here at all;
+     * the only thing skipped (and re-pushed, so a later call can reconsider it) is a **stale**
+     * entry, whose id is no longer resident or has been re-timed since (see {@link heapPushTs}'s
+     * docstring), and `protectedId` (see below).
+     *
+     * @param protectedId - An id to never evict during *this* call, however old, because the caller
+     *     just on-demand-materialized it ({@link materializeIfPending}) and is about to act on it
+     *     synchronously. Without this, a caller like {@link deleteEvent} that pulls a very old row
+     *     in specifically to remove it could find eviction got there first: `events.has(targetId)`
+     *     would read false, `deleteEvent` would report nothing to remove, and the redaction would
+     *     silently fail to reach disk. The protection is one call's worth, not permanent: the
+     *     record becomes a normal candidate again the next time anything triggers this method.
+     *
+     * Called from {@link flushLiveWrites}, once a batch's writes actually commit (so the budget can
+     * lag insertion by at most one batch's worth, never unboundedly -- see {@link residentHeap}'s
+     * docstring for why calling this eagerly at every insertion was tried and measured to make a
+     * 200k-event ingest not finish inside a 15-minute harness timeout), and from {@link
+     * materializeIfPending}, immediately after an on-demand pull, with `protectedId` set.
+     */
+    private enforceResidentBudget(protectedId?: string): void {
+        const bounds = getEventIndexBounds();
+        if (this.residentByteEstimate() <= bounds.hotWindowBytes) return;
+        const deferred: TsEntry[] = [];
+        let evictedMaxTs: number | undefined;
+        while (this.residentByteEstimate() > bounds.hotWindowBytes && this.residentHeap.length > 0) {
+            const top = heapPopMinTs(this.residentHeap)!;
+            const stored = this.events.get(top.id);
+            if (!stored || stored.originServerTs !== top.ts) continue; // Stale: gone, or re-timed.
+            if (top.id === protectedId) {
+                deferred.push(top);
+                continue;
+            }
+            this.removeFromIndex(top.id);
+            evictedMaxTs = evictedMaxTs === undefined ? top.ts : Math.max(evictedMaxTs, top.ts);
+        }
+        for (const entry of deferred) heapPushTs(this.residentHeap, entry);
+        if (evictedMaxTs !== undefined) {
+            // The new floor is at most evictedMaxTs (everything actually evicted is gone), but a
+            // heap pop is non-decreasing, so a *deferred* entry popped before some later-evicted one
+            // can still be resident with a smaller ts than evictedMaxTs -- min-heap pop order alone
+            // does not let eviction skip over a deferred entry the way it can skip a merely-stale
+            // one. Folding in the deferred batch's own minimum keeps this a genuine floor (at most
+            // the true new minimum, matching residentHeap's claim to be exact) rather than
+            // overstating coverage the way a plain evictedMaxTs cutoff could whenever a deferral
+            // happened to land ahead of an eviction in pop order.
+            const deferredMinTs = deferred.length > 0 ? Math.min(...deferred.map((e) => e.ts)) : undefined;
+            const cutoff = deferredMinTs === undefined ? evictedMaxTs : Math.min(evictedMaxTs, deferredMinTs);
+            this.oldestResidentTs =
+                this.oldestResidentTs === undefined ? cutoff : Math.max(this.oldestResidentTs, cutoff);
+            this.residentBudgetExceeded = true;
+        }
+    }
+
+    /**
+     * Delete the oldest on-disk rows, by `originServerTs`, until {@link ciphertextBytes} is back
+     * under `DISK_BUDGET_BYTES` -- the disk half of `research/SYNTHESIS.md` §3.6 ("drop = delete":
+     * unlike {@link enforceResidentBudget}, this removes the row itself, not just its residency).
+     * A cheap no-op in the overwhelmingly common case (`ciphertextBytes` already under budget).
+     *
+     * Candidates come from {@link diskTsHeap}, which -- see that field's docstring -- only knows
+     * about records this session has written or decrypted at least once. If it runs dry before the
+     * total is back under budget (nothing left to pop, or every remaining entry turns out stale),
+     * this stops there rather than guessing: the remaining excess is real, but this session does
+     * not yet know which rows account for it, and a future call (the next write, or hydration
+     * reaching further) will have more information than this one does.
+     */
+    private async enforceDiskBudget(userId: string): Promise<void> {
+        const bounds = getEventIndexBounds();
+        if (this.ciphertextBytes <= bounds.diskBudgetBytes) return;
+        const toDelete: string[] = [];
+        let projected = this.ciphertextBytes;
+        let deletedMaxTs: number | undefined;
+        while (projected > bounds.diskBudgetBytes && this.diskTsHeap.length > 0) {
+            const top = heapPopMinTs(this.diskTsHeap)!;
+            if (!this.recordBytes.has(top.id) || this.recordTs.get(top.id) !== top.ts) continue; // Stale.
+            toDelete.push(top.id);
+            projected -= this.recordBytes.get(top.id) ?? 0;
+            deletedMaxTs = deletedMaxTs === undefined ? top.ts : Math.max(deletedMaxTs, top.ts);
+        }
+        if (toDelete.length === 0 || deletedMaxTs === undefined) return;
+        await this.deleteRecordsForDiskBudget(userId, toDelete, deletedMaxTs);
+    }
+
+    /**
+     * The write half of {@link enforceDiskBudget}: delete `ids` from the `events` store and update
+     * the persisted disk-byte total and coverage floor in `meta`, in one bounded transaction over
+     * both stores, then only after it commits mutate the live accounting to match -- the same
+     * commit-before-mutate discipline every other disk-touching path in this class follows.
+     *
+     * A deleted id still resident (old by timestamp, but not yet reached by {@link
+     * enforceResidentBudget}) is also removed from memory here: "drop = delete" means a deleted row
+     * has no business staying resident on the strength of a memory copy whose disk backing has just
+     * been pulled out from under it (see {@link recordBytes}' role as the "is this durable" test
+     * {@link enforceResidentBudget} relies on -- leaving it resident-but-not-in-recordBytes would
+     * wrongly make it *permanently* unevictable there instead).
+     */
+    private async deleteRecordsForDiskBudget(userId: string, ids: string[], deletedMaxTs: number): Promise<void> {
+        if (!this.db || ids.length === 0) return;
+        let newTotal = this.ciphertextBytes;
+        for (const id of ids) newTotal -= this.recordBytes.get(id) ?? 0;
+        const newOldest =
+            this.oldestIndexedTs === undefined ? deletedMaxTs : Math.max(this.oldestIndexedTs, deletedMaxTs);
+
+        const meta = await this.loadMeta(userId);
+        const tx = this.db.transaction(["events", "meta"], "readwrite");
+        const store = tx.objectStore("events");
+        for (const id of ids) store.delete([userId, id]);
+        if (meta) tx.objectStore("meta").put({ ...meta, diskBytes: newTotal, oldestIndexedTs: newOldest });
+        await txDone(tx);
+
+        this.ciphertextBytes = newTotal;
+        this.oldestIndexedTs = newOldest;
+        this.diskBudgetDropped = true;
+        for (const id of ids) {
+            this.recordBytes.delete(id);
+            this.recordTs.delete(id);
+            if (this.events.has(id)) this.removeFromIndex(id);
         }
     }
 
@@ -2820,6 +3355,39 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * The resident-set byte estimate `hydrate()`/{@link enforceResidentBudget} check against
+     * `HOT_WINDOW_BYTES`; see {@link RESIDENT_BYTES_PER_EVENT_ESTIMATE}'s docstring for why this is
+     * a flat per-event figure rather than {@link plainTextByteEstimate}. O(1): `events.size` is a
+     * `Map`'s own maintained count, the same one `getStats()`'s `eventCount` already reads.
+     */
+    private residentByteEstimate(): number {
+        return this.events.size * RESIDENT_BYTES_PER_EVENT_ESTIMATE;
+    }
+
+    /**
+     * Ask the browser to make this origin's storage persistent (best-effort; not every browser
+     * grants it, and some never prompt at all), once, at the moment this user's index is first
+     * created; see {@link initEventIndex}'s only call site and {@link storagePersisted}'s docstring
+     * for why it is not repeated on a later re-open. Fire-and-forget by design -- never awaited, and
+     * its own rejection is caught here rather than left to become an unhandled one -- because a
+     * permission prompt in some browsers could otherwise hang around waiting for the user, and
+     * `initEventIndex` must never wait on that.
+     */
+    private requestStoragePersistenceOnce(): void {
+        const storage = (globalThis.navigator as { storage?: StorageManager } | undefined)?.storage;
+        if (!storage?.persist) return;
+        storage
+            .persist()
+            .then((granted) => {
+                this.storagePersisted = granted;
+            })
+            .catch((e: unknown) => {
+                log.debug("EventIndex: navigator.storage.persist() failed", e);
+                this.storagePersisted = false;
+            });
+    }
+
+    /**
      * Release both key handles. Dropping the references is the whole of it and is enough: the keys are non-extractable,
      * so the key material never existed in JavaScript memory to be zeroed.
      */
@@ -2849,6 +3417,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.roomOrder.clear();
         this.ciphertextBytes = 0;
         this.recordBytes.clear();
+        this.recordTs.clear();
+        this.residentHeap.length = 0;
+        this.diskTsHeap.length = 0;
+        this.oldestResidentTs = undefined;
+        this.oldestIndexedTs = undefined;
+        this.residentBudgetExceeded = false;
+        this.diskBudgetDropped = false;
+        this.crawlBoundDeclined = false;
         this.pendingRedactions.clear();
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;

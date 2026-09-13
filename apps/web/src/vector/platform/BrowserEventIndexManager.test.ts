@@ -28,10 +28,12 @@ import {
     isBrowserEventIndexEnabled,
     isWebEventIndexSupported,
     replacedEventId,
+    RESIDENT_BYTES_PER_EVENT_ESTIMATE,
     tokenize,
     effectiveEventForIndex,
     VOCABULARY_MERGE_THRESHOLD,
 } from "./BrowserEventIndexManager";
+import { DAY_MS, setEventIndexBoundsOverrideForTesting } from "./eventIndexBounds";
 
 const SEARCH_DEFAULTS = {
     before_limit: 0,
@@ -3329,5 +3331,332 @@ describe("BrowserEventIndexManager (a persisted index at scale)", () => {
         } finally {
             await reloaded.closeEventIndex();
         }
+    });
+});
+
+/**
+ * Increment C: shouldCrawl, the resident (hot-window) budget and the disk budget
+ * (`research/SYNTHESIS.md` §3.5-§3.7). Every record here shares one body so that a term search for
+ * it -- {@link BODY_TOKEN} -- doubles as a cheap "which ids are resident right now" probe, without
+ * adding any new instrumentation to the class under test.
+ */
+describe("BrowserEventIndexManager (increment C: bounds)", () => {
+    const DEVICE = "DEVICE1";
+    const ROOM = "!bounds:example.org";
+    const BODY_TOKEN = "x".repeat(100);
+    // The manager's own resident-budget gate: a flat per-event figure, not text-length-weighted
+    // (see RESIDENT_BYTES_PER_EVENT_ESTIMATE's docstring for why), so this is exact regardless of
+    // BODY_TOKEN's length.
+    const BYTES_PER_EVENT = RESIDENT_BYTES_PER_EVENT_ESTIMATE;
+    const BUDGET_N = 40;
+
+    let userCounter = 0;
+    let userId: string;
+    let toClose: BrowserEventIndexManager[] = [];
+
+    const search = (term: string, overrides: Record<string, unknown> = {}): any =>
+        ({ search_term: term, ...SEARCH_DEFAULTS, ...overrides }) as any;
+
+    /** ids ascending == ts ascending == the order hydrate()'s ascending-key-order paging visits them in. */
+    function budgetCorpus(n = BUDGET_N): any[] {
+        return Array.from({ length: n }, (_unused, i) =>
+            msg(`$b${String(i).padStart(3, "0")}`, BODY_TOKEN, { room_id: ROOM, origin_server_ts: 1_000_000 + i }),
+        );
+    }
+    const idAt = (i: number): string => `$b${String(i).padStart(3, "0")}`;
+
+    /**
+     * ids ascending (so hydration still visits them in the same id order and stops at the same
+     * point), but *ts descending*: the un-hydrated tail this corpus leaves behind is the OLDEST by
+     * timestamp, not the newest -- unlike {@link budgetCorpus}. Needed specifically to exercise
+     * `enforceResidentBudget`'s `protectedId` guard: pulling in a row that is *not* the current
+     * global minimum can never race its own eviction regardless of whether the guard exists, so a
+     * test using the ascending-ts corpus for this purpose would pass even with that guard deleted.
+     */
+    function oldTailCorpus(n = BUDGET_N): any[] {
+        return Array.from({ length: n }, (_unused, i) =>
+            msg(`$b${String(i).padStart(3, "0")}`, BODY_TOKEN, { room_id: ROOM, origin_server_ts: 2_000_000 - i }),
+        );
+    }
+
+    function track(m: BrowserEventIndexManager): BrowserEventIndexManager {
+        toClose.push(m);
+        return m;
+    }
+
+    /** Every currently-*resident* id, via the one shared token every record's body tokenises to. */
+    async function residentIds(manager: BrowserEventIndexManager): Promise<Set<string>> {
+        const hit = await manager.searchEventIndex(search(BODY_TOKEN, { limit: BUDGET_N + 10 }));
+        return new Set(resultIds(hit));
+    }
+
+    beforeEach(() => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        userId = `@bounds${++userCounter}:example.org`;
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue("unit-test-pickle-key") });
+        toClose = [];
+    });
+
+    afterEach(async () => {
+        setEventIndexBoundsOverrideForTesting(null);
+        for (const m of toClose.splice(0)) await m.closeEventIndex();
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    /** Seed the whole corpus with a generous budget, close, then reopen under `hotWindowBytes`. */
+    async function seedAndReopen(
+        hotWindowBytes: number,
+        n = BUDGET_N,
+        corpus: (n: number) => any[] = budgetCorpus,
+    ): Promise<BrowserEventIndexManager> {
+        setEventIndexBoundsOverrideForTesting(null); // generous default budget while seeding
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (const ev of corpus(n)) {
+            await seed.addEventToIndex(ev, {});
+            await seed.commitLiveEvents();
+        }
+        await seed.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        return reloaded;
+    }
+
+    describe("shouldCrawl", () => {
+        it("declines a room whose crawl has already passed CRAWL_WINDOW_DAYS back", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlWindowDays: 1 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            const old = Date.now() - 2 * DAY_MS;
+            await manager.addEventToIndex(msg("$old", "hi", { room_id: "!r:x", origin_server_ts: old }), {});
+
+            expect(await manager.shouldCrawl({ roomId: "!r:x", token: "t", direction: Direction.Backward })).toBe(
+                false,
+            );
+        });
+
+        it("allows a room whose crawl is still within CRAWL_WINDOW_DAYS", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlWindowDays: 90 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            const recent = Date.now() - 1 * DAY_MS;
+            await manager.addEventToIndex(msg("$recent", "hi", { room_id: "!r:x", origin_server_ts: recent }), {});
+
+            expect(await manager.shouldCrawl({ roomId: "!r:x", token: "t", direction: Direction.Backward })).toBe(true);
+        });
+
+        it("allows a room with nothing indexed for it yet -- it cannot be windowed or ranked", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlWindowDays: 1, crawlRoomCap: 1 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+
+            expect(await manager.shouldCrawl({ roomId: "!unseen:x", token: "t", direction: Direction.Backward })).toBe(
+                true,
+            );
+        });
+
+        it("declines a room outside the top CRAWL_ROOM_CAP rooms by most recent indexed activity", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlRoomCap: 1 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            const now = Date.now();
+            await manager.addEventToIndex(msg("$a", "hi", { room_id: "!a:x", origin_server_ts: now - 1000 }), {});
+            await manager.addEventToIndex(msg("$b", "hi", { room_id: "!b:x", origin_server_ts: now }), {});
+
+            // !b is more recently active than !a; with a cap of 1, only !b is inside the bound.
+            expect(await manager.shouldCrawl({ roomId: "!b:x", token: "t", direction: Direction.Backward })).toBe(true);
+            expect(await manager.shouldCrawl({ roomId: "!a:x", token: "t", direction: Direction.Backward })).toBe(
+                false,
+            );
+        });
+    });
+
+    describe("resident (hot-window) budget", () => {
+        it("hydration stops at the budget; rows beyond it stay on disk, un-hydrated", async () => {
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20);
+            const stats = await reloaded.getStats();
+            expect(stats.eventCount).toBeGreaterThan(0);
+            expect(stats.eventCount).toBeLessThan(BUDGET_N);
+            expect(stats.windowed).toBe(true);
+
+            // Every row is still on disk regardless of whether it was hydrated.
+            const onDisk = await dumpRawStore("events");
+            expect(onDisk.length).toBe(BUDGET_N);
+        });
+
+        it("a live insert over budget evicts the oldest resident event; the row survives on disk", async () => {
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: BYTES_PER_EVENT * 5 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+
+            for (const ev of budgetCorpus(10)) {
+                await manager.addEventToIndex(ev, {});
+                await manager.commitLiveEvents(); // durable before the next insert may need to evict it
+            }
+
+            const stats = await manager.getStats();
+            expect(stats.eventCount).toBeLessThan(10);
+            expect(stats.windowed).toBe(true);
+
+            const resident = await residentIds(manager);
+            expect(resident.has(idAt(0))).toBe(false); // the oldest was evicted from memory...
+            expect(resident.has(idAt(9))).toBe(true); // ...but the newest is still there.
+
+            const onDisk = await dumpRawStore("events");
+            expect(onDisk.some((r: any) => r.eventId === idAt(0))).toBe(true); // ...and never deleted.
+            expect(onDisk.length).toBe(10);
+        });
+
+        it("on-demand materialization of an evicted/un-hydrated row still reaches its redaction", async () => {
+            // oldTailCorpus, not budgetCorpus: the un-hydrated tail here is the OLDEST by
+            // timestamp, so pulling it in on demand makes it the new global minimum of
+            // residentHeap -- exactly the case that would race its own eviction without
+            // enforceResidentBudget's `protectedId` guard, which a corpus where the pulled-in row
+            // is never the minimum could not exercise.
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20, BUDGET_N, oldTailCorpus);
+            const before = await reloaded.getStats();
+            expect(before.eventCount).toBeLessThan(BUDGET_N);
+
+            // Ascending id order means the tail is guaranteed to be the un-hydrated part at this
+            // budget: hydrate() stops once the budget fills, and never gets this far.
+            const targetId = idAt(BUDGET_N - 1);
+            const removed = await reloaded.deleteEvent(targetId);
+            expect(removed).toBe(true); // not a silent no-op that would leave content on disk
+
+            const onDisk = await dumpRawStore("events");
+            expect(onDisk.some((r: any) => r.eventId === targetId)).toBe(false);
+            expect(onDisk.length).toBe(BUDGET_N - 1);
+        });
+
+        it("on-demand materialization does not let the resident set grow past budget unboundedly", async () => {
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20);
+            const initial = (await reloaded.getStats()).eventCount;
+
+            // Pull in five of the un-hydrated tail, one at a time, via a live edit. The resident
+            // budget is a flat per-event figure (RESIDENT_BYTES_PER_EVENT_ESTIMATE), not weighted by
+            // text length, so the edit's own body length has no bearing on this property -- BODY_TOKEN
+            // is reused here only for `residentIds()`'s shared-token probe, not to control size.
+            for (let i = BUDGET_N - 5; i < BUDGET_N; i++) {
+                await reloaded.addEventToIndex(edit(`$edit${i}`, idAt(i), BODY_TOKEN), {});
+                await reloaded.commitLiveEvents();
+                const eventCount = (await reloaded.getStats()).eventCount;
+                // Pulling an old row in and evicting a different one to pay for it nets to the
+                // same count each time; it must never accumulate.
+                expect(eventCount).toBeLessThanOrEqual(initial);
+            }
+        });
+
+        it("oldestResidentTs never claims less coverage than a deferred pull actually leaves resident", async () => {
+            // oldTailCorpus: hydration keeps the NEWEST 20 (ids 0-19, descending ts) resident and
+            // leaves the OLDEST 20 (ids 20-39) un-hydrated. Pulling in the single oldest one (id39)
+            // on demand makes it the new global minimum of residentHeap -- it is popped, and
+            // deferred (protected), *before* the enforceResidentBudget call's one eviction (of
+            // id19, the previous oldest of the original 20) is even reached. Without folding the
+            // deferred batch's own minimum into the reported floor, this call would report id19's
+            // ts (newer) as the new oldestResidentTs even though id39 (older) remains resident --
+            // see enforceResidentBudget's `deferredMinTs` and oldestResidentTs's own docstring.
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20, BUDGET_N, oldTailCorpus);
+            const oldTailCorpusTs = (i: number): number => 2_000_000 - i;
+
+            const before = await reloaded.getStats();
+            expect(before.oldestResidentTs).toBe(oldTailCorpusTs(19)); // the original 20's own oldest
+
+            await reloaded.addEventToIndex(edit("$editTail", idAt(BUDGET_N - 1), BODY_TOKEN), {});
+            await reloaded.commitLiveEvents();
+
+            const after = await reloaded.getStats();
+            expect(after.oldestResidentTs).toBe(oldTailCorpusTs(BUDGET_N - 1)); // id39's own ts, not id19's
+            expect(after.eventCount).toBe(before.eventCount); // one evicted (id19) to pay for the pull
+
+            const resident = await residentIds(reloaded);
+            expect(resident.has(idAt(BUDGET_N - 1))).toBe(true); // id39 itself really is still there
+            expect(resident.has(idAt(19))).toBe(false); // id19 is who paid for it
+        });
+    });
+
+    describe("disk budget", () => {
+        it("deletes the oldest rows by timestamp; accounting survives a reopen", async () => {
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            for (const ev of budgetCorpus()) {
+                await seed.addEventToIndex(ev, {});
+                await seed.commitLiveEvents();
+            }
+            const before = await seed.getStats();
+            await seed.closeEventIndex();
+
+            setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.floor(before.size / 2) });
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+
+            const onDisk = await dumpRawStore("events");
+            expect(onDisk.length).toBeGreaterThan(0);
+            expect(onDisk.length).toBeLessThan(BUDGET_N);
+            const keptIds = new Set(onDisk.map((r: any) => r.eventId));
+            expect(keptIds.has(idAt(BUDGET_N - 1))).toBe(true); // newest kept
+            expect(keptIds.has(idAt(0))).toBe(false); // oldest dropped
+
+            const after = await reloaded.getStats();
+            expect(after.windowed).toBe(true);
+            expect(after.size).toBeLessThanOrEqual(Math.floor(before.size / 2));
+            expect(after.oldestIndexedTs).toBeGreaterThan(1_000_000); // moved forward, past $b000's ts
+
+            // A further reopen must not need to hydrate anything to know the same totals: they are
+            // read back from `meta`, restored before any row this session has decrypted.
+            await reloaded.closeEventIndex();
+            const restoreDecrypt = slowDownDecrypt(50);
+            try {
+                const third = track(new BrowserEventIndexManager());
+                await third.initEventIndex(userId, DEVICE);
+                const stats = await third.getStats();
+                expect(stats.size).toBe(after.size);
+                expect(stats.oldestIndexedTs).toBe(after.oldestIndexedTs);
+            } finally {
+                restoreDecrypt();
+            }
+        });
+    });
+
+    describe("navigator.storage.persist()", () => {
+        it("is requested once at creation, records the answer, and is not asked again on reopen", async () => {
+            const persist = vi.fn().mockResolvedValue(true);
+            vi.stubGlobal("navigator", { ...globalThis.navigator, storage: { persist } });
+
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            expect(persist).toHaveBeenCalledTimes(1);
+            // Fire-and-forget: give its microtask a turn to settle before reading the stat.
+            await Promise.resolve();
+            await Promise.resolve();
+            expect((await manager.getStats()).storagePersisted).toBe(true);
+            await manager.closeEventIndex();
+
+            const reopened = track(new BrowserEventIndexManager());
+            await reopened.initEventIndex(userId, DEVICE);
+            await reopened.waitForHydration();
+            expect(persist).toHaveBeenCalledTimes(1); // still once, not once per open
+        });
+
+        it("never fails init when navigator.storage is absent", async () => {
+            vi.stubGlobal("navigator", { ...globalThis.navigator, storage: undefined });
+            const manager = track(new BrowserEventIndexManager());
+            await expect(manager.initEventIndex(userId, DEVICE)).resolves.toBeUndefined();
+            expect((await manager.getStats()).storagePersisted).toBeUndefined();
+        });
     });
 });
