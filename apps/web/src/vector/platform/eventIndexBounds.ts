@@ -109,46 +109,65 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
  * up a little over this figure (whatever single entry pushed it past the target stays in), never
  * under it except for the very last, still-open chunk.
  *
- * **Basis.** Two real thresholds bound the useful range, both independent of this feature's own
- * choices:
+ * **Basis.** Two real thresholds bound the *useful range* a candidate has to be picked from:
+ * Chromium's IndexedDB backing store keeps a value inline up to the tens of kilobytes before writing
+ * it out-of-line as a separate blob file (`research/browser-limits-model.md`'s IndexedDB-value-storage
+ * section puts that boundary at 64 KiB -- a target at or past it risks the extra round trip on every
+ * read), and AES-GCM's own fixed per-call dispatch cost is mostly amortised by roughly 16 KiB. Neither
+ * threshold, on its own, said *where inside* 16-64 KiB to land -- that took a real measurement, and
+ * the first one run (a bare `crypto.subtle.encrypt`/`decrypt` of one isolated chunk-sized buffer per
+ * candidate, no manager, no repeated flushes) picked 48 KiB and was **wrong**, for a reason it could
+ * not see: it never exercised {@link BrowserEventIndexManager.flushLiveWrites}'s real behaviour, which
+ * re-encrypts the **entire accumulated open chunk from scratch on every flush that touches it**, not
+ * just the newly-added entries (`~/.cache/eventindex-perf-c`'s own review-pr-c.md C2-F3 already found
+ * this exact shape of cost for the manifest's own tail page; the open chunk has the same shape). A
+ * crawler batch arrives roughly every 100 events, so a *larger* target means *more* flushes touch the
+ * same still-filling chunk before it seals, and each of those flushes re-pays for the entries the
+ * flush before it already paid for -- real per-event write cost rises with target size instead of
+ * falling, the opposite of what a single-encrypt-per-candidate microbenchmark can show.
  *
- * 1. Chromium's IndexedDB backing store keeps a value inline in its own record up to a size in the
- *    tens of kilobytes, past which it is written out-of-line as a separate blob file on disk with an
- *    extra filesystem round trip per read -- `research/browser-limits-model.md`'s IndexedDB-value-
- *    storage section (increment-D handover) puts that boundary at 64&nbsp;KiB. A chunk sized *at* or
- *    *above* that line risks paying the extra round trip on every read; this increment stays clear of
- *    it rather than depend on where exactly a given Chromium version draws it.
- * 2. AES-GCM's own per-call cost is dominated by a small fixed dispatch overhead at very small inputs
- *    and becomes throughput-bound above roughly 16&nbsp;KiB -- so a target much below that amortises
- *    poorly, and past the several-tens-of-KiB range the amortisation is mostly already spent.
+ * **Measured for real** by `~/.cache/eventindex-perf-d/chunk-size-sweep.mjs`, real Chromium 149 (the
+ * `chromium-1228` build this project's harnesses standardise on), driving the actual, unmodified
+ * `BrowserEventIndexManager` through `addHistoricEvents()` in real 100-event crawl batches (not an
+ * isolated encrypt call) against a 20,000-event corpus shaped like this feature's own `StoredEvent`
+ * (~981 B plaintext JSON/event), for every one of the five candidates this constant's own basis asks
+ * for. `encrypt`/`decrypt` µs/event divide the harness's own cumulative `encryptMs`/`decryptMs`
+ * instrumentation by the event count actually written/restored; `restoreMs` is a full cold
+ * `initEventIndex()` + `waitForHydration()`; the point-lookup column is
+ * {@link BrowserEventIndexManager.materializeIfPending}'s own bounded read, forced to fire by
+ * capping the resident budget to near-zero before asking for one specific, not-yet-hydrated event:
  *
- * **Measured, not merely modelled**, by `~/.cache/eventindex-perf-d/chunk-size-sweep.mjs` (real
- * Node WebCrypto, the same AES-GCM implementation family Chromium uses, over a 50,000-event synthetic
- * corpus shaped like this feature's own `StoredEvent` -- encrypted-room fields included -- averaging
- * 981&nbsp;B of plaintext JSON per event) sweeping exactly the candidates this constant's own basis
- * asks for, 16/32/48/64/96&nbsp;KiB:
- *
- * | target | events/chunk | ciphertext overhead | encrypt (µs/event) | decrypt (µs/event) | one-chunk point-lookup |
+ * | target | write (µs/event) | restore, full (ms) | read (µs/event) | one-chunk point-lookup (ms) | disk (19,603 events) |
  * |---|---|---|---|---|---|
- * | 16 KiB | 15.3 | 0.18% | 12.62 | 12.32 | 0.19 ms |
- * | 32 KiB | 31.2 | 0.09% | 8.48 | 8.09 | 0.25 ms |
- * | **48 KiB** | **47.1** | **0.06%** | **7.06** | **6.58** | **0.31 ms** |
- * | 64 KiB | 63.0 | 0.04% | 5.93 | 6.79 | 0.41 ms |
- * | 96 KiB | 94.7 | 0.03% | 5.18 | 5.54 | 0.48 ms |
+ * | **16 KiB** | **8.59** | 3007 | 8.18 | **136** | 14,426,120 B |
+ * | 32 KiB | 10.75 | 3591 | 9.26 | 164 | 14,414,583 B |
+ * | 48 KiB (the modelled pick) | 12.57 | 2986 | 8.05 | 131 | 14,409,764 B |
+ * | 64 KiB | 12.10 | 4456 | 9.05 | 150 | 14,408,436 B |
+ * | 96 KiB | 14.76 | 4699 | 9.70 | 160 | 14,407,809 B |
  *
- * Throughput keeps improving past 48&nbsp;KiB (as amortisation theory predicts), but the gains are
- * small and, past 48 KiB, noisy in the wrong direction for decrypt (64 KiB measures *worse* than 48
- * KiB there, run-to-run GC jitter on a difference this small) -- while every candidate at or past
- * 64&nbsp;KiB sits at or over threshold 1 above (a sealed chunk is target-plus-one-entry, so a 64 KiB
- * *target* produces chunks that measure slightly *over* 64 KiB on disk, i.e. squarely in the
- * externalised-blob range that number 1 warns about). The one-chunk point-lookup cost ({@link
- * BrowserEventIndexManager.materializeIfPending}'s own bounded read) rises monotonically with target
- * size as expected, but every candidate measured is well under a millisecond -- two orders of
- * magnitude inside the 50 ms long-task ceiling -- so it does not meaningfully constrain the choice
- * either way at these sizes. Net: the measured optimum **matches the original 48 KiB estimate** (the
- * point where most of the throughput gain has already been captured, comfortably clear of the
- * externalisation threshold, mean chunk population 47 events -- within the "roughly 50-90 events"
- * estimate the increment's own design brief gave), so it is kept as the default rather than moved.
+ * Write cost rises close to monotonically with target size (16 KiB is 32% cheaper per event than
+ * 48 KiB, 42% cheaper than 96 KiB) -- exactly the open-chunk-rewrite mechanism above, and the
+ * dominant real cost here: a write happens on every crawler batch and every live-buffer flush, for
+ * the life of the account, where a restore happens once per session. The point-lookup cost tracks
+ * write cost for the same reason (decrypting a chunk this small is cheap regardless of target, so the
+ * *count* of entries sharing that one decrypt, which is what varies, is what shows up). Disk size and
+ * read cost are close to flat across the whole range (disk varies by under 0.2% end to end; read has
+ * no reason to depend on target at all, since a chunk is decrypted exactly once per restore regardless
+ * of how many flushes built it, and the small spread here is run-to-run noise, not a trend) -- neither
+ * one is a reason to prefer a larger target. **The measured optimum is 16 KiB, not 48 KiB**, the
+ * smallest of the five candidates the design brief asked to sweep; nothing in this data rules out an
+ * even smaller target doing better still, but 16 KiB is the floor this sweep actually measured, so it
+ * is what this constant now carries. Mean chunk population at 16 KiB is `~17` events, well under the
+ * "roughly 50-90 events" figure an earlier, unmeasured estimate assumed -- disk size shows that
+ * smaller-and-more-numerous chunks cost essentially nothing extra in per-record overhead at this
+ * scale, so the 50-90 figure was never load-bearing for anything this constant actually has to satisfy
+ * (the two hard thresholds above, both comfortably clear at 16 KiB).
+ *
+ * **Named limitation, not fixed here**: the real fix for the open-chunk-rewrite cost is packing only
+ * the *delta* into the open chunk's ciphertext (an append-friendly encrypted structure, or accepting
+ * multiple small ciphertexts per open chunk merged on read) rather than re-encrypting the whole thing
+ * per flush; that is a write-path redesign this increment's own review should weigh against simply
+ * shipping the smaller measured target, not something this measurement pass should decide unilaterally.
  *
  * @knipignore - exported for tests, that read it directly to size a fixture relative to a chunk
  *     boundary; production code reads {@link getChunkTargetBytes} instead, which is the one that
@@ -156,7 +175,7 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
  *     itself never changes, so a test cannot cross a chunk boundary with a *small* fixture by
  *     reading this alone, only by overriding what production code reads.
  */
-export const CHUNK_TARGET_BYTES = 48 * 1024;
+export const CHUNK_TARGET_BYTES = 16 * 1024;
 
 /**
  * Test-only override for {@link getChunkTargetBytes}, the same shape as {@link
