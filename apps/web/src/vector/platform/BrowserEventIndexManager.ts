@@ -3360,7 +3360,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             // disk too, and this is the one place already deleting *something* for this id, so it
             // costs nothing to also drop a legacy row if one happens to exist (review-pr-d.md D3).
             const alsoDropLegacyRow = this.db.objectStoreNames.contains("events");
-            const tx = this.db.transaction(alsoDropLegacyRow ? ["chunks", "events", "meta"] : ["chunks", "meta"], "readwrite");
+            const tx = this.db.transaction(
+                alsoDropLegacyRow ? ["chunks", "events", "meta"] : ["chunks", "meta"],
+                "readwrite",
+            );
             if (alsoDropLegacyRow) tx.objectStore("events").delete([userId, targetId]);
             if (chunkRecord) tx.objectStore("chunks").put(chunkRecord);
             else tx.objectStore("chunks").delete([userId, chunkId]);

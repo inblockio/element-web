@@ -3982,7 +3982,12 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
                 | { salt: string }
                 | undefined;
             expect(metaRow).toBeDefined();
-            const dek = await deriveDek(pickleKey, decodeBase64(metaRow!.salt) as Uint8Array<ArrayBuffer>, userId, DEVICE);
+            const dek = await deriveDek(
+                pickleKey,
+                decodeBase64(metaRow!.salt) as Uint8Array<ArrayBuffer>,
+                userId,
+                DEVICE,
+            );
             const chunks: Array<{ chunkId: number; maxTs: number; idsDesc: string[] }> = [];
             for (const row of rawChunks) {
                 const arr = await decryptBinaryJson<Array<[string, { originServerTs: number }]>>(
@@ -5104,7 +5109,10 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         const N = 24;
         for (let i = 0; i < N; i++) {
             const ts = i % 3 === 0 ? 1000 + i : 9_000_000 + i;
-            await seed.addEventToIndex(msg(`$mix${String(i).padStart(3, "0")}`, `zqmixbody ${i}`, { origin_server_ts: ts }), {});
+            await seed.addEventToIndex(
+                msg(`$mix${String(i).padStart(3, "0")}`, `zqmixbody ${i}`, { origin_server_ts: ts }),
+                {},
+            );
         }
         await seed.commitLiveEvents();
         const before = await seed.getStats();
@@ -5172,7 +5180,10 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         for (let i = 0; i < N; i++) {
             const stripe = i % 4;
             const ts = 1_000_000 * stripe + i;
-            batch.push({ event: msg(`$h${String(i).padStart(5, "0")}`, `zqhydbody ${i}`, { origin_server_ts: ts }), profile: {} });
+            batch.push({
+                event: msg(`$h${String(i).padStart(5, "0")}`, `zqhydbody ${i}`, { origin_server_ts: ts }),
+                profile: {},
+            });
             if (batch.length === 100) await seed.addHistoricEvents(batch.splice(0), null, null);
         }
         if (batch.length) await seed.addHistoricEvents(batch.splice(0), null, null);
@@ -5249,7 +5260,13 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
             req.onsuccess = (): void => {
                 const db = req.result;
                 const tx = db.transaction(["meta", "events"], "readwrite");
-                tx.objectStore("meta").put({ userId, salt: encodeBase64(salt), userVersion: 0, manifestPageCount: pageCount, diskBytes: 0 });
+                tx.objectStore("meta").put({
+                    userId,
+                    salt: encodeBase64(salt),
+                    userVersion: 0,
+                    manifestPageCount: pageCount,
+                    diskBytes: 0,
+                });
                 for (const rec of pageRecords) tx.objectStore("meta").put(rec);
                 for (const rec of evRecords) tx.objectStore("events").put(rec);
                 tx.oncomplete = (): void => {
@@ -5418,7 +5435,10 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         await m.addEventToIndex(
             msg("$seal1", "zqsealbody one EDITED", {
                 origin_server_ts: 1,
-                content: { "m.new_content": { body: "zqsealbody one EDITED", msgtype: "m.text" }, "m.relates_to": { rel_type: "m.replace", event_id: "$seal1" } },
+                content: {
+                    "m.new_content": { body: "zqsealbody one EDITED", msgtype: "m.text" },
+                    "m.relates_to": { rel_type: "m.replace", event_id: "$seal1" },
+                },
             }),
             {},
         );
@@ -5469,7 +5489,9 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         const remainingRows = await decryptAllChunkEvents(pickleKey!, DEVICE);
         const remainingIds = new Set(remainingRows.map((r: any) => r.eventId));
         for (const id of remainingIds) {
-            const hit = await reloaded.searchEventIndex(search(id.startsWith("$mv1") ? "zqmovebody one" : "zqmovebody two"));
+            const hit = await reloaded.searchEventIndex(
+                search(id.startsWith("$mv1") ? "zqmovebody one" : "zqmovebody two"),
+            );
             expect(hit.count).toBeGreaterThanOrEqual(0); // no throw; a stale chunkMembers pointer would misbehave, not just miss
         }
         void chunkA;
@@ -5613,7 +5635,9 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         // The same ciphertext, "re-filed" under a different chunkId's AAD, must fail.
         await expect(decryptBinaryJson(dek, row.blob, chunkAad(userId, row.chunkId + 9999))).rejects.toBeDefined();
         // ... and under a different userId's AAD.
-        await expect(decryptBinaryJson(dek, row.blob, chunkAad("@someone-else:example.org", row.chunkId))).rejects.toBeDefined();
+        await expect(
+            decryptBinaryJson(dek, row.blob, chunkAad("@someone-else:example.org", row.chunkId)),
+        ).rejects.toBeDefined();
     });
 
     it("every chunk write uses a fresh, unique IV -- never a constant one (kills M21)", async () => {
@@ -5634,5 +5658,4 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
             expect((r.blob.iv as Uint8Array).some((b: number) => b !== 0)).toBe(true); // not an all-zero IV
         }
     });
-
 });
