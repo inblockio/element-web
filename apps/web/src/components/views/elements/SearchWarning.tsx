@@ -6,7 +6,7 @@ SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Com
 Please see LICENSE files in the repository root for full details.
 */
 
-import React, { type JSX, type ReactNode, useCallback, useEffect, useState } from "react";
+import React, { type JSX, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { logger } from "matrix-js-sdk/src/logger";
 
 import EventIndexPeg from "../../../indexing/EventIndexPeg";
@@ -33,6 +33,9 @@ interface IProps {
     /** The room being searched. Mirrors `SearchInfo.roomId`: `undefined` when searching all rooms. */
     roomId?: string;
 }
+
+/** How often to re-read {@link EventIndex.getStats} while `loading` is true; see the docstring below. */
+const LOADING_POLL_MS = 1000;
 
 /**
  * Track whether the index is still missing history that is relevant to the given search.
@@ -61,7 +64,17 @@ interface IProps {
  * (see `BrowserEventIndexManager.initEventIndex`), and a query issued before that finishes can
  * silently return only what has loaded so far, even with no checkpoints outstanding at all. Unlike
  * the two questions above, this one is not scoped by room: while it is true, every search is
- * potentially incomplete.
+ * potentially incomplete, and every kind of warning cares about it, not only {@link
+ * WarningKind.Search} — see this hook's `loading` return value and its two call sites in {@link
+ * SearchWarning} below.
+ *
+ * `loading` has no event of its own to clear it, unlike the checkpoint signal's `changedCheckpoint`:
+ * the backend does not fire anything when hydration finishes. Polling on a plain interval, armed
+ * only while `loading` is true (so a session that finished hydrating before this ever mounts pays
+ * nothing), is the fix chosen here over adding an emitter to `EventIndex`/`BrowserEventIndexManager`
+ * for one signal only this hook consumes; gating this disjunct on `anyOutstanding` the way the
+ * `isRoomIndexed` one already is would avoid needing a poll at all, but was rejected because it
+ * under-warns in exactly the case this signal exists for (no checkpoints outstanding at all).
  *
  * The `changedCheckpoint` payload carries only the globally-current room and so cannot answer a
  * per-room question: we re-read the index on each event rather than trust it.
@@ -69,9 +82,17 @@ interface IProps {
  * @param index The event index to observe, or `null` if there is no index.
  * @param scope The scope of the search, if this warning is being rendered for one.
  * @param roomId The room being searched, or `undefined` when searching all rooms.
- * @returns `true` while the index is known to be missing history for the search, `false` otherwise.
+ * @returns `incomplete`: true while the index is known to be missing history relevant to this
+ *     specific search (the property every existing, `WarningKind.Search`-only caller wants).
+ *     `loading`: true while the backend is still hydrating from disk at all, regardless of scope or
+ *     room — the property a `WarningKind.Files` caller wants instead, the checkpoint-based signal
+ *     never having applied to it.
  */
-function useIsIndexIncomplete(index: EventIndex | null, scope?: SearchScope, roomId?: string): boolean {
+function useIsIndexIncomplete(
+    index: EventIndex | null,
+    scope?: SearchScope,
+    roomId?: string,
+): { incomplete: boolean; loading: boolean } {
     const readCheckpoints = useCallback((): { relevant: boolean; anyOutstanding: boolean } => {
         if (!index) return { relevant: false, anyOutstanding: false };
         const { crawlingRooms } = index.crawlingRooms();
@@ -87,53 +108,74 @@ function useIsIndexIncomplete(index: EventIndex | null, scope?: SearchScope, roo
     // The checkpoint half of the answer is known synchronously, so seed from it rather than
     // rendering an unwarned search for a room we already know is being crawled.
     const [incomplete, setIncomplete] = useState<boolean>(() => readCheckpoints().relevant);
+    const [loading, setLoading] = useState<boolean>(false);
 
-    useEffect(() => {
-        if (!index) {
+    // Shared between the subscription effect below and the poll effect further down, so a tick
+    // from either agrees with the other about which answer is current; a ref rather than a
+    // useCallback-captured local because both effects' cleanups, and the poll's own repeated
+    // ticks, all need to see every increment, not the value each closure captured at creation.
+    const generationRef = useRef(0);
+
+    // A plain function wrapping the ref bump, so the effect cleanup below calls this instead of
+    // writing `generationRef.current` directly: react-hooks' exhaustive-deps rule flags a bare
+    // `.current` access inside a cleanup (it is normally about a DOM ref having already changed
+    // by the time cleanup runs, which does not apply to a plain mutable counter like this one, but
+    // the rule does not distinguish the two).
+    const invalidate = useCallback((): void => {
+        generationRef.current++;
+    }, []);
+
+    const update = useCallback(async (): Promise<void> => {
+        if (!index) return;
+        const current = ++generationRef.current;
+        const { relevant, anyOutstanding } = readCheckpoints();
+
+        // The index can still be hydrating from disk with no checkpoints outstanding at all -- a
+        // fresh session, before the crawler has run this pass -- in which case a query can
+        // silently return only what has been decrypted so far. This applies regardless of scope
+        // or room, unlike the checkpoint checks below, so it is fetched unconditionally rather
+        // than only when the checkpoint question alone leaves the answer open.
+        let isLoading = false;
+        try {
+            const stats = await index.getStats();
+            if (current !== generationRef.current) return;
+            isLoading = Boolean(stats?.loading);
+        } catch (e) {
+            // A backend whose getStats() rejects is not evidence either way; log and treat it as
+            // not loading rather than let the rejection go unhandled (this function is always
+            // invoked as `void update()` or from a timer callback, neither of which has a catch).
+            if (current !== generationRef.current) return;
+            logger.warn("SearchWarning: getStats() failed; treating the index as not loading", e);
+        }
+        setLoading(isLoading);
+
+        if (relevant || isLoading) {
+            setIncomplete(true);
+            return;
+        }
+        if (!anyOutstanding || scope !== SearchScope.Room || roomId === undefined) {
             setIncomplete(false);
             return;
         }
 
-        // Guards against a slow isRoomIndexed() response overwriting a newer one, or landing after
-        // the scope changed or the component unmounted.
-        let generation = 0;
+        // Nothing is queued for this room yet, but the index may hold nothing for it at all.
+        // `undefined` means there is no index manager to ask, which is not evidence either way.
+        const indexed = await index.isRoomIndexed(roomId);
+        if (current === generationRef.current) setIncomplete(indexed === false);
+    }, [index, scope, roomId, readCheckpoints]);
+
+    useEffect(() => {
+        if (!index) {
+            setIncomplete(false);
+            setLoading(false);
+            return;
+        }
 
         // Answer this scope and room from the checkpoint set up front, so that the previous
         // search's result is not left on screen while the first lookup below is in flight. Doing
         // this per effect run rather than per event matters: a checkpoint change is not a new
         // question, and resetting on one would blink an already-earned warning off and on again.
         setIncomplete(readCheckpoints().relevant);
-
-        const update = async (): Promise<void> => {
-            const current = ++generation;
-            const { relevant, anyOutstanding } = readCheckpoints();
-
-            if (relevant) {
-                setIncomplete(true);
-                return;
-            }
-
-            // The index can still be hydrating from disk with no checkpoints outstanding at all --
-            // a fresh session, before the crawler has run this pass -- in which case a query can
-            // silently return only what has been decrypted so far. This applies regardless of scope
-            // or room, unlike the checkpoint checks above and below.
-            const stats = await index.getStats();
-            if (current !== generation) return;
-            if (stats?.loading) {
-                setIncomplete(true);
-                return;
-            }
-
-            if (!anyOutstanding || scope !== SearchScope.Room || roomId === undefined) {
-                setIncomplete(false);
-                return;
-            }
-
-            // Nothing is queued for this room yet, but the index may hold nothing for it at all.
-            // `undefined` means there is no index manager to ask, which is not evidence either way.
-            const indexed = await index.isRoomIndexed(roomId);
-            if (current === generation) setIncomplete(indexed === false);
-        };
 
         const onChangedCheckpoint = (): void => {
             void update();
@@ -144,17 +186,27 @@ function useIsIndexIncomplete(index: EventIndex | null, scope?: SearchScope, roo
         index.on("changedCheckpoint", onChangedCheckpoint);
 
         return () => {
-            generation++;
+            invalidate();
             index.removeListener("changedCheckpoint", onChangedCheckpoint);
         };
-    }, [index, scope, roomId, readCheckpoints]);
+    }, [index, scope, roomId, readCheckpoints, update, invalidate]);
 
-    return incomplete;
+    // changedCheckpoint fires only on checkpoint transitions, and hydration finishing has no event
+    // of its own, so `loading` would otherwise be raised once and never re-checked. Poll on a plain
+    // interval instead, armed only while `loading` is true, so a session that finished hydrating
+    // before this ever mounts (the overwhelmingly common case) never starts a timer at all.
+    useEffect(() => {
+        if (!index || !loading) return;
+        const poll = setInterval(() => void update(), LOADING_POLL_MS);
+        return () => clearInterval(poll);
+    }, [index, loading, update]);
+
+    return { incomplete, loading };
 }
 
 export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, scope, roomId }: IProps): JSX.Element {
     const eventIndex = EventIndexPeg.get();
-    const indexIncomplete = useIsIndexIncomplete(eventIndex, scope, roomId);
+    const { incomplete: indexIncomplete, loading: indexLoading } = useIsIndexIncomplete(eventIndex, scope, roomId);
 
     if (!isRoomEncrypted) return <></>;
 
@@ -167,6 +219,18 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
             return (
                 <div className="mx_SearchWarning" role="status">
                     <span>{_t("seshat|warning_kind_search_partial")}</span>
+                </div>
+            );
+        }
+        // The Files kind never cared about crawler checkpoints -- loadFileEvents() answers from
+        // whatever is resident, same as search, but nothing above ever warned about it for Files.
+        // Hydration is the one signal that does apply here regardless of kind: while it is running,
+        // the attachment list loadFileEvents() answers from is truncated or empty the same way a
+        // search's results would be.
+        if (indexLoading && kind === WarningKind.Files) {
+            return (
+                <div className="mx_SearchWarning" role="status">
+                    <span>{_t("seshat|warning_kind_files_partial")}</span>
                 </div>
             );
         }
