@@ -1931,6 +1931,37 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * The position of `hit.eventId` within `list` (one room's {@link roomOrder} entry), or -1 if it is not there.
+     * Binary search over `originServerTs` rather than `Array.prototype.indexOf`'s O(n) linear scan, exploiting the
+     * invariant {@link insertRoomOrder}/{@link reindexRoomOrder} already maintain -- `list` is always sorted by
+     * `originServerTs` ascending -- so this needs no cache or position map of its own to stay correct across inserts,
+     * hydration and removals: it just reads the current, always-sorted structure, the same one every other reader of
+     * {@link roomOrder} already trusts.
+     *
+     * Finds the *lower bound* of `hit.originServerTs` first, then scans forward through the run of entries sharing
+     * that exact timestamp for the matching id. Ties are rare in real chat data and the run they form is short, so
+     * this stays O(log n) amortized; a plain id-indexed `Map<eventId, position>` was rejected instead, because
+     * {@link insertRoomOrder} splices into the *middle* of the list, which would shift every later entry's stored
+     * position on every insert -- trading an O(n) `indexOf` for an O(n) index-map repair on every write, no better.
+     */
+    private positionInRoomOrder(list: string[], hit: StoredEvent): number {
+        let lo = 0;
+        let hi = list.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            const ts = this.events.get(list[mid])?.originServerTs ?? 0;
+            if (ts < hit.originServerTs) lo = mid + 1;
+            else hi = mid;
+        }
+        for (let i = lo; i < list.length; i++) {
+            const candidate = this.events.get(list[i]);
+            if (list[i] === hit.eventId) return i;
+            if ((candidate?.originServerTs ?? 0) !== hit.originServerTs) break;
+        }
+        return -1;
+    }
+
+    /**
      * The events immediately around a hit, for the lines of context shown with a search result. Slices the room's
      * timestamp-ordered id list either side of the hit, so the context is the neighbourhood *in the index*, not in the
      * room: anything not indexed is simply absent, and a gap does not announce itself as one.
@@ -1945,7 +1976,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         afterLimit: number,
     ): { events_before: IMatrixEvent[]; events_after: IMatrixEvent[]; profile_info: Record<string, IMatrixProfile> } {
         const list = this.roomOrder.get(hit.roomId) ?? [];
-        const idx = list.indexOf(hit.eventId);
+        const idx = this.positionInRoomOrder(list, hit);
         const beforeIds = idx >= 0 ? list.slice(Math.max(0, idx - beforeLimit), idx) : [];
         const afterIds = idx >= 0 ? list.slice(idx + 1, idx + 1 + afterLimit) : [];
         const events_before = beforeIds.map((id) => this.resultEvent(this.events.get(id)!.event));
