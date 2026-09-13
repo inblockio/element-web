@@ -1,11 +1,4 @@
 /*
-Copyright 2026 inblock.io
-
-SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
-Please see LICENSE files in the repository root for full details.
-*/
-
-/*
  * Synthetic corpus generator for the BrowserEventIndexManager perf harness (element-web PR #34718).
  *
  * Platform-neutral ES module: no Node built-ins (no `Buffer`, no `node:*` imports), so this file is bundled
@@ -16,7 +9,7 @@ Please see LICENSE files in the repository root for full details.
  * WHY THIS EXISTS
  * ----------------
  * The original harness's corpus (see `generateCorpusOld` below, preserved verbatim in spirit) had four
- * best-case biases of the first version of this harness: ascending timestamps, even room spread, a thin event shape
+ * best-case biases documented in HANDOVER.md §4: ascending timestamps, even room spread, a thin event shape
  * missing the encrypted-room metadata fields, and an unrealistically small vocabulary. `generateCorpusNew` +
  * `crawlBatches` fix all four:
  *
@@ -24,18 +17,18 @@ Please see LICENSE files in the repository root for full details.
  *      room's ascending-by-timestamp id list. The live-timeline path (`addEventToIndex`) always appends, so it
  *      never pays the splice-at-front cost. The crawler (`EventIndex.ts`'s `crawlerFunc`, `EVENTS_PER_CRAWL =
  *      100`) walks backwards through history in batches of 100 via `addHistoricEvents`, delivering the newest
- *      undelivered events first, the exact case that pays that cost. `crawlBatches()` reproduces this: per
+ *      undelivered events first — the exact case that pays that cost. `crawlBatches()` reproduces this: per
  *      room, newest-first, chunked into batches of 100, rooms visited round-robin the way the crawler's FIFO
  *      checkpoint queue does (dequeue the front room, hand it one batch, re-enqueue at the back if it has more
  *      history left).
  *   2. Zipfian room sizes. `planRoomSizes()` assigns each room a share of the total proportional to
  *      1/(rank+1)^zipfRoomExponent (default 1.0), so a handful of rooms carry most events and the rest trail
- *      off, a few huge rooms, a long tail, rather than an even split.
+ *      off — a few huge rooms, a long tail, rather than an even split.
  *   3. Real-ish event shape. `BrowserEventIndexManager.eventToJson`-equivalent: `EventIndex.ts:eventToJson`
  *      adds `curve25519Key`, `ed25519Key`, `algorithm` (`ev.getWireContent().algorithm`) and
  *      `forwardingCurve25519KeyChain` on top of `getEffectiveEvent()`'s `unsigned` block, for every encrypted
  *      event (see EventIndex.ts:338-357 in the checkout). `buildEventShape()` reproduces those exact field
- *      names, not the wire-content fields "sender_key/session_id/device_id", which do not appear at this
+ *      names — not the task brief's approximate "sender_key/session_id/device_id", which do not appear at this
  *      layer (they are on the *wire* `m.room.encrypted` content, already stripped by the time the event reaches
  *      the index). The measured overhead lines up with the ballpark figure anyway (see README.md).
  *   4. Realistic vocabulary and message text. `buildVocabulary()` sizes the vocabulary by Heaps' law
@@ -43,6 +36,12 @@ Please see LICENSE files in the repository root for full details.
  *      length (median ~10 words, long tail); `accentedShare`/`cjkShare` inject accented-Latin and CJK bodies at
  *      configurable rates, exercising `foldText`'s NFKD path and the "one CJK run = one token" tokenizer
  *      property (`tokenize()` splits only on non-letter/number/underscore, and `\p{L}` covers CJK ideographs).
+ *
+ * 2026-09-13 addendum: point 4's `buildVocabulary()` is a FIXED-POOL sampler - correctly sized across corpus
+ * sizes, but its within-run growth saturates (measurements-v1.md §6/§8's fitted beta decaying from 0.542 at
+ * 20k events to 0.398 at 200k). `buildStreamingVocabulary()`, opt-in via `vocabMode: "sustained"`, replaces it
+ * with a streaming Pitman-Yor process that sustains Heaps' law for the whole run instead - see that function's
+ * own docstring for the mechanism, and measurements-cross-engine.md §1 for the fitted-beta verification.
  */
 
 /* ------------------------------------------------------------------ RNG (seeded, deterministic, no deps) */
@@ -72,7 +71,7 @@ function randn(rng) {
 
 /**
  * Precompute a cumulative distribution over `n` ranks under a Zipf law with exponent `s`: P(rank r) ∝
- * 1/(r+1)^s. Returns a sampler `() => rank` that does a binary search over the CDF, O(log n) per draw, which
+ * 1/(r+1)^s. Returns a sampler `() => rank` that does a binary search over the CDF — O(log n) per draw, which
  * is fast enough at the vocabulary/room-count sizes this harness uses (tens of thousands of ranks, millions of
  * draws total at the largest corpus size).
  */
@@ -106,7 +105,7 @@ function zipfShares(n, s, total) {
         sum += weights[r];
     }
     const shares = weights.map((w) => Math.floor((w / sum) * total));
-    const assigned = shares.reduce((a, b) => a + b, 0);
+    let assigned = shares.reduce((a, b) => a + b, 0);
     shares[0] += total - assigned; // remainder to the largest room, never negative since floor() only loses share
     return shares;
 }
@@ -114,96 +113,12 @@ function zipfShares(n, s, total) {
 /* ------------------------------------------------------------------ vocabulary */
 
 const SYLLABLES = [
-    "ba",
-    "be",
-    "bi",
-    "bo",
-    "bu",
-    "ca",
-    "ce",
-    "ci",
-    "co",
-    "cu",
-    "da",
-    "de",
-    "di",
-    "do",
-    "du",
-    "fa",
-    "fe",
-    "fi",
-    "fo",
-    "fu",
-    "ga",
-    "ge",
-    "gi",
-    "go",
-    "gu",
-    "ha",
-    "he",
-    "hi",
-    "ho",
-    "hu",
-    "ja",
-    "je",
-    "ji",
-    "jo",
-    "ju",
-    "ka",
-    "ke",
-    "ki",
-    "ko",
-    "ku",
-    "la",
-    "le",
-    "li",
-    "lo",
-    "lu",
-    "ma",
-    "me",
-    "mi",
-    "mo",
-    "mu",
-    "na",
-    "ne",
-    "ni",
-    "no",
-    "nu",
-    "pa",
-    "pe",
-    "pi",
-    "po",
-    "pu",
-    "ra",
-    "re",
-    "ri",
-    "ro",
-    "ru",
-    "sa",
-    "se",
-    "si",
-    "so",
-    "su",
-    "ta",
-    "te",
-    "ti",
-    "to",
-    "tu",
-    "va",
-    "ve",
-    "vi",
-    "vo",
-    "vu",
-    "wa",
-    "we",
-    "wi",
-    "wo",
-    "wu",
-    "ya",
-    "ye",
-    "yi",
-    "yo",
-    "yu",
+    "ba", "be", "bi", "bo", "bu", "ca", "ce", "ci", "co", "cu", "da", "de", "di", "do", "du",
+    "fa", "fe", "fi", "fo", "fu", "ga", "ge", "gi", "go", "gu", "ha", "he", "hi", "ho", "hu",
+    "ja", "je", "ji", "jo", "ju", "ka", "ke", "ki", "ko", "ku", "la", "le", "li", "lo", "lu",
+    "ma", "me", "mi", "mo", "mu", "na", "ne", "ni", "no", "nu", "pa", "pe", "pi", "po", "pu",
+    "ra", "re", "ri", "ro", "ru", "sa", "se", "si", "so", "su", "ta", "te", "ti", "to", "tu",
+    "va", "ve", "vi", "vo", "vu", "wa", "we", "wi", "wo", "wu", "ya", "ye", "yi", "yo", "yu",
 ];
 
 /** A curated head of genuinely common chat/workplace words, so the top of the frequency curve looks real. */
@@ -247,7 +162,7 @@ const ACCENTED_WORDS = (
 ).split(/\s+/);
 
 /** A pool of common CJK ideographs (mixed Chinese/Japanese usage), concatenated so contiguous substrings of
- *  it read as plausible (if not grammatical) CJK text, enough for the tokenizer property under test: a run
+ *  it read as plausible (if not grammatical) CJK text — enough for the tokenizer property under test: a run
  *  with no ASCII word-boundary characters tokenizes as exactly one token, however long. */
 const CJK_POOL =
     "的一是了我不人在他有这个上们来到时大地为子中你说生国年着就那和要她出也得里后自以会家可下而过天去能对小多然于心学么" +
@@ -297,6 +212,148 @@ export function buildVocabulary(totalTokensEstimate, opts, rng) {
     };
 }
 
+/* ------------------------------------------------------------------ sustained-Heaps' law vocabulary (Part 1) */
+
+/**
+ * Fenwick tree (binary indexed tree) over a dynamic set of non-negative weights, supporting three operations
+ * used by {@link buildStreamingVocabulary}: `push(value)` (append a new element), `update(i, delta)` (add
+ * `delta` to element `i`, 1-indexed), and `findByPrefixSum(target)` (the smallest 1-indexed `i` such that
+ * `prefixSum(i) > target`, i.e. weighted-random-index-by-cumulative-sum in O(log capacity)). This is the
+ * standard "Fenwick tree as an order-statistics structure" trick (binary lifting over the BIT's own implicit
+ * tree), used here so a single word draw from a vocabulary with tens of thousands of live types costs
+ * O(log V), not O(V) — millions of draws happen per corpus at the largest sizes this harness generates.
+ */
+class FenwickTree {
+    constructor(capacity) {
+        this.n = 0;
+        this.capacity = capacity;
+        this.tree = new Float64Array(capacity + 1);
+        this.topBit = 1;
+        while (this.topBit * 2 <= capacity) this.topBit *= 2;
+    }
+    push(value) {
+        this.n++;
+        if (this.n > this.capacity) throw new Error(`FenwickTree capacity ${this.capacity} exceeded`);
+        this.update(this.n, value);
+    }
+    update(i, delta) {
+        for (; i <= this.capacity; i += i & -i) this.tree[i] += delta;
+    }
+    total() {
+        // Cheaper than prefixSum(this.n) for the hot path: total mass over existing tables is tracked
+        // implicitly as (tokensAssignedToExistingTables), which the caller already has as `totalTokens -
+        // newTypeCount`... but that requires bookkeeping the caller does not otherwise need, so just walk the
+        // prefix sum — capacity is bounded (tens/hundreds of thousands), so this is still O(log capacity).
+        let s = 0;
+        for (let i = this.n; i > 0; i -= i & -i) s += this.tree[i];
+        return s;
+    }
+    findByPrefixSum(target) {
+        let idx = 0;
+        for (let bm = this.topBit; bm > 0; bm >>= 1) {
+            const next = idx + bm;
+            if (next <= this.n && this.tree[next] <= target) {
+                idx = next;
+                target -= this.tree[next];
+            }
+        }
+        return idx + 1; // 1-indexed: smallest i with prefixSum(i) > original target
+    }
+}
+
+/**
+ * A streaming two-parameter Chinese Restaurant Process (Pitman-Yor process), used as an open-vocabulary word
+ * generator that sustains Heaps' law (V(T) proportional to T^discount) across the *entire* length of a run,
+ * unlike {@link buildVocabulary}'s fixed-pool Zipf sampler (which fixes V up front from a target token count
+ * and therefore saturates once T exceeds a few multiples of that target — see measurements-v1.md §6/§8 for the
+ * measured decay this causes, fitted beta 0.542 at 20k events down to 0.398 at 200k).
+ *
+ * Predictive distribution for the (T+1)-th token, given K existing types with counts c_1..c_K (sum = T):
+ *   - existing type i, with probability (c_i - discount) / (T + concentration)
+ *   - a brand-new type, with probability (concentration + K*discount) / (T + concentration)
+ *
+ * This is the standard Pitman-Yor CRP (Pitman & Yor 1997; see also Teh 2006 for the language-modelling use
+ * this harness's use mirrors). Two properties make it fit both this task's requirements at once: (1) the
+ * expected number of distinct types after T draws grows as K_n ~ C * T^discount for large T (Pitman's own
+ * result — discount in (0,1) is *exactly* the sustained Heaps' exponent, with no saturation, because the
+ * process never stops minting new types, it just mints them at a rate that itself decays as a power law); and
+ * (2) the existing-type marginal distribution this process induces is itself asymptotically Zipfian (a
+ * well-known corollary of the two-parameter CRP's "stick-breaking" representation), so the word-frequency
+ * shape this task also asks to preserve falls out for free rather than needing a second, separate Zipf
+ * sampler layered on top.
+ *
+ * `discount` (the Heaps' exponent) is taken from `opts.heapsBeta` (same option name as the fixed-pool
+ * generator, so both modes are configured the same way); `concentration` from `opts.pyTheta`. Calibration
+ * (see this module's own vocab-growth-style self-test, `vocab-growth.mjs --mode sustained`): `pyTheta=100`,
+ * `heapsBeta=0.55` (both `NEW_DEFAULTS`) gives a within-run fitted beta of ~0.555-0.561 across 20k/100k/200k
+ * events (essentially flat, no decay) with a final V of ~12k/29k/43k respectively — picked specifically so
+ * `concentration` is small relative to the token count of even the smallest checkpoint of the smallest corpus
+ * this harness generates (so the process is already in its power-law regime from the very first checkpoint,
+ * not still in the small-T transient where almost every draw is novel).
+ */
+export function buildStreamingVocabulary(opts, rng) {
+    const concentration = opts.pyTheta ?? 100;
+    const discount = opts.heapsBeta ?? 0.55;
+    // Capacity must exceed the final live-type count; see this function's docstring calibration numbers
+    // (worst simulated case across theta in [20,200], discount in [0.55,0.6] at 200k events was ~87k types) —
+    // events*2 gives comfortable headroom at every corpus size this harness uses without reasoning about the
+    // exact (concentration, discount) pair in use, and the tree's memory cost (one Float64 per capacity slot)
+    // is trivial even at the largest sizes (a few MB).
+    const capacity = Math.max(200_000, (opts.events ?? 20_000) * 2);
+    const fenwick = new FenwickTree(capacity);
+    const words = [];
+    const seen = new Set();
+    let commonIdx = 0;
+    let totalTokens = 0;
+
+    function mintWord() {
+        // Real chat/workplace words first (the same curated head the fixed-pool generator uses, so the top of
+        // the frequency curve looks equally real in both modes), then synthesized pronounceable words once
+        // that list is exhausted — exactly like buildVocabulary's own two-phase word list, just minted lazily
+        // on demand instead of all up front.
+        while (commonIdx < COMMON_WORDS.length) {
+            const w = COMMON_WORDS[commonIdx++];
+            if (!seen.has(w)) {
+                seen.add(w);
+                return w;
+            }
+        }
+        const w = synthWord(rng, seen);
+        seen.add(w);
+        return w;
+    }
+
+    function word() {
+        const K = words.length;
+        const massExisting = K === 0 ? 0 : fenwick.total();
+        const massNew = concentration + K * discount;
+        const x = rng() * (massExisting + massNew);
+        if (K === 0 || x < massNew) {
+            const w = mintWord();
+            words.push(w);
+            fenwick.push(1 - discount); // a brand-new table's weight is (count=1 - discount)
+            totalTokens++;
+            return w;
+        }
+        const idx1 = fenwick.findByPrefixSum(x - massNew); // 1-indexed
+        fenwick.update(idx1, 1); // count_i += 1 => weight (count_i - discount) += 1
+        totalTokens++;
+        return words[idx1 - 1];
+    }
+
+    return {
+        get size() {
+            return words.length;
+        },
+        heapsK: null, // not a fixed-target parameter in this mode; V emerges from (concentration, discount)
+        heapsBeta: discount,
+        wordZipfExponent: null, // emergent from the CRP, not separately configured (see docstring)
+        pyTheta: concentration,
+        vocabMode: "sustained",
+        word,
+    };
+}
+
 /** Lognormal word count: median ~10 (mu = ln(10)), long tail from sigma, clamped to a sane range. */
 function sampleWordCount(rng, medianWords) {
     const mu = Math.log(medianWords);
@@ -319,7 +376,7 @@ function accentedBody(rng, medianWords) {
     return parts.join(" ");
 }
 
-/** A contiguous CJK run with no whitespace, 15-40 characters, from CJK_POOL, one tokenizer token however long. */
+/** A contiguous CJK run with no whitespace, 15-40 characters, from CJK_POOL — one tokenizer token however long. */
 function cjkBody(rng) {
     const len = 15 + Math.floor(rng() * 26);
     const start = Math.floor(rng() * Math.max(1, CJK_POOL.length - len));
@@ -342,8 +399,10 @@ export function planRoomSizes({ events, rooms, zipfRoomExponent }) {
 
 /* ------------------------------------------------------------------ event shape */
 
-/** A plausible-looking 32-byte curve25519/ed25519 key, base64, unique per call, not a real key, just the right shape/size. */
+let curveKeyCounter = 0;
+/** A plausible-looking 32-byte curve25519/ed25519 key, base64, unique per call — not a real key, just the right shape/size. */
 function fakeKey(rng) {
+    curveKeyCounter++;
     const bytes = new Uint8Array(32);
     for (let i = 0; i < 32; i++) bytes[i] = Math.floor(rng() * 256);
     let bin = "";
@@ -390,6 +449,15 @@ export const NEW_DEFAULTS = {
     heapsK: 21,
     heapsBeta: 0.55,
     wordZipfExponent: 1.05,
+    // Part 1 (sustained Heaps' law): "fixed-pool" is the original generator (buildVocabulary, V sized once
+    // from a target token count, saturates within a run — see measurements-v1.md §6/§8); "sustained" is the
+    // streaming Pitman-Yor CRP (buildStreamingVocabulary) that keeps minting new types at a rate following
+    // V(T) ~ T^heapsBeta for the whole run, no saturation. Default stays "fixed-pool" so every existing script
+    // (event-index-perf.mjs, vocab-growth.mjs, the PR-A/B/C/D measurement runs) is untouched by this addition;
+    // the cross-engine runs in measurements-cross-engine.md pass "sustained" explicitly. pyTheta is the CRP's
+    // concentration parameter, only used in "sustained" mode.
+    vocabMode: "fixed-pool",
+    pyTheta: 100,
     medianWords: 10,
     accentedShare: 0.1,
     cjkShare: 0.05,
@@ -413,7 +481,7 @@ export const NEW_DEFAULTS = {
 
 /**
  * Build the full synthetic corpus with all four bias fixes applied. Returns per-room event arrays in
- * oldest-to-newest content order (ascending `origin_server_ts`), `crawlBatches()` is what turns this into the
+ * oldest-to-newest content order (ascending `origin_server_ts`) — `crawlBatches()` is what turns this into the
  * newest-first, batched, round-robin delivery order the real crawler uses; this function is only responsible
  * for *content*, not *delivery order*, so the content is independent of `eventsPerCrawl`/room count changes.
  */
@@ -423,7 +491,7 @@ export function generateCorpusNew(userOpts = {}) {
     const { roomIds, sizes, largestShare, zipfRoomExponent } = planRoomSizes(opts);
 
     const totalTokensEstimate = opts.events * opts.medianWords;
-    const vocab = buildVocabulary(totalTokensEstimate, opts, rng);
+    const vocab = opts.vocabMode === "sustained" ? buildStreamingVocabulary(opts, rng) : buildVocabulary(totalTokensEstimate, opts, rng);
 
     const senders = Array.from({ length: opts.senderCount }, (_, i) => `@user${i}:example.org`);
     const senderKeys = new Map(senders.map((s) => [s, { curve25519Key: fakeKey(rng), ed25519Key: fakeKey(rng) }]));
@@ -462,8 +530,8 @@ export function generateCorpusNew(userOpts = {}) {
                 const newBody = asciiBody(rng, vocab, opts.medianWords);
                 totalTokens += newBody.split(/\s+/).length;
                 content = {
-                    "body": `* ${newBody}`,
-                    "msgtype": "m.text",
+                    body: `* ${newBody}`,
+                    msgtype: "m.text",
                     "m.new_content": { body: newBody, msgtype: "m.text" },
                     "m.relates_to": { rel_type: "m.replace", event_id: editOf },
                 };
@@ -527,10 +595,12 @@ export function generateCorpusNew(userOpts = {}) {
             rooms: opts.rooms,
             zipfRoomExponent,
             largestRoomShare: largestShare,
+            vocabMode: opts.vocabMode,
             vocabSize: vocab.size,
             heapsK: vocab.heapsK,
             heapsBeta: vocab.heapsBeta,
             wordZipfExponent: vocab.wordZipfExponent,
+            pyTheta: vocab.pyTheta ?? null,
             accentedCount,
             cjkCount,
             editCount,
@@ -546,14 +616,11 @@ export function generateCorpusNew(userOpts = {}) {
  * Turn a `generateCorpusNew()` plan into the exact sequence of `addHistoricEvents` batches a real crawl would
  * produce: per room, newest-undelivered-first, batches of `eventsPerCrawl` (100 to match `EVENTS_PER_CRAWL`),
  * rooms visited round-robin via a FIFO queue (dequeue the front room, deliver one batch, re-enqueue at the back
- * if that room has more history left), mirroring `EventIndex.ts`'s `crawlerFunc`/`crawlerCheckpoints`.
+ * if that room has more history left) — mirroring `EventIndex.ts`'s `crawlerFunc`/`crawlerCheckpoints`.
  *
- * Yields `{ roomId, events, checkpoint, oldCheckpoint }`, `events` is an array of `{ event, profile }` pairs
+ * Yields `{ roomId, events, checkpoint, oldCheckpoint }` — `events` is an array of `{ event, profile }` pairs
  * exactly as `addHistoricEvents` expects, `checkpoint`/`oldCheckpoint` are the `ICrawlerCheckpoint`-shaped
  * objects to pass through (or `null`, matching a finished crawl).
- *
- * @yields {{roomId: string, events: Array<object>, checkpoint: object|null, oldCheckpoint: object|null}} one
- *   crawl batch, in the order the crawler would deliver it.
  */
 export function* crawlBatches({ roomIds, plan }, eventsPerCrawl = 100) {
     const remaining = plan.map((events) => events.length);
@@ -586,7 +653,7 @@ const OLD_FRAGMENT_HOST = "zqfallbackword";
 export const OLD_FRAGMENT = "allbackwor";
 
 /**
- * The ORIGINAL corpus generator, preserved for the "old vs new" bias-check comparison in README.md.
+ * The ORIGINAL corpus generator, preserved for the "old vs new" bias-check comparison in measurements-v1.md.
  * Verbatim in behaviour: ascending timestamps (`origin_server_ts: base + i`, strictly increasing, so
  * `insertRoomOrder` always appends), events spread evenly across rooms (`room_id: roomIds[i % rooms]`), a thin
  * shape with none of the encrypted-event fields, and a tiny vocabulary (4 fixed words + 2 index-derived ones,

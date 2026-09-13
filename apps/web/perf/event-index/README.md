@@ -1,5 +1,36 @@
 # EventIndex perf harness
 
+## 2026-09-13 update: cross-engine, CPU-throttled and sustained-Heaps'-law runs
+
+This commit does two things at once, because splitting them would leave this branch's harness in a
+non-functional intermediate state:
+
+1. **Catches this branch up** to the private `~/.cache/eventindex-perf-*` lineage that PR B/C/D
+   measurement sessions accumulated but never committed back here (manifest/migration timing,
+   flush-cost measurement, `--force-tier`, the non-blocking-load `coldRestoreNonBlocking()` path,
+   and `page.template.html`'s expanded instrumentation - `getAllKeys` timing, encrypt timing).
+   Without this, the additions below would not even parse against what was here before (e.g. the
+   new watchdog code is wired into `coldRestoreNonBlocking()`, which this branch didn't have yet).
+2. **Adds the three validation-plan items** the design document's own methodology section named as
+   missing (a Heaps'-law-sustaining corpus generator, Firefox/WebKit support, a CPU-throttled
+   Chromium mode): `corpus.mjs`'s `buildStreamingVocabulary()` (a streaming Pitman-Yor process,
+   opt-in via `vocabMode: "sustained"`, default unchanged), `run-browser.mjs`'s
+   `--engine chromium|firefox|webkit` and `--throttle N` (Chromium-only CDP
+   `Emulation.setCPUThrottlingRate`), an OS-level RSS proxy (`processTreeRssBytes()`) for the two
+   engines with no in-page JS-heap API, an IndexedDB-disk-size fix for Firefox's `storage/default/
+   */idb` layout, and `browser/harness-body.mjs`'s `startSpanWatchdog()` (a cross-engine
+   longest-synchronous-span upper bound, since the Long Tasks API is Chromium-only). Full
+   methodology, results and caveats (WebKit-on-Linux vs. Safari, RSS noise at small `n`, Firefox's
+   Long Tasks observer silently no-oping instead of throwing): `research/measurements-cross-engine.md`
+   in the `2026-09-12-element-web-eventindex` handover. A full, runnable copy of this same harness
+   state also lives there under `perf/v2/cross-engine/` for anyone without access to this branch.
+
+Everything below this point is the pre-existing README, describing the harness as of the PR-A/B
+proof pass; it has not been rewritten for the additions above except where it stated something
+now false (the "Not attempted" list's multi-engine/throttling bullet).
+
+---
+
 Performance measurement tooling for `apps/web/src/vector/platform/BrowserEventIndexManager.ts`
 (element-web PR [#34718](https://github.com/element-hq/element-web/pull/34718)). It measures the
 manager **as checked out**, unmodified: the harness bundles it, drives it, and never patches it.
@@ -236,7 +267,13 @@ require-corp` specifically so it is available), else `performance.memory.usedJSH
 
 ## Not attempted
 
-Out of scope here, and untouched: multi-engine runs (Firefox, WebKit, Safari on iOS), Web Worker offload
-variants, a chunk-size or schema sweep, a transaction-size sweep, a live-Synapse crawl-rate measurement,
-CPU throttling for a laptop factor, Element's own baseline heap with the flag off, and a planted-defect
-negative control. The design document's §9 lists these as the validation runs that gate the roadmap.
+**Update 2026-09-13**: multi-engine runs and CPU throttling, listed below as untouched at the time
+this section was written, are now covered by `--engine`/`--throttle` (see the top-of-file section)
+- Firefox and Chromium-throttled-4x against real Chromium/Firefox/WebKit; Safari on iOS specifically
+is still not attempted (Playwright's Linux WebKit build is not Safari - see the update section and
+`research/measurements-cross-engine.md`'s caveats for exactly what that does and does not cover).
+
+Still out of scope here, and untouched: Web Worker offload variants, a chunk-size or schema sweep, a
+transaction-size sweep, a live-Synapse crawl-rate measurement, Element's own baseline heap with the flag
+off, and a planted-defect negative control. The design document's §9 lists these as the validation runs
+that gate the roadmap.

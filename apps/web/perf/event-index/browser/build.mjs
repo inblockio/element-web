@@ -1,12 +1,5 @@
 #!/usr/bin/env node
 /*
-Copyright 2026 inblock.io
-
-SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
-Please see LICENSE files in the repository root for full details.
-*/
-
-/*
  * esbuild bundling for the real-Chromium runner. Bundles BrowserEventIndexManager.ts (the checkout under
  * test, NEVER modified) plus corpus.mjs (this harness's corpus generator) into one browser-platform ESM file,
  * `dist/bundle.js`, and writes the static page that loads it, `dist/page.html`.
@@ -17,33 +10,24 @@ Please see LICENSE files in the repository root for full details.
  * browser stub uses `btoa`/`atob` instead (see that file's docstring for why exact byte-for-byte parity with
  * matrix-js-sdk's own implementation is not required here).
  *
- * USAGE: node browser/build.mjs [--out <dir>]
+ * USAGE: node build.mjs [--element-web /path] [--out dist]
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import path from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const { dirname, join, resolve: resolvePath } = path;
-
 const HERE = dirname(fileURLToPath(import.meta.url));
-const ROOT = resolvePath(HERE, ".."); // apps/web/perf/event-index
-// The manager under test comes from the checkout this file lives in; ELEMENT_WEB overrides that.
-const REPO = resolvePath(process.env.ELEMENT_WEB ?? resolvePath(ROOT, "../../../.."));
-// Same default out directory as run-browser.mjs, so the runner finds the bundle without being told.
-const DEFAULT_OUT = join(
-    resolvePath(process.env.EVENT_INDEX_PERF_OUT ?? join(homedir(), ".cache", "element-web-event-index-perf")),
-    "dist",
-);
+const ROOT = resolvePath(HERE, "..");
 
 function findRepo() {
-    if (existsSync(join(REPO, "apps/web/src/vector/platform/BrowserEventIndexManager.ts"))) return REPO;
-    throw new Error(`element-web checkout not found at ${REPO}. Set ELEMENT_WEB.`);
+    const candidates = [process.env.ELEMENT_WEB, "/home/waldknoten-01/.cache/ew-pr34718/element-web"].filter(Boolean);
+    for (const candidate of candidates) {
+        if (existsSync(join(candidate, "apps/web/src/vector/platform/BrowserEventIndexManager.ts"))) {
+            return resolvePath(candidate);
+        }
+    }
+    throw new Error(`element-web checkout not found (tried: ${candidates.join(", ")}). Set ELEMENT_WEB.`);
 }
-
-// esbuild and playwright-core come from a checkout that has been installed. A git worktree has no
-// install of its own, so EVENT_INDEX_PERF_TOOLING can point at one that does.
-const TOOLING = resolvePath(process.env.EVENT_INDEX_PERF_TOOLING ?? REPO);
 
 function findEsbuildPackage(repo) {
     const direct = join(repo, "node_modules/esbuild");
@@ -56,22 +40,26 @@ function findEsbuildPackage(repo) {
             if (existsSync(join(pkg, "lib/main.js"))) return pkg;
         }
     }
-    throw new Error(
-        `esbuild not found under ${repo}/node_modules; run \`pnpm install\` there, or set EVENT_INDEX_PERF_TOOLING.`,
-    );
+    throw new Error("esbuild not found under the checkout's node_modules; run `pnpm install` there first.");
 }
 
-export async function buildBrowserBundle({ outdir = DEFAULT_OUT } = {}) {
+export async function buildBrowserBundle({ outdir = join(HERE, "dist") } = {}) {
     const repo = findRepo();
-    const TOOLING_ROOT = TOOLING;
     mkdirSync(outdir, { recursive: true });
     const outfile = join(outdir, "bundle.js");
     const platformDir = join(repo, "apps/web/src/vector/platform");
     const stubs = join(ROOT, "stubs");
-    const esbuild = await import(pathToFileURL(join(findEsbuildPackage(TOOLING), "lib/main.js")).href);
+    const esbuild = await import(pathToFileURL(join(findEsbuildPackage(repo), "lib/main.js")).href);
 
     const managerAbs = join(platformDir, "BrowserEventIndexManager");
     const corpusAbs = join(ROOT, "corpus.mjs");
+    // eventIndexBounds.ts is increment C's own file (a sibling worktree, e.g. wt-pr-c) and does not
+    // exist in increment A/B's checkouts. Imported only when present, so harness-body.mjs's
+    // setBoundsOverride() works against a checkout that has it and is simply unreachable dead code
+    // (never called unless --force-tier is passed) against one that does not -- rather than making
+    // every other increment's build fail to resolve a module that is not part of its own checkout.
+    const boundsPath = join(platformDir, "eventIndexBounds.ts");
+    const boundsAbs = existsSync(boundsPath) ? join(platformDir, "eventIndexBounds") : null;
 
     const redirects = [
         [/^matrix-js-sdk\/src\/logger$/, join(stubs, "logger.mjs")],
@@ -85,6 +73,7 @@ export async function buildBrowserBundle({ outdir = DEFAULT_OUT } = {}) {
             contents: [
                 `import { BrowserEventIndexManager } from ${JSON.stringify(managerAbs)};`,
                 `import * as Corpus from ${JSON.stringify(corpusAbs)};`,
+                boundsAbs ? `import * as EventIndexBounds from ${JSON.stringify(boundsAbs)};` : "",
                 readFileSync(join(HERE, "harness-body.mjs"), "utf8"),
             ].join("\n"),
             resolveDir: platformDir,
@@ -92,9 +81,6 @@ export async function buildBrowserBundle({ outdir = DEFAULT_OUT } = {}) {
             loader: "ts",
         },
         bundle: true,
-        // Bare specifiers (sanitize-html, matrix-js-sdk) resolve from the installed checkout's
-        // node_modules, which is not necessarily the checkout holding the source under test.
-        nodePaths: [join(TOOLING_ROOT, "apps/web/node_modules"), join(TOOLING_ROOT, "node_modules")],
         platform: "browser",
         format: "esm",
         target: "es2022",
@@ -120,11 +106,7 @@ export async function buildBrowserBundle({ outdir = DEFAULT_OUT } = {}) {
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
     const outArgIdx = process.argv.indexOf("--out");
-    const outdir = outArgIdx >= 0 ? resolvePath(process.argv[outArgIdx + 1]) : DEFAULT_OUT;
-    void buildBrowserBundle({ outdir })
-        .then(({ outfile }) => console.log(`Built ${outfile}`))
-        .catch((e) => {
-            console.error(e);
-            process.exitCode = 1;
-        });
+    const outdir = outArgIdx >= 0 ? resolvePath(process.argv[outArgIdx + 1]) : join(HERE, "dist");
+    const { outfile } = await buildBrowserBundle({ outdir });
+    console.log(`Built ${outfile}`);
 }

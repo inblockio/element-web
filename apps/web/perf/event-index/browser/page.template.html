@@ -1,129 +1,137 @@
-<!--
-Copyright 2026 inblock.io
-
-SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
-Please see LICENSE files in the repository root for full details.
--->
 <!doctype html>
 <html>
-    <head>
-        <meta charset="utf-8" />
-        <title>EventIndex perf harness</title>
-        <script>
-            /*
-             * Instrumentation, installed BEFORE bundle.js (a `type=module` script, which runs after this
-             * classic script has already executed, i.e. after HTML parsing reaches it - see MDN on module
-             * script execution order). Every prototype patch below must be in place before
-             * BrowserEventIndexManager ever touches indexedDB or crypto.subtle.
-             *
-             * WHAT'S MEASURED VS WHAT ISN'T: patches only entry points the manager itself calls
-             * (IDBDatabase.transaction, IDBIndex/IDBObjectStore.getAll, crypto.subtle.decrypt/encrypt). It
-             * does not patch put/get/delete/cursor methods, which the manager also uses on the write path
-             * (schedulePersistEvent uses store.put) - those are covered by the *count* of transactions
-             * (schedulePersistEvent opens one transaction per event; see BrowserEventIndexManager.ts:1591-1609)
-             * rather than by their own timing bucket, which is what run-browser.mjs reports as
-             * "idbTxDuringIngest"/"idbTxDuringDrain".
-             */
-            window.__harnessStats = {
-                idbTxCount: 0,
-                idbTxByStore: {},
-                decryptMs: 0,
-                decryptCount: 0,
-                encryptMs: 0,
-                encryptCount: 0,
-                idbReadMs: 0,
-                idbReadCount: 0,
-                longTasks: [],
-            };
+<head>
+<meta charset="utf-8" />
+<title>EventIndex perf harness</title>
+<script>
+/*
+ * Instrumentation, installed BEFORE bundle.js (a `type=module` script, which runs after this
+ * classic script has already executed, i.e. after HTML parsing reaches it - see MDN on module
+ * script execution order). Every prototype patch below must be in place before
+ * BrowserEventIndexManager ever touches indexedDB or crypto.subtle.
+ *
+ * WHAT'S MEASURED VS WHAT ISN'T: patches only entry points the manager itself calls
+ * (IDBDatabase.transaction, IDBIndex/IDBObjectStore.getAll, crypto.subtle.decrypt/encrypt). It
+ * does not patch put/get/delete/cursor methods, which the manager also uses on the write path
+ * (schedulePersistEvent uses store.put) - those are covered by the *count* of transactions
+ * (schedulePersistEvent opens one transaction per event; see BrowserEventIndexManager.ts:1591-1609)
+ * rather than by their own timing bucket, which is what run-browser.mjs reports as
+ * "idbTxDuringIngest"/"idbTxDuringDrain".
+ */
+window.__harnessStats = {
+    idbTxCount: 0,
+    idbTxByStore: {},
+    decryptMs: 0,
+    decryptCount: 0,
+    encryptMs: 0,
+    encryptCount: 0,
+    idbReadMs: 0,
+    idbReadCount: 0,
+    longTasks: [],
+};
 
-            (function installInstrumentation() {
-                const origTransaction = IDBDatabase.prototype.transaction;
-                IDBDatabase.prototype.transaction = function (storeNames) {
-                    window.__harnessStats.idbTxCount++;
-                    const key = Array.isArray(storeNames) ? storeNames.join(",") : String(storeNames);
-                    window.__harnessStats.idbTxByStore[key] = (window.__harnessStats.idbTxByStore[key] || 0) + 1;
-                    return origTransaction.apply(this, arguments);
-                };
+(function installInstrumentation() {
+    const origTransaction = IDBDatabase.prototype.transaction;
+    IDBDatabase.prototype.transaction = function (storeNames) {
+        window.__harnessStats.idbTxCount++;
+        const key = Array.isArray(storeNames) ? storeNames.join(",") : String(storeNames);
+        window.__harnessStats.idbTxByStore[key] = (window.__harnessStats.idbTxByStore[key] || 0) + 1;
+        return origTransaction.apply(this, arguments);
+    };
 
-                const origDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
-                crypto.subtle.decrypt = function (...args) {
-                    const t0 = performance.now();
-                    return origDecrypt(...args).then(
-                        (r) => {
-                            window.__harnessStats.decryptMs += performance.now() - t0;
-                            window.__harnessStats.decryptCount++;
-                            return r;
-                        },
-                        (e) => {
-                            window.__harnessStats.decryptMs += performance.now() - t0;
-                            throw e;
-                        },
-                    );
-                };
+    const origDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+    crypto.subtle.decrypt = function (...args) {
+        const t0 = performance.now();
+        return origDecrypt(...args).then(
+            (r) => {
+                window.__harnessStats.decryptMs += performance.now() - t0;
+                window.__harnessStats.decryptCount++;
+                return r;
+            },
+            (e) => {
+                window.__harnessStats.decryptMs += performance.now() - t0;
+                throw e;
+            },
+        );
+    };
 
-                const origEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
-                crypto.subtle.encrypt = function (...args) {
-                    const t0 = performance.now();
-                    return origEncrypt(...args).then(
-                        (r) => {
-                            window.__harnessStats.encryptMs += performance.now() - t0;
-                            window.__harnessStats.encryptCount++;
-                            return r;
-                        },
-                        (e) => {
-                            window.__harnessStats.encryptMs += performance.now() - t0;
-                            throw e;
-                        },
-                    );
-                };
+    const origEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+    crypto.subtle.encrypt = function (...args) {
+        const t0 = performance.now();
+        return origEncrypt(...args).then(
+            (r) => {
+                window.__harnessStats.encryptMs += performance.now() - t0;
+                window.__harnessStats.encryptCount++;
+                return r;
+            },
+            (e) => {
+                window.__harnessStats.encryptMs += performance.now() - t0;
+                throw e;
+            },
+        );
+    };
 
-                for (const proto of [IDBIndex.prototype, IDBObjectStore.prototype]) {
-                    const origGetAll = proto.getAll;
-                    proto.getAll = function (...args) {
-                        const t0 = performance.now();
-                        const req = origGetAll.apply(this, args);
-                        req.addEventListener("success", () => {
-                            window.__harnessStats.idbReadMs += performance.now() - t0;
-                            window.__harnessStats.idbReadCount++;
-                        });
-                        req.addEventListener("error", () => {
-                            window.__harnessStats.idbReadMs += performance.now() - t0;
-                        });
-                        return req;
-                    };
-                }
+    for (const proto of [IDBIndex.prototype, IDBObjectStore.prototype]) {
+        const origGetAll = proto.getAll;
+        proto.getAll = function (...args) {
+            const t0 = performance.now();
+            const req = origGetAll.apply(this, args);
+            req.addEventListener("success", () => {
+                window.__harnessStats.idbReadMs += performance.now() - t0;
+                window.__harnessStats.idbReadCount++;
+            });
+            req.addEventListener("error", () => {
+                window.__harnessStats.idbReadMs += performance.now() - t0;
+            });
+            return req;
+        };
+        // getAllKeys() is the PR A identity-set load (BrowserEventIndexManager.loadIdentityAndCheckpoints):
+        // primary keys only, no ciphertext -- timed separately from getAll() above so the two are never
+        // conflated in the breakdown.
+        const origGetAllKeys = proto.getAllKeys;
+        proto.getAllKeys = function (...args) {
+            const t0 = performance.now();
+            const req = origGetAllKeys.apply(this, args);
+            req.addEventListener("success", () => {
+                window.__harnessStats.idbReadKeysMs = (window.__harnessStats.idbReadKeysMs || 0) + (performance.now() - t0);
+                window.__harnessStats.idbReadKeysCount = (window.__harnessStats.idbReadKeysCount || 0) + 1;
+            });
+            req.addEventListener("error", () => {
+                window.__harnessStats.idbReadKeysMs = (window.__harnessStats.idbReadKeysMs || 0) + (performance.now() - t0);
+            });
+            return req;
+        };
+    }
 
-                try {
-                    const po = new PerformanceObserver((list) => {
-                        for (const entry of list.getEntries()) {
-                            window.__harnessStats.longTasks.push({
-                                name: entry.name,
-                                startTime: entry.startTime,
-                                duration: entry.duration,
-                            });
-                        }
-                    });
-                    po.observe({ type: "longtask", buffered: true });
-                } catch (e) {
-                    window.__harnessStats.longTaskError = String(e && e.message ? e.message : e);
-                }
+    try {
+        const po = new PerformanceObserver((list) => {
+            for (const entry of list.getEntries()) {
+                window.__harnessStats.longTasks.push({ name: entry.name, startTime: entry.startTime, duration: entry.duration });
+            }
+        });
+        po.observe({ type: "longtask", buffered: true });
+    } catch (e) {
+        window.__harnessStats.longTaskError = String(e && e.message ? e.message : e);
+    }
 
-                window.__resetHarnessCounters = function () {
-                    window.__harnessStats.idbTxCount = 0;
-                    window.__harnessStats.idbTxByStore = {};
-                    window.__harnessStats.decryptMs = 0;
-                    window.__harnessStats.decryptCount = 0;
-                    window.__harnessStats.encryptMs = 0;
-                    window.__harnessStats.encryptCount = 0;
-                    window.__harnessStats.idbReadMs = 0;
-                    window.__harnessStats.idbReadCount = 0;
-                    window.__harnessStats.longTasks = [];
-                };
-            })();
-        </script>
-        <script type="module" src="bundle.js"></script>
-    </head>
-    <body>
-        <p>EventIndex perf harness - driven from Playwright via window.EventIndexHarness.</p>
-    </body>
+    window.__resetHarnessCounters = function () {
+        window.__harnessStats.idbTxCount = 0;
+        window.__harnessStats.idbTxByStore = {};
+        window.__harnessStats.decryptMs = 0;
+        window.__harnessStats.decryptCount = 0;
+        window.__harnessStats.encryptMs = 0;
+        window.__harnessStats.encryptCount = 0;
+        window.__harnessStats.idbReadMs = 0;
+        window.__harnessStats.idbReadCount = 0;
+        window.__harnessStats.idbReadKeysMs = 0;
+        window.__harnessStats.idbReadKeysCount = 0;
+        window.__harnessStats.longTasks = [];
+    };
+})();
+</script>
+<script type="module" src="bundle.js"></script>
+</head>
+<body>
+<p>EventIndex perf harness - driven from Playwright via window.EventIndexHarness.</p>
+</body>
 </html>

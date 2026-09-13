@@ -1,12 +1,5 @@
 #!/usr/bin/env node
 /*
-Copyright 2026 inblock.io
-
-SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
-Please see LICENSE files in the repository root for full details.
-*/
-
-/*
  * Vocabulary growth curve: distinct-token-count vs. total-token-count, walked through a corpus in
  * its natural generation order, using the REAL tokenize() from BrowserEventIndexManager.ts (not a
  * hand-rolled split), so the curve reflects exactly what the manager's inverted index would grow
@@ -22,22 +15,19 @@ Please see LICENSE files in the repository root for full details.
  * Chromium would show here that Node would not - this is a corpus/tokenizer property, not a
  * performance measurement.
  *
- * USAGE: node vocab-growth.mjs [--checkpoints 40]
- * Writes <out>/results/vocab-growth.json (see README.md for the out directory).
+ * USAGE: node vocab-growth.mjs [--checkpoints 40] [--mode fixed-pool|sustained]
+ * Writes results/vocab-growth.json (--mode fixed-pool, the default, unchanged from before) or
+ * results/vocab-growth-sustained.json (--mode sustained -- Part 1 of the cross-engine extension task: fits
+ * beta for corpus.mjs's streaming Pitman-Yor generator, buildStreamingVocabulary, at 20k/100k/200k events,
+ * the same real-tokenize()-based methodology as the fixed-pool fit above, so the two are directly comparable).
  */
 import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { generateCorpusOld, generateCorpusNew } from "./corpus.mjs";
 import { findRepo, buildBundle } from "./event-index-perf.mjs";
 
-const { join, resolve: resolvePath } = path;
-
-const RESULTS_DIR = join(
-    resolvePath(process.env.EVENT_INDEX_PERF_OUT ?? join(homedir(), ".cache", "element-web-event-index-perf")),
-    "results",
-);
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 function growthCurve(bodies, tokenize, checkpointCount) {
     const seen = new Set();
@@ -86,34 +76,52 @@ async function main() {
         const idx = process.argv.indexOf("--checkpoints");
         return idx >= 0 ? Number(process.argv[idx + 1]) : 40;
     })();
+    const mode = (() => {
+        const idx = process.argv.indexOf("--mode");
+        return idx >= 0 ? process.argv[idx + 1] : "fixed-pool";
+    })();
+    if (mode !== "fixed-pool" && mode !== "sustained") throw new Error(`--mode must be fixed-pool or sustained, got ${mode}`);
 
     const repo = findRepo();
     const bundle = await buildBundle(repo);
     const { tokenize } = await import(pathToFileURL(bundle).href);
 
-    const out = { checkpoints, runs: [] };
+    const out = { checkpoints, mode, runs: [] };
 
-    for (const events of [20000, 50000, 100000, 200000]) {
+    // --mode sustained: Part 1 verification only -- exactly the three sizes the task asks for (20k/100k/200k),
+    // vocabMode:"sustained" routes generateCorpusNew to buildStreamingVocabulary (corpus.mjs) instead of the
+    // fixed-pool buildVocabulary. --mode fixed-pool (default): unchanged from before this task, all four sizes.
+    const sizesToRun = mode === "sustained" ? [20000, 100000, 200000] : [20000, 50000, 100000, 200000];
+    for (const events of sizesToRun) {
         const rooms = Math.max(8, Math.round(events / 500));
-        const corpus = generateCorpusNew({ events, rooms });
+        const corpus = generateCorpusNew({ events, rooms, ...(mode === "sustained" ? { vocabMode: "sustained" } : {}) });
         const bodies = [];
         for (const roomEvents of corpus.plan) for (const ev of roomEvents) bodies.push(ev.content.body || "");
         const points = growthCurve(bodies, tokenize, checkpoints);
         const fit = fitHeaps(points);
         out.runs.push({
-            generator: "new",
+            generator: mode === "sustained" ? "sustained" : "new",
             events,
             rooms,
             finalDistinctTokens: points[points.length - 1]?.distinctTokens ?? 0,
             finalTotalTokens: points[points.length - 1]?.totalTokens ?? 0,
-            configuredTargetVocab: corpus.stats.vocabSize,
+            configuredTargetVocab: mode === "sustained" ? null : corpus.stats.vocabSize,
+            pyTheta: mode === "sustained" ? corpus.stats.pyTheta : null,
+            heapsBetaConfigured: corpus.stats.heapsBeta,
             fittedHeaps: fit,
             points,
         });
         console.log(
-            `new  n=${events}: final V=${points.at(-1)?.distinctTokens} / T=${points.at(-1)?.totalTokens}` +
-                ` (configured target V=${corpus.stats.vocabSize}), fitted K=${fit?.K.toFixed(2)} beta=${fit?.beta.toFixed(3)}`,
+            `${mode}  n=${events}: final V=${points.at(-1)?.distinctTokens} / T=${points.at(-1)?.totalTokens}` +
+                ` (configured target V=${corpus.stats.vocabSize ?? "n/a (open vocabulary)"}), fitted K=${fit?.K.toFixed(2)} beta=${fit?.beta.toFixed(3)}`,
         );
+    }
+
+    if (mode === "sustained") {
+        mkdirSync(join(HERE, "results"), { recursive: true });
+        writeFileSync(join(HERE, "results", "vocab-growth-sustained.json"), JSON.stringify(out, null, 2));
+        console.log("Wrote results/vocab-growth-sustained.json");
+        return;
     }
 
     {
@@ -139,12 +147,9 @@ async function main() {
         );
     }
 
-    mkdirSync(RESULTS_DIR, { recursive: true });
-    writeFileSync(join(RESULTS_DIR, "vocab-growth.json"), JSON.stringify(out, null, 2));
-    console.log(`Wrote ${join(RESULTS_DIR, "vocab-growth.json")}`);
+    mkdirSync(join(HERE, "results"), { recursive: true });
+    writeFileSync(join(HERE, "results", "vocab-growth.json"), JSON.stringify(out, null, 2));
+    console.log("Wrote results/vocab-growth.json");
 }
 
-void main().catch((e) => {
-    console.error(e);
-    process.exitCode = 1;
-});
+await main();

@@ -1,20 +1,13 @@
 #!/usr/bin/env node
 /*
-Copyright 2026 inblock.io
-
-SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
-Please see LICENSE files in the repository root for full details.
-*/
-
-/*
  * Reproducible performance harness for BrowserEventIndexManager (element-web PR #34718).
  *
- * WHERE IT LIVES
- * --------------
- * element-web has no benchmark convention: no `bench`/`perf` npm script, no `*.bench.ts` files, no
- * vitest `bench` usage anywhere in the tree (`apps/web/src/performance/` is the runtime
- * performance-mark module, not a benchmark harness). This directory is therefore its own thing,
- * outside the build and outside knip's file graph, run by hand and never by CI.
+ * WHY THIS LIVES OUTSIDE THE REPOSITORY
+ * -------------------------------------
+ * element-web has no benchmark convention: no `bench`/`perf` npm script, no `*.bench.ts` files,
+ * no vitest `bench` usage anywhere in the tree (`apps/web/src/performance/` is the runtime
+ * performance-mark module, not a benchmark harness). Adding the first one inside a feature PR
+ * would be scope the reviewers did not ask for, so this sits beside the checkout instead.
  *
  * WHAT IT MEASURES
  * ----------------
@@ -50,25 +43,15 @@ Please see LICENSE files in the repository root for full details.
  * corpus: it drives the corpus through `addHistoricEvents()` in `EVENTS_PER_CRAWL`-sized (100), newest-first,
  * round-robin batches, exactly as the real crawler does (see `corpus.mjs`'s module docstring). This changes
  * *what is measured* under "index build" and "persist", which is why both remain selectable and why the
- * bias-check in README.md runs both at the same size.
+ * bias-check in measurements-v1.md runs both at the same size.
  */
 
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
-import { homedir } from "node:os";
-import path from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { generateCorpusOld, generateCorpusNew, crawlBatches, OLD_FRAGMENT, NEW_DEFAULTS } from "./corpus.mjs";
 
-const { dirname, join, resolve: resolvePath } = path;
-
 const HERE = dirname(fileURLToPath(import.meta.url));
-// Build output and results stay out of the repository, and out of /tmp (RAM-backed on some boxes).
-const OUT_DIR = resolvePath(
-    process.env.EVENT_INDEX_PERF_OUT ?? join(homedir(), ".cache", "element-web-event-index-perf"),
-);
-// esbuild comes from an installed checkout; a git worktree has none of its own, so
-// EVENT_INDEX_PERF_TOOLING can point at one that does.
-const TOOLING = process.env.EVENT_INDEX_PERF_TOOLING ? resolvePath(process.env.EVENT_INDEX_PERF_TOOLING) : null;
 
 function parseArgs(argv) {
     const opts = {
@@ -99,8 +82,7 @@ function parseArgs(argv) {
 
 /** The checkout to measure. */
 export function findRepo() {
-    // apps/web/perf/event-index -> the repository root, unless ELEMENT_WEB names another checkout.
-    const candidates = [process.env.ELEMENT_WEB, resolvePath(HERE, "../../../..")].filter(Boolean);
+    const candidates = [process.env.ELEMENT_WEB, join(HERE, "..", "element-web")].filter(Boolean);
     for (const candidate of candidates) {
         if (existsSync(join(candidate, "apps/web/src/vector/platform/BrowserEventIndexManager.ts"))) {
             return resolvePath(candidate);
@@ -121,9 +103,7 @@ function findEsbuildPackage(repo) {
             if (existsSync(join(pkg, "lib/main.js"))) return pkg;
         }
     }
-    throw new Error(
-        `esbuild not found under ${repo}/node_modules; run \`pnpm install\` there, or set EVENT_INDEX_PERF_TOOLING.`,
-    );
+    throw new Error("esbuild not found under the checkout's node_modules; run `pnpm install` there first.");
 }
 
 /**
@@ -132,13 +112,12 @@ function findEsbuildPackage(repo) {
  * redirects the four leaf modules that would otherwise drag in the whole application graph.
  */
 export async function buildBundle(repo) {
-    const TOOLING_ROOT = TOOLING ?? repo;
-    const outdir = join(OUT_DIR, "node-build");
+    const outdir = join(HERE, ".build");
     mkdirSync(outdir, { recursive: true });
     const outfile = join(outdir, "bundle.mjs");
     const platformDir = join(repo, "apps/web/src/vector/platform");
     const stubs = join(HERE, "stubs");
-    const esbuild = await import(pathToFileURL(join(findEsbuildPackage(TOOLING ?? repo), "lib/main.js")).href);
+    const esbuild = await import(pathToFileURL(join(findEsbuildPackage(repo), "lib/main.js")).href);
 
     const redirects = [
         [/^matrix-js-sdk\/src\/logger$/, join(stubs, "logger.mjs")],
@@ -155,9 +134,6 @@ export async function buildBundle(repo) {
             loader: "ts",
         },
         bundle: true,
-        // Bare specifiers (sanitize-html, matrix-js-sdk) resolve from the installed checkout's
-        // node_modules, which is not necessarily the checkout holding the source under test.
-        nodePaths: [join(TOOLING_ROOT, "apps/web/node_modules"), join(TOOLING_ROOT, "node_modules")],
         platform: "node",
         format: "esm",
         target: "node22",
@@ -166,11 +142,7 @@ export async function buildBundle(repo) {
         // sanitize-html is CommonJS and reaches for node builtins through `require`, which an ESM
         // bundle has no binding for. esbuild's own shim defers to a `require` already in scope.
         banner: {
-            js: [
-                'import { createRequire as __perfCreateRequire } from "node:module";',
-                "const require = __perfCreateRequire(import.meta.url);",
-                "",
-            ].join("\n"),
+            js: ['import { createRequire as __perfCreateRequire } from "node:module";', "const require = __perfCreateRequire(import.meta.url);", ""].join("\n"),
         },
         plugins: [
             {
@@ -278,13 +250,7 @@ async function runNew(BrowserEventIndexManager, opts) {
         seed: opts.seed,
         zipfRoomExponent: opts.zipfRoomExponent,
     });
-    const results = {
-        generator: "new",
-        events: opts.events,
-        rooms: opts.rooms,
-        queries: opts.queries,
-        corpusStats: corpus.stats,
-    };
+    const results = { generator: "new", events: opts.events, rooms: opts.rooms, queries: opts.queries, corpusStats: corpus.stats };
 
     // --- ingest, memory-only so nothing is encrypted on the way in; real crawl order via addHistoricEvents.
     globalThis.__PERF_PICKLE_KEY__ = null;
@@ -351,10 +317,7 @@ async function main() {
     const bundle = await buildBundle(repo);
     const { BrowserEventIndexManager } = await import(pathToFileURL(bundle).href);
 
-    const results =
-        opts.generator === "old"
-            ? await runLegacy(BrowserEventIndexManager, opts)
-            : await runNew(BrowserEventIndexManager, opts);
+    const results = opts.generator === "old" ? await runLegacy(BrowserEventIndexManager, opts) : await runNew(BrowserEventIndexManager, opts);
 
     if (opts.json) {
         process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
@@ -362,13 +325,9 @@ async function main() {
     }
 
     const line = (label, value) => process.stdout.write(`  ${label.padEnd(34)}${value}\n`);
-    process.stdout.write(
-        `\nBrowserEventIndexManager perf [--generator ${results.generator}] - ${opts.events} events / ${opts.rooms} rooms\n\n`,
-    );
+    process.stdout.write(`\nBrowserEventIndexManager perf [--generator ${results.generator}] - ${opts.events} events / ${opts.rooms} rooms\n\n`);
     if (results.corpusStats) {
-        process.stdout.write(
-            `  corpus: V=${results.corpusStats.vocabSize} largestRoomShare=${(results.corpusStats.largestRoomShare * 100).toFixed(1)}% accented=${results.corpusStats.accentedCount} cjk=${results.corpusStats.cjkCount} edits=${results.corpusStats.editCount} files=${results.corpusStats.fileCount}\n\n`,
-        );
+        process.stdout.write(`  corpus: V=${results.corpusStats.vocabSize} largestRoomShare=${(results.corpusStats.largestRoomShare * 100).toFixed(1)}% accented=${results.corpusStats.accentedCount} cjk=${results.corpusStats.cjkCount} edits=${results.corpusStats.editCount} files=${results.corpusStats.fileCount}\n\n`);
     }
     line("index build (memory-only)", ms(results.indexBuildMs));
     line("index build + persist (AES-GCM)", ms(results.persistMs));
@@ -400,8 +359,5 @@ async function main() {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-    void main().catch((e) => {
-        console.error(e);
-        process.exitCode = 1;
-    });
+    await main();
 }

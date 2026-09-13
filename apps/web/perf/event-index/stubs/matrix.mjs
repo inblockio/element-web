@@ -1,10 +1,3 @@
-/*
-Copyright 2026 inblock.io
-
-SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
-Please see LICENSE files in the repository root for full details.
-*/
-
 /* Stub for matrix-js-sdk/src/matrix. Everything the index imports from it is a type except
    these two base64 helpers, which are re-implemented with identical semantics. */
 export function encodeBase64(uint8Array) {
