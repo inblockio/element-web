@@ -108,8 +108,74 @@ async function dumpRawStore(name: string): Promise<any[]> {
 }
 
 /**
- * Every record of every store, serialised. This is the string a reader of the IndexedDB file
- * sees, and so the thing a "nothing in the clear" assertion has to be made against.
+ * Decode `bytes` the one way that can never lose a substring: one JS code unit per byte
+ * (ISO-8859-1/Latin-1). Whatever encoding actually produced a byte run -- raw ASCII, UTF-8,
+ * UTF-16LE, anything -- its bytes reappear verbatim as a Latin-1 substring of the same bytes,
+ * because this mapping is a bijection on the byte value itself, not an interpretation of it. This
+ * is why it is the right tool for a *guard*, where "no interpretation of this buffer contains the
+ * marker" has to hold even for an encoding nobody anticipated -- unlike {@link TextDecoder}, which
+ * is faithful only for the one encoding it is told to assume and can silently substitute U+FFFD
+ * for anything else, hiding exactly the bytes a marker search most needs to see.
+ */
+function decodeLatin1(bytes: Uint8Array): string {
+    let s = "";
+    // String.fromCharCode(...bytes) blows the call stack on a large chunk; a loop does not.
+    for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return s;
+}
+
+/**
+ * Render `value` into every text form a plaintext substring could plausibly survive as, recursing
+ * into arrays and plain objects the way `JSON.stringify` would, but treating a binary leaf
+ * specially. This is IV-1's fix (`research/review-pr-c.md`'s lineage; `~/handovers/.../research/
+ * SYNTHESIS.md` §6 row D): `JSON.stringify(new ArrayBuffer(n))` is the string `"{}"` for *any*
+ * content, so `JSON.stringify`ing a record that holds a chunk's ciphertext as a binary
+ * `ArrayBuffer`/`Uint8Array` -- schema v3's whole point, {@link EncryptedBlob} being replaced by a
+ * raw binary value for exactly this reason -- makes every byte of that value invisible to the old
+ * `dumpWholeDb`, which returned early with `"{}"` for that field regardless of what was inside it.
+ * A `.not.toContain(marker)` assertion against that string therefore passed whether or not the
+ * buffer secretly held cleartext: not because the marker was absent, but because the tool could not
+ * have found it either way. This function is what makes the guard capable of failing again: every
+ * binary leaf is decoded twice -- once as Latin-1 ({@link decodeLatin1}, so any ASCII/UTF-8 byte
+ * run, which is what every marker used in this file's tests is, reappears verbatim regardless of
+ * what encoding produced it) and once as UTF-8 (`TextDecoder`, non-fatal, so genuinely multi-byte
+ * text also round-trips readably) -- and both decodings are folded into the same search string a
+ * structural `JSON.stringify` of the non-binary fields already contributes to.
+ *
+ * Called directly by the test-of-the-test below, to keep that test independent of `dumpWholeDb`'s
+ * own IndexedDB plumbing.
+ */
+function scanValueForText(value: unknown): string {
+    if (value instanceof ArrayBuffer) {
+        const bytes = new Uint8Array(value);
+        return decodeLatin1(bytes) + "\n" + new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    }
+    if (ArrayBuffer.isView(value)) {
+        const view = value as Uint8Array;
+        const bytes = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
+        return decodeLatin1(bytes) + "\n" + new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    }
+    if (Array.isArray(value)) {
+        return value.map((v) => scanValueForText(v)).join("\n");
+    }
+    if (value && typeof value === "object") {
+        const obj = value as Record<string, unknown>;
+        const parts: string[] = [];
+        for (const key of Object.keys(obj)) {
+            parts.push(key, scanValueForText(obj[key]));
+        }
+        return parts.join("\n");
+    }
+    // A primitive (string/number/boolean/null): JSON.stringify keeps the exact-match behaviour
+    // (e.g. the quoted `"${Direction.Backward}"` check below) that predates this rewrite.
+    return JSON.stringify(value) ?? "";
+}
+
+/**
+ * Every record of every store, rendered into text by {@link scanValueForText}. This is the string
+ * a "nothing in the clear" assertion has to be made against -- see that function's docstring for
+ * why a plain `JSON.stringify` of the raw rows stopped being sufficient once a value can be a
+ * binary `ArrayBuffer`/`Uint8Array` (schema v3's `chunks` store).
  */
 async function dumpWholeDb(): Promise<string> {
     return withRawDb(async (db) => {
@@ -119,7 +185,7 @@ async function dumpWholeDb(): Promise<string> {
         // Every request is issued before anything is awaited: a transaction dies as soon as
         // control returns to the event loop with none outstanding.
         const rows = await Promise.all(names.map((n) => idbPromise(tx.objectStore(n).getAll())));
-        return JSON.stringify(Object.fromEntries(names.map((n, i) => [n, rows[i]])));
+        return names.map((n, i) => `${n}:\n${scanValueForText(rows[i])}`).join("\n\n");
     });
 }
 
@@ -642,6 +708,63 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         await manager.closeEventIndex();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
+    });
+
+    describe("the no-plaintext-in-IndexedDB guard (IV-1)", () => {
+        // review-pr-c.md's lineage; this increment's own design doc, item 6: the guard has to be
+        // proven, not merely rewritten, or a second regression of the same shape (some *other*
+        // future binary field JSON.stringify cannot see into) would again pass silently.
+
+        it("scanValueForText finds a marker planted inside a binary field, not just a string one", () => {
+            // Exercises the tool directly, independent of any real store's shape or of IndexedDB
+            // at all -- see scanValueForText's own docstring for why JSON.stringify alone cannot
+            // do this (`JSON.stringify(new ArrayBuffer(n))` is `"{}"` for any content).
+            const poisoned = {
+                userId: "@nobody:example.org",
+                // A schema-v3-shaped binary leaf: exactly what a chunk's ciphertext value looks
+                // like on disk, holding a marker no encryption ever produced.
+                chunk: new TextEncoder().encode("zqplaintextcanary lives in a binary leaf").buffer,
+            };
+            expect(scanValueForText(poisoned)).toContain("zqplaintextcanary");
+            // A Uint8Array view (not a bare ArrayBuffer) must also be caught -- IndexedDB and this
+            // class both hand around typed-array views at least as often as raw buffers.
+            const view = { chunk: new TextEncoder().encode("zqplaintextcanary2") };
+            expect(scanValueForText(view)).toContain("zqplaintextcanary2");
+        });
+
+        it("dumpWholeDb catches a marker planted directly on disk, in a binary field of a real store", async () => {
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            await manager.closeEventIndex(); // release the connection before opening a raw one
+
+            // Bypass the manager -- and so its encryption -- entirely: write straight to the real
+            // database's `meta` store a plaintext marker inside a binary ArrayBuffer field, the
+            // same *shape* a chunk's ciphertext value has if encryption were ever accidentally
+            // skipped. This is the positive control the design doc calls for: the guard must be
+            // proven to catch a planted plaintext, not merely assumed to.
+            await withRawDb(async (db) => {
+                await new Promise<void>((resolve, reject) => {
+                    const tx = db.transaction("meta", "readwrite");
+                    tx.objectStore("meta").put({
+                        userId: "@planted:example.org",
+                        salt: "irrelevant",
+                        userVersion: 0,
+                        // A binary field, not a base64 string -- the exact case the old
+                        // JSON.stringify-based dumpWholeDb could not see into at all.
+                        diskBytes: new TextEncoder().encode("zqcanarymarker hidden in a buffer").buffer,
+                    });
+                    tx.oncomplete = (): void => resolve();
+                    tx.onerror = (): void => reject(tx.error);
+                });
+            });
+
+            const whole = await dumpWholeDb();
+            // Positive control: the dump really does reach this row.
+            expect(whole).toContain("@planted:example.org");
+            // The actual assertion: a plaintext marker inside a binary field is found, not hidden
+            // behind JSON.stringify's vacuous "{}" the way it would have been before this fix.
+            expect(whole).toContain("zqcanarymarker");
+        });
     });
 
     it("reloads events, checkpoints and the user version from IndexedDB", async () => {
