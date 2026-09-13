@@ -3482,8 +3482,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     ): Promise<void> {
         const started = now();
         let scanned = 0;
-        let totalBytes = 0;
-        let oldestTs: number | undefined;
         let afterEventId: string | undefined;
 
         for (;;) {
@@ -3516,14 +3514,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 if (this.closed || epoch !== this.hydrationEpoch) return;
                 this.manifestAdd(stored.eventId, stored.originServerTs, stored.roomId);
                 const bytes = ciphertextByteLength(row.blob.ct);
-                totalBytes += bytes;
-                oldestTs = oldestTs === undefined ? stored.originServerTs : Math.min(oldestTs, stored.originServerTs);
                 // review-pr-c.md C3-F1: without these three, enforceDiskBudget has no candidate to
                 // evict for any row this session has not otherwise touched -- recordBytes/recordTs
                 // are its "is this durable, and how old" test, diskTsHeap is what it pops from. This
                 // scan already decrypts every row and has both numbers in hand; populate them here so
                 // a migrated database's disk budget is enforceable immediately, not only for whatever
-                // subset bounded hydration happens to materialise afterward.
+                // subset bounded hydration happens to materialise afterward. (Also, as of C4-F1, this
+                // is now the *only* place these numbers are tracked during the scan -- no pass-local
+                // totalBytes/oldestTs running total any more; see the derivation after the loop.)
                 this.recordBytes.set(stored.eventId, bytes);
                 this.recordTs.set(stored.eventId, stored.originServerTs);
                 heapPushTs(this.diskTsHeap, { ts: stored.originServerTs, id: stored.eventId });
@@ -3539,13 +3537,25 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             if (rows.length < HYDRATION_PAGE_SIZE) break;
         }
 
-        this.ciphertextBytes = totalBytes;
-        // In memory, exactly as before C2-F4; only the persistence below changed (encrypted row,
-        // not a cleartext meta field), so a *future* regular reopen (loadManifest's path) can read
-        // this back without needing to re-scan.
-        this.oldestIndexedTs = oldestTs;
+        // review-pr-c.md C4-F1: NOT `this.ciphertextBytes = totalBytes` / `this.oldestIndexedTs =
+        // oldestTs` -- those are pass-*local* totals, and assigning them clobbers the contribution
+        // of any write that landed concurrently while this scan was running (its own
+        // flushLiveWrites already added its bytes to this.ciphertextBytes and folded its ts into
+        // this.oldestIndexedTs correctly; an assignment here would overwrite both with this scan's
+        // own, now-stale, totals -- the reviewer measured this as a real, silent 14,130 B
+        // understatement with 70 concurrent writes, reproducing unchanged since C3-F1). recordBytes
+        // and recordTs are authoritative for every row this session knows about -- this scan just
+        // populated them for everything it visited, and a concurrent write's own flushLiveWrites
+        // populates them too -- so deriving fresh from those Maps is exact by construction and
+        // immune to ordering between this pass and any write racing it.
+        this.ciphertextBytes = Array.from(this.recordBytes.values()).reduce((a, b) => a + b, 0);
+        let exactOldestTs: number | undefined;
+        for (const ts of this.recordTs.values()) {
+            if (exactOldestTs === undefined || ts < exactOldestTs) exactOldestTs = ts;
+        }
+        this.oldestIndexedTs = exactOldestTs;
         const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
-        const oldestIndexedTsRecord = await this.prepareOldestIndexedTsWrite(userId, dek, oldestTs);
+        const oldestIndexedTsRecord = await this.prepareOldestIndexedTsWrite(userId, dek, exactOldestTs);
         const meta = await this.loadMeta(userId);
         const tx = this.db.transaction("meta", "readwrite");
         for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
@@ -3553,7 +3563,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (meta) {
             tx.objectStore("meta").put({
                 ...meta,
-                diskBytes: totalBytes,
+                diskBytes: this.ciphertextBytes,
                 manifestPageCount: this.manifestPages.length,
             });
         }

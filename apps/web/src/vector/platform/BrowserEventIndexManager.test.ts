@@ -4165,6 +4165,79 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
                 if (seenSurvivor) expect(present).toBe(true);
             }
         });
+
+        it("writes landing mid-pass are included in the totals after the pass, not clobbered by it (review-pr-c.md C4-F1)", async () => {
+            // review-pr-c.md C4-F1 (pre-existing, reproduces unchanged on the commit before C3-F1's
+            // fix too): the pass used to end with `this.ciphertextBytes = totalBytes` -- an
+            // *assignment* of this scan's own pass-local total, clobbering whatever a concurrent
+            // write's own flushLiveWrites had already correctly added to this.ciphertextBytes while
+            // the scan was running. The reviewer measured a real, silent 14,130 B understatement
+            // with 70 concurrent writes; membership (manifest vs. disk) was never wrong, only the
+            // *count*, persisted into meta for the rest of the session. Same pattern for
+            // oldestIndexedTs.
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            const corpus = budgetCorpus(300);
+            for (const ev of corpus) {
+                await seed.addEventToIndex(ev, {});
+            }
+            await seed.commitLiveEvents(); // one batched flush
+            const before = await seed.getStats();
+            await seed.closeEventIndex();
+
+            // Same pre-manifest strip as the tests above.
+            await withRawDb(async (db) => {
+                const tx = db.transaction("meta", "readwrite");
+                const store = tx.objectStore("meta");
+                const row = await idbPromise(store.get(userId));
+                store.put({ userId: row.userId, salt: row.salt, userVersion: row.userVersion });
+                const manifestKeys = await idbPromise(
+                    store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
+                );
+                for (const key of manifestKeys) store.delete(key);
+                store.delete(`${userId}|oldestIndexedTs`);
+                await new Promise<void>((resolve, reject) => {
+                    tx.oncomplete = (): void => resolve();
+                    tx.onerror = (): void => reject(tx.error);
+                });
+            });
+
+            // No budget pressure -- isolates the accounting bug from disk-budget deletion (already
+            // covered by the test above) and from the resident budget.
+            setEventIndexBoundsOverrideForTesting(null);
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+
+            // Fired immediately, without awaiting the migration first, so they race its scan -- a
+            // live write and a crawler batch, the same two concurrent-write paths the reviewer's own
+            // E7 used, both with an *older* origin_server_ts than the migration's own oldest
+            // (so the fix's Math.min-equivalent derivation is exercised, not just the byte sum).
+            const liveWrite = (async () => {
+                await reloaded.addEventToIndex(msg("$midLive", "x", { room_id: ROOM, origin_server_ts: 500_000 }), {});
+                await reloaded.commitLiveEvents();
+            })();
+            const crawlerWrite = reloaded.addHistoricEvents(
+                [{ event: msg("$midCrawl", "x", { room_id: ROOM, origin_server_ts: 400_000 }), profile: {} }],
+                null,
+                null,
+            );
+
+            await Promise.all([liveWrite, crawlerWrite, reloaded.waitForManifest()]);
+            await reloaded.waitForHydration();
+
+            const stats = await reloaded.getStats();
+            const rawRows = await dumpRawStore("events");
+            // Mirrors the production ciphertextByteLength helper (base64 decoded length), so this
+            // check does not depend on the very accounting it is verifying.
+            const rawTotal = rawRows.reduce((sum: number, r: any) => sum + Math.ceil((r.blob.ct.length * 3) / 4), 0);
+
+            expect(rawRows.length).toBe(corpus.length + 2); // the two concurrent writes really landed
+            expect(stats.size).toBeGreaterThan(before.size); // grew past the pre-migration total...
+            expect(stats.size).toBe(rawTotal); // ...and is *exact*, not merely "grew" (the bug this survived two passes as)
+            expect(stats.oldestIndexedTs).toBe(400_000); // the older of the two concurrent writes, not clobbered either
+        });
     });
 
     describe("navigator.storage.persist()", () => {
