@@ -5476,7 +5476,7 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         void stats;
     });
 
-    it("a redaction of the currently-open chunk uses its live buffer, so a later flush cannot resurrect it (kills M6, M7)", async () => {
+    it("a redaction of the currently-open chunk uses its live buffer, so a later flush cannot resurrect it (kills M7)", async () => {
         setChunkTargetBytesOverrideForTesting(100_000); // large: everything below stays in one open chunk
         const m = track(new BrowserEventIndexManager());
         await m.initEventIndex(userId, DEVICE);
@@ -5499,14 +5499,33 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
         expect(rows.map((r: any) => r.eventId).sort()).toEqual(["$op1", "$op3"]);
         expect((await m.searchEventIndex(search("zqopenbody"))).count).toBe(2);
+    });
 
-        // M6: the open chunk's own size accounting must have been re-established after the
-        // redaction, not left at the pre-redaction figure -- provable by adding enough further
-        // content to approach (but not cross) the target and confirming it is still ONE chunk, not
-        // sealed early on stale, over-counted bytes.
-        await m.addEventToIndex(msg("$op4", "zqopenbody four".repeat(50), { origin_server_ts: 4 }), {});
+    it("the open chunk's byte accounting is re-established after a redaction, not left at a stale pre-redaction figure (kills M6)", async () => {
+        // Tightly calibrated: seed a large entry as the open chunk's only member, redact it (so the
+        // correct post-redaction size is ~0), then add a small entry and set the target strictly
+        // between "correct" (tiny) and "stale" (the deleted entry's own large size still counted).
+        // Correct accounting keeps sealing off; stale accounting (M6) seals immediately.
+        setChunkTargetBytesOverrideForTesting(100_000); // large enough that seeding never seals early
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        const bigBody = "zqm6body ".repeat(400); // a few KB, comfortably over the target set below
+        await m.addEventToIndex(msg("$m6big", bigBody, { origin_server_ts: 10 }), {});
         await m.commitLiveEvents();
         expect(await dumpRawStore("chunks")).toHaveLength(1);
+        expect(await m.deleteEvent("$m6big")).toBe(true);
+        await m.commitLiveEvents(); // enqueueDeleteRecord only queues; this is the barrier that awaits it
+        // The deleted entry is gone from disk entirely (its chunk had no other members).
+        expect(await dumpRawStore("chunks")).toHaveLength(0);
+
+        setChunkTargetBytesOverrideForTesting(500); // between a tiny new entry and the deleted big one
+        await m.addEventToIndex(msg("$m6small", "zqm6small", { origin_server_ts: 11 }), {});
+        await m.commitLiveEvents();
+        const rows = await dumpRawStore("chunks");
+        expect(rows).toHaveLength(1); // one small chunk, not sealed early on the deleted entry's stale size
+        const decrypted = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        expect(decrypted.map((r: any) => r.eventId)).toEqual(["$m6small"]);
     });
 
     it("a stale disk-eviction heap entry is re-validated against the chunk's current maxTs, not evicted on faith (kills M11)", async () => {
