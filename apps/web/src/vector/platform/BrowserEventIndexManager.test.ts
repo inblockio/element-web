@@ -11,15 +11,18 @@ import "fake-indexeddb/auto";
 
 import { vi, describe, it, expect, afterEach, beforeEach } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
-import { Direction, encodeBase64 } from "matrix-js-sdk/src/matrix";
+import { decodeBase64, Direction, encodeBase64 } from "matrix-js-sdk/src/matrix";
 
 import { mockPlatformPeg } from "../../../test/test-utils";
 import SettingsStore from "../../settings/SettingsStore";
 import {
     BrowserEventIndexManager,
+    chunkAad,
+    decryptBinaryJson,
     decryptJson,
     deriveCheckpointMacKey,
     deriveDek,
+    encryptBinary,
     encryptJson,
     eventHasFile,
     extractSearchText,
@@ -36,7 +39,11 @@ import {
     effectiveEventForIndex,
     VOCABULARY_MERGE_THRESHOLD,
 } from "./BrowserEventIndexManager";
-import { DAY_MS, setEventIndexBoundsOverrideForTesting } from "./eventIndexBounds";
+import {
+    DAY_MS,
+    setChunkTargetBytesOverrideForTesting,
+    setEventIndexBoundsOverrideForTesting,
+} from "./eventIndexBounds";
 
 const SEARCH_DEFAULTS = {
     before_limit: 0,
@@ -89,16 +96,130 @@ async function withRawDb<T>(fn: (db: IDBDatabase) => Promise<T>, version?: numbe
 
 interface RawSnapshot {
     version: number;
-    eventIndexNames: string[];
+    /** Index names on the `chunks` store -- empty for schema v3, which addresses chunks only by their exact primary key. */
+    chunkIndexNames: string[];
+    /** Every event actually on disk, decrypted from every `chunks` row; see {@link decryptAllChunkEvents}. */
     events: any[];
 }
 
-async function inspectRawDb(): Promise<RawSnapshot> {
+/**
+ * Decrypt every event currently on disk, straight off a raw second connection, for *every* user the
+ * database currently holds a `chunks` row for (not just one): the `userId` on each raw chunk record
+ * is still cleartext (see the class threat model), so this groups by that, reads each user's own
+ * `meta` row for its salt, and re-derives each one's own DEK the same way {@link
+ * BrowserEventIndexManager.initEventIndex} does -- the schema-v3 analogue of what a plain
+ * `dumpRawStore("events")` gave for schema v2, before events stopped being individually addressable
+ * and a raw row's own cleartext `userId`/`eventId` fields were enough on their own. Returns one
+ * flattened `{eventId, userId, ...StoredEvent}` object per event, in no particular order, so every
+ * existing `.toHaveLength(n)`/`.map(r => r.eventId)`/`.filter(r => r.userId === ...)`/
+ * `expect.objectContaining({eventId: ...})` assertion written against the old per-row shape keeps
+ * working unchanged.
+ */
+async function decryptAllChunkEvents(pickleKey: string, deviceId: string): Promise<any[]> {
     return withRawDb(async (db) => {
-        const store = db.transaction("events", "readonly").objectStore("events");
+        const chunkRows = (await idbPromise(
+            db.transaction("chunks", "readonly").objectStore("chunks").getAll(),
+        )) as Array<{
+            userId: string;
+            chunkId: number;
+            blob: { iv: Uint8Array<ArrayBuffer>; ct: Uint8Array<ArrayBuffer> };
+        }>;
+        const deks = new Map<string, CryptoKey>();
+        const out: any[] = [];
+        for (const row of chunkRows) {
+            let dek = deks.get(row.userId);
+            if (!dek) {
+                const metaRow = (await idbPromise(
+                    db.transaction("meta", "readonly").objectStore("meta").get(row.userId),
+                )) as { salt: string } | undefined;
+                if (!metaRow) continue; // No meta for this user; nothing to derive a key from.
+                const salt = decodeBase64(metaRow.salt) as Uint8Array<ArrayBuffer>;
+                dek = await deriveDek(pickleKey, salt, row.userId, deviceId);
+                deks.set(row.userId, dek);
+            }
+            const arr = await decryptBinaryJson<Array<[string, any]>>(dek, row.blob, chunkAad(row.userId, row.chunkId));
+            for (const [eventId, stored] of arr) out.push({ eventId, userId: row.userId, ...stored });
+        }
+        return out;
+    });
+}
+
+/**
+ * Seed a genuine schema-v2, pre-manifest, pre-chunk fixture: a real `events` object store (one
+ * encrypted `EventRecord` row per event, exactly as v2 wrote it, `byUser` index only) plus a bare
+ * `meta` row with no `manifestPageCount` and no `checkpoints`. Bypasses {@link
+ * BrowserEventIndexManager} entirely on the write side -- unlike this class, which never writes to
+ * `events` at all under schema v3, so seeding "a v2 database" by writing through the manager and
+ * then merely stripping `meta`'s increment-C/D fields (this file's own pattern before this
+ * increment) no longer produces one: the data would already be sitting in `chunks`. This is what
+ * `runManifestMigration` (self-heal) + `runChunkMigrationIfNeeded` (this increment's own conversion)
+ * together have to turn back into a working v3 index.
+ *
+ * @param rawEvents - Matrix events, `msg()`-shaped, in the order to store them (arrival order,
+ *     ascending `eventId` expected by callers that pass `budgetCorpus()`-style ids).
+ * @returns The salt this fixture's DEK was derived from, so a caller that also needs a `meta` row
+ *     mid-test can encrypt for the same key.
+ */
+async function seedLegacyV2Fixture(
+    pickleKey: string,
+    userId: string,
+    deviceId: string,
+    rawEvents: any[],
+): Promise<{ salt: Uint8Array<ArrayBuffer> }> {
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    const dek = await deriveDek(pickleKey, salt, userId, deviceId);
+    const records: Array<{ userId: string; eventId: string; blob: { iv: string; ct: string } }> = [];
+    for (const ev of rawEvents) {
+        const stored = {
+            event: ev,
+            profile: {},
+            roomId: ev.room_id,
+            eventId: ev.event_id,
+            originServerTs: ev.origin_server_ts ?? 0,
+            searchText: extractSearchText(ev),
+            hasFile: eventHasFile(ev),
+            edited: false,
+        };
+        const blob = await encryptJson(dek, stored, `${userId}|${ev.event_id}`);
+        records.push({ userId, eventId: ev.event_id, blob });
+    }
+
+    await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.open(EVENTINDEX_DB_NAME, 2);
+        req.onupgradeneeded = (): void => {
+            const db = req.result;
+            db.createObjectStore("meta", { keyPath: "userId" });
+            const events = db.createObjectStore("events", { keyPath: ["userId", "eventId"] });
+            events.createIndex("byUser", "userId", { unique: false });
+            const cps = db.createObjectStore("checkpoints", { keyPath: "id" });
+            cps.createIndex("byUser", "userId", { unique: false });
+        };
+        req.onerror = (): void => reject(req.error);
+        req.onsuccess = (): void => {
+            const db = req.result;
+            const tx = db.transaction(["meta", "events"], "readwrite");
+            tx.objectStore("meta").put({ userId, salt: encodeBase64(salt), userVersion: 0 });
+            for (const rec of records) tx.objectStore("events").put(rec);
+            tx.oncomplete = (): void => {
+                db.close();
+                resolve();
+            };
+            tx.onerror = (): void => {
+                db.close();
+                reject(tx.error);
+            };
+        };
+    });
+    return { salt };
+}
+
+async function inspectRawDb(pickleKey: string, deviceId: string): Promise<RawSnapshot> {
+    const events = await decryptAllChunkEvents(pickleKey, deviceId);
+    return withRawDb(async (db) => {
+        const store = db.transaction("chunks", "readonly").objectStore("chunks");
         const names: string[] = [];
         for (let i = 0; i < store.indexNames.length; i++) names.push(store.indexNames.item(i)!);
-        return { version: db.version, eventIndexNames: names, events: await idbPromise(store.getAll()) };
+        return { version: db.version, chunkIndexNames: names, events };
     });
 }
 
@@ -343,6 +464,25 @@ describe("BrowserEventIndex helpers", () => {
         const other = await deriveDek("pickle-secret-two", salt, "@a:hs", "DEVICE");
         await expect(decryptJson(other, blob, "@a:hs|$e")).rejects.toThrow();
         await expect(decryptJson(dek, blob, "wrong-aad")).rejects.toThrow();
+    });
+
+    it("encryptBinary/decryptBinaryJson round-trip as raw bytes, never base64, and reject the wrong key or AAD", async () => {
+        const salt = crypto.getRandomValues(new Uint8Array(32));
+        const dek = await deriveDek("pickle-secret-one", salt, "@a:hs", "DEVICE");
+        const blob = await encryptBinary(dek, [["$e", { body: "chunked secret" }]], "@a:hs|chunk:0");
+        expect(blob.ct).toBeInstanceOf(Uint8Array);
+        expect(blob.iv).toBeInstanceOf(Uint8Array);
+        expect(blob.iv).toHaveLength(12);
+        // Not JSON at all: decoding the raw ciphertext bytes as UTF-8 text must never surface the
+        // marker -- the direct analogue of the base64 check above, for a binary value.
+        expect(new TextDecoder("utf-8", { fatal: false }).decode(blob.ct)).not.toContain("chunked secret");
+
+        const out = await decryptBinaryJson<Array<[string, { body: string }]>>(dek, blob, "@a:hs|chunk:0");
+        expect(out).toEqual([["$e", { body: "chunked secret" }]]);
+
+        const other = await deriveDek("pickle-secret-two", salt, "@a:hs", "DEVICE");
+        await expect(decryptBinaryJson(other, blob, "@a:hs|chunk:0")).rejects.toThrow();
+        await expect(decryptBinaryJson(dek, blob, "@a:hs|chunk:1")).rejects.toThrow();
     });
 
     it("derives a sign-only checkpoint subkey that is bound to the pickle key, user and device", async () => {
@@ -1183,7 +1323,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect(await dumpRawStore("checkpoints")).toHaveLength(1);
     });
 
-    it("writes nothing but the record key and the ciphertext in the clear", async () => {
+    it("writes nothing but userId/chunkId and the ciphertext in the clear -- eventId has left the cleartext key set (schema v3)", async () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
         await manager.addEventToIndex(
@@ -1195,24 +1335,41 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         );
         await manager.commitLiveEvents();
 
-        const raw = await inspectRawDb();
-        expect(raw.events).toHaveLength(1);
-        const [record] = raw.events;
-        // Anything added to this list is metadata handed to whoever can read the IndexedDB
-        // file. userId and eventId are the record key, and eventId is bound into the AAD.
-        expect(Object.keys(record).sort()).toEqual(["blob", "eventId", "userId"]);
+        const chunkRows = await dumpRawStore("chunks");
+        expect(chunkRows).toHaveLength(1);
+        const [record] = chunkRows;
+        // Anything added to this list is metadata handed to whoever can read the IndexedDB file.
+        // userId and chunkId are the record key; chunkId is an opaque per-user counter with no
+        // relationship to any event or room, unlike schema v2's cleartext eventId primary key.
+        expect(Object.keys(record).sort()).toEqual(["blob", "chunkId", "userId"]);
         expect(Object.keys(record.blob).sort()).toEqual(["ct", "iv"]);
+        expect(record.blob.ct).toBeInstanceOf(Uint8Array); // binary, never base64 JSON (see ChunkBlob)
+        expect(record.blob.iv).toBeInstanceOf(Uint8Array);
         expect(record.userId).toEqual(userId);
-        expect(record.eventId).toEqual("$plain");
+        expect(record.chunkId).toEqual(0);
+        // The crux of this test: no eventId field survives on the raw record at all -- it lives only
+        // inside the ciphertext now.
+        expect("eventId" in record).toBe(false);
 
-        const serialised = JSON.stringify(record);
-        expect(serialised).not.toContain("!room:example.org");
-        expect(serialised).not.toContain("1234567890123");
-        expect(serialised).not.toContain("mxc://");
-        expect(serialised).not.toContain("secret");
+        // No index at all on `chunks`: every read addresses it by the exact [userId, chunkId]
+        // primary key, so there is nothing for an index to usefully answer (unlike schema v2's
+        // events store, which needed byUser to enumerate one user's rows for deletion).
+        await withRawDb(async (db) => {
+            const store = db.transaction("chunks", "readonly").objectStore("chunks");
+            const names: string[] = [];
+            for (let i = 0; i < store.indexNames.length; i++) names.push(store.indexNames.item(i)!);
+            expect(names).toEqual([]);
+        });
 
-        // Only the index the read path actually uses.
-        expect(raw.eventIndexNames).toEqual(["byUser"]);
+        // Whole-database guard, via the IV-1-fixed scanValueForText path (dumpWholeDb): a plain
+        // JSON.stringify of a binary blob field would pass every one of these vacuously (IV-1) --
+        // this is the guard that actually decodes it.
+        const whole = await dumpWholeDb();
+        expect(whole).not.toContain("!room:example.org");
+        expect(whole).not.toContain("1234567890123");
+        expect(whole).not.toContain("mxc://");
+        expect(whole).not.toContain("secret");
+        expect(whole).not.toContain("$plain"); // the eventId itself, now only inside the ciphertext
     });
 
     it("migrates a v1 database: resets the index and leaves no v1 cleartext behind", async () => {
@@ -1279,10 +1436,17 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
 
-        const raw = await inspectRawDb();
-        expect(raw.version).toBe(2);
-        // The unused v1 index is gone ...
-        expect(raw.eventIndexNames).toEqual(["byUser"]);
+        const raw = await inspectRawDb(pickleKey!, DEVICE);
+        expect(raw.version).toBe(3); // v1 -> v2 -> v3 in one upgrade transaction
+        // The unused v1 index is gone from the legacy `events` store (still present, empty, while
+        // nothing has been chunked -- see openDb: an events store that already existed is kept, not
+        // recreated, so this is the same store v1 wrote to, missing only byUserRoom).
+        await withRawDb(async (db) => {
+            const store = db.transaction("events", "readonly").objectStore("events");
+            const names: string[] = [];
+            for (let i = 0; i < store.indexNames.length; i++) names.push(store.indexNames.item(i)!);
+            expect(names).toEqual(["byUser"]);
+        });
 
         // ... and so are the records. The plaintext-keyed checkpoints cannot be re-keyed inside
         // the versionchange transaction (no key material exists there), so they are deleted; the
@@ -1295,15 +1459,19 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect((await manager.searchEventIndex(search("legacy"))).count).toBe(0);
 
         // meta survives, because its salt is what keeps the derived key usable -- minus the
-        // `deviceId` column, which nothing ever read. `diskBytes`/`manifestPageCount` are new: the
-        // v1->v2 wipe leaves manifestPageCount undefined, which is exactly the "pre-manifest
-        // database" signal runManifestMigration self-heals from -- it runs (over zero rows, events
-        // having just been cleared) and persists its own empty result, so a *third* open does not
-        // pay for a migration scan all over again. `oldestIndexedTs` is deliberately absent
-        // (review-pr-c.md C2-F4): it is derived from the manifest at open, never a cleartext meta
-        // field, and this exact key set is what pins that it cannot come back.
+        // `deviceId` column, which nothing ever read. `manifestPageCount` is new: the v1->v2 wipe
+        // leaves it undefined, which is exactly the "pre-manifest database" signal
+        // runManifestMigration self-heals from -- it runs (over zero rows, events having just been
+        // cleared) and persists its own empty result (manifestPageCount 0), so a *third* open does
+        // not pay for a migration scan all over again. `diskBytes`/`nextChunkId` are deliberately
+        // absent: nothing has ever been chunked for this user (runChunkMigrationIfNeeded finds the
+        // now-empty legacy `events` store and returns immediately, writing nothing), and
+        // `existingMeta.diskBytes ?? 0` already treats "absent" the same as "explicitly zero" at the
+        // next open, so there is nothing to gain by writing a real zero here pre-emptively.
+        // `oldestIndexedTs` is deliberately absent too (review-pr-c.md C2-F4): it is derived from the
+        // manifest at open, never a cleartext meta field, and this exact key set is what pins that it
+        // cannot come back.
         expect(Object.keys((await dumpRawStore("meta"))[0]).sort()).toEqual([
-            "diskBytes",
             "manifestPageCount",
             "salt",
             "userId",
@@ -1338,7 +1506,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect(await manager.isEventIndexEmpty()).toBe(true);
 
         await manager.commitLiveEvents();
-        expect((await inspectRawDb()).events).toEqual([]);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
         // Deleting it again is a no-op rather than a second hit.
         expect(await manager.deleteEvent("$edit")).toBe(false);
     });
@@ -1358,13 +1526,13 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             expect(await reloaded.deleteEvent("$edit")).toBe(true);
             expect((await reloaded.searchEventIndex(search("edited"))).count).toBe(0);
             await reloaded.commitLiveEvents();
-            expect((await inspectRawDb()).events).toEqual([]);
+            expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
         } finally {
             await reloaded.closeEventIndex();
         }
     });
 
-    it("drops the rows it already loaded when a later row cannot be decrypted", async () => {
+    it("drops the whole index when a chunk cannot be decrypted", async () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
         await manager.addEventToIndex(msg("$a", "first wording"), {});
@@ -1372,11 +1540,15 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         await manager.commitLiveEvents();
         await manager.closeEventIndex();
 
-        // Corrupt the second row only: the first decrypts and is indexed before the failure.
+        // Both events pack into the same (only, still-open) chunk -- schema v3's decrypt failure
+        // unit is a whole chunk, not one row, so corrupting it takes both with it; unlike schema
+        // v2's per-row failure, there is no "the first row already decrypted, the second did not"
+        // case within a single chunk, only across chunks (see the "hydration newest-first across
+        // chunk boundaries" tests for that).
         await withRawDb(async (db) => {
-            const store = db.transaction("events", "readwrite").objectStore("events");
-            const row = await idbPromise(store.get([userId, "$b"]));
-            row.blob.ct = encodeBase64(crypto.getRandomValues(new Uint8Array(64)));
+            const store = db.transaction("chunks", "readwrite").objectStore("chunks");
+            const row = await idbPromise(store.get([userId, 0]));
+            row.blob.ct = crypto.getRandomValues(new Uint8Array(64));
             await idbPromise(store.put(row));
         });
 
@@ -1388,7 +1560,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             expect(await reloaded.isRoomIndexed("!room:example.org")).toBe(false);
             // The crawler relies on this to decide the index needs rebuilding.
             expect(await reloaded.isEventIndexEmpty()).toBe(true);
-            expect((await inspectRawDb()).events).toEqual([]);
+            expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
         } finally {
             await reloaded.closeEventIndex();
         }
@@ -1489,7 +1661,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         // connection it produces belongs to nobody: openDb has to close it rather than leak a
         // handle that would block deleting the database for the rest of the session.
         v1.close();
-        expect(await dumpRawStore("events")).toEqual([]);
+        expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).toEqual([]);
         const blocked = vi.fn();
         await new Promise<void>((resolve, reject) => {
             const req = indexedDB.deleteDatabase(EVENTINDEX_DB_NAME);
@@ -1538,7 +1710,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         // The warm index survived, and nothing else was filed under this user.
         expect((await manager.searchEventIndex(search("warm"))).count).toBe(1);
-        const rows = await dumpRawStore("events");
+        const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
         expect(rows.filter((r) => r.userId === other).map((r) => r.eventId)).toEqual(["$warm"]);
     });
 
@@ -1562,20 +1734,32 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         // Re-initialise the same manager (the settings panel's Enable path does this without
         // closing first) landing a live re-delivery of the *original* message, unaware of the
-        // edit, from inside the checkpoint's own decrypt -- the first crypto.subtle.decrypt call
-        // this second initEventIndex makes.
+        // edit, from inside the very first crypto.subtle.decrypt call this second initEventIndex
+        // makes -- whichever of checkpoints/the manifest phase reaches it first is now started
+        // before this one under this increment's own initEventIndex ordering (materializeIfPending
+        // needs the manifest to resolve an id to its chunk, unlike schema v2's direct keyed get(),
+        // so manifestReadyPromise/chunkMigrationReadyPromise must already point at the live session
+        // by the time anything this early could call it). The injected write is *not* awaited from
+        // inside the mock itself -- only kicked off -- specifically so it cannot deadlock against
+        // whichever pass's own decrypt this lands inside of: materializeIfPending awaits that same
+        // pass's own readiness promise, so awaiting it synchronously from inside that pass's own
+        // in-flight decrypt call would be waiting on itself. Kicking it off and letting the mocked
+        // decrypt call return immediately lets that pass actually finish, which is what the
+        // kicked-off write is itself waiting on.
         const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
         let landed = false;
+        let injected: Promise<void> = Promise.resolve();
         const decryptSpy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
             if (!landed) {
                 landed = true;
-                await manager.addEventToIndex(msg("$orig", "original wording"), {});
+                injected = manager.addEventToIndex(msg("$orig", "original wording"), {});
             }
             return realDecrypt(...(args as Parameters<typeof realDecrypt>));
         });
 
         try {
             await manager.initEventIndex(userId, DEVICE);
+            await injected;
             await manager.waitForHydration();
             expect(landed).toBe(true);
 
@@ -1640,7 +1824,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             );
         }
         await manager.commitLiveEvents();
-        expect(await dumpRawStore("events")).toHaveLength(1);
+        expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).toHaveLength(1);
         const rewritten = (await manager.getStats()).size;
         expect(rewritten).toBeLessThan(one * 1.5);
 
@@ -1756,7 +1940,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         await manager.addEventToIndex(msg("$race", "racing secret"), {});
         // No commitLiveEvents(): the encrypt-and-put is still queued.
         await manager.deleteEventIndex();
-        expect((await inspectRawDb()).events).toEqual([]);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
     });
 
     describe("non-blocking load", () => {
@@ -1833,9 +2017,14 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         });
 
         it("search during hydration returns what is resident so far, and never throws", async () => {
-            const ids = await seed(8);
+            // Progress happens at CHUNK granularity now (a whole chunk's worth of events
+            // materializes at once, right after its one decrypt resolves), so a corpus under one
+            // chunk's worth (CHUNK_TARGET_BYTES) would jump straight from 0 to fully hydrated with
+            // no observable partial state -- this needs enough events to span several chunks.
+            const NB_CHUNK_SPANNING_COUNT = 200;
+            const ids = await seed(NB_CHUNK_SPANNING_COUNT);
             const lastId = ids[0]; // lowest ts; hydrated last now that hydration reads newest-ts-first
-            const restore = slowDownDecrypt(15);
+            const restore = slowDownDecrypt(5);
             try {
                 const reloaded = new BrowserEventIndexManager();
                 await reloaded.initEventIndex(userId, DEVICE);
@@ -1902,15 +2091,18 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         });
 
         it("teardown mid-hydration stops the loop cleanly, without a dangling transaction", async () => {
-            await seed(8);
-            const restore = slowDownDecrypt(20);
+            // See the "search during hydration" test above: progress is per-chunk now, so this needs
+            // enough events to span several chunks for a genuinely partial state to exist at all.
+            const NB_CHUNK_SPANNING_COUNT = 200;
+            await seed(NB_CHUNK_SPANNING_COUNT);
+            const restore = slowDownDecrypt(8);
             try {
                 const reloaded = new BrowserEventIndexManager();
                 await reloaded.initEventIndex(userId, DEVICE);
 
                 while (true) {
                     const count = (await reloaded.getStats()).eventCount;
-                    if (count > 0 && count < 8) break;
+                    if (count > 0 && count < NB_CHUNK_SPANNING_COUNT) break;
                     await sleep(4);
                 }
 
@@ -2006,7 +2198,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             try {
                 const reloaded = new BrowserEventIndexManager();
                 await reloaded.initEventIndex(userId, DEVICE);
-                while ((await reloaded.getStats()).eventCount === 0) await sleep(2);
+                await reloaded.waitForHydration();
 
                 const batch = [0, 1, 2, 3].map((i) => ({
                     event: msg(`$crawl${i}`, `zqcrawl body ${i}`, { room_id: room, origin_server_ts: 500 + i }),
@@ -2017,7 +2209,19 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
                 const allAlready = await crawl;
 
                 expect(allAlready).toBe(false);
-                expect((await reloaded.getStats()).eventCount).toBe(0);
+                // materializeIfPending() for a brand-new id (never on disk, no manifest entry) no
+                // longer touches IndexedDB at all under schema v3 -- it short-circuits synchronously
+                // on the manifest lookup, unlike schema v2's unconditional get(). That removes the
+                // real-I/O yield point closeEventIndex() used to reliably interleave against mid-loop,
+                // so at most the one iteration already past its own (now I/O-free) await when
+                // `closed` flips can still land before the loop's own `if (this.closed) return false;`
+                // check catches it on the next iteration -- the invariant this test exists to prove is
+                // that the *rest* of the batch does not, not that literally nothing before the flip
+                // can ever complete.
+                expect((await reloaded.getStats()).eventCount).toBeLessThanOrEqual(1);
+                for (const i of [1, 2, 3]) {
+                    expect((await reloaded.searchEventIndex(search(`zqcrawl body ${i}`))).count).toBe(0);
+                }
             } finally {
                 restore();
             }
@@ -2103,13 +2307,11 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             }
         });
 
-        it("materializeOnce runs at most one decrypt for two concurrent attempts at the same row", async () => {
-            // Direct unit test of materializeOnce's own de-duplication contract, independent of
-            // any higher-level race: two callers wanting the same not-yet-resident row at once
-            // must share one decrypt, not run two. The idempotent insert inside materializeRow
-            // (belt-and-braces for a future caller that bypasses this layer) would still stop a
-            // duplicate *insert*, but it does nothing about a wasted second *decrypt* -- counting
-            // decrypt() calls is what isolates this layer specifically.
+        it("decryptChunkOnce runs at most one decrypt for two concurrent attempts at the same chunk", async () => {
+            // Direct unit test of decryptChunkOnce's own de-duplication contract (schema v3's
+            // chunk-level analogue of schema v2's materializeOnce), independent of any higher-level
+            // race: two callers wanting the same not-yet-decrypted chunk at once must share one
+            // decrypt, not run two.
             await seed(1);
             const restore = slowDownDecrypt(20);
             try {
@@ -2117,26 +2319,27 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
                 await reloaded.initEventIndex(userId, DEVICE);
                 await reloaded.waitForHydration();
 
-                const rows = await dumpRawStore("events");
+                const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
                 expect(rows).toHaveLength(1);
                 const priv = reloaded as unknown as {
                     dek: CryptoKey;
-                    hydrationEpoch: number;
-                    events: Map<string, unknown>;
-                    materializeOnce: (userId: string, dek: CryptoKey, row: unknown, epoch: number) => Promise<void>;
+                    decryptChunkOnce: (
+                        userId: string,
+                        dek: CryptoKey,
+                        chunkId: number,
+                    ) => Promise<Map<string, unknown>>;
                 };
-                // Simulate the narrow window where two callers have each independently found this
-                // row not yet resident: it is already hydrated, so remove it from `events` only,
-                // without touching the disk row materializeOnce will re-read.
-                priv.events.delete(rows[0].eventId);
+                const chunkId = 0; // the one and only chunk this single-event seed produced
 
                 const decryptSpy = vi.spyOn(crypto.subtle, "decrypt");
                 const before = decryptSpy.mock.calls.length;
-                await Promise.all([
-                    priv.materializeOnce(userId, priv.dek, rows[0], priv.hydrationEpoch),
-                    priv.materializeOnce(userId, priv.dek, rows[0], priv.hydrationEpoch),
+                const [a, b] = await Promise.all([
+                    priv.decryptChunkOnce(userId, priv.dek, chunkId),
+                    priv.decryptChunkOnce(userId, priv.dek, chunkId),
                 ]);
                 expect(decryptSpy.mock.calls.length - before).toBe(1);
+                expect(a).toBe(b); // the second caller got the exact same in-flight attempt, not a fresh one
+                expect(a.size).toBe(1);
                 decryptSpy.mockRestore();
                 await reloaded.closeEventIndex();
             } finally {
@@ -2236,7 +2439,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
                 ...rest
             ) {
                 const tx = realTransaction.call(this, names, mode, ...rest);
-                if (!capturedTx && names === "events" && mode !== "readwrite") capturedTx = tx;
+                if (!capturedTx && names === "chunks" && mode !== "readwrite") capturedTx = tx;
                 return tx;
             });
 
@@ -2245,7 +2448,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             const decryptSpy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
                 if (inactiveAtFirstDecrypt === undefined && capturedTx) {
                     try {
-                        capturedTx.objectStore("events").get(["@nobody:example.org", "$probe"]);
+                        capturedTx.objectStore("chunks").get(["@nobody:example.org", 999999]);
                         inactiveAtFirstDecrypt = false; // the transaction accepted a new request: still active
                     } catch {
                         inactiveAtFirstDecrypt = true; // refused: already inactive, as the invariant requires
@@ -2270,8 +2473,11 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             // Direct test that a slice deadline actually causes a yield: without it, hydrate()'s
             // per-row loop would never call setTimeout at all. scheduler.yield does not exist in
             // this test environment, so yieldToEventLoop() always takes the setTimeout(0) path.
+            // Decrypt now happens once per CHUNK, not once per event -- a small corpus like this
+            // packs into one chunk, one decrypt call, so the deadline check right after that one
+            // decrypt is what has to trip, not an accumulation across many small per-row decrypts.
             await seed(6);
-            const restore = slowDownDecrypt(12); // 6 rows * 12ms > the 30ms slice deadline
+            const restore = slowDownDecrypt(35); // one chunk decrypt alone > the 30ms slice deadline
             const zeroDelayTimeouts: number[] = [];
             const realSetTimeout = globalThis.setTimeout;
             const timeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
@@ -2328,6 +2534,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
 describe("BrowserEventIndexManager (the labs gate)", () => {
     const DEVICE = "DEVICE1";
+    const pickleKey = "unit-test-pickle-key";
     let manager: BrowserEventIndexManager;
     let userCounter = 0;
     let userId: string;
@@ -2374,7 +2581,7 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
         await manager.waitForHydration();
         await manager.addEventToIndex(msg("$before", "before the flag"), {});
         await manager.commitLiveEvents();
-        expect(await dumpRawStore("events")).toHaveLength(1);
+        expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).toHaveLength(1);
 
         enabled = false;
         await manager.addEventToIndex(msg("$after", "after the flag"), {});
@@ -2388,7 +2595,7 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
         await manager.commitLiveEvents();
 
         // Nothing new, in memory or on disk ...
-        expect(await dumpRawStore("events")).toHaveLength(1);
+        expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).toHaveLength(1);
         expect(await dumpRawStore("checkpoints")).toEqual([]);
         expect(await manager.loadCheckpoints()).toEqual([]);
         expect((await manager.searchEventIndex(search("after"))).count).toBe(0);
@@ -2412,18 +2619,19 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
         expect(await manager.deleteEvent("$drop")).toBe(true);
         await manager.removeCrawlerCheckpoint(cp);
         await manager.commitLiveEvents();
-        expect((await dumpRawStore("events")).map((r) => r.eventId)).toEqual(["$keep"]);
+        expect((await decryptAllChunkEvents(pickleKey!, DEVICE)).map((r) => r.eventId)).toEqual(["$keep"]);
         expect(await dumpRawStore("checkpoints")).toEqual([]);
 
         await manager.deleteEventIndex();
         expect(await manager.isEventIndexEmpty()).toBe(true);
-        expect(await dumpRawStore("events")).toEqual([]);
+        expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).toEqual([]);
         expect(await dumpRawStore("meta")).toEqual([]);
     });
 });
 
 describe("BrowserEventIndexManager (batched writes)", () => {
     const DEVICE = "DEVICE1";
+    const pickleKey = "unit-test-pickle-key";
     let manager: BrowserEventIndexManager;
     let userCounter = 0;
     let userId: string;
@@ -2453,11 +2661,11 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         // Searchable immediately, in memory -- before commitLiveEvents, before the 5s timer,
         // before the LIVE_WRITE_BUFFER_MAX threshold, before anything has touched disk.
         expect((await manager.searchEventIndex(search("unflushed"))).count).toBe(1);
-        expect((await inspectRawDb()).events).toEqual([]);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
 
         // Only once explicitly flushed does the encrypted copy land.
         await manager.commitLiveEvents();
-        expect((await inspectRawDb()).events).toHaveLength(1);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toHaveLength(1);
     });
 
     it("batches several live writes into one IndexedDB transaction instead of one per event", async () => {
@@ -2468,17 +2676,17 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         for (let i = 0; i < 12; i++) {
             await manager.addEventToIndex(msg(`$batch${i}`, `batched body ${i}`), {});
         }
-        // Twelve live writes, none flushed yet: no "events" transaction opened for any of them.
+        // Twelve live writes, none flushed yet: no "chunks" transaction opened for any of them.
         const eventsTxCalls = (): number =>
             txSpy.mock.calls.filter(
-                (call) => call[0] === "events" || (Array.isArray(call[0]) && call[0].includes("events")),
+                (call) => call[0] === "chunks" || (Array.isArray(call[0]) && call[0].includes("chunks")),
             ).length;
         expect(eventsTxCalls()).toBe(0);
 
         await manager.commitLiveEvents();
-        // Exactly one "events" transaction for the whole flushed batch, not twelve.
+        // Exactly one "chunks" transaction for the whole flushed batch, not twelve.
         expect(eventsTxCalls()).toBe(1);
-        expect((await inspectRawDb()).events).toHaveLength(12);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toHaveLength(12);
 
         txSpy.mockRestore();
     });
@@ -2494,7 +2702,7 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         // Deliberately no commitLiveEvents() and no closeEventIndex() here: this simulates a
         // crash before the live-write buffer's 5s timer or size threshold has had a chance to
         // flush it. Only the durable baseline is on disk.
-        expect((await inspectRawDb()).events.map((r) => r.eventId)).toEqual(["$durable"]);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events.map((r) => r.eventId)).toEqual(["$durable"]);
 
         // A fresh session over the same, uncleanly-abandoned database sees exactly the durable
         // baseline: the lost event is gone as if it never happened, and nothing else is disturbed.
@@ -2515,13 +2723,13 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         await manager.addEventToIndex(msg("$buffered", "buffered secret"), {});
         // Confirms it is genuinely still unflushed at the moment of redaction, not already
         // written -- otherwise this would only exercise the ordinary delete path.
-        expect((await inspectRawDb()).events).toEqual([]);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
 
         expect(await manager.deleteEvent("$buffered")).toBe(true);
         expect((await manager.searchEventIndex(search("buffered"))).count).toBe(0);
 
         await manager.commitLiveEvents();
-        expect((await inspectRawDb()).events).toEqual([]);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toEqual([]);
         expect(await manager.isEventIndexEmpty()).toBe(true);
     });
 
@@ -2533,7 +2741,7 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         expect(await manager.deleteEvent("$drop")).toBe(true);
 
         await manager.commitLiveEvents();
-        const raw = await inspectRawDb();
+        const raw = await inspectRawDb(pickleKey!, DEVICE);
         expect(raw.events.map((r) => r.eventId)).toEqual(["$keep"]);
         expect((await manager.searchEventIndex(search("keep"))).count).toBe(1);
         expect((await manager.searchEventIndex(search("drop"))).count).toBe(0);
@@ -2547,7 +2755,7 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         // Nothing flushed yet, and isEventIndexEmpty answers straight from IndexedDB when
         // persistence is enabled -- so this only reports non-empty if it flushes first.
         expect(await manager.isEventIndexEmpty()).toBe(false);
-        expect((await inspectRawDb()).events).toHaveLength(1);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toHaveLength(1);
     });
 
     it("addHistoricEvents writes a whole crawler batch as one IndexedDB transaction", async () => {
@@ -2563,10 +2771,10 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         await manager.commitLiveEvents();
 
         const eventsTxCalls = txSpy.mock.calls.filter(
-            (call) => call[0] === "events" || (Array.isArray(call[0]) && call[0].includes("events")),
+            (call) => call[0] === "chunks" || (Array.isArray(call[0]) && call[0].includes("chunks")),
         ).length;
         expect(eventsTxCalls).toBe(1);
-        expect((await inspectRawDb()).events).toHaveLength(15);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toHaveLength(15);
         txSpy.mockRestore();
     });
 
@@ -2576,7 +2784,7 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction");
         const eventsTxCalls = (): number =>
             txSpy.mock.calls.filter(
-                (call) => call[0] === "events" || (Array.isArray(call[0]) && call[0].includes("events")),
+                (call) => call[0] === "chunks" || (Array.isArray(call[0]) && call[0].includes("chunks")),
             ).length;
 
         // No explicit commitLiveEvents() anywhere in this test, and nowhere near the 5s timer:
@@ -2607,7 +2815,7 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         expect(eventsTxCalls()).toBe(2);
 
         await manager.commitLiveEvents();
-        expect((await inspectRawDb()).events).toHaveLength(650);
+        expect((await inspectRawDb(pickleKey!, DEVICE)).events).toHaveLength(650);
         txSpy.mockRestore();
     });
 
@@ -3482,6 +3690,7 @@ describe("BrowserEventIndexManager (a persisted index at scale)", () => {
  */
 describe("BrowserEventIndexManager (increment C: bounds)", () => {
     const DEVICE = "DEVICE1";
+    const pickleKey = "unit-test-pickle-key";
     const ROOM = "!bounds:example.org";
     const BODY_TOKEN = "x".repeat(100);
     // The manager's own resident-budget gate: a flat per-event figure, not text-length-weighted
@@ -3540,6 +3749,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
     afterEach(async () => {
         setEventIndexBoundsOverrideForTesting(null);
+        setChunkTargetBytesOverrideForTesting(null);
         for (const m of toClose.splice(0)) await m.closeEventIndex();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
@@ -3694,7 +3904,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(stats.windowed).toBe(true);
 
             // Every row is still on disk regardless of whether it was hydrated.
-            const onDisk = await dumpRawStore("events");
+            const onDisk = await decryptAllChunkEvents(pickleKey!, DEVICE);
             expect(onDisk.length).toBe(BUDGET_N);
         });
 
@@ -3873,7 +4083,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(resident.has(idAt(0))).toBe(false); // the oldest was evicted from memory...
             expect(resident.has(idAt(9))).toBe(true); // ...but the newest is still there.
 
-            const onDisk = await dumpRawStore("events");
+            const onDisk = await decryptAllChunkEvents(pickleKey!, DEVICE);
             expect(onDisk.some((r: any) => r.eventId === idAt(0))).toBe(true); // ...and never deleted.
             expect(onDisk.length).toBe(10);
         });
@@ -3908,7 +4118,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             const afterEviction = await manager.getStats();
             expect(afterEviction.oldestResidentTs).toBe(1_000_001); // idAt(1)'s own ts -- moved forward
             expect(afterEviction.oldestIndexedTs).toBe(1_000_000); // disk floor unmoved -- idAt(0)/idAt(1) still on disk
-            const onDiskIds = new Set((await dumpRawStore("events")).map((r: any) => r.eventId));
+            const onDiskIds = new Set((await decryptAllChunkEvents(pickleKey!, DEVICE)).map((r: any) => r.eventId));
             expect(onDiskIds.has(idAt(0))).toBe(true);
             expect(onDiskIds.has(idAt(1))).toBe(true);
             expect(onDiskIds.size).toBe(7); // nothing deleted -- an eviction is RAM-only
@@ -3931,7 +4141,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(removed).toBe(true); // not a silent no-op that would leave content on disk
             await reloaded.commitLiveEvents(); // await the persist chain the delete was queued on
 
-            const onDisk = await dumpRawStore("events");
+            const onDisk = await decryptAllChunkEvents(pickleKey!, DEVICE);
             expect(onDisk.some((r: any) => r.eventId === targetId)).toBe(false);
             expect(onDisk.length).toBe(BUDGET_N - 1);
         });
@@ -3984,11 +4194,16 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
     describe("disk budget", () => {
         it("deletes the oldest rows by timestamp; accounting survives a reopen", async () => {
+            // Schema v3 evicts whole CHUNKS, not individual events -- the default BUDGET_N-sized
+            // corpus fits entirely in one chunk (well under CHUNK_TARGET_BYTES), so halving the
+            // budget would delete that one chunk whole rather than leaving a genuinely partial
+            // disk state to assert against. This needs enough events to span several chunks.
+            const DISK_BUDGET_N = 300;
             setEventIndexBoundsOverrideForTesting(null);
             const seed = track(new BrowserEventIndexManager());
             await seed.initEventIndex(userId, DEVICE);
             await seed.waitForHydration();
-            for (const ev of budgetCorpus()) {
+            for (const ev of budgetCorpus(DISK_BUDGET_N)) {
                 await seed.addEventToIndex(ev, {});
                 await seed.commitLiveEvents();
             }
@@ -4000,11 +4215,11 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await reloaded.initEventIndex(userId, DEVICE);
             await reloaded.waitForHydration();
 
-            const onDisk = await dumpRawStore("events");
+            const onDisk = await decryptAllChunkEvents(pickleKey!, DEVICE);
             expect(onDisk.length).toBeGreaterThan(0);
-            expect(onDisk.length).toBeLessThan(BUDGET_N);
+            expect(onDisk.length).toBeLessThan(DISK_BUDGET_N);
             const keptIds = new Set(onDisk.map((r: any) => r.eventId));
-            expect(keptIds.has(idAt(BUDGET_N - 1))).toBe(true); // newest kept
+            expect(keptIds.has(idAt(DISK_BUDGET_N - 1))).toBe(true); // newest kept
             expect(keptIds.has(idAt(0))).toBe(false); // oldest dropped
 
             const after = await reloaded.getStats();
@@ -4056,6 +4271,11 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
         it("disk-budget deletion clears a room's manifest entry once its last row is gone", async () => {
             setEventIndexBoundsOverrideForTesting(null);
+            // Force each event into its own chunk: schema v3 evicts whole chunks, so $drop and
+            // $keep must land in two *different* ones for a disk-budget deletion to be able to
+            // take one without the other -- with the real (48 KiB) target both tiny events would
+            // pack into the same still-open chunk, and evicting "just $drop" would be impossible.
+            setChunkTargetBytesOverrideForTesting(1);
             const seed = track(new BrowserEventIndexManager());
             await seed.initEventIndex(userId, DEVICE);
             await seed.waitForHydration();
@@ -4077,8 +4297,12 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await reloaded.initEventIndex(userId, DEVICE);
             await reloaded.waitForHydration();
 
-            expect(await dumpRawStore("events")).not.toContainEqual(expect.objectContaining({ eventId: "$drop" }));
-            expect(await dumpRawStore("events")).toContainEqual(expect.objectContaining({ eventId: "$keep" }));
+            expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).not.toContainEqual(
+                expect.objectContaining({ eventId: "$drop" }),
+            );
+            expect(await decryptAllChunkEvents(pickleKey!, DEVICE)).toContainEqual(
+                expect.objectContaining({ eventId: "$keep" }),
+            );
 
             const cpDrop = { roomId: "!drop:x", token: "t", direction: Direction.Backward };
             const cpKeep = { roomId: "!keep:x", token: "t", direction: Direction.Backward };
@@ -4147,49 +4371,32 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
     });
 
     describe("manifest migration (review-pr-c.md C-F5)", () => {
-        it("builds a correct manifest and exact byte total from a pre-manifest (schema v2) fixture", async () => {
+        it("builds a correct manifest and converts a pre-manifest (schema v2) fixture into chunks with an exact byte total", async () => {
             setEventIndexBoundsOverrideForTesting(null);
-            const seed = track(new BrowserEventIndexManager());
-            await seed.initEventIndex(userId, DEVICE);
-            await seed.waitForHydration();
             const corpus = budgetCorpus(10);
-            for (const ev of corpus) {
-                await seed.addEventToIndex(ev, {});
-                await seed.commitLiveEvents();
-            }
-            const before = await seed.getStats();
-            await seed.closeEventIndex();
-
-            // Simulate a database schema v2 wrote before this increment existed: strip every
-            // increment-C field this session's own writes just added to `meta`, and delete the
-            // manifest pages *and* the encrypted oldestIndexedTs row (review-pr-c.md C2-F4) those
-            // same writes created, so `manifestPageCount` really is absent the way it would be for
-            // a production v2 user today (review-pr-c.md's own framing).
-            await withRawDb(async (db) => {
-                const tx = db.transaction("meta", "readwrite");
-                const store = tx.objectStore("meta");
-                const row = await idbPromise(store.get(userId));
-                store.put({ userId: row.userId, salt: row.salt, userVersion: row.userVersion });
-                const manifestKeys = await idbPromise(
-                    store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
-                );
-                for (const key of manifestKeys) store.delete(key);
-                store.delete(`${userId}|oldestIndexedTs`);
-                await new Promise<void>((resolve, reject) => {
-                    tx.oncomplete = (): void => resolve();
-                    tx.onerror = (): void => reject(tx.error);
-                });
-            });
+            await seedLegacyV2Fixture(pickleKey!, userId, DEVICE, corpus);
             expect(await dumpRawStore("meta")).toEqual([{ userId, salt: expect.any(String), userVersion: 0 }]);
+            expect(await dumpRawStore("events")).toHaveLength(10); // genuinely schema v2: one row per event
 
             const reloaded = track(new BrowserEventIndexManager());
             await reloaded.initEventIndex(userId, DEVICE);
-            await reloaded.waitForManifest();
+            await reloaded.waitForManifest(); // C's self-heal: ts/roomId for every id, chunkId still UNCHUNKED
+            await reloaded.waitForChunkMigration(); // D's own pass: packs them into real chunks
             await reloaded.waitForHydration();
 
             const after = await reloaded.getStats();
-            expect(after.size).toBe(before.size); // exact byte total rebuilt by the migration scan
             expect(after.eventCount).toBe(corpus.length); // small corpus, well under any budget
+
+            // Exact byte total: independently sum every chunk's own ciphertext length and compare
+            // against what the migration persisted to meta and what getStats() reports -- the v3
+            // analogue of the original test's "before/after" comparison, which no longer applies
+            // once the source of truth (chunk packing) only exists after this pass runs.
+            const chunkRows = await dumpRawStore("chunks");
+            const exactBytes = chunkRows.reduce((a: number, r: any) => a + r.blob.ct.length + r.blob.iv.length, 0);
+            expect(after.size).toBe(exactBytes);
+
+            // Converted, not just self-healed: the legacy events store is fully drained.
+            expect(await dumpRawStore("events")).toEqual([]);
 
             // The manifest itself was rebuilt, not just the byte total: shouldCrawl's per-room
             // floor (sourced from the manifest, C-F2's fix) already has an answer for this room
@@ -4199,73 +4406,61 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
             const rawMeta = (await dumpRawStore("meta"))[0];
             expect(rawMeta.manifestPageCount).toBeGreaterThanOrEqual(1);
-            expect(rawMeta.diskBytes).toBe(before.size);
+            expect(rawMeta.diskBytes).toBe(exactBytes);
 
-            // A *further* reopen must not re-run the migration: manifestPageCount is now present,
-            // so this open takes loadManifest's (page-count-driven) path, not another full scan --
-            // confirmed by the fixture's own events being untouched, and by the page count staying
-            // exactly what the migration pass wrote (a re-migration would rebuild it from the same
-            // events and land on the same number by coincidence, but would also mean a change to
-            // either path silently regressed the "no full scan on a second open" guarantee is not
+            // A *further* reopen must not re-run either pass: manifestPageCount is now present (so
+            // loadManifest's page-count-driven path runs, not runManifestMigration), and the legacy
+            // events store is empty (so runChunkMigrationIfNeeded's cheap getKey() check finds
+            // nothing and returns immediately, not runChunkMigration) -- confirmed by the page count
+            // staying exactly what the first pass wrote (a re-migration would rebuild it from the
+            // same chunks and land on the same number by coincidence, but would also mean a change
+            // to either path silently regressed the "no full scan on a second open" guarantee is not
             // caught here; the disk-budget describe block above already asserts a third reopen's
             // `getStats()` is correct *before* `waitForHydration()`, which is the same property).
             await reloaded.closeEventIndex();
             const third = track(new BrowserEventIndexManager());
             await third.initEventIndex(userId, DEVICE);
             await third.waitForManifest();
+            await third.waitForChunkMigration();
             const thirdMeta = (await dumpRawStore("meta"))[0];
             expect(thirdMeta.manifestPageCount).toBe(rawMeta.manifestPageCount);
+            expect(thirdMeta.diskBytes).toBe(exactBytes);
         });
 
         it("a pre-manifest fixture over its disk budget is brought under budget after the migration pass, oldest first (review-pr-c.md C3-F1)", async () => {
             // review-pr-c.md C3-F1: runManifestMigration built the manifest and the exact byte
-            // total, but not recordBytes/recordTs/diskTsHeap -- the three structures
-            // enforceDiskBudget needs to pick and delete a victim -- so a migrated database's disk
-            // usage got stuck at whatever it was, however far over budget, forever. This is exactly
-            // the state today's prod (pre-increment-C) users are in on their first post-upgrade open.
+            // total, but not the disk-eviction candidate structures the schema-v2 disk budget
+            // needed -- so a migrated database's disk usage got stuck at whatever it was, however
+            // far over budget, forever. Schema v3's equivalent (chunkInfo/diskChunkHeap) is what
+            // this test proves runChunkMigration itself now populates.
             setEventIndexBoundsOverrideForTesting(null);
-            const seed = track(new BrowserEventIndexManager());
-            await seed.initEventIndex(userId, DEVICE);
-            await seed.waitForHydration();
             const corpus = budgetCorpus(40);
-            for (const ev of corpus) {
-                await seed.addEventToIndex(ev, {});
-                await seed.commitLiveEvents();
-            }
-            const before = await seed.getStats();
-            await seed.closeEventIndex();
+            await seedLegacyV2Fixture(pickleKey!, userId, DEVICE, corpus);
 
-            // Same pre-manifest strip as the test above: no manifestPageCount, no manifest pages,
-            // no encrypted oldestIndexedTs row -- a genuine schema-v2-only database.
-            await withRawDb(async (db) => {
-                const tx = db.transaction("meta", "readwrite");
-                const store = tx.objectStore("meta");
-                const row = await idbPromise(store.get(userId));
-                store.put({ userId: row.userId, salt: row.salt, userVersion: row.userVersion });
-                const manifestKeys = await idbPromise(
-                    store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
-                );
-                for (const key of manifestKeys) store.delete(key);
-                store.delete(`${userId}|oldestIndexedTs`);
-                await new Promise<void>((resolve, reject) => {
-                    tx.oncomplete = (): void => resolve();
-                    tx.onerror = (): void => reject(tx.error);
-                });
-            });
+            // Force several chunks out of the conversion: with the real 48 KiB target, 40 small
+            // events pack into one chunk, and a disk budget of "a third of the total" would delete
+            // that one chunk whole (nothing smaller to evict), leaving no survivors to assert
+            // "oldest-first" against.
+            setChunkTargetBytesOverrideForTesting(2000);
 
             // A budget well under the fixture's real footprint -- roughly a third of it, so more
-            // than one row must go -- forcing the migration path (not the live-write path E4(a) of
+            // than one chunk must go -- forcing the migration path (not the live-write path E4(a) of
             // the review's own repro already covers) to actually shrink disk usage. The hot window
-            // is deliberately much smaller than the corpus too (5 of 40): materializeRow() also
-            // populates recordBytes/recordTs/diskTsHeap for whatever it hydrates, so a hot window
-            // generous enough to hydrate every row would let hydration itself backfill the very
-            // structures this test exists to prove the *migration* pass populates, masking the bug
-            // this repro's own E4(b) needed a small hot window (50 of 600) to expose.
-            const diskBudgetBytes = Math.floor(before.size / 3);
+            // is deliberately much smaller than the corpus too (5 of 40): a hot window generous
+            // enough to hydrate every row would let hydration itself backfill chunkInfo/diskChunkHeap
+            // for chunks it decrypts along the way, masking whether the *migration* pass populated
+            // them on its own -- this repro's own E4(b) needed a small hot window (50 of 600) to
+            // expose the original schema-v2 bug the same way.
+            const rawEventsBytes = (await dumpRawStore("events")).reduce(
+                (a: number, r: any) => a + Math.ceil((r.blob.ct.length * 3) / 4),
+                0,
+            );
+            const diskBudgetBytes = Math.floor(rawEventsBytes / 3);
             setEventIndexBoundsOverrideForTesting({ diskBudgetBytes, hotWindowBytes: BYTES_PER_EVENT * 5 });
             const reloaded = track(new BrowserEventIndexManager());
             await reloaded.initEventIndex(userId, DEVICE);
             await reloaded.waitForManifest();
+            await reloaded.waitForChunkMigration();
             await reloaded.waitForHydration();
 
             const after = await reloaded.getStats();
@@ -4274,7 +4469,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
             // Oldest-first: the ids dropped are a contiguous prefix of the ascending-ts corpus, the
             // newest one is never among them.
-            const onDiskIds = new Set((await dumpRawStore("events")).map((r: any) => r.eventId));
+            const onDiskIds = new Set((await decryptAllChunkEvents(pickleKey!, DEVICE)).map((r: any) => r.eventId));
             expect(onDiskIds.size).toBeLessThan(40);
             expect(onDiskIds.has(idAt(39))).toBe(true); // newest survives
             expect(onDiskIds.has(idAt(0))).toBe(false); // oldest is gone
@@ -4297,35 +4492,12 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             // the scan was running. The reviewer measured a real, silent 14,130 B understatement
             // with 70 concurrent writes; membership (manifest vs. disk) was never wrong, only the
             // *count*, persisted into meta for the rest of the session. Same pattern for
-            // oldestIndexedTs.
+            // oldestIndexedTs. Schema v3 relocates this exact derivation from runManifestMigration
+            // to runChunkMigration (see that method's own docstring), so this races the CHUNK
+            // migration phase specifically, not just the manifest self-heal ahead of it.
             setEventIndexBoundsOverrideForTesting(null);
-            const seed = track(new BrowserEventIndexManager());
-            await seed.initEventIndex(userId, DEVICE);
-            await seed.waitForHydration();
             const corpus = budgetCorpus(300);
-            for (const ev of corpus) {
-                await seed.addEventToIndex(ev, {});
-            }
-            await seed.commitLiveEvents(); // one batched flush
-            const before = await seed.getStats();
-            await seed.closeEventIndex();
-
-            // Same pre-manifest strip as the tests above.
-            await withRawDb(async (db) => {
-                const tx = db.transaction("meta", "readwrite");
-                const store = tx.objectStore("meta");
-                const row = await idbPromise(store.get(userId));
-                store.put({ userId: row.userId, salt: row.salt, userVersion: row.userVersion });
-                const manifestKeys = await idbPromise(
-                    store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
-                );
-                for (const key of manifestKeys) store.delete(key);
-                store.delete(`${userId}|oldestIndexedTs`);
-                await new Promise<void>((resolve, reject) => {
-                    tx.oncomplete = (): void => resolve();
-                    tx.onerror = (): void => reject(tx.error);
-                });
-            });
+            await seedLegacyV2Fixture(pickleKey!, userId, DEVICE, corpus);
 
             // No budget pressure -- isolates the accounting bug from disk-budget deletion (already
             // covered by the test above) and from the resident budget.
@@ -4333,10 +4505,11 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             const reloaded = track(new BrowserEventIndexManager());
             await reloaded.initEventIndex(userId, DEVICE);
 
-            // Fired immediately, without awaiting the migration first, so they race its scan -- a
-            // live write and a crawler batch, the same two concurrent-write paths the reviewer's own
-            // E7 used, both with an *older* origin_server_ts than the migration's own oldest
-            // (so the fix's Math.min-equivalent derivation is exercised, not just the byte sum).
+            // Fired immediately, without awaiting either pass first, so they race the chunk
+            // migration's own scan -- a live write and a crawler batch, the same two concurrent-write
+            // paths the reviewer's own E7 used, both with an *older* origin_server_ts than the
+            // migration's own oldest (so the fix's Math.min-equivalent derivation is exercised, not
+            // just the byte sum).
             const liveWrite = (async () => {
                 await reloaded.addEventToIndex(msg("$midLive", "x", { room_id: ROOM, origin_server_ts: 500_000 }), {});
                 await reloaded.commitLiveEvents();
@@ -4347,18 +4520,18 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
                 null,
             );
 
-            await Promise.all([liveWrite, crawlerWrite, reloaded.waitForManifest()]);
+            await Promise.all([liveWrite, crawlerWrite, reloaded.waitForChunkMigration()]);
             await reloaded.waitForHydration();
 
             const stats = await reloaded.getStats();
-            const rawRows = await dumpRawStore("events");
-            // Mirrors the production ciphertextByteLength helper (base64 decoded length), so this
-            // check does not depend on the very accounting it is verifying.
-            const rawTotal = rawRows.reduce((sum: number, r: any) => sum + Math.ceil((r.blob.ct.length * 3) / 4), 0);
+            const rawEvents = await decryptAllChunkEvents(pickleKey!, DEVICE);
+            const chunkRows = await dumpRawStore("chunks");
+            // Independently sums every chunk's own on-disk ciphertext length, so this check does not
+            // depend on the very accounting (ciphertextBytes/chunkInfo) it is verifying.
+            const rawTotal = chunkRows.reduce((sum: number, r: any) => sum + r.blob.ct.length + r.blob.iv.length, 0);
 
-            expect(rawRows.length).toBe(corpus.length + 2); // the two concurrent writes really landed
-            expect(stats.size).toBeGreaterThan(before.size); // grew past the pre-migration total...
-            expect(stats.size).toBe(rawTotal); // ...and is *exact*, not merely "grew" (the bug this survived two passes as)
+            expect(rawEvents.length).toBe(corpus.length + 2); // the two concurrent writes really landed
+            expect(stats.size).toBe(rawTotal); // exact, not merely "close" (the bug this survived two passes as)
             expect(stats.oldestIndexedTs).toBe(400_000); // the older of the two concurrent writes, not clobbered either
         });
     });
@@ -4391,4 +4564,303 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect((await manager.getStats()).storagePersisted).toBeUndefined();
         });
     });
+});
+
+/**
+ * Increment D: schema v3 chunks. Every test here uses {@link setChunkTargetBytesOverrideForTesting}
+ * to force meaningful chunk boundaries with small, fast fixtures rather than seeding a real 48 KiB
+ * chunk's worth of events.
+ */
+describe("BrowserEventIndexManager (increment D: chunks)", () => {
+    const DEVICE = "DEVICE1";
+    const pickleKey = "unit-test-pickle-key";
+    let userCounter = 0;
+    let userId: string;
+    let toClose: BrowserEventIndexManager[] = [];
+
+    const search = (term: string, overrides: Record<string, unknown> = {}): any =>
+        ({ search_term: term, ...SEARCH_DEFAULTS, ...overrides }) as any;
+
+    function track(m: BrowserEventIndexManager): BrowserEventIndexManager {
+        toClose.push(m);
+        return m;
+    }
+
+    beforeEach(() => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue(pickleKey) });
+        userId = `@chunks${++userCounter}:example.org`;
+        toClose = [];
+    });
+
+    afterEach(async () => {
+        setEventIndexBoundsOverrideForTesting(null);
+        setChunkTargetBytesOverrideForTesting(null);
+        for (const m of toClose.splice(0)) await m.closeEventIndex();
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    it("packs several small events into one chunk, then seals it once the target size is crossed", async () => {
+        // Small enough that a handful of ~100-byte entries cross it, generous enough that at
+        // least one full entry fits (a target smaller than one entry would seal on every event).
+        setChunkTargetBytesOverrideForTesting(400);
+        const manager = track(new BrowserEventIndexManager());
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        for (let i = 0; i < 8; i++) {
+            await manager.addEventToIndex(msg(`$seal${i}`, `zqsealbody ${i}`, { origin_server_ts: i }), {});
+        }
+        await manager.commitLiveEvents();
+
+        const chunkRows = await dumpRawStore("chunks");
+        expect(chunkRows.length).toBeGreaterThan(1); // sealed at least once: not everything in one chunk
+        expect(chunkRows.length).toBeLessThan(8); // but not one chunk per event either: real packing happened
+
+        // Nothing lost or duplicated across the seal boundary.
+        const rows = await decryptAllChunkEvents(pickleKey, DEVICE);
+        expect(rows).toHaveLength(8);
+        expect(new Set(rows.map((r: any) => r.eventId)).size).toBe(8);
+        expect((await manager.searchEventIndex(search("zqsealbody"))).count).toBe(8);
+    });
+
+    it("redacting one event rewrites its chunk, keeping every sibling entry intact", async () => {
+        setChunkTargetBytesOverrideForTesting(100_000); // generous: every event lands in one chunk
+        const manager = track(new BrowserEventIndexManager());
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$keep1", "zqredactkeep one"), {});
+        await manager.addEventToIndex(msg("$drop", "zqredactdrop target"), {});
+        await manager.addEventToIndex(msg("$keep2", "zqredactkeep two"), {});
+        await manager.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toHaveLength(1); // sanity: genuinely one chunk to rewrite
+
+        expect(await manager.deleteEvent("$drop")).toBe(true);
+        await manager.commitLiveEvents(); // the redaction's own chunk rewrite is queued the same way
+
+        expect(await dumpRawStore("chunks")).toHaveLength(1); // rewritten in place, not split or dropped
+        const rows = await decryptAllChunkEvents(pickleKey, DEVICE);
+        expect(rows.map((r: any) => r.eventId).sort()).toEqual(["$keep1", "$keep2"]);
+        expect((await manager.searchEventIndex(search("zqredactkeep"))).count).toBe(2);
+        expect((await manager.searchEventIndex(search("zqredactdrop"))).count).toBe(0);
+    });
+
+    it("deletes whole chunks for the disk budget, with exact ciphertext accounting", async () => {
+        setChunkTargetBytesOverrideForTesting(300); // small: each event gets (roughly) its own chunk
+        setEventIndexBoundsOverrideForTesting(null);
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (let i = 0; i < 10; i++) {
+            await seed.addEventToIndex(msg(`$db${i}`, `zqdiskbudget body ${i}`, { origin_server_ts: i }), {});
+            await seed.commitLiveEvents();
+        }
+        const before = await seed.getStats();
+        const chunksBefore = (await dumpRawStore("chunks")).length;
+        expect(chunksBefore).toBeGreaterThan(1); // several chunks exist to selectively evict from
+        await seed.closeEventIndex();
+
+        // A budget under the full footprint but well above zero: some, not all, whole chunks must go.
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.floor(before.size / 2) });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+
+        const after = await reloaded.getStats();
+        expect(after.size).toBeLessThanOrEqual(Math.floor(before.size / 2));
+        const chunkRows = await dumpRawStore("chunks");
+        expect(chunkRows.length).toBeGreaterThan(0);
+        expect(chunkRows.length).toBeLessThan(chunksBefore); // whole chunks were dropped, not all of them
+        // Exact accounting: the persisted total matches an independent sum of what is actually left.
+        const exactBytes = chunkRows.reduce((a: number, r: any) => a + r.blob.ct.length + r.blob.iv.length, 0);
+        expect(after.size).toBe(exactBytes);
+        expect(await dumpRawStore("meta").then((rows) => rows[0].diskBytes)).toBe(exactBytes);
+        // Newest survives, oldest is gone -- the same oldest-first contract as schema v2's version.
+        const onDiskIds = new Set((await decryptAllChunkEvents(pickleKey, DEVICE)).map((r: any) => r.eventId));
+        expect(onDiskIds.has("$db9")).toBe(true);
+        expect(onDiskIds.has("$db0")).toBe(false);
+    });
+
+    it("a same-session disk-budget eviction clears the evicted chunk's manifest entries too, not only on a later reload", async () => {
+        // Deliberately never closes/reopens: enforceDiskBudget runs inline, at the end of the very
+        // flushLiveWrites() call that pushes usage over budget, so this exercises manifestAdd's own
+        // write-time chunkMembers bookkeeping directly -- a test that always went through a reload
+        // first (like the one above) would still pass even if that bookkeeping were missing,
+        // because loadManifest() independently rebuilds chunkMembers from scratch on every open,
+        // masking exactly this bug.
+        setChunkTargetBytesOverrideForTesting(300); // small: each event gets (roughly) its own chunk
+        // crawlRoomCap: 0 declines *any* room with a resident manifest entry (the same technique
+        // the "redaction clears a room's manifest entry" test above uses), which is what makes a
+        // stale, un-cleaned-up entry observable at all -- crawlWindowDays/crawlRoomCap alone would
+        // never distinguish "properly removed" from "stale" for a single, recent, one-room checkpoint.
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: 1, crawlRoomCap: 0 }); // evict on the very first flush that can
+        const manager = track(new BrowserEventIndexManager());
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$sdrop", "x", { room_id: "!sdrop:x", origin_server_ts: Date.now() }), {});
+        await manager.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toEqual([]); // the only chunk was already over budget and evicted
+
+        const cp = { roomId: "!sdrop:x", token: "t", direction: Direction.Backward };
+        // If chunkMembers were never populated at write time, enforceDiskBudget would still delete
+        // the chunk row itself (that part does not depend on chunkMembers) but would have no member
+        // ids to pass to manifestRemove(), leaving a phantom manifest entry that still says this
+        // room has indexed content -- shouldCrawl would then wrongly decline it.
+        expect(await manager.shouldCrawl(cp)).toBe(true); // "never seen": the manifest entry is genuinely gone
+    });
+
+    it("hydrates newest-first across chunk boundaries, with tied timestamps admitted or excluded together", async () => {
+        // Not asserted via a recency-ordered search result: searchEventIndex's own
+        // `order_by_recency` re-sorts every hit by its real originServerTs at query time,
+        // regardless of what order hydrate() actually visited rows in, so it cannot tell
+        // "newest-first" apart from any other visiting order -- only which events exist at all.
+        // What *is* load-bearing evidence of visiting order is which events a bounded hot window
+        // admits: hydrate() stops the instant one more row would breach the budget, so *which*
+        // rows are still resident afterwards is a direct signature of the order it walked them in.
+        setChunkTargetBytesOverrideForTesting(250); // forces several small chunks across 6 events
+        const manager = track(new BrowserEventIndexManager());
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const plan: Array<[string, number]> = [
+            ["$h0", 3000],
+            ["$h1", 2000],
+            ["$h2", 1000], // tie
+            ["$h3", 1000], // tie
+            ["$h4", 500],
+            ["$h5", 100],
+        ];
+        for (const [id, ts] of plan) {
+            await manager.addEventToIndex(msg(id, "zqhtie body", { origin_server_ts: ts }), {});
+            await manager.commitLiveEvents(); // one flush per event: a real chance to land in different chunks
+        }
+        expect((await dumpRawStore("chunks")).length).toBeGreaterThan(1); // genuinely spans chunks
+        await manager.closeEventIndex();
+
+        // A hot window admitting exactly the two newest events.
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes: RESIDENT_BYTES_PER_EVENT_ESTIMATE * 2 });
+        const twoNewest = track(new BrowserEventIndexManager());
+        await twoNewest.initEventIndex(userId, DEVICE);
+        await twoNewest.waitForHydration();
+        expect((await twoNewest.getStats()).eventCount).toBe(2);
+        expect(new Set(resultIds(await twoNewest.searchEventIndex(search("zqhtie", { limit: 10 }))))).toEqual(
+            new Set(["$h0", "$h1"]), // the two objectively newest -- not $h4/$h5, not a random pair
+        );
+
+        // A wider window admitting the tied pair too: whichever of $h2/$h3 the k-way merge yields
+        // first is not asserted (both orders are equally correct for a genuine tie), only that the
+        // budget cutoff never splits them -- one admitted without the other would mean ties are not
+        // actually handled together.
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes: RESIDENT_BYTES_PER_EVENT_ESTIMATE * 4 });
+        const withTie = track(new BrowserEventIndexManager());
+        await withTie.initEventIndex(userId, DEVICE);
+        await withTie.waitForHydration();
+        expect(new Set(resultIds(await withTie.searchEventIndex(search("zqhtie", { limit: 10 }))))).toEqual(
+            new Set(["$h0", "$h1", "$h2", "$h3"]),
+        );
+    });
+
+    it("materializeIfPending keeps the requested event and only as many chunk-mates as the resident budget allows", async () => {
+        setChunkTargetBytesOverrideForTesting(100_000); // one chunk holds every seeded event
+        setEventIndexBoundsOverrideForTesting(null);
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (let i = 0; i < 5; i++) {
+            await seed.addEventToIndex(msg(`$mp${i}`, "zqmpbody", { origin_server_ts: i }), {});
+        }
+        await seed.commitLiveEvents();
+        await seed.closeEventIndex();
+        expect(await dumpRawStore("chunks")).toHaveLength(1); // sanity: genuinely one chunk to pull from
+
+        // A hot window sized for exactly two of the five events: hydrate() (newest-first: $mp4,
+        // $mp3) stops there, leaving $mp2/$mp1/$mp0 un-hydrated on disk in that same chunk.
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes: RESIDENT_BYTES_PER_EVENT_ESTIMATE * 2 });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        const afterHydrate = (await reloaded.getStats()).eventCount;
+        expect(afterHydrate).toBe(2);
+
+        // $mp0 (the oldest) is guaranteed still un-hydrated. Ask for it on demand.
+        await reloaded.addEventToIndex(msg("$mp0", "zqmpbody", { origin_server_ts: 0 }), {});
+        const afterPull = (await reloaded.getStats()).eventCount;
+        // $mp0 itself is materialized unconditionally, but enforceResidentBudget() (called at the
+        // end of materializeIfPending, with $mp0 itself protected) then evicts the oldest of what
+        // is left over budget to make room for it -- the same "evict to fit" contract every other
+        // write-over-budget path in this class already has, not a case where the pull is simply
+        // refused. Net residency therefore stays *at* the budget rather than growing past it: this
+        // is the bound under test, not merely "less than the whole chunk".
+        expect(afterPull).toBe(afterHydrate); // net unchanged: one sibling evicted to admit $mp0
+        expect(afterPull).toBeLessThan(5); // bounded: nowhere near the rest of the chunk
+        const survivors = resultIds(await reloaded.searchEventIndex(search("zqmpbody", { limit: 10 })));
+        expect(survivors).toContain("$mp0"); // $mp0 is the one that survived the eviction, exactly as requested
+    });
+
+    it("resumes and finishes correctly after a v2-to-v3 conversion is interrupted mid-pass", async () => {
+        // More than one HYDRATION_PAGE_SIZE-worth of legacy events, so runChunkMigration's own
+        // paged loop genuinely spans more than one transaction -- the unit an "interruption"
+        // (a crash, or another tab's onversionchange closing the connection) can land between.
+        const total = HYDRATION_PAGE_SIZE + 50;
+        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
+            msg(`$conv${String(i).padStart(5, "0")}`, `zqconvbody ${i}`, { origin_server_ts: i }),
+        );
+        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
+        expect(await dumpRawStore("events")).toHaveLength(total);
+
+        // Let the first page's conversion transaction land for real, then fail the *next* one --
+        // exactly what a connection closing mid-pass looks like (see the R3 test's own technique).
+        const realTransaction = IDBDatabase.prototype.transaction;
+        let conversionTxSeen = 0;
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+            this: IDBDatabase,
+            names,
+            mode,
+            ...rest
+        ) {
+            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
+                conversionTxSeen++;
+                if (conversionTxSeen === 2) {
+                    throw new DOMException("The database connection is closing.", "InvalidStateError");
+                }
+            }
+            return realTransaction.call(this, names, mode, ...rest);
+        });
+
+        const interrupted = track(new BrowserEventIndexManager());
+        await interrupted.initEventIndex(userId, DEVICE);
+        // Unlike waitForHydration() (whose own promise never rejects -- hydrate() catches
+        // everything internally), chunkMigrationReadyPromise is the raw promise chain
+        // runChunkMigration runs on, and the injected connection-closing error is a genuine
+        // rejection of it; hydrate()'s own independent await of the same promise is what catches
+        // it for production purposes (see the "hydration failed" log line this test's own
+        // interruption produces). Waiting for it here is only to let the interrupted pass settle
+        // before inspecting on-disk state, not a claim that it resolves cleanly.
+        await interrupted.waitForChunkMigration().catch(() => {});
+        await interrupted.waitForHydration();
+        txSpy.mockRestore();
+        await interrupted.closeEventIndex();
+
+        // A crash left a database that still opens (the version bump already happened) with some
+        // rows converted and some not: neither store's contents are asserted precisely here --
+        // only that the interruption genuinely left a resumable, partial state.
+        const remainingLegacy = await dumpRawStore("events");
+        expect(remainingLegacy.length).toBeGreaterThan(0);
+        expect(remainingLegacy.length).toBeLessThan(total);
+        expect((await dumpRawStore("chunks")).length).toBeGreaterThan(0);
+
+        // A fresh open resumes: runChunkMigrationIfNeeded's own cheap check finds the events still
+        // sitting there and picks up exactly where the crash left off, no separate cursor needed.
+        const resumed = track(new BrowserEventIndexManager());
+        await resumed.initEventIndex(userId, DEVICE);
+        await resumed.waitForChunkMigration();
+        await resumed.waitForHydration();
+
+        expect(await dumpRawStore("events")).toEqual([]); // fully converted now
+        const finalRows = await decryptAllChunkEvents(pickleKey, DEVICE);
+        expect(finalRows).toHaveLength(total);
+        expect(new Set(finalRows.map((r: any) => r.eventId)).size).toBe(total); // nothing duplicated by the resume
+        expect((await resumed.getStats()).eventCount).toBeGreaterThan(0);
+        expect((await resumed.searchEventIndex(search("zqconvbody", { limit: 10 }))).count).toBe(total);
+    }, 20000);
 });
