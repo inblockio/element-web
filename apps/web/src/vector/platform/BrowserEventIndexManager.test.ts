@@ -1356,6 +1356,53 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect(rows.filter((r) => r.userId === other).map((r) => r.eventId)).toEqual(["$warm"]);
     });
 
+    it("F9 regression: hydrating is set eagerly at initEventIndex's top, so a live write landing before hydrate() itself starts still sees the disk copy", async () => {
+        // Session 1: an edited record and a crawler checkpoint, both persisted, then closed. The
+        // checkpoint is the hook: loadCrawlerCheckpoints() decrypts it during initEventIndex,
+        // strictly after persistEnabled/db/dek are all set but strictly before hydrate() is even
+        // called -- the exact window review-pr-a.md's F9/mutant M16 is about. Without the eager
+        // `this.hydrating = true` at initEventIndex's top (removed by M16, which the full suite
+        // otherwise did not catch), `hydrating` would still read false here, materializeIfPending()
+        // would be a no-op, and the live write below would be upserted as a brand-new record,
+        // discarding the edit the disk copy already held.
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$orig", "original wording"), {});
+        await manager.addEventToIndex(edit("$edit", "$orig", "edited wording"), {});
+        const cp = { roomId: "!room:example.org", token: "tok", direction: Direction.Backward };
+        await manager.addCrawlerCheckpoint(cp);
+        await manager.commitLiveEvents();
+        await manager.closeEventIndex();
+
+        // Re-initialise the same manager (the settings panel's Enable path does this without
+        // closing first) landing a live re-delivery of the *original* message, unaware of the
+        // edit, from inside the checkpoint's own decrypt -- the first crypto.subtle.decrypt call
+        // this second initEventIndex makes.
+        const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+        let landed = false;
+        const decryptSpy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+            if (!landed) {
+                landed = true;
+                await manager.addEventToIndex(msg("$orig", "original wording"), {});
+            }
+            return realDecrypt(...(args as Parameters<typeof realDecrypt>));
+        });
+
+        try {
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            expect(landed).toBe(true);
+
+            // The edit survived: upsertEvent's "historic original after an edit" case took the
+            // envelope from the live redelivery but kept the disk copy's edited body -- only
+            // possible because materializeIfPending() pulled that disk copy in first.
+            expect((await manager.searchEventIndex(search("edited"))).count).toBe(1);
+            expect((await manager.searchEventIndex(search("original"))).count).toBe(0);
+        } finally {
+            decryptSpy.mockRestore();
+        }
+    });
+
     it("does not report a batch of edit repairs as already added", async () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
