@@ -179,13 +179,6 @@ interface MetaRecord {
      */
     diskBytes?: number;
     /**
-     * The oldest event timestamp (`origin_server_ts`) this session or a previous one has ever
-     * confirmed is on disk for this user, restored into {@link
-     * BrowserEventIndexManager.oldestIndexedTs} at open. See that field's own docstring for the
-     * exact semantics (a guarantee floor, not necessarily the literal minimum surviving row).
-     */
-    oldestIndexedTs?: number;
-    /**
      * Number of manifest pages currently persisted for this user (see {@link ManifestPageRecord}),
      * so {@link BrowserEventIndexManager.loadManifest} knows how many `manifest:<page>` rows to
      * read without a range query. `undefined` means "this database pre-dates the manifest" (schema
@@ -197,6 +190,16 @@ interface MetaRecord {
      * trigger a re-migration.
      */
     manifestPageCount?: number;
+    // No `oldestIndexedTs` field, deliberately (review-pr-c.md C2-F4): an earlier revision of this
+    // increment stored it here as a verbatim `origin_server_ts`, cleartext, which the class threat
+    // model's "What is still cleartext on disk" list does not allow -- unlike `diskBytes`, it
+    // discloses something not otherwise recoverable from the ciphertext's own shape (when an
+    // account's indexed history begins, to the millisecond). It is persisted instead as its own
+    // small *encrypted* row, keyed by {@link oldestIndexedTsKey} -- see {@link
+    // BrowserEventIndexManager.prepareOldestIndexedTsWrite}/{@link
+    // BrowserEventIndexManager.loadOldestIndexedTs}. Do not re-add it here -- the
+    // exact-cleartext-key-set test in the test file pins this interface's field set and will fail
+    // if it comes back.
 }
 
 /**
@@ -727,6 +730,26 @@ const HYDRATION_SLICE_DEADLINE_MS = 30;
 export const RESIDENT_BYTES_PER_EVENT_ESTIMATE = 1024;
 
 /**
+ * Flat per-entry resident-byte estimate for {@link BrowserEventIndexManager.manifest} (an id, a
+ * number and a room id, plus `Map`/`Set` overhead), used by {@link
+ * BrowserEventIndexManager.residentByteEstimate} to count the manifest *into* `HOT_WINDOW_BYTES`
+ * rather than exempting it -- review-pr-c.md C2-F2: the manifest covers every row on **disk**, not
+ * just the resident ones, so at a tier's own `diskBudgetBytes` it can reach a real fraction of the
+ * hot window on its own (`research/measurements-pr-c.md` §9 measured 136.7 B/event at 200k, small
+ * tier, and 138.1 B/event at 500k, desktop -- close to constant across a 2.5x scale change, the
+ * same "per-entry, not proportional to anything else" shape {@link
+ * RESIDENT_BYTES_PER_EVENT_ESTIMATE} already assumes for events). 160 rounds that measured range up
+ * for headroom, the same convention. Counting it *inside* the same budget `hydrate()`/{@link
+ * enforceResidentBudget} already check means the manifest is never itself evicted or truncated to
+ * make room (it cannot be -- see {@link manifest}'s own docstring on why it must survive eviction)
+ * -- what shrinks as the manifest grows toward a tier's disk-budget-implied worst case is the
+ * number of *events* that fit in what is left of `hotWindowBytes`, never the manifest's own share.
+ * See `eventIndexBounds.ts`'s module docstring for the worst-case numbers this implies per tier.
+ * @knipignore - exported for tests, for the same reason {@link RESIDENT_BYTES_PER_EVENT_ESTIMATE} is.
+ */
+export const MANIFEST_BYTES_PER_ENTRY_ESTIMATE = 160;
+
+/**
  * Traversal order for {@link BrowserEventIndexManager.runManifestMigration}'s paged *full* scan
  * over the current (v2, unchunked) schema's primary key: ascending, i.e. ascending `eventId` for
  * one user, which is what `IDBObjectStore.getAll()` over a key range returns for free, one
@@ -842,19 +865,36 @@ function ciphertextByteLength(ct: string): number {
 }
 
 /**
- * Entries per manifest page ({@link ManifestPageRecord}) before a new page is started. ~10k triples
- * of a short string id, a number and a room id JSON-encode to roughly 0.5 MB of plaintext -- small
- * enough that re-encrypting one page on a write that touches it is cheap, large enough that even a
- * disk-budget-sized manifest (hundreds of thousands of entries) stays a few dozen pages, not
- * thousands of tiny ones.
+ * Entries per manifest page ({@link ManifestPageRecord}) before a new page is started. The
+ * *current* (last, still-filling) page is what every flush re-encrypts (see {@link
+ * prepareManifestPageWrites}'s docstring), so this is effectively "the size of the append-only
+ * tail" -- review-pr-c.md C2-F3 measured a 10k-entry page (the original value) costing ~15.8ms
+ * median to re-encrypt on every flush that touches it (`JSON.stringify` + one AES-GCM encrypt of
+ * ~0.5MB of plaintext), which is a large constant cost bought for nothing: a *sealed* page (one
+ * that has already filled and rolled over to the next) is only re-encrypted again on a removal,
+ * not on every flush, so the page size is a free parameter for flush cost with no correctness
+ * trade-off either way. 1,000 (~0.05MB/page) cuts that to ~1.6ms while still keeping even a
+ * disk-budget-sized manifest (hundreds of thousands of entries) at a few hundred pages, not
+ * thousands.
  * @knipignore - exported for tests, so a fixture can cross a page boundary without seeding a
  *     production-sized manifest.
  */
-export const MANIFEST_PAGE_SIZE = 10_000;
+export const MANIFEST_PAGE_SIZE = 1_000;
 
 /** The primary key -- and AAD -- of one manifest page's record in the `meta` store; see {@link ManifestPageRecord}. */
 function manifestPageKey(userId: string, page: number): string {
     return `${userId}|manifest:${page}`;
+}
+
+/**
+ * The primary key -- and AAD -- of the one encrypted row holding {@link
+ * BrowserEventIndexManager.oldestIndexedTs}'s persisted value (review-pr-c.md C2-F4). Reuses {@link
+ * ManifestPageRecord}'s shape (`{userId, blob}`) rather than a new interface -- it is exactly the
+ * same "one keyed encrypted row in the `meta` store" pattern, just holding `{ts: number}` instead
+ * of a page of manifest entries.
+ */
+function oldestIndexedTsKey(userId: string): string {
+    return `${userId}|oldestIndexedTs`;
 }
 
 /**
@@ -910,6 +950,56 @@ function heapPopMinTs(heap: TsEntry[]): TsEntry | undefined {
             if (smallest === i) break;
             [heap[i], heap[smallest]] = [heap[smallest], heap[i]];
             i = smallest;
+        }
+    }
+    return top;
+}
+
+/**
+ * One page's current head in the k-way merge {@link BrowserEventIndexManager.hydrate} runs over
+ * per-page-sorted manifest pages (review-pr-c.md C2-F1): which page it came from, and its position
+ * within that page's own sorted-by-`ts`-descending id array, so the merge can push that page's next
+ * entry back onto the heap once this one is popped.
+ */
+interface ManifestMergeHead {
+    ts: number;
+    page: number;
+    pos: number;
+}
+
+/**
+ * Push onto a max-heap (by `ts`) of {@link ManifestMergeHead}s -- the same array-backed binary heap
+ * shape as {@link heapPushTs}, but max- rather than min-ordered: the k-way merge needs the *newest*
+ * of the pages' current heads first, not the oldest, and carries page/position rather than an id.
+ */
+function mergeHeapPush(heap: ManifestMergeHead[], entry: ManifestMergeHead): void {
+    heap.push(entry);
+    let i = heap.length - 1;
+    while (i > 0) {
+        const parent = (i - 1) >> 1;
+        if (heap[parent].ts >= heap[i].ts) break;
+        [heap[parent], heap[i]] = [heap[i], heap[parent]];
+        i = parent;
+    }
+}
+
+/** Pop and return the entry with the largest `ts`, or `undefined` if `heap` is empty. */
+function mergeHeapPop(heap: ManifestMergeHead[]): ManifestMergeHead | undefined {
+    if (heap.length === 0) return undefined;
+    const top = heap[0];
+    const last = heap.pop()!;
+    if (heap.length > 0) {
+        heap[0] = last;
+        let i = 0;
+        for (;;) {
+            const l = i * 2 + 1;
+            const r = i * 2 + 2;
+            let largest = i;
+            if (l < heap.length && heap[l].ts > heap[largest].ts) largest = l;
+            if (r < heap.length && heap[r].ts > heap[largest].ts) largest = r;
+            if (largest === i) break;
+            [heap[i], heap[largest]] = [heap[largest], heap[i]];
+            i = largest;
         }
     }
     return top;
@@ -1139,15 +1229,28 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private oldestResidentTs: number | undefined;
     /**
-     * The oldest `originServerTs` this session (or a previous one, via {@link MetaRecord.oldestIndexedTs})
-     * has confirmed is on disk. Read this as a *guarantee floor* -- "nothing older than this is
-     * promised findable" -- not as the literal timestamp of the single oldest surviving row, and the
-     * two are allowed to diverge: {@link enforceDiskBudget} raises this to at least the newest
-     * record it just deleted, which is exact for what it deleted but says nothing about whether some
-     * other, untouched-this-session row happens to be even older (see {@link diskTsHeap}'s
-     * docstring for why that can happen under the current schema). The floor can only move forward
-     * from a deliberate drop, or backward from genuinely discovering an older record still exists
-     * ({@link Math.min} on write or on {@link materializeRow}); it is never guessed at.
+     * The oldest `originServerTs` this session (or a previous one) has confirmed is on disk. Read
+     * this as a *guarantee floor* -- "nothing older than this is promised findable" -- not as the
+     * literal timestamp of the single oldest surviving row, and the two are allowed to diverge:
+     * {@link enforceDiskBudget} raises this to at least the newest record it just deleted, which is
+     * exact for what it deleted but says nothing about whether some other, untouched-this-session
+     * row happens to be even older (see {@link diskTsHeap}'s docstring for why that can happen
+     * under the current schema). The floor can only move forward from a deliberate drop, or
+     * backward from genuinely discovering an older record still exists ({@link Math.min} on write
+     * or on {@link materializeRow}); it is never guessed at.
+     *
+     * **Never persisted in cleartext** (review-pr-c.md C2-F4: an earlier revision stored this
+     * verbatim in the `meta` row -- a real event timestamp, disclosing to the millisecond when an
+     * account's indexed history begins to anyone with database read access, which the class threat
+     * model's cleartext list does not allow). Persisted instead as its own small encrypted row
+     * ({@link prepareOldestIndexedTsWrite}/{@link loadOldestIndexedTs}), in the same transaction as
+     * whatever write just changed it -- **not** derived from {@link manifestOldestByRoom} at read
+     * time, even though that map tracks a per-room version of the same idea, because that map is
+     * deliberately left *stale* on a partial removal (the safe direction for a per-room crawl
+     * floor, C-F2's fix) which is the *wrong* direction for this field (it must move forward on a
+     * drop, never stay behind it). {@link runManifestMigration} is the one exception: its own full
+     * scan computes this value directly, with no staleness concern, since there is nothing yet to
+     * be stale relative to.
      */
     private oldestIndexedTs: number | undefined;
     /**
@@ -1210,21 +1313,24 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * ({@link enforceResidentBudget}), which is the entire point -- a row leaving the resident set
      * must not look, to this map, like it left disk.
      *
-     * **Memory cost, and why it is deliberately not part of `HOT_WINDOW_BYTES`:** roughly 100
-     * B/event (a short id, a number, a room id, plus `Map`/`Set` overhead) -- accounted in {@link
-     * getStats}' `size` fallback and in {@link residentByteEstimate}'s own docstring, but *outside*
-     * the hot-window budget, because it is not optional the way hydrated content is: without it,
-     * neither the ordering fix nor the crawl-bound fix this field exists for is possible. On the
-     * small tier, at the 128 MiB `DISK_BUDGET_BYTES` a manifest could in principle describe (though
-     * the small tier's own budget is 128 MiB total, not 512, so its own manifest is smaller in
-     * practice), 100 B/event over ~170k events is ~17 MB -- a meaningful fraction of the 48 MiB
-     * `HOT_WINDOW_BYTES` on that tier, named here rather than left implicit.
+     * **Memory cost, and why it counts *inside* `HOT_WINDOW_BYTES` (review-pr-c.md C2-F2):**
+     * {@link MANIFEST_BYTES_PER_ENTRY_ESTIMATE} per entry, included in {@link residentByteEstimate}
+     * alongside the resident event count. An earlier revision of this docstring (and this
+     * increment's own commit message) claimed the manifest was exempted from the hot-window budget
+     * -- it was not: `residentByteEstimate()` counted only `events.size`, so the manifest's real
+     * memory cost was simply missing from the check entirely, a silent overshoot the review measured
+     * at +54%/+75% of `hotWindowBytes` once a session's manifest reached a tier's own
+     * `diskBudgetBytes`-implied population (~170k events small tier, ~700k desktop; see
+     * `eventIndexBounds.ts`'s module docstring for the numbers). The manifest is still never itself
+     * evicted or truncated to make room -- it cannot be, per the two questions above -- so counting
+     * it inside the same budget means it is the *event* count that shrinks as the manifest grows
+     * toward that worst case, never the manifest's own share.
      *
      * Kept as `Map<eventId, ManifestEntry>` rather than a structure pre-sorted by `originServerTs`:
-     * inserts (overwhelmingly the common operation, one per write) are O(1); {@link hydrate} pays
-     * one O(n log n) sort once per hydration run, not once per insert, which is the trade this
-     * class already made for {@link residentHeap}/{@link diskTsHeap} and is cheap in absolute terms
-     * even at hundreds of thousands of entries (a plain-object array sort, not a crypto operation).
+     * inserts (overwhelmingly the common operation, one per write) are O(1); {@link hydrate} reads
+     * this snapshot via a sliced per-page sort plus a k-way merge (review-pr-c.md C2-F1), not the
+     * single unsliced whole-manifest sort this docstring once described -- see {@link hydrate}'s own
+     * comment on why a page-index-ordered concatenation would not be correct here.
      */
     private readonly manifest = new Map<string, ManifestEntry>();
     /**
@@ -1437,7 +1543,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // hydration has re-visited every row -- which it may never do now that hydration
                 // itself is bounded; see MetaRecord.diskBytes and ciphertextBytes' own docstring.
                 this.ciphertextBytes = existingMeta.diskBytes ?? 0;
-                this.oldestIndexedTs = existingMeta.oldestIndexedTs;
+                // oldestIndexedTs is NOT restored here (review-pr-c.md C2-F4): it is no longer a
+                // stored field at all, and is instead derived from the manifest once loadManifest
+                // or runManifestMigration finishes, below.
             }
         } catch (e) {
             log.warn("IndexedDB unavailable; index will be memory-only this session", e);
@@ -1691,6 +1799,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * reads too -- see {@link residentBudgetExceeded}, {@link diskBudgetDropped}, {@link
      * crawlBoundDeclined}, {@link oldestIndexedTs} and {@link oldestResidentTs} for how each is
      * maintained -- so none of the three costs this method anything it did not already cost.
+     *
+     * `manifestBytes` is {@link manifest}'s own share of {@link residentByteEstimate} (review-pr-c.md
+     * C2-F2) -- `manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE`, another O(1) `Map.size` read.
      */
     public async getStats(): Promise<IIndexStats> {
         return {
@@ -1702,6 +1813,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             oldestIndexedTs: this.oldestIndexedTs,
             oldestResidentTs: this.oldestResidentTs,
             storagePersisted: this.storagePersisted,
+            manifestBytes: this.manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
         };
     }
 
@@ -2065,6 +2177,63 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         }
         withTs.sort((a, b) => b[1] - a[1]);
         return withTs.map(([roomId]) => roomId);
+    }
+
+    /**
+     * Encrypt {@link oldestIndexedTs}'s current value for persistence, if it has one, the same
+     * "encrypt before the transaction opens" discipline {@link prepareManifestPageWrites} follows
+     * (review-pr-c.md C2-F4). Deliberately **not** derived from {@link manifestOldestByRoom} at
+     * read time -- that map is intentionally left *stale* on a partial removal (see its own
+     * docstring, C-F2's fix), which is the safe direction for a per-room crawl floor but is the
+     * *wrong* direction here: this value must move **forward** whenever a disk-budget deletion
+     * drops rows, or `SearchWarning` would claim coverage back further than genuinely survives.
+     * {@link oldestIndexedTs} itself is still maintained incrementally, in memory, exactly as
+     * before every one of C2-F4's changes (the same `Math.min`/`Math.max` call sites); only *where*
+     * it is persisted changed, from a cleartext `meta` field to this encrypted row. Returns `null`
+     * when there is nothing to write, so a caller with no manifest yet (a brand-new index) does not
+     * write a spurious record. Takes the value to persist as a parameter, rather than reading
+     * `this.oldestIndexedTs` directly, because every caller here follows the class's usual
+     * "compute the new value locally, encrypt it before the transaction opens, only assign
+     * `this.oldestIndexedTs` once the transaction has committed" ordering, and reading the field
+     * here would read the *old*, not-yet-updated value.
+     */
+    private async prepareOldestIndexedTsWrite(
+        userId: string,
+        dek: CryptoKey,
+        ts: number | undefined,
+    ): Promise<ManifestPageRecord | null> {
+        if (ts === undefined) return null;
+        const key = oldestIndexedTsKey(userId);
+        const blob = await encryptJson(dek, { ts }, key);
+        return { userId: key, blob };
+    }
+
+    /**
+     * Read and decrypt {@link oldestIndexedTs}'s persisted value, if any -- the counterpart to
+     * {@link prepareOldestIndexedTsWrite}, called once by {@link loadManifest} (a pre-manifest
+     * database, migrated by {@link runManifestMigration}, has none yet; that method sets {@link
+     * oldestIndexedTs} directly from its own full scan instead, and this row is only read back on
+     * the *next* open after that, once {@link loadManifest} is the path taken). A row that is
+     * simply absent (a pre-C2-F4 manifest-having database, or a brand-new index) is `undefined`,
+     * not an error. A row that fails to **decrypt** is the caller's problem, not this method's --
+     * it throws, and {@link loadManifest} responds exactly like a manifest-page decrypt failure
+     * does (a rotated key looks identical either way).
+     */
+    private async loadOldestIndexedTs(userId: string, dek: CryptoKey): Promise<number | undefined> {
+        if (!this.db) return undefined;
+        const key = oldestIndexedTsKey(userId);
+        let row: ManifestPageRecord | undefined;
+        try {
+            const tx = this.db.transaction("meta", "readonly");
+            row = (await idbReq(tx.objectStore("meta").get(key))) as ManifestPageRecord | undefined;
+            await txDone(tx);
+        } catch (e) {
+            log.warn("EventIndex: could not read the persisted oldestIndexedTs row; treating it as absent", e);
+            return undefined;
+        }
+        if (!row) return undefined;
+        const { ts } = await decryptJson<{ ts: number }>(dek, row.blob, key);
+        return ts;
     }
 
     /**
@@ -3011,17 +3180,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // hydration ordering and the crawl bound correct across a restart and across eviction.
         for (const [id, , ts, roomId] of sizes) this.manifestAdd(id, ts, roomId);
         const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
+        const oldestIndexedTsRecord = await this.prepareOldestIndexedTsWrite(userId, dek, newOldest);
         const meta = await this.loadMeta(userId);
 
         const tx = this.db.transaction(["events", "meta"], "readwrite");
         const store = tx.objectStore("events");
         for (const rec of records) store.put(rec);
         for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+        if (oldestIndexedTsRecord) tx.objectStore("meta").put(oldestIndexedTsRecord);
         if (meta) {
             tx.objectStore("meta").put({
                 ...meta,
                 diskBytes: newTotal,
-                oldestIndexedTs: newOldest,
                 manifestPageCount: this.manifestPages.length,
             });
         }
@@ -3030,6 +3200,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // Only once the whole batch has committed, and replacing each record's previous contribution rather than
         // adding to it: these are puts, so a rewrite leaves one row per id, not two.
         this.ciphertextBytes = newTotal;
+        // Persisted encrypted, not cleartext (review-pr-c.md C2-F4), just above; still moves
+        // backward here exactly as before, on genuine discovery of an older record.
         this.oldestIndexedTs = newOldest;
         for (const [id, bytes, ts] of sizes) {
             this.recordBytes.set(id, bytes);
@@ -3237,6 +3409,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 sliceStart = now();
             }
         }
+        if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+        // review-pr-c.md C2-F4: read back from its own encrypted row, never a cleartext meta field.
+        // Absent (`undefined`) on a database that has a manifest but pre-dates C2-F4's own fix, or
+        // on a brand-new index -- not an error; see loadOldestIndexedTs's own docstring.
+        try {
+            this.oldestIndexedTs = await this.loadOldestIndexedTs(userId, dek);
+        } catch {
+            log.warn(
+                "EventIndex: the persisted oldestIndexedTs row could not be decrypted; wiping leftover for this user",
+            );
+            this.clearIndexMaps();
+            await this.deleteUserRecords(userId);
+            await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+            this.userVersion = 0;
+            this.manifestLoaded = true;
+            return;
+        }
         this.manifestLoaded = true;
         log.info(
             `EventIndex: manifest loaded in ${(now() - started).toFixed(1)}ms, ${this.manifest.size} entries, ${pageCount} pages`,
@@ -3326,16 +3515,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         }
 
         this.ciphertextBytes = totalBytes;
+        // In memory, exactly as before C2-F4; only the persistence below changed (encrypted row,
+        // not a cleartext meta field), so a *future* regular reopen (loadManifest's path) can read
+        // this back without needing to re-scan.
         this.oldestIndexedTs = oldestTs;
         const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
+        const oldestIndexedTsRecord = await this.prepareOldestIndexedTsWrite(userId, dek, oldestTs);
         const meta = await this.loadMeta(userId);
         const tx = this.db.transaction("meta", "readwrite");
         for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+        if (oldestIndexedTsRecord) tx.objectStore("meta").put(oldestIndexedTsRecord);
         if (meta) {
             tx.objectStore("meta").put({
                 ...meta,
                 diskBytes: totalBytes,
-                oldestIndexedTs: oldestTs,
                 manifestPageCount: this.manifestPages.length,
             });
         }
@@ -3409,25 +3602,82 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             await this.manifestReadyPromise;
             if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
 
-            // One O(n log n) sort, once per hydration run, not once per insert -- the same trade
-            // {@link residentHeap}/{@link diskTsHeap} already make. `manifest` is a snapshot read
-            // here (a `Map`'s insertion order is irrelevant once sorted), so a write landing mid-sort
-            // cannot corrupt it; it would just not be reflected in *this* run's order, and this
-            // run's own `events.has()` skip means it is never overwritten either way.
-            const sortedIds = Array.from(this.manifest.keys());
-            sortedIds.sort((a, b) => (this.manifest.get(b)?.ts ?? 0) - (this.manifest.get(a)?.ts ?? 0));
+            // review-pr-c.md C2-F1: a single `Array.from(...).sort()` over the *whole* manifest was
+            // one unsliced synchronous task -- 563ms at 200k entries, 2,083ms at 500k, 11-42x the
+            // 50ms ceiling increment A's proof requirement set, with two `Map.get` calls inside every
+            // comparison on top. Replaced by a per-page sort (sliced across this method's own 30ms
+            // deadline, exactly like {@link loadManifest}'s own per-page loop) plus a bounded k-way
+            // merge over the sorted pages' heads ({@link mergeHeapPush}/{@link mergeHeapPop}): pages
+            // are already the unit `manifestAdd` groups entries into, so sorting one page (at most
+            // {@link MANIFEST_PAGE_SIZE} entries) is cheap and interruptible, and the merge only ever
+            // does O(log P) work (P = page count, in the low hundreds even at disk-budget scale) per
+            // id produced -- never one task proportional to the whole manifest. `[id, ts]` pairs are
+            // sorted on the number directly, not via a comparator that calls back into `manifest`,
+            // which is itself the other half of C2-F1's fix (3.4-4.4x fewer cache-unfriendly lookups).
+            //
+            // This does *not* lean on {@link loadManifest}'s own "newest page first" disk-read order
+            // for correctness -- it cannot: `manifestAdd` fills pages in *arrival* order, which tracks
+            // recency for live events but not for a multi-room backward crawl (review-pr-c.md's own
+            // `loadManifest` docstring), so a later-filled page is not guaranteed to hold newer
+            // content than an earlier one, and the merge below is a genuine k-way merge across every
+            // page rather than a page-index-ordered concatenation. `manifest` is a snapshot read here
+            // exactly as before (a write landing mid-merge is simply not reflected in *this* run's
+            // order), and this run's own `events.has()` skip means it is never overwritten either way.
+            const sortedPageIds = new Map<number, string[]>();
+            const sortedManifestPage = (page: number): string[] => {
+                let ids = sortedPageIds.get(page);
+                if (ids) return ids;
+                const pairs: Array<[string, number]> = [];
+                for (const id of this.manifestPages[page]) pairs.push([id, this.manifest.get(id)?.ts ?? 0]);
+                pairs.sort((a, b) => b[1] - a[1]); // Descending by the number, not a Map lookup.
+                ids = pairs.map((pair) => pair[0]);
+                sortedPageIds.set(page, ids);
+                return ids;
+            };
 
-            let i = 0;
-            while (i < sortedIds.length) {
+            const mergeHeap: ManifestMergeHead[] = [];
+            let seedSliceStart = now();
+            for (let page = 0; page < this.manifestPages.length; page++) {
+                if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
+                if (this.manifestPages[page].size > 0) {
+                    const ids = sortedManifestPage(page);
+                    mergeHeapPush(mergeHeap, { ts: this.manifest.get(ids[0])?.ts ?? 0, page, pos: 0 });
+                }
+                if (now() - seedSliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
+                    await yieldToEventLoop();
+                    if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
+                    seedSliceStart = now();
+                }
+            }
+            // Pop the merge's next id, newest-`ts`-first across every page, and push that page's own
+            // next entry in its place -- the standard k-way merge shape, O(log P) per call.
+            const nextMergedId = (): string | undefined => {
+                const head = mergeHeapPop(mergeHeap);
+                if (!head) return undefined;
+                const ids = sortedManifestPage(head.page);
+                const id = ids[head.pos];
+                if (head.pos + 1 < ids.length) {
+                    mergeHeapPush(mergeHeap, {
+                        ts: this.manifest.get(ids[head.pos + 1])?.ts ?? 0,
+                        page: head.page,
+                        pos: head.pos + 1,
+                    });
+                }
+                return id;
+            };
+
+            for (;;) {
                 if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
                 const dek = this.dek;
                 const db = this.db;
 
                 const chunkIds: string[] = [];
-                while (chunkIds.length < HYDRATION_PAGE_SIZE && i < sortedIds.length) {
-                    const id = sortedIds[i++];
+                while (chunkIds.length < HYDRATION_PAGE_SIZE) {
+                    const id = nextMergedId();
+                    if (id === undefined) break;
                     if (!this.events.has(id)) chunkIds.push(id);
                 }
+                if (chunkIds.length === 0 && mergeHeap.length === 0) break; // Manifest fully consumed.
                 if (chunkIds.length === 0) continue; // Every id in range was already resident.
 
                 const tx = db.transaction("events", "readonly");
@@ -3841,23 +4091,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         for (const id of ids) this.manifestRemove(id);
         const dek = this.dek;
         const manifestRecords = dek ? await this.prepareManifestPageWrites(userId, dek) : [];
+        const oldestIndexedTsRecord = dek ? await this.prepareOldestIndexedTsWrite(userId, dek, newOldest) : null;
 
         const meta = await this.loadMeta(userId);
         const tx = this.db.transaction(["events", "meta"], "readwrite");
         const store = tx.objectStore("events");
         for (const id of ids) store.delete([userId, id]);
         for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+        if (oldestIndexedTsRecord) tx.objectStore("meta").put(oldestIndexedTsRecord);
         if (meta) {
             tx.objectStore("meta").put({
                 ...meta,
                 diskBytes: newTotal,
-                oldestIndexedTs: newOldest,
                 manifestPageCount: this.manifestPages.length,
             });
         }
         await txDone(tx);
 
         this.ciphertextBytes = newTotal;
+        // Encrypted, not cleartext (review-pr-c.md C2-F4); persisted just above, in the same
+        // transaction as everything else this deletion touches.
         this.oldestIndexedTs = newOldest;
         this.diskBudgetDropped = true;
         for (const id of ids) {
@@ -3903,6 +4156,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             metaStore.getAllKeys(IDBKeyRange.bound(manifestPrefix, manifestPrefix + "￿")),
         );
         for (const key of manifestKeys) metaStore.delete(key);
+        metaStore.delete(oldestIndexedTsKey(userId)); // review-pr-c.md C2-F4's own encrypted row
         await txDone(metaTx);
     }
 
@@ -3924,11 +4178,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     /**
      * The resident-set byte estimate `hydrate()`/{@link enforceResidentBudget} check against
      * `HOT_WINDOW_BYTES`; see {@link RESIDENT_BYTES_PER_EVENT_ESTIMATE}'s docstring for why this is
-     * a flat per-event figure rather than {@link plainTextByteEstimate}. O(1): `events.size` is a
-     * `Map`'s own maintained count, the same one `getStats()`'s `eventCount` already reads.
+     * a flat per-event figure rather than {@link plainTextByteEstimate}. Includes {@link manifest}'s
+     * own resident cost ({@link MANIFEST_BYTES_PER_ENTRY_ESTIMATE} per entry) as of review-pr-c.md
+     * C2-F2 -- previously exempted here despite the manifest's docstring and the commit message both
+     * claiming otherwise, which the review caught as a real, silent overshoot (+54%/+75% of
+     * `hotWindowBytes` at a tier's own disk-budget-implied population). O(1): both `events.size` and
+     * `manifest.size` are `Map`s' own maintained counts.
      */
     private residentByteEstimate(): number {
-        return this.events.size * RESIDENT_BYTES_PER_EVENT_ESTIMATE;
+        return (
+            this.events.size * RESIDENT_BYTES_PER_EVENT_ESTIMATE +
+            this.manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE
+        );
     }
 
     /**

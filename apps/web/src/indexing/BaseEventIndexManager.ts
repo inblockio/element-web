@@ -103,6 +103,15 @@ export interface IIndexStats {
      * Informational only for the settings UI; nothing reads this to change behaviour.
      */
     storagePersisted?: boolean;
+    /**
+     * Estimated resident bytes of this backend's own recency-tracking bookkeeping (review-pr-c.md
+     * C2-F2), if it keeps one -- `undefined` for a backend that does not, the same convention as
+     * {@link loading}. Counted *inside* {@link size}'s own budget accounting where applicable (see
+     * `BrowserEventIndexManager`'s own field of this name), not a separate allowance; surfaced here
+     * purely so the settings UI, or a future proof step, can see how much of the resident budget
+     * this bookkeeping -- as opposed to actual indexed content -- currently accounts for.
+     */
+    manifestBytes?: number;
 }
 
 /**

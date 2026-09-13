@@ -27,6 +27,8 @@ import {
     HYDRATION_PAGE_SIZE,
     isBrowserEventIndexEnabled,
     isWebEventIndexSupported,
+    MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
+    MANIFEST_PAGE_SIZE,
     replacedEventId,
     RESIDENT_BYTES_PER_EVENT_ESTIMATE,
     tokenize,
@@ -1169,15 +1171,16 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect((await manager.searchEventIndex(search("legacy"))).count).toBe(0);
 
         // meta survives, because its salt is what keeps the derived key usable -- minus the
-        // `deviceId` column, which nothing ever read. `diskBytes`/`manifestPageCount`/
-        // `oldestIndexedTs` are new: the v1->v2 wipe leaves manifestPageCount undefined, which is
-        // exactly the "pre-manifest database" signal runManifestMigration self-heals from -- it
-        // runs (over zero rows, events having just been cleared) and persists its own empty
-        // result, so a *third* open does not pay for a migration scan all over again.
+        // `deviceId` column, which nothing ever read. `diskBytes`/`manifestPageCount` are new: the
+        // v1->v2 wipe leaves manifestPageCount undefined, which is exactly the "pre-manifest
+        // database" signal runManifestMigration self-heals from -- it runs (over zero rows, events
+        // having just been cleared) and persists its own empty result, so a *third* open does not
+        // pay for a migration scan all over again. `oldestIndexedTs` is deliberately absent
+        // (review-pr-c.md C2-F4): it is derived from the manifest at open, never a cleartext meta
+        // field, and this exact key set is what pins that it cannot come back.
         expect(Object.keys((await dumpRawStore("meta"))[0]).sort()).toEqual([
             "diskBytes",
             "manifestPageCount",
-            "oldestIndexedTs",
             "salt",
             "userId",
             "userVersion",
@@ -3590,6 +3593,72 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(resident.has(idAt(0))).toBe(false); // oldest -- the bug's own wrong answer
         });
 
+        it("the k-way merge is correct across multiple manifest pages, not just within one (review-pr-c.md C2-F1)", async () => {
+            // MANIFEST_PAGE_SIZE entries fill exactly one page in *arrival* order (manifestAdd's own
+            // fill order), so N = 2.5 pages guarantees at least three pages exist. Timestamps are a
+            // scrambled permutation of arrival order (ts[i] = base + (i*37 mod N), 37 coprime with
+            // every N used here) rather than tracking arrival/page order at all -- if the merge were
+            // a page-index-ordered concatenation instead of a genuine k-way merge (the mistake
+            // loadManifest's own "newest page first is a heuristic, not a guarantee" docstring warns
+            // against), a "newer" page could still hold plenty of ids that are actually older than
+            // ids sitting in an "older" page, and this shape is what would expose that.
+            const n = MANIFEST_PAGE_SIZE * 2 + 500;
+            const base = 10_000_000;
+            const tsAt = (i: number): number => base + ((i * 37) % n);
+            const mpId = (i: number): string => `$mp${String(i).padStart(5, "0")}`;
+
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            for (let i = 0; i < n; i++) {
+                await seed.addEventToIndex(msg(mpId(i), BODY_TOKEN, { room_id: ROOM, origin_server_ts: tsAt(i) }), {});
+            }
+            await seed.commitLiveEvents(); // one batched flush; manifestAdd still fills pages in this call's own iteration order
+            await seed.closeEventIndex();
+
+            const K = 50;
+            const sortedByTsDesc = Array.from({ length: n }, (_unused, i) => i).sort((a, b) => tsAt(b) - tsAt(a));
+            const expectedNewestIds = new Set(sortedByTsDesc.slice(0, K).map(mpId));
+
+            // Budget = K events' worth *plus* the full n-entry manifest's own share (review-pr-c.md
+            // C2-F2: residentByteEstimate() counts manifest.size too, and the whole corpus of n is
+            // manifested at reopen regardless of how many are hydrated).
+            setEventIndexBoundsOverrideForTesting({
+                hotWindowBytes: BYTES_PER_EVENT * K + MANIFEST_BYTES_PER_ENTRY_ESTIMATE * n,
+            });
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+
+            const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: K + 10 }));
+            const resident = new Set(resultIds(hit));
+            expect(resident).toEqual(expectedNewestIds);
+        });
+
+        it("getStats().manifestBytes reports the manifest's own share (review-pr-c.md C2-F2)", async () => {
+            setEventIndexBoundsOverrideForTesting(null);
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            for (const ev of budgetCorpus(5)) {
+                await manager.addEventToIndex(ev, {});
+                await manager.commitLiveEvents();
+            }
+            const stats = await manager.getStats();
+            expect(stats.manifestBytes).toBe(5 * MANIFEST_BYTES_PER_ENTRY_ESTIMATE);
+        });
+
+        it("the manifest's own bytes count against the hot window, shrinking admitted events rather than being exempt (review-pr-c.md C2-F2)", async () => {
+            // A budget sized for exactly 20 events' worth with NO manifest headroom added: if the
+            // manifest's MANIFEST_BYTES_PER_ENTRY_ESTIMATE * 40 entries were (wrongly) exempt from
+            // this check, all 20 would fit; since it counts, fewer than 20 must.
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20, 40);
+            const stats = await reloaded.getStats();
+            expect(stats.eventCount).toBeLessThan(20);
+            expect(stats.manifestBytes).toBe(40 * MANIFEST_BYTES_PER_ENTRY_ESTIMATE);
+        });
+
         it("a live insert over budget evicts the oldest resident event; the row survives on disk", async () => {
             setEventIndexBoundsOverrideForTesting({ hotWindowBytes: BYTES_PER_EVENT * 5 });
             const manager = track(new BrowserEventIndexManager());
@@ -3663,7 +3732,16 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             // deferred batch's own minimum into the reported floor, this call would report id19's
             // ts (newer) as the new oldestResidentTs even though id39 (older) remains resident --
             // see enforceResidentBudget's `deferredMinTs` and oldestResidentTs's own docstring.
-            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20, BUDGET_N, oldTailCorpus);
+            //
+            // Budget = 20 events' worth *plus* the full 40-entry manifest's own share (review-pr-c.md
+            // C2-F2: residentByteEstimate() now counts manifest.size too, and the whole corpus of 40
+            // is manifested at reopen regardless of how many are hydrated) -- otherwise fewer than 20
+            // would fit and this test's own "the original 20"/"id19" framing would no longer hold.
+            const reloaded = await seedAndReopen(
+                BYTES_PER_EVENT * 20 + MANIFEST_BYTES_PER_ENTRY_ESTIMATE * BUDGET_N,
+                BUDGET_N,
+                oldTailCorpus,
+            );
             const oldTailCorpusTs = (i: number): number => 2_000_000 - i;
 
             const before = await reloaded.getStats();
@@ -3712,8 +3790,12 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(after.size).toBeLessThanOrEqual(Math.floor(before.size / 2));
             expect(after.oldestIndexedTs).toBeGreaterThan(1_000_000); // moved forward, past $b000's ts
 
-            // A further reopen must not need to hydrate anything to know the same totals: they are
-            // read back from `meta`, restored before any row this session has decrypted.
+            // A further reopen must not need to hydrate anything to know the disk total: it is read
+            // back from `meta`, restored before any row this session has decrypted. `oldestIndexedTs`
+            // is different since review-pr-c.md C2-F4 (it is no longer a cleartext meta field at
+            // all -- see MetaRecord's own comment on why): it is only known once the manifest itself
+            // has been decrypted, so it genuinely is not available before that, unlike `size`. Both
+            // properties are proven here, at the granularity each actually holds at.
             await reloaded.closeEventIndex();
             const restoreDecrypt = slowDownDecrypt(50);
             try {
@@ -3721,7 +3803,9 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
                 await third.initEventIndex(userId, DEVICE);
                 const stats = await third.getStats();
                 expect(stats.size).toBe(after.size);
-                expect(stats.oldestIndexedTs).toBe(after.oldestIndexedTs);
+                expect(stats.oldestIndexedTs).toBeUndefined(); // not yet known -- no cleartext to read it from
+                await third.waitForManifest();
+                expect((await third.getStats()).oldestIndexedTs).toBe(after.oldestIndexedTs);
             } finally {
                 restoreDecrypt();
             }
@@ -3779,6 +3863,65 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(await reloaded.shouldCrawl(cpDrop)).toBe(true); // !drop's manifest entry is gone
             expect(await reloaded.shouldCrawl(cpKeep)).toBe(false); // !keep still has one; cap 0 declines it
         });
+
+        it("oldestIndexedTs is never persisted in cleartext and is correctly re-derived on reopen (review-pr-c.md C2-F4)", async () => {
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            await seed.addEventToIndex(msg("$old", "x", { room_id: "!r:x", origin_server_ts: 5_000_000 }), {});
+            await seed.commitLiveEvents();
+            await seed.addEventToIndex(msg("$new", "x", { room_id: "!r:x", origin_server_ts: 6_000_000 }), {});
+            await seed.commitLiveEvents();
+            expect((await seed.getStats()).oldestIndexedTs).toBe(5_000_000);
+
+            // No meta row anywhere in this session's writes carries the raw timestamp in the clear.
+            for (const row of await dumpRawStore("meta")) {
+                expect(row).not.toHaveProperty("oldestIndexedTs");
+            }
+            const whole = await dumpWholeDb();
+            expect(whole).not.toContain("5000000");
+            await seed.closeEventIndex();
+
+            // Derived fresh from the manifest at reopen, not read back from a stored field.
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForManifest();
+            expect((await reloaded.getStats()).oldestIndexedTs).toBe(5_000_000);
+            for (const row of await dumpRawStore("meta")) {
+                expect(row).not.toHaveProperty("oldestIndexedTs");
+            }
+        });
+
+        it("per-flush cost is proportional to the (now 1k) page, not the old 10k one (review-pr-c.md C2-F3)", async () => {
+            // Fill the current page to exactly MANIFEST_PAGE_SIZE first (each in its own flush, so
+            // the *timed* flush below is the one that re-encrypts a genuinely full page, not a
+            // partially-filled one), then time one more flush that touches (dirties) it again.
+            setEventIndexBoundsOverrideForTesting(null);
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            for (let i = 0; i < MANIFEST_PAGE_SIZE; i++) {
+                await manager.addEventToIndex(
+                    msg(`$pf${String(i).padStart(5, "0")}`, "x", { room_id: ROOM, origin_server_ts: 3_000_000 + i }),
+                    {},
+                );
+            }
+            await manager.commitLiveEvents(); // one batched flush fills the page
+
+            await manager.addEventToIndex(msg("$pfDirty", "x", { room_id: ROOM, origin_server_ts: 4_000_000 }), {});
+            const t0 = performance.now();
+            await manager.commitLiveEvents(); // this flush re-encrypts the now-full page, timed
+            const flushMs = performance.now() - t0;
+            console.log(
+                `review-pr-c.md C2-F3: one flush touching a full ${MANIFEST_PAGE_SIZE}-entry page: ${flushMs.toFixed(2)}ms`,
+            );
+            // Generous headroom over the ~1.6ms the review's own linear scaling predicts for a page
+            // 10x smaller than the original 10k (measured ~15.8ms there) -- loose enough not to be
+            // flaky on a shared CI runner, tight enough to catch a regression back toward the old
+            // page size's cost.
+            expect(flushMs).toBeLessThan(10);
+        });
     });
 
     describe("manifest migration (review-pr-c.md C-F5)", () => {
@@ -3797,8 +3940,9 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
             // Simulate a database schema v2 wrote before this increment existed: strip every
             // increment-C field this session's own writes just added to `meta`, and delete the
-            // manifest pages those same writes created, so `manifestPageCount` really is absent
-            // the way it would be for a production v2 user today (review-pr-c.md's own framing).
+            // manifest pages *and* the encrypted oldestIndexedTs row (review-pr-c.md C2-F4) those
+            // same writes created, so `manifestPageCount` really is absent the way it would be for
+            // a production v2 user today (review-pr-c.md's own framing).
             await withRawDb(async (db) => {
                 const tx = db.transaction("meta", "readwrite");
                 const store = tx.objectStore("meta");
@@ -3808,6 +3952,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
                     store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
                 );
                 for (const key of manifestKeys) store.delete(key);
+                store.delete(`${userId}|oldestIndexedTs`);
                 await new Promise<void>((resolve, reject) => {
                     tx.oncomplete = (): void => resolve();
                     tx.onerror = (): void => reject(tx.error);
