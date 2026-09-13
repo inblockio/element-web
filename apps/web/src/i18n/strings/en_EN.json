@@ -2428,7 +2428,8 @@
         "warning_kind_files_partial": "Some encrypted files may be missing because your search index is still being built.",
         "warning_kind_search": "This version of %(brand)s does not support searching encrypted messages",
         "warning_kind_search_app": "Use the <a>Desktop app</a> to search encrypted messages",
-        "warning_kind_search_partial": "Results may be incomplete because your search index is still being built."
+        "warning_kind_search_partial": "Results may be incomplete because your search index is still being built.",
+        "warning_kind_search_windowed": "Search covers messages newer than %(date)s."
     },
     "setting": {
         "help_about": {

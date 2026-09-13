@@ -13,6 +13,7 @@ import EventIndexPeg from "../../../indexing/EventIndexPeg";
 import type EventIndex from "../../../indexing/EventIndex";
 import { SearchScope } from "../../../Searching";
 import { _t } from "../../../languageHandler";
+import { formatFullDateNoTime } from "../../../DateUtils";
 import SdkConfig from "../../../SdkConfig";
 import dis from "../../../dispatcher/dispatcher";
 import { Action } from "../../../dispatcher/actions";
@@ -86,13 +87,18 @@ const LOADING_POLL_MS = 1000;
  *     specific search (the property every existing, `WarningKind.Search`-only caller wants).
  *     `loading`: true while the backend is still hydrating from disk at all, regardless of scope or
  *     room — the property a `WarningKind.Files` caller wants instead, the checkpoint-based signal
- *     never having applied to it.
+ *     never having applied to it. `windowed`: true once a crawl bound or a byte budget has excluded
+ *     or dropped something the index would otherwise cover ({@link IIndexStats.windowed}); absent
+ *     from a backend that does not report it, same convention as `loading`. `oldestIndexedTs`: the
+ *     date before which coverage is not guaranteed, when known, for the "Search covers messages
+ *     newer than {date}" line — `undefined` on a backend that does not report it, or before this
+ *     session has learned one.
  */
 function useIsIndexIncomplete(
     index: EventIndex | null,
     scope?: SearchScope,
     roomId?: string,
-): { incomplete: boolean; loading: boolean } {
+): { incomplete: boolean; loading: boolean; windowed: boolean; oldestIndexedTs?: number } {
     const readCheckpoints = useCallback((): { relevant: boolean; anyOutstanding: boolean } => {
         if (!index) return { relevant: false, anyOutstanding: false };
         const { crawlingRooms } = index.crawlingRooms();
@@ -109,6 +115,13 @@ function useIsIndexIncomplete(
     // rendering an unwarned search for a room we already know is being crawled.
     const [incomplete, setIncomplete] = useState<boolean>(() => readCheckpoints().relevant);
     const [loading, setLoading] = useState<boolean>(false);
+    // Unlike `loading`, these two have no poll of their own armed on their account: they are
+    // refreshed opportunistically, on whatever `update()` call happens to run for another reason
+    // (mount, a checkpoint change, or the loading poll below), which under-warns (per this file's
+    // existing convention for every signal here) rather than adding a second timer for a pair of
+    // properties that, once true, are expected to stay true or only become more true.
+    const [windowed, setWindowed] = useState<boolean>(false);
+    const [oldestIndexedTs, setOldestIndexedTs] = useState<number | undefined>(undefined);
 
     // Shared between the subscription effect below and the poll effect further down, so a tick
     // from either agrees with the other about which answer is current; a ref rather than a
@@ -140,6 +153,8 @@ function useIsIndexIncomplete(
             const stats = await index.getStats();
             if (current !== generationRef.current) return;
             isLoading = Boolean(stats?.loading);
+            setWindowed(Boolean(stats?.windowed));
+            setOldestIndexedTs(stats?.oldestIndexedTs);
         } catch (e) {
             // A backend whose getStats() rejects is not evidence either way; log and treat it as
             // not loading rather than let the rejection go unhandled (this function is always
@@ -178,6 +193,8 @@ function useIsIndexIncomplete(
         if (!index) {
             setIncomplete(false);
             setLoading(false);
+            setWindowed(false);
+            setOldestIndexedTs(undefined);
             return;
         }
 
@@ -211,14 +228,25 @@ function useIsIndexIncomplete(
         return () => clearInterval(poll);
     }, [index, loading, update]);
 
-    return { incomplete, loading };
+    return { incomplete, loading, windowed, oldestIndexedTs };
 }
 
 export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, scope, roomId }: IProps): JSX.Element {
     const eventIndex = EventIndexPeg.get();
-    const { incomplete: indexIncomplete, loading: indexLoading } = useIsIndexIncomplete(eventIndex, scope, roomId);
+    const {
+        incomplete: indexIncomplete,
+        loading: indexLoading,
+        windowed: indexWindowed,
+        oldestIndexedTs,
+    } = useIsIndexIncomplete(eventIndex, scope, roomId);
 
-    if (!isRoomEncrypted) return <></>;
+    // An all-rooms search merges hits from every locally-indexed encrypted room, regardless of
+    // whether the room this panel happens to be docked in (isRoomEncrypted, a property of *that one*
+    // room) is itself encrypted -- so a search-all in an unencrypted room must not be silenced here.
+    // WarningKind.Files has no such scope (always one room's own panel; scope/roomId are never
+    // passed to it), so it is unaffected: `scope !== SearchScope.All` is true when scope is
+    // `undefined`, preserving the previous behaviour for every existing caller except this one case.
+    if (!isRoomEncrypted && scope !== SearchScope.All) return <></>;
 
     if (eventIndex) {
         // The index is still missing history for this search, so it may silently return partial
@@ -229,6 +257,22 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
             return (
                 <div className="mx_SearchWarning" role="status">
                     <span>{_t("seshat|warning_kind_search_partial")}</span>
+                </div>
+            );
+        }
+        // A crawl bound or a byte budget has excluded or dropped something (SYNTHESIS.md §4's
+        // degradation policy, step 3): state the date rather than let old messages go quietly
+        // unfindable. Only shown once the index is not actively (re)building (the branch above),
+        // and only when a date is actually known -- see oldestIndexedTs's own docstring for why
+        // `windowed` and "a date is known" are two separate conditions.
+        if (indexWindowed && oldestIndexedTs !== undefined && kind === WarningKind.Search) {
+            return (
+                <div className="mx_SearchWarning" role="status">
+                    <span>
+                        {_t("seshat|warning_kind_search_windowed", {
+                            date: formatFullDateNoTime(new Date(oldestIndexedTs)),
+                        })}
+                    </span>
                 </div>
             );
         }

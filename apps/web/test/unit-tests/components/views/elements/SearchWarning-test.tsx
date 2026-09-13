@@ -39,6 +39,10 @@ class FakeEventIndex {
     /** Settable after construction, so a test can flip it mid-render without a new instance. */
     public loading = false;
 
+    /** Settable after construction; see the "windowed" describe block below. */
+    public windowed = false;
+    public oldestIndexedTs: number | undefined = undefined;
+
     /** getStats() rejects once, then answers normally; see "treats a getStats() failure as not loading". */
     public getStatsFailsOnce = false;
 
@@ -60,12 +64,26 @@ class FakeEventIndex {
         return this.indexed === undefined ? undefined : this.indexed.includes(roomId);
     }
 
-    public async getStats(): Promise<{ size: number; eventCount: number; roomCount: number; loading: boolean }> {
+    public async getStats(): Promise<{
+        size: number;
+        eventCount: number;
+        roomCount: number;
+        loading: boolean;
+        windowed: boolean;
+        oldestIndexedTs: number | undefined;
+    }> {
         if (this.getStatsFailsOnce) {
             this.getStatsFailsOnce = false;
             throw new Error("simulated getStats() failure");
         }
-        return { size: 0, eventCount: 0, roomCount: 0, loading: this.loading };
+        return {
+            size: 0,
+            eventCount: 0,
+            roomCount: 0,
+            loading: this.loading,
+            windowed: this.windowed,
+            oldestIndexedTs: this.oldestIndexedTs,
+        };
     }
 
     public on(event: string, listener: (...args: any[]) => void): void {
@@ -389,6 +407,35 @@ describe("<SearchWarning />", () => {
             expect(container).toBeEmptyDOMElement();
         });
 
+        it("still warns an all-rooms search even when the current room is not encrypted", async () => {
+            // An all-rooms search merges hits from every locally-indexed encrypted room, regardless
+            // of whether the room this panel happens to be docked in is itself encrypted -- the gap
+            // this test guards. `roomId` is undefined for an all-rooms search (SearchInfo.roomId's
+            // own contract), so `scope === SearchScope.All` is the only signal available.
+            setIndex(new FakeEventIndex([SEARCHED_ROOM], []));
+
+            const { queryByText } = render(
+                <SearchWarning isRoomEncrypted={false} kind={WarningKind.Search} scope={SearchScope.All} />,
+            );
+            await settle();
+
+            expect(queryByText(PARTIAL_WARNING)).toBeInTheDocument();
+        });
+
+        it("still renders nothing for WarningKind.Files when the room is not encrypted", async () => {
+            // Files has no all-rooms concept (scope/roomId are never passed to it; see FilePanel's
+            // call site), so it must keep the previous behaviour exactly: `scope` is `undefined`
+            // there, and `undefined !== SearchScope.All` is true, same as before this change.
+            const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+            index.loading = true;
+            setIndex(index);
+
+            const { container } = render(<SearchWarning isRoomEncrypted={false} kind={WarningKind.Files} />);
+            await settle();
+
+            expect(container).toBeEmptyDOMElement();
+        });
+
         it("warns while the browser backend is still hydrating, with no checkpoints outstanding at all", async () => {
             // The scenario the loading disjunct exists for: a fresh session, crawler idle, nothing
             // queued, but the backend is still decrypting its on-disk store in the background.
@@ -505,6 +552,104 @@ describe("<SearchWarning />", () => {
             await settle();
 
             expect(container).toBeEmptyDOMElement();
+        });
+
+        describe("windowed (a crawl bound or a budget has excluded something)", () => {
+            const WINDOWED_TS = new Date("2026-01-15T00:00:00Z").getTime();
+
+            it('shows "Search covers messages newer than {date}" when windowed and a date is known', async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.windowed = true;
+                index.oldestIndexedTs = WINDOWED_TS;
+                setIndex(index);
+
+                const { queryByText } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+
+                expect(queryByText(/Search covers messages newer than/)).toBeInTheDocument();
+            });
+
+            it("does not show the windowed line when nothing has been excluded", async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.windowed = false;
+                index.oldestIndexedTs = WINDOWED_TS; // a date being known is not sufficient on its own
+                setIndex(index);
+
+                const { queryByText, container } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+
+                expect(queryByText(/Search covers messages newer than/)).not.toBeInTheDocument();
+                expect(container).toBeEmptyDOMElement();
+            });
+
+            it("does not show the windowed line when windowed but no date is known yet", async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.windowed = true;
+                index.oldestIndexedTs = undefined; // windowed without a date is not enough either
+                setIndex(index);
+
+                const { queryByText, container } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+
+                expect(queryByText(/Search covers messages newer than/)).not.toBeInTheDocument();
+                expect(container).toBeEmptyDOMElement();
+            });
+
+            it("never shows the windowed line for WarningKind.Files", async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.windowed = true;
+                index.oldestIndexedTs = WINDOWED_TS;
+                setIndex(index);
+
+                const { queryByText } = render(<SearchWarning isRoomEncrypted={true} kind={WarningKind.Files} />);
+                await settle();
+
+                expect(queryByText(/Search covers messages newer than/)).not.toBeInTheDocument();
+            });
+
+            it("prefers the still-loading message over the windowed line while both are true", async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.loading = true;
+                index.windowed = true;
+                index.oldestIndexedTs = WINDOWED_TS;
+                setIndex(index);
+
+                const { queryByText } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+
+                // Not asserted as "still building" via PARTIAL_WARNING here, since `loading` alone
+                // already makes `incomplete` true for this scope/room regardless of windowed.
+                expect(queryByText(PARTIAL_WARNING)).toBeInTheDocument();
+                expect(queryByText(/Search covers messages newer than/)).not.toBeInTheDocument();
+            });
         });
     });
 
