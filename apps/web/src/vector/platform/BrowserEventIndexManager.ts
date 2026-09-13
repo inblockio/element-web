@@ -4360,7 +4360,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             // silent, permanent data loss. Applying right here keeps the window to what
             // flushLiveWrites/enqueueDeleteRecord already accept: this transaction's own attempt,
             // not an arbitrarily larger one.
+            // Sliced: a batch can hold thousands of events across hundreds of chunks, and
+            // manifestAdd's own per-id page bookkeeping is not free -- applying a whole batch in
+            // one synchronous pass produced main-thread tasks over 200ms at 200k (measured against
+            // a real v2-with-manifest fixture), exactly the long-task regression every other loop
+            // in this file is careful to slice against. Safe to interrupt here (unlike the window
+            // between "apply" and "attempt" this method's own comment above is about): nothing has
+            // been queued for the transaction yet, so a teardown landing mid-loop simply abandons
+            // this batch's optimistic manifest state the same way any other early return in this
+            // class does.
+            let applySliceStart = now();
             for (const { chunkId, blob, entries } of pendingChunks) {
+                if (this.closed || epoch !== this.hydrationEpoch || !this.db) return false;
                 const { minTs, maxTs } = tsRangeOf(entries);
                 this.chunkInfo.set(chunkId, { bytes: blob.ct.length + blob.iv.length, minTs, maxTs });
                 // Ordered by maxTs, not minTs (review-pr-d.md D4): see enforceDiskBudget's own
@@ -4368,6 +4379,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // pass must compare chunks by.
                 heapPushTs(this.diskChunkHeap, { ts: maxTs, id: String(chunkId) });
                 for (const [id, ev] of entries) this.manifestAdd(id, ev.originServerTs, ev.roomId, chunkId);
+                if (now() - applySliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
+                    await yieldToEventLoop();
+                    if (this.closed || epoch !== this.hydrationEpoch || !this.db) return false;
+                    applySliceStart = now();
+                }
             }
             const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
             const meta = await this.loadMeta(userId);
