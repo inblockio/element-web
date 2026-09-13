@@ -150,6 +150,35 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
  * externalisation threshold, mean chunk population 47 events -- within the "roughly 50-90 events"
  * estimate the increment's own design brief gave), so it is kept as the default rather than moved.
  *
+ * **Re-swept with the real manager end to end (review-pr-d.md D10), not just intrinsic crypto
+ * cost.** The table above is Node WebCrypto in isolation and cannot see two costs that dominate in
+ * practice: `flushLiveWrites` re-encrypts the *entire open chunk* on every flush that touches it, so
+ * write cost per event rises with the target (a live path flushing a handful of events pays close
+ * to the whole chunk's re-encrypt each time); and, before the D5 hydration fix, restore cost was
+ * dominated by *read amplification* proportional to events per chunk, the opposite sign from what
+ * this table implies. `~/.cache/eventindex-perf-d/chunk-size-sweep.mjs --events 100000`, re-run
+ * against the fixed (chunk-once) hydration, driving the real manager's write, cold-restore and
+ * point-lookup path rather than isolated crypto:
+ *
+ * | target | encrypt µs/event (write) | decrypt µs/event (read) | restore ms | disk bytes |
+ * |---|---|---|---|---|
+ * | 16 KiB | 4.51 | 1.87 | 3,390.1 | 72,288,547 |
+ * | 32 KiB | 4.57 | 1.43 | 3,277.5 | 72,228,020 |
+ * | **48 KiB (HEAD)** | **4.84** | **1.11** | **2,792.0** | **72,207,288** |
+ * | 64 KiB | 5.21 | 1.03 | 3,139.4 | 72,198,375 |
+ * | 96 KiB | 6.11 | 0.93 | 2,654.0 | 72,187,906 |
+ *
+ * Write cost rises monotonically with target (+35% from 16 to 96 KiB), read cost falls
+ * monotonically (-50%), on-disk size is flat (0.13% across the whole range), and restore time is
+ * **not monotone** and spans only ±13% -- once hydration reads each chunk exactly once, restore is
+ * dominated by the per-event resident-insertion cost (`insertRoomOrder`/D-R6), not by chunk size.
+ * **Honest conclusion: 48 KiB is defensible and is the best of 16/32/48/64 on restore in this sweep,
+ * but the data does not identify it as a unique optimum** -- any value in 32-64 KiB is within noise
+ * on restore, and the real trade is simply write cost against read cost. What the data does settle
+ * is that 16 KiB (briefly landed, then reverted, in this increment's history) is wrong in both
+ * directions: worst on restore *and* on decrypt, no better on write. Kept at 48 KiB: no value in
+ * this range is clearly better, and it is the value already measured, deployed and gated on.
+ *
  * @knipignore - exported for tests, that read it directly to size a fixture relative to a chunk
  *     boundary; production code reads {@link getChunkTargetBytes} instead, which is the one that
  *     can actually be overridden ({@link setChunkTargetBytesOverrideForTesting}) -- this constant
@@ -185,45 +214,6 @@ export function getChunkTargetBytes(): number {
  */
 export function setChunkTargetBytesOverrideForTesting(override: number | null): void {
     chunkTargetBytesOverrideForTesting = override;
-}
-
-/**
- * How many outer conversion pages (each up to `HYDRATION_PAGE_SIZE` legacy rows,
- * `BrowserEventIndexManager.runChunkMigration`) to accumulate in memory before one v2-to-v3
- * conversion batch is committed to disk. review-pr-d.md D6: a v2 database that already carries a
- * manifest (every account that has ever run increment C) has its manifest pages filled in
- * *arrival* order, uncorrelated with the ascending-`eventId` order conversion scans in, so
- * committing every single outer page can dirty -- and therefore re-encrypt and rewrite -- every
- * manifest page on every commit: `conversionPages x manifestPages` re-encrypts, measured at ~64s
- * of pure crypto on top of an 88s conversion at 200k. Batching amortises that to roughly
- * `conversionPages / CONVERSION_BATCH_PAGES` full-manifest rewrites instead of one per page.
- *
- * The honest cost of this: a crash loses at most one batch's worth of conversion progress (up to
- * `CONVERSION_BATCH_PAGES * HYDRATION_PAGE_SIZE` events, not the whole session, and never more --
- * legacy rows are only ever deleted in the same transaction their chunks and manifest pages commit
- * in) rather than at most one outer page's worth, a coarser but still strictly bounded unit of
- * durability; see `runChunkMigration`'s own docstring for the full trade-off.
- *
- * @knipignore - exported for tests, which override it to a small value so a fixture far smaller
- *     than 10 real conversion pages can still exercise more than one batch boundary.
- */
-export const CONVERSION_BATCH_PAGES = 10;
-
-/** Test-only override for {@link getConversionBatchPages}; `null` means "use {@link CONVERSION_BATCH_PAGES}". */
-let conversionBatchPagesOverrideForTesting: number | null = null;
-
-/** The conversion batch size in effect right now: {@link CONVERSION_BATCH_PAGES} unless a test has overridden it. */
-export function getConversionBatchPages(): number {
-    return conversionBatchPagesOverrideForTesting ?? CONVERSION_BATCH_PAGES;
-}
-
-/**
- * Test-only hook: force {@link getConversionBatchPages} to a specific value, or pass `null` to
- * clear the override. Never called from production code.
- * @knipignore - exported for tests
- */
-export function setConversionBatchPagesOverrideForTesting(override: number | null): void {
-    conversionBatchPagesOverrideForTesting = override;
 }
 
 const DESKTOP_BOUNDS: EventIndexBounds = {

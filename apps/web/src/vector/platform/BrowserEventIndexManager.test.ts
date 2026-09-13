@@ -27,7 +27,6 @@ import {
     eventHasFile,
     extractSearchText,
     flattenCopy,
-    HYDRATION_PAGE_SIZE,
     HYDRATION_SLICE_DEADLINE_MS,
     isBrowserEventIndexEnabled,
     isWebEventIndexSupported,
@@ -42,7 +41,6 @@ import {
 import {
     DAY_MS,
     setChunkTargetBytesOverrideForTesting,
-    setConversionBatchPagesOverrideForTesting,
     setEventIndexBoundsOverrideForTesting,
 } from "./eventIndexBounds";
 
@@ -147,14 +145,14 @@ async function decryptAllChunkEvents(pickleKey: string, deviceId: string): Promi
 
 /**
  * Seed a genuine schema-v2, pre-manifest, pre-chunk fixture: a real `events` object store (one
- * encrypted `EventRecord` row per event, exactly as v2 wrote it, `byUser` index only) plus a bare
- * `meta` row with no `manifestPageCount` and no `checkpoints`. Bypasses {@link
- * BrowserEventIndexManager} entirely on the write side -- unlike this class, which never writes to
- * `events` at all under schema v3, so seeding "a v2 database" by writing through the manager and
- * then merely stripping `meta`'s increment-C/D fields (this file's own pattern before this
- * increment) no longer produces one: the data would already be sitting in `chunks`. This is what
- * `runManifestMigration` (self-heal) + `runChunkMigrationIfNeeded` (this increment's own conversion)
- * together have to turn back into a working v3 index.
+ * encrypted row per event, exactly as v2 wrote it, `byUser` index only) plus a bare `meta` row with
+ * no `manifestPageCount` and no `checkpoints`. Bypasses {@link BrowserEventIndexManager} entirely on
+ * the write side -- unlike this class, which never writes to `events` at all under schema v3, so
+ * seeding "a v2 database" by writing through the manager and then merely stripping `meta`'s
+ * increment-C/D fields (this file's own pattern before increment D) no longer produces one: the
+ * data would already be sitting in `chunks`. This is what the very next {@link
+ * BrowserEventIndexManager.initEventIndex} open resets rather than converts -- see {@link
+ * BrowserEventIndexManager.openDb}'s "Migration v2 -> v3: reset, not convert".
  *
  * @param rawEvents - Matrix events, `msg()`-shaped, in the order to store them (arrival order,
  *     ascending `eventId` expected by callers that pass `budgetCorpus()`-style ids).
@@ -1438,46 +1436,42 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         await manager.waitForHydration();
 
         const raw = await inspectRawDb(pickleKey!, DEVICE);
-        expect(raw.version).toBe(3); // v1 -> v2 -> v3 in one upgrade transaction
-        // The unused v1 index is gone from the legacy `events` store (still present, empty, while
-        // nothing has been chunked -- see openDb: an events store that already existed is kept, not
-        // recreated, so this is the same store v1 wrote to, missing only byUserRoom).
+        expect(raw.version).toBe(3); // v1 -> v3 in one upgrade transaction, reset not converted
+        // The legacy `events` store is dropped outright, not merely emptied: v3 has no use for it
+        // at all (see openDb's "Migration v2 -> v3: reset, not convert").
         await withRawDb(async (db) => {
-            const store = db.transaction("events", "readonly").objectStore("events");
-            const names: string[] = [];
-            for (let i = 0; i < store.indexNames.length; i++) names.push(store.indexNames.item(i)!);
-            expect(names).toEqual(["byUser"]);
+            expect(db.objectStoreNames.contains("events")).toBe(false);
         });
 
-        // ... and so are the records. The plaintext-keyed checkpoints cannot be re-keyed inside
-        // the versionchange transaction (no key material exists there), so they are deleted; the
-        // events go with them, because EventIndex only re-seeds checkpoints for an index that
-        // reports itself empty. The pair is what turns "no crawl position" into a full rebuild.
+        // The plaintext-keyed checkpoints cannot be re-keyed inside the versionchange transaction
+        // (no key material exists there), so they are deleted; the events go with them, because
+        // EventIndex only re-seeds checkpoints for an index that reports itself empty. The pair is
+        // what turns "no crawl position" into a full rebuild.
         expect(raw.events).toEqual([]);
+        expect(await dumpRawStore("chunks")).toEqual([]);
         expect(await dumpRawStore("checkpoints")).toEqual([]);
         expect(await manager.isEventIndexEmpty()).toBe(true);
         expect(await manager.loadCheckpoints()).toEqual([]);
         expect((await manager.searchEventIndex(search("legacy"))).count).toBe(0);
 
         // meta survives, because its salt is what keeps the derived key usable -- minus the
-        // `deviceId` column, which nothing ever read. `manifestPageCount` is new: the v1->v2 wipe
-        // leaves it undefined, which is exactly the "pre-manifest database" signal
-        // runManifestMigration self-heals from -- it runs (over zero rows, events having just been
-        // cleared) and persists its own empty result (manifestPageCount 0), so a *third* open does
-        // not pay for a migration scan all over again. `diskBytes`/`nextChunkId` are deliberately
-        // absent: nothing has ever been chunked for this user (runChunkMigrationIfNeeded finds the
-        // now-empty legacy `events` store and returns immediately, writing nothing), and
+        // `deviceId` column, which nothing ever read. `manifestPageCount`/`nextChunkId` are written
+        // back as `0`, exactly like a fresh v3 install, so the next open takes the ordinary
+        // loadManifest path rather than dispatching to a self-heal scan. `diskBytes` is deliberately
+        // absent, the same as a fresh install: nothing has ever been chunked for this user, and
         // `existingMeta.diskBytes ?? 0` already treats "absent" the same as "explicitly zero" at the
-        // next open, so there is nothing to gain by writing a real zero here pre-emptively.
-        // `oldestIndexedTs` is deliberately absent too (review-pr-c.md C2-F4): it is derived from the
-        // manifest at open, never a cleartext meta field, and this exact key set is what pins that it
-        // cannot come back.
+        // next open. `oldestIndexedTs` is deliberately absent too (review-pr-c.md C2-F4): it is
+        // derived from the manifest at open, never a cleartext meta field, and this exact key set is
+        // what pins that it cannot come back.
         expect(Object.keys((await dumpRawStore("meta"))[0]).sort()).toEqual([
             "manifestPageCount",
+            "nextChunkId",
             "salt",
             "userId",
             "userVersion",
         ]);
+        // userVersion is untouched by this schema migration -- it is EventIndex's own field, not
+        // this class's, and a reset of the storage layout is not a reason to reset it.
         expect(await manager.getUserVersion()).toBe(3);
 
         // Nothing v1 wrote in the clear survives anywhere in the database.
@@ -2501,10 +2495,11 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             }
         });
 
-        it("resumes correctly across more than one hydration page", async () => {
-            // Direct test of the multi-page resume branch in userEventKeyRange (afterEventId set):
-            // never exercised by any other fixture, all of which stay under HYDRATION_PAGE_SIZE.
-            const total = HYDRATION_PAGE_SIZE + 50;
+        it("resumes correctly across more than one hydration chunk batch", async () => {
+            // A corpus well past one HYDRATION_CHUNK_BATCH-worth of chunks, so restore exercises
+            // more than one batch of chunk reads, not just the special case of everything fitting
+            // in the first one.
+            const total = 1050;
             await manager.initEventIndex(userId, DEVICE);
             await manager.waitForHydration();
             const ids: string[] = [];
@@ -4436,169 +4431,55 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
         });
     });
 
-    describe("manifest migration (review-pr-c.md C-F5)", () => {
-        it("builds a correct manifest and converts a pre-manifest (schema v2) fixture into chunks with an exact byte total", async () => {
-            setEventIndexBoundsOverrideForTesting(null);
-            const corpus = budgetCorpus(10);
+    describe("schema v3 reset migration (v2 -> v3, D-core)", () => {
+        it("opens a real v2 fixture empty, drops the legacy events store, and re-seeds and searches after a re-crawl", async () => {
+            // A real, populated v2 database: pre-manifest, pre-chunk, one encrypted row per event
+            // in `events` -- exactly what a real account that has never run increment C or D has on
+            // disk. Old content is deliberately distinctive so the assertions below can tell "reset,
+            // then re-crawled" apart from "somehow still has the old rows".
+            const corpus = budgetCorpus(10).map((ev, i) => ({
+                ...ev,
+                content: { ...ev.content, body: `zqlegacy-only-content-${i}` },
+            }));
             await seedLegacyV2Fixture(pickleKey!, userId, DEVICE, corpus);
-            expect(await dumpRawStore("meta")).toEqual([{ userId, salt: expect.any(String), userVersion: 0 }]);
-            expect(await dumpRawStore("events")).toHaveLength(10); // genuinely schema v2: one row per event
+            expect(await dumpRawStore("events")).toHaveLength(10); // genuinely schema v2 on disk
 
-            const reloaded = track(new BrowserEventIndexManager());
-            await reloaded.initEventIndex(userId, DEVICE);
-            await reloaded.waitForManifest(); // C's self-heal: ts/roomId for every id, chunkId still UNCHUNKED
-            await reloaded.waitForChunkMigration(); // D's own pass: packs them into real chunks
-            await reloaded.waitForHydration();
-
-            const after = await reloaded.getStats();
-            expect(after.eventCount).toBe(corpus.length); // small corpus, well under any budget
-
-            // Exact byte total: independently sum every chunk's own ciphertext length and compare
-            // against what the migration persisted to meta and what getStats() reports -- the v3
-            // analogue of the original test's "before/after" comparison, which no longer applies
-            // once the source of truth (chunk packing) only exists after this pass runs.
-            const chunkRows = await dumpRawStore("chunks");
-            const exactBytes = chunkRows.reduce((a: number, r: any) => a + r.blob.ct.length + r.blob.iv.length, 0);
-            expect(after.size).toBe(exactBytes);
-
-            // Converted, not just self-healed: the legacy events store is fully drained.
-            expect(await dumpRawStore("events")).toEqual([]);
-
-            // The manifest itself was rebuilt, not just the byte total: shouldCrawl's per-room
-            // floor (sourced from the manifest, C-F2's fix) already has an answer for this room
-            // immediately, from data the migration scan alone produced.
-            setEventIndexBoundsOverrideForTesting({ crawlWindowDays: 1 });
-            expect(await reloaded.shouldCrawl({ roomId: ROOM, token: "t", direction: Direction.Backward })).toBe(false); // budgetCorpus's ts (1_000_000-ish) is far more than a day old
-
-            const rawMeta = (await dumpRawStore("meta"))[0];
-            expect(rawMeta.manifestPageCount).toBeGreaterThanOrEqual(1);
-            expect(rawMeta.diskBytes).toBe(exactBytes);
-
-            // A *further* reopen must not re-run either pass: manifestPageCount is now present (so
-            // loadManifest's page-count-driven path runs, not runManifestMigration), and the legacy
-            // events store is empty (so runChunkMigrationIfNeeded's cheap getKey() check finds
-            // nothing and returns immediately, not runChunkMigration) -- confirmed by the page count
-            // staying exactly what the first pass wrote (a re-migration would rebuild it from the
-            // same chunks and land on the same number by coincidence, but would also mean a change
-            // to either path silently regressed the "no full scan on a second open" guarantee is not
-            // caught here; the disk-budget describe block above already asserts a third reopen's
-            // `getStats()` is correct *before* `waitForHydration()`, which is the same property).
-            await reloaded.closeEventIndex();
-            const third = track(new BrowserEventIndexManager());
-            await third.initEventIndex(userId, DEVICE);
-            await third.waitForManifest();
-            await third.waitForChunkMigration();
-            const thirdMeta = (await dumpRawStore("meta"))[0];
-            expect(thirdMeta.manifestPageCount).toBe(rawMeta.manifestPageCount);
-            expect(thirdMeta.diskBytes).toBe(exactBytes);
-        });
-
-        it("a pre-manifest fixture over its disk budget is brought under budget after the migration pass, oldest first (review-pr-c.md C3-F1)", async () => {
-            // review-pr-c.md C3-F1: runManifestMigration built the manifest and the exact byte
-            // total, but not the disk-eviction candidate structures the schema-v2 disk budget
-            // needed -- so a migrated database's disk usage got stuck at whatever it was, however
-            // far over budget, forever. Schema v3's equivalent (chunkInfo/diskChunkHeap) is what
-            // this test proves runChunkMigration itself now populates.
-            setEventIndexBoundsOverrideForTesting(null);
-            const corpus = budgetCorpus(40);
-            await seedLegacyV2Fixture(pickleKey!, userId, DEVICE, corpus);
-
-            // Force several chunks out of the conversion: with the real 48 KiB target, 40 small
-            // events pack into one chunk, and a disk budget of "a third of the total" would delete
-            // that one chunk whole (nothing smaller to evict), leaving no survivors to assert
-            // "oldest-first" against.
-            setChunkTargetBytesOverrideForTesting(2000);
-
-            // A budget well under the fixture's real footprint -- roughly a third of it, so more
-            // than one chunk must go -- forcing the migration path (not the live-write path E4(a) of
-            // the review's own repro already covers) to actually shrink disk usage. The hot window
-            // is deliberately much smaller than the corpus too (5 of 40): a hot window generous
-            // enough to hydrate every row would let hydration itself backfill chunkInfo/diskChunkHeap
-            // for chunks it decrypts along the way, masking whether the *migration* pass populated
-            // them on its own -- this repro's own E4(b) needed a small hot window (50 of 600) to
-            // expose the original schema-v2 bug the same way.
-            const rawEventsBytes = (await dumpRawStore("events")).reduce(
-                (a: number, r: any) => a + Math.ceil((r.blob.ct.length * 3) / 4),
-                0,
-            );
-            const diskBudgetBytes = Math.floor(rawEventsBytes / 3);
-            setEventIndexBoundsOverrideForTesting({ diskBudgetBytes, hotWindowBytes: BYTES_PER_EVENT * 5 });
             const reloaded = track(new BrowserEventIndexManager());
             await reloaded.initEventIndex(userId, DEVICE);
             await reloaded.waitForManifest();
-            await reloaded.waitForChunkMigration();
             await reloaded.waitForHydration();
 
-            const after = await reloaded.getStats();
-            expect(after.size).toBeLessThanOrEqual(diskBudgetBytes); // no longer stuck over budget
-            expect(after.windowed).toBe(true);
+            // The reset, not a conversion: the legacy store is gone outright (never merely
+            // emptied), chunks are empty, and the manifest/meta bookkeeping reads exactly like a
+            // fresh v3 install rather than "a manifest built from the old rows".
+            await withRawDb(async (db) => {
+                expect(db.objectStoreNames.contains("events")).toBe(false);
+            });
+            expect(await dumpRawStore("chunks")).toEqual([]);
+            const metaRow = (await dumpRawStore("meta"))[0];
+            expect(metaRow.manifestPageCount).toBe(0);
+            expect(metaRow.userVersion).toBe(0);
+            expect(await reloaded.isEventIndexEmpty()).toBe(true);
+            expect(await reloaded.loadCheckpoints()).toEqual([]);
+            expect((await reloaded.searchEventIndex(search("zqlegacy-only-content-0"))).count).toBe(0);
+            const statsAfterReset = await reloaded.getStats();
+            expect(statsAfterReset.eventCount).toBe(0);
 
-            // Oldest-first: the ids dropped are a contiguous prefix of the ascending-ts corpus, the
-            // newest one is never among them.
-            const onDiskIds = new Set((await decryptAllChunkEvents(pickleKey!, DEVICE)).map((r: any) => r.eventId));
-            expect(onDiskIds.size).toBeLessThan(40);
-            expect(onDiskIds.has(idAt(39))).toBe(true); // newest survives
-            expect(onDiskIds.has(idAt(0))).toBe(false); // oldest is gone
-            let seenSurvivor = false;
-            for (let i = 0; i < 40; i++) {
-                const present = onDiskIds.has(idAt(i));
-                if (present) seenSurvivor = true;
-                // Once a survivor is seen, every id at or after it must also survive (ascending ts,
-                // oldest-first deletion) -- a gap in the middle would mean deletion did not go
-                // oldest-first.
-                if (seenSurvivor) expect(present).toBe(true);
-            }
-        });
-
-        it("writes landing mid-pass are included in the totals after the pass, not clobbered by it (review-pr-c.md C4-F1)", async () => {
-            // review-pr-c.md C4-F1 (pre-existing, reproduces unchanged on the commit before C3-F1's
-            // fix too): the pass used to end with `this.ciphertextBytes = totalBytes` -- an
-            // *assignment* of this scan's own pass-local total, clobbering whatever a concurrent
-            // write's own flushLiveWrites had already correctly added to this.ciphertextBytes while
-            // the scan was running. The reviewer measured a real, silent 14,130 B understatement
-            // with 70 concurrent writes; membership (manifest vs. disk) was never wrong, only the
-            // *count*, persisted into meta for the rest of the session. Same pattern for
-            // oldestIndexedTs. Schema v3 relocates this exact derivation from runManifestMigration
-            // to runChunkMigration (see that method's own docstring), so this races the CHUNK
-            // migration phase specifically, not just the manifest self-heal ahead of it.
-            setEventIndexBoundsOverrideForTesting(null);
-            const corpus = budgetCorpus(300);
-            await seedLegacyV2Fixture(pickleKey!, userId, DEVICE, corpus);
-
-            // No budget pressure -- isolates the accounting bug from disk-budget deletion (already
-            // covered by the test above) and from the resident budget.
-            setEventIndexBoundsOverrideForTesting(null);
-            const reloaded = track(new BrowserEventIndexManager());
-            await reloaded.initEventIndex(userId, DEVICE);
-
-            // Fired immediately, without awaiting either pass first, so they race the chunk
-            // migration's own scan -- a live write and a crawler batch, the same two concurrent-write
-            // paths the reviewer's own E7 used, both with an *older* origin_server_ts than the
-            // migration's own oldest (so the fix's Math.min-equivalent derivation is exercised, not
-            // just the byte sum).
-            const liveWrite = (async () => {
-                await reloaded.addEventToIndex(msg("$midLive", "x", { room_id: ROOM, origin_server_ts: 500_000 }), {});
-                await reloaded.commitLiveEvents();
-            })();
-            const crawlerWrite = reloaded.addHistoricEvents(
-                [{ event: msg("$midCrawl", "x", { room_id: ROOM, origin_server_ts: 400_000 }), profile: {} }],
+            // The crawler re-seeds from a known-empty state (the point of a reset): a fresh
+            // backward crawl for the same room, indexing brand-new content, works exactly as it
+            // would for a never-before-seen account.
+            await reloaded.addHistoricEvents(
+                [{ event: msg("$reseeded1", "zqreseeded fresh content one", { room_id: ROOM }), profile: {} }],
                 null,
                 null,
             );
-
-            await Promise.all([liveWrite, crawlerWrite, reloaded.waitForChunkMigration()]);
+            await reloaded.commitLiveEvents();
             await reloaded.waitForHydration();
 
-            const stats = await reloaded.getStats();
-            const rawEvents = await decryptAllChunkEvents(pickleKey!, DEVICE);
-            const chunkRows = await dumpRawStore("chunks");
-            // Independently sums every chunk's own on-disk ciphertext length, so this check does not
-            // depend on the very accounting (ciphertextBytes/chunkInfo) it is verifying.
-            const rawTotal = chunkRows.reduce((sum: number, r: any) => sum + r.blob.ct.length + r.blob.iv.length, 0);
-
-            expect(rawEvents.length).toBe(corpus.length + 2); // the two concurrent writes really landed
-            expect(stats.size).toBe(rawTotal); // exact, not merely "close" (the bug this survived two passes as)
-            expect(stats.oldestIndexedTs).toBe(400_000); // the older of the two concurrent writes, not clobbered either
+            const hit = await reloaded.searchEventIndex(search("zqreseeded"));
+            expect(hit.count).toBe(1);
+            expect((await reloaded.searchEventIndex(search("zqlegacy-only-content-0"))).count).toBe(0); // still gone
+            expect((await reloaded.getStats()).eventCount).toBe(1);
         });
     });
 
@@ -4663,7 +4544,6 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
     afterEach(async () => {
         setEventIndexBoundsOverrideForTesting(null);
         setChunkTargetBytesOverrideForTesting(null);
-        setConversionBatchPagesOverrideForTesting(null);
         for (const m of toClose.splice(0)) await m.closeEventIndex();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
@@ -4864,79 +4744,6 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         expect(survivors).toContain("$mp0"); // $mp0 is the one that survived the eviction, exactly as requested
     });
 
-    it("resumes and finishes correctly after a v2-to-v3 conversion is interrupted mid-pass", async () => {
-        // Batch size pinned to 1 (review-pr-d.md D6's own batching, getConversionBatchPages):
-        // this test wants an interruption between the *first* and *second* outer conversion page's
-        // own commit specifically, which needs each outer page to commit separately. A dedicated
-        // test below ("a conversion interrupted mid-batch loses at most one batch's progress")
-        // covers the batched-commit shape this test used to also exercise implicitly.
-        setConversionBatchPagesOverrideForTesting(1);
-        // More than one HYDRATION_PAGE_SIZE-worth of legacy events, so runChunkMigration's own
-        // paged loop genuinely spans more than one transaction -- the unit an "interruption"
-        // (a crash, or another tab's onversionchange closing the connection) can land between.
-        const total = HYDRATION_PAGE_SIZE + 50;
-        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
-            msg(`$conv${String(i).padStart(5, "0")}`, `zqconvbody ${i}`, { origin_server_ts: i }),
-        );
-        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
-        expect(await dumpRawStore("events")).toHaveLength(total);
-
-        // Let the first page's conversion transaction land for real, then fail the *next* one --
-        // exactly what a connection closing mid-pass looks like (see the R3 test's own technique).
-        const realTransaction = IDBDatabase.prototype.transaction;
-        let conversionTxSeen = 0;
-        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
-            this: IDBDatabase,
-            names,
-            mode,
-            ...rest
-        ) {
-            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
-                conversionTxSeen++;
-                if (conversionTxSeen === 2) {
-                    throw new DOMException("The database connection is closing.", "InvalidStateError");
-                }
-            }
-            return realTransaction.call(this, names, mode, ...rest);
-        });
-
-        const interrupted = track(new BrowserEventIndexManager());
-        await interrupted.initEventIndex(userId, DEVICE);
-        // Unlike waitForHydration() (whose own promise never rejects -- hydrate() catches
-        // everything internally), chunkMigrationReadyPromise is the raw promise chain
-        // runChunkMigration runs on, and the injected connection-closing error is a genuine
-        // rejection of it; hydrate()'s own independent await of the same promise is what catches
-        // it for production purposes (see the "hydration failed" log line this test's own
-        // interruption produces). Waiting for it here is only to let the interrupted pass settle
-        // before inspecting on-disk state, not a claim that it resolves cleanly.
-        await interrupted.waitForChunkMigration().catch(() => {});
-        await interrupted.waitForHydration();
-        txSpy.mockRestore();
-        await interrupted.closeEventIndex();
-
-        // A crash left a database that still opens (the version bump already happened) with some
-        // rows converted and some not: neither store's contents are asserted precisely here --
-        // only that the interruption genuinely left a resumable, partial state.
-        const remainingLegacy = await dumpRawStore("events");
-        expect(remainingLegacy.length).toBeGreaterThan(0);
-        expect(remainingLegacy.length).toBeLessThan(total);
-        expect((await dumpRawStore("chunks")).length).toBeGreaterThan(0);
-
-        // A fresh open resumes: runChunkMigrationIfNeeded's own cheap check finds the events still
-        // sitting there and picks up exactly where the crash left off, no separate cursor needed.
-        const resumed = track(new BrowserEventIndexManager());
-        await resumed.initEventIndex(userId, DEVICE);
-        await resumed.waitForChunkMigration();
-        await resumed.waitForHydration();
-
-        expect(await dumpRawStore("events")).toEqual([]); // fully converted now
-        const finalRows = await decryptAllChunkEvents(pickleKey, DEVICE);
-        expect(finalRows).toHaveLength(total);
-        expect(new Set(finalRows.map((r: any) => r.eventId)).size).toBe(total); // nothing duplicated by the resume
-        expect((await resumed.getStats()).eventCount).toBeGreaterThan(0);
-        expect((await resumed.searchEventIndex(search("zqconvbody", { limit: 10 }))).count).toBe(total);
-    }, 20000);
-
     // ---------------------------------------------------------------------------------- D1
     it("a fresh v3 install survives being closed and reopened before its first write ever commits (review-pr-d.md D1)", async () => {
         const first = track(new BrowserEventIndexManager());
@@ -4990,113 +4797,6 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         await third.waitForHydration();
         expect((await third.getStats()).eventCount).toBe(0);
     });
-
-    // ---------------------------------------------------------------------------------- D2
-    it("a resumed v2-to-v3 conversion's byte total and oldest-ts are exact, derived from disk, not a session-local tally (review-pr-d.md D2)", async () => {
-        setConversionBatchPagesOverrideForTesting(1); // one outer page per commit, so the first genuinely lands
-        const total = HYDRATION_PAGE_SIZE + 50;
-        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
-            msg(`$acct${String(i).padStart(5, "0")}`, `zqacctbody ${i}`, { origin_server_ts: i }),
-        );
-        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
-
-        const realTransaction = IDBDatabase.prototype.transaction;
-        let seen = 0;
-        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
-            this: IDBDatabase,
-            names,
-            mode,
-            ...rest
-        ) {
-            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
-                seen++;
-                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
-            }
-            return realTransaction.call(this, names, mode, ...rest);
-        });
-        const interrupted = track(new BrowserEventIndexManager());
-        await interrupted.initEventIndex(userId, DEVICE);
-        await interrupted.waitForChunkMigration().catch(() => {});
-        await interrupted.waitForHydration();
-        txSpy.mockRestore();
-        await interrupted.closeEventIndex();
-
-        const partialChunks = await dumpRawStore("chunks");
-        expect(partialChunks.length).toBeGreaterThan(0); // the first page's chunks really did commit
-
-        const resumed = track(new BrowserEventIndexManager());
-        await resumed.initEventIndex(userId, DEVICE);
-        await resumed.waitForChunkMigration();
-        await resumed.waitForHydration();
-
-        const chunkRows = await dumpRawStore("chunks");
-        const trueBytes = chunkRows.reduce((a: number, r: any) => a + r.blob.ct.length + r.blob.iv.length, 0);
-        const stats = await resumed.getStats();
-        const persisted = (await dumpRawStore("meta"))[0].diskBytes;
-        expect(stats.size).toBe(trueBytes);
-        expect(persisted).toBe(trueBytes);
-        expect(stats.oldestIndexedTs).toBe(0); // the oldest seeded ts, genuinely found on disk
-    }, 30000);
-
-    // ---------------------------------------------------------------------------------- D3
-    it("a redaction during a stalled conversion is not resurrected by the resume (review-pr-d.md D3)", async () => {
-        setConversionBatchPagesOverrideForTesting(1);
-        // Three outer pages: the first commits, the second's own commit is what throws (so its
-        // rows are read and optimistically manifested, same as the interrupted-conversion tests
-        // elsewhere), and the THIRD is never read at all -- genuinely, untouched UNCHUNKED, which
-        // is the state this test needs its victim in (an id merely *read* by a page whose own
-        // commit then failed carries a real-but-undurable chunk id in memory; redacting *that* is
-        // its own separate, narrower gap, not what this test is about -- see deleteEvent's own
-        // docstring on why its UNCHUNKED-only case is deliberately that narrow).
-        const total = HYDRATION_PAGE_SIZE * 2 + 50;
-        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
-            msg(`$red${String(i).padStart(5, "0")}`, `zqredactme ${i}`, { origin_server_ts: i }),
-        );
-        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
-
-        const realTransaction = IDBDatabase.prototype.transaction;
-        let seen = 0;
-        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
-            this: IDBDatabase,
-            names,
-            mode,
-            ...rest
-        ) {
-            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
-                seen++;
-                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
-            }
-            return realTransaction.call(this, names, mode, ...rest);
-        });
-        const interrupted = track(new BrowserEventIndexManager());
-        await interrupted.initEventIndex(userId, DEVICE);
-        await interrupted.waitForChunkMigration().catch(() => {});
-        await interrupted.waitForHydration();
-        txSpy.mockRestore();
-
-        // Pick the NEWEST-arriving id still sitting in the legacy store: with the interruption
-        // above, that is always in the third, never-read page -- genuinely still UNCHUNKED.
-        const remaining = (await dumpRawStore("events")).map((r: any) => r.eventId);
-        expect(remaining.length).toBeGreaterThan(0);
-        const victim = remaining[remaining.length - 1];
-        expect(victim).toBe(`$red${String(total - 1).padStart(5, "0")}`);
-        const removed = await interrupted.deleteEvent(victim);
-        expect(removed).toBe(true); // the fourth deleteEvent case: a genuinely UNCHUNKED id
-        await interrupted.commitLiveEvents();
-        await interrupted.closeEventIndex();
-
-        expect(await dumpRawStore("events")).not.toContainEqual(expect.objectContaining({ eventId: victim }));
-
-        const resumed = track(new BrowserEventIndexManager());
-        await resumed.initEventIndex(userId, DEVICE);
-        await resumed.waitForChunkMigration();
-        await resumed.waitForHydration();
-        expect(await dumpRawStore("events")).toEqual([]); // the resume finished converting everything else
-        const hits = await resumed.searchEventIndex(search("zqredactme", { limit: 5000 }));
-        const ids = new Set((hits.results ?? []).map((r: any) => r.result.event_id));
-        expect(ids.has(victim)).toBe(false);
-        expect(ids.size).toBe(total - 1);
-    }, 30000);
 
     // ---------------------------------------------------------------------------------- D4
     it("disk-budget eviction never drops a chunk while a chunk with a strictly older maxTs survives (review-pr-d.md D4)", async () => {
@@ -5172,7 +4872,7 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         // round-robin multi-room backward crawl produces), so each chunk's members are scattered
         // across the ts range rather than clustered together.
         setChunkTargetBytesOverrideForTesting(1600);
-        const N = HYDRATION_PAGE_SIZE * 2 + 200; // several times HYDRATION_CHUNK_BATCH
+        const N = 2200; // several times HYDRATION_CHUNK_BATCH
         const seed = track(new BrowserEventIndexManager());
         await seed.initEventIndex(userId, DEVICE);
         await seed.waitForHydration();
@@ -5210,209 +4910,6 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         expect(chunkGets).toBeLessThanOrEqual(chunkRows.length);
         expect(chunkGets).toBeGreaterThan(0);
     }, 120000);
-
-    // ---------------------------------------------------------------------------------- D6
-    it("converting a v2 database that already carries a C-shaped manifest batches manifest-page rewrites, and loses nothing (review-pr-d.md D6, kills M24)", async () => {
-        // A v2 database exactly as increment C leaves it: legacy `events` rows AND a populated
-        // manifest whose pages were filled in ARRIVAL order (C's own crawler order) and whose
-        // entries are C-shaped TRIPLES -- [eventId, ts, roomId], no fourth (chunkId) element --
-        // uncorrelated with the ascending-eventId order runChunkMigration scans in.
-        const N = MANIFEST_PAGE_SIZE * 3;
-        const salt = crypto.getRandomValues(new Uint8Array(32));
-        const dek = await deriveDek(pickleKey, salt, userId, DEVICE);
-        const ids: string[] = [];
-        const evRecords: any[] = [];
-        for (let i = 0; i < N; i++) {
-            const id = `$m${String((i * 1237) % N).padStart(6, "0")}`; // permuted vs arrival order
-            ids.push(id);
-            const ev = msg(id, `zqmanibody ${i}`, { origin_server_ts: 1000 + i });
-            const stored = {
-                event: ev,
-                profile: {},
-                roomId: ev.room_id,
-                eventId: id,
-                originServerTs: ev.origin_server_ts,
-                searchText: extractSearchText(ev),
-                hasFile: false,
-                edited: false,
-            };
-            evRecords.push({ userId, eventId: id, blob: await encryptJson(dek, stored, `${userId}|${id}`) });
-        }
-        const pageRecords: any[] = [];
-        const pageCount = Math.ceil(N / MANIFEST_PAGE_SIZE);
-        for (let p = 0; p < pageCount; p++) {
-            const slice = ids.slice(p * MANIFEST_PAGE_SIZE, (p + 1) * MANIFEST_PAGE_SIZE);
-            const entries = slice.map((id, k) => [id, 1000 + p * MANIFEST_PAGE_SIZE + k, "!room:example.org"]);
-            const key = `${userId}|manifest:${p}`;
-            pageRecords.push({ userId: key, blob: await encryptJson(dek, entries, key) });
-        }
-        await new Promise<void>((resolve, reject) => {
-            const req = indexedDB.open(EVENTINDEX_DB_NAME, 2);
-            req.onupgradeneeded = (): void => {
-                const db = req.result;
-                db.createObjectStore("meta", { keyPath: "userId" });
-                const events = db.createObjectStore("events", { keyPath: ["userId", "eventId"] });
-                events.createIndex("byUser", "userId", { unique: false });
-                const cps = db.createObjectStore("checkpoints", { keyPath: "id" });
-                cps.createIndex("byUser", "userId", { unique: false });
-            };
-            req.onerror = (): void => reject(req.error);
-            req.onsuccess = (): void => {
-                const db = req.result;
-                const tx = db.transaction(["meta", "events"], "readwrite");
-                tx.objectStore("meta").put({
-                    userId,
-                    salt: encodeBase64(salt),
-                    userVersion: 0,
-                    manifestPageCount: pageCount,
-                    diskBytes: 0,
-                });
-                for (const rec of pageRecords) tx.objectStore("meta").put(rec);
-                for (const rec of evRecords) tx.objectStore("events").put(rec);
-                tx.oncomplete = (): void => {
-                    db.close();
-                    resolve();
-                };
-                tx.onerror = (): void => {
-                    db.close();
-                    reject(tx.error);
-                };
-            };
-        });
-
-        let metaPuts = 0;
-        const realPut = IDBObjectStore.prototype.put;
-        const putSpy = vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (
-            this: IDBObjectStore,
-            ...args: any[]
-        ): IDBRequest {
-            if (this.name === "meta" && String((args[0] as any)?.userId ?? "").includes("|manifest:")) metaPuts++;
-            return (realPut as any).apply(this, args);
-        });
-
-        const m = track(new BrowserEventIndexManager());
-        await m.initEventIndex(userId, DEVICE);
-        await m.waitForChunkMigration();
-        await m.waitForHydration();
-        putSpy.mockRestore();
-
-        const conversionPages = Math.ceil(N / HYDRATION_PAGE_SIZE);
-        // The quadratic shape this fixes would write conversionPages * pageCount times (9 here);
-        // batching (CONVERSION_BATCH_PAGES=10 default, so this whole 3-page conversion fits in one
-        // batch) should write at most a small constant multiple of pageCount, not that product.
-        expect(metaPuts).toBeLessThanOrEqual(pageCount * 2);
-        expect(metaPuts).toBeLessThan(conversionPages * pageCount);
-
-        // Nothing lost: every one of the N events is still findable, which is only true if the
-        // C-shaped (chunkId-less) triples loaded as UNCHUNKED, not chunk 0 (M24) -- a wrong default
-        // of 0 would make runChunkMigration treat every id as "already converted" and skip packing
-        // it, while still deleting its legacy row (D3's own fix), silently losing every event.
-        expect(await dumpRawStore("events")).toEqual([]);
-        expect((await m.getStats()).eventCount).toBeGreaterThan(0);
-        expect((await m.searchEventIndex(search("zqmanibody", { limit: N + 10 }))).count).toBe(N);
-    }, 60000);
-
-    it("a conversion interrupted mid-batch loses at most one batch's worth of progress, and resumes correctly (review-pr-d.md D6)", async () => {
-        setConversionBatchPagesOverrideForTesting(2);
-        const total = HYDRATION_PAGE_SIZE * 2 + 30; // 3 outer pages -> 2 batches (<=2 pages, then 1)
-        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
-            msg(`$bat${String(i).padStart(6, "0")}`, `zqbatchbody ${i}`, { origin_server_ts: i }),
-        );
-        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
-
-        const realTransaction = IDBDatabase.prototype.transaction;
-        let seen = 0;
-        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
-            this: IDBDatabase,
-            names,
-            mode,
-            ...rest
-        ) {
-            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
-                seen++;
-                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
-            }
-            return realTransaction.call(this, names, mode, ...rest);
-        });
-        const interrupted = track(new BrowserEventIndexManager());
-        await interrupted.initEventIndex(userId, DEVICE);
-        await interrupted.waitForChunkMigration().catch(() => {});
-        await interrupted.waitForHydration();
-        txSpy.mockRestore();
-        await interrupted.closeEventIndex();
-
-        // The first batch (<=2 outer pages, i.e. <=2000 events) committed; the rest is still legacy.
-        const remainingLegacy = await dumpRawStore("events");
-        expect(remainingLegacy.length).toBeGreaterThan(0);
-        expect(remainingLegacy.length).toBeLessThan(total);
-        expect(remainingLegacy.length).toBeGreaterThanOrEqual(total - HYDRATION_PAGE_SIZE * 2);
-
-        const resumed = track(new BrowserEventIndexManager());
-        await resumed.initEventIndex(userId, DEVICE);
-        await resumed.waitForChunkMigration();
-        await resumed.waitForHydration();
-        expect(await dumpRawStore("events")).toEqual([]);
-        const finalRows = await decryptAllChunkEvents(pickleKey, DEVICE);
-        expect(finalRows).toHaveLength(total);
-        expect(new Set(finalRows.map((r: any) => r.eventId)).size).toBe(total);
-    }, 30000);
-
-    // ---------------------------------------------------------------------------------- D7
-    it("mid-conversion, the legacy events store still discloses one cleartext eventId per unconverted row (review-pr-d.md D7)", async () => {
-        setConversionBatchPagesOverrideForTesting(1);
-        const total = HYDRATION_PAGE_SIZE + 50;
-        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
-            msg(`$mck${String(i).padStart(5, "0")}`, `zqmidconv ${i}`, { origin_server_ts: i }),
-        );
-        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
-
-        const realTransaction = IDBDatabase.prototype.transaction;
-        let seen = 0;
-        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
-            this: IDBDatabase,
-            names,
-            mode,
-            ...rest
-        ) {
-            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
-                seen++;
-                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
-            }
-            return realTransaction.call(this, names, mode, ...rest);
-        });
-        const mid = track(new BrowserEventIndexManager());
-        await mid.initEventIndex(userId, DEVICE);
-        await mid.waitForChunkMigration().catch(() => {});
-        await mid.waitForHydration();
-        txSpy.mockRestore();
-
-        const remainingLegacy = await dumpRawStore("events");
-        expect(remainingLegacy.length).toBeGreaterThan(0);
-        expect(remainingLegacy.length).toBeLessThan(total);
-
-        const evKeys = await withRawDb((db) =>
-            idbPromise(db.transaction("events", "readonly").objectStore("events").getAllKeys()),
-        );
-        expect((evKeys as unknown[]).length).toBe(remainingLegacy.length);
-        for (const key of evKeys as Array<[string, string]>) {
-            expect(key[0]).toBe(userId);
-            expect(typeof key[1]).toBe("string"); // the cleartext eventId itself, still disclosed
-        }
-        const chunkKeys = (await withRawDb((db) =>
-            idbPromise(db.transaction("chunks", "readonly").objectStore("chunks").getAllKeys()),
-        )) as Array<[string, number]>;
-        expect(chunkKeys.length).toBeGreaterThan(0);
-        for (const key of chunkKeys) {
-            expect(key[0]).toBe(userId);
-            expect(typeof key[1]).toBe("number"); // an opaque chunk id, not an eventId
-        }
-
-        const resumed = track(new BrowserEventIndexManager());
-        await resumed.initEventIndex(userId, DEVICE);
-        await resumed.waitForChunkMigration();
-        await resumed.waitForHydration();
-        expect(await dumpRawStore("events")).toEqual([]); // the disclosure does not recur once finished
-    }, 30000);
 
     // -------------------------------------------------------------- mutation-gap regressions
     it("an update landing on an already-sealed chunk rewrites that chunk, not the open one (kills M3)", async () => {

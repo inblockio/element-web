@@ -133,3 +133,5 @@ Builds a client-side search index so that Search works in encrypted rooms withou
 Message content is encrypted at rest under a key tied to the current session, which is discarded on logout. The index covers message bodies, filenames and caption text, but not the contents of media or other attachments. It is populated by a background crawler, so search results may be incomplete until crawling has finished. This flag can be set via `config.json` to enable the feature for a whole deployment.
 
 The crawler and the amount kept in memory are both bounded: history older than 90 days, and rooms past the most-recently-active 100 (desktop) or 20 (memory-constrained devices), are not crawled, and once the in-memory or on-disk budget for a device's tier is reached, older content is left un-indexed for now rather than searched; Search states the covered date when this applies.
+
+Upgrading an existing index to a newer storage format resets it rather than converting it in place, so search coverage restarts from the crawl window above and rebuilds in the background exactly as it did the first time the feature was enabled.
