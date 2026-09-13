@@ -60,6 +60,16 @@ export interface IIndexStats {
     size: number;
     eventCount: number;
     roomCount: number;
+    /**
+     * True while historic events are still being decrypted and loaded from disk into memory, in
+     * the background, after {@link BaseEventIndexManager.initEventIndex} has already returned;
+     * false once nothing more is pending (including immediately, if there was never anything to
+     * load). `eventCount`/`roomCount`/`size` above are always answered from what is resident right
+     * now, so they climb while this is true rather than reporting the eventual total early. Optional
+     * because a backend that restores synchronously, such as desktop's Seshat, has nothing to report
+     * here and every caller must treat "not present" the same as `false`.
+     */
+    loading?: boolean;
 }
 
 /**
