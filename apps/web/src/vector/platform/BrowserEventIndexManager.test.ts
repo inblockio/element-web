@@ -2342,6 +2342,9 @@ describe("BrowserEventIndexManager (increment B correctness: stats, prefix, subs
     let userCounter = 0;
     let userId: string;
 
+    const search = (term: string, overrides: Record<string, unknown> = {}): any =>
+        ({ search_term: term, ...SEARCH_DEFAULTS, ...overrides }) as any;
+
     beforeEach(() => {
         vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
         // No IndexedDB stubbing and no pickle key: these tests are about the in-memory index
@@ -2377,6 +2380,52 @@ describe("BrowserEventIndexManager (increment B correctness: stats, prefix, subs
 
         expect(stats.eventCount).toBe(5000);
         expect(stats.roomCount).toBe(rooms.length);
+    });
+
+    it("prefix query results match an independent term-startsWith scan over a random corpus", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+
+        // A random, low-cardinality vocabulary so prefixes have several matches and ties in
+        // sorted order are exercised, independent of the deliberately-crafted marker corpus the
+        // (at scale) describe below uses.
+        const alphabet = "abcdefghij";
+        const randomWord = (): string => {
+            const len = 3 + Math.floor(Math.random() * 4);
+            let w = "";
+            for (let i = 0; i < len; i++) w += alphabet[Math.floor(Math.random() * alphabet.length)];
+            return w;
+        };
+        const words = Array.from({ length: 40 }, randomWord);
+        const roomId = "!randomprefix:example.org";
+        const bodies: string[] = [];
+        for (let i = 0; i < 250; i++) {
+            const pickCount = 3 + Math.floor(Math.random() * 4);
+            const body = Array.from({ length: pickCount }, () => words[Math.floor(Math.random() * words.length)]).join(
+                " ",
+            );
+            bodies.push(body);
+            await manager.addEventToIndex(msg(`$rp${i}`, body, { room_id: roomId, origin_server_ts: i }), {});
+        }
+
+        // Reference: an independent scan using the same exported tokenize() the index itself
+        // uses (so folding/splitting rules match), computed fresh from the raw bodies rather
+        // than from anything the manager built -- the "old O(V) scan" this change replaced,
+        // re-derived from source data instead of from the code under test.
+        const referenceHits = (prefix: string): string[] =>
+            bodies
+                .map((body, i) => (tokenize(body).some((t) => t.startsWith(prefix)) ? `$rp${i}` : undefined))
+                .filter((id): id is string => id !== undefined);
+
+        const prefixes = new Set<string>();
+        for (const w of words) for (let len = 2; len <= w.length; len++) prefixes.add(w.slice(0, len));
+
+        for (const prefix of prefixes) {
+            const expected = referenceHits(prefix).sort();
+            const hit = await manager.searchEventIndex(search(prefix, { limit: bodies.length }));
+            const actual = (hit.results ?? []).map((r) => r.result.event_id).sort();
+            expect(actual).toEqual(expected);
+        }
     });
 });
 

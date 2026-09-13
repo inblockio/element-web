@@ -796,6 +796,22 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private readonly inverted = new Map<string, Set<string>>();
     /**
+     * Every term currently in {@link inverted}, sorted, for {@link lookupToken}'s prefix path to binary-search
+     * instead of walking the whole vocabulary. Rebuilt lazily by {@link ensureSortedVocabulary} rather than kept in
+     * sync on every insert: a term's sort position never changes while it exists, so nothing here needs to move
+     * until a term is *added* or *removed* from {@link inverted}'s key set, which {@link vocabularyDirty} tracks.
+     */
+    private readonly sortedVocabulary: string[] = [];
+    /**
+     * True when {@link inverted}'s key set has changed (a term added or its posting set emptied) since {@link
+     * sortedVocabulary} was last rebuilt. Checked, and cleared, by {@link ensureSortedVocabulary} -- set by {@link
+     * indexTokens} and {@link unindexTokens} only, and only on the add/remove-a-key edge, never on an existing term
+     * merely gaining or losing a posting. This is what makes the rebuild "at most once per query burst": several
+     * prefix lookups in the same {@link searchEventIndex} call, or several calls with no intervening write, share one
+     * rebuild.
+     */
+    private vocabularyDirty = false;
+    /**
      * Room id -> that room's record ids, ordered by `origin_server_ts` ascending. The ordering is an invariant,
      * maintained by {@link insertRoomOrder} and repaired by {@link reindexRoomOrder}; {@link contextFor} and {@link
      * loadFileEvents} depend on it.
@@ -1842,6 +1858,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * rather than a convention: both re-tokenise the text they are given, so removing a record's terms requires passing
      * the *same text it was indexed with* -- which is why {@link upsertEvent} unindexes before it overwrites
      * `searchText`, never after.
+     *
+     * Sets {@link vocabularyDirty} exactly when a *new* term enters {@link inverted}'s key set, never when an existing
+     * term merely gains another posting: that is the only edge {@link sortedVocabulary} needs to hear about, since a
+     * term's sort position is a property of the string alone and cannot change while it stays in the map.
      */
     private indexTokens(eventId: string, text: string): void {
         for (const token of tokenize(text)) {
@@ -1849,6 +1869,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             if (!set) {
                 set = new Set();
                 this.inverted.set(token, set);
+                this.vocabularyDirty = true;
             }
             set.add(eventId);
         }
@@ -1858,14 +1879,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * Remove a record's terms from the inverted index, passing the exact text the record was indexed with; see {@link
      * indexTokens}. A term whose posting set empties is deleted rather than left behind: {@link lookupToken} walks the
      * entire vocabulary on every prefix query, so dead terms would make queries progressively slower for the life of
-     * the session.
+     * the session -- and, since this increment, would also linger in {@link sortedVocabulary} as a term with an empty
+     * posting set, so this sets {@link vocabularyDirty} on exactly that edge for the same reason {@link indexTokens}
+     * does on the opposite one.
      */
     private unindexTokens(eventId: string, text: string): void {
         for (const token of tokenize(text)) {
             const set = this.inverted.get(token);
             if (!set) continue;
             set.delete(eventId);
-            if (set.size === 0) this.inverted.delete(token);
+            if (set.size === 0) {
+                this.inverted.delete(token);
+                this.vocabularyDirty = true;
+            }
         }
     }
 
@@ -1911,9 +1937,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * {@link searchEventIndex} adopts this object directly as the running intersection for the first term.
      *
      * @param prefix - When true, indexed terms that *start with* `token` match as well as the exact term, so typing
-     *     "mess" already finds "message". It costs a walk over the whole vocabulary, which is why the caller passes
-     *     false for single-character terms; the inner length check repeats that condition, so the prefix walk is
-     *     unreachable for one-character terms.
+     *     "mess" already finds "message". Answered by binary-searching {@link sortedVocabulary} for the contiguous
+     *     range of terms starting with `token` ({@link vocabularyRange}) rather than walking the whole vocabulary,
+     *     which is why the caller passes false for single-character terms; the inner length check repeats that
+     *     condition, so the prefix walk is unreachable for one-character terms.
      */
     private lookupToken(token: string, prefix: boolean): Set<string> {
         if (!prefix) return new Set(this.inverted.get(token) ?? []);
@@ -1921,13 +1948,58 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const exact = this.inverted.get(token);
         if (exact) for (const id of exact) out.add(id);
         if (token.length >= 2) {
-            for (const [idx, ids] of this.inverted) {
-                if (idx !== token && idx.startsWith(token)) {
-                    for (const id of ids) out.add(id);
-                }
+            this.ensureSortedVocabulary();
+            const [start, end] = this.vocabularyRange(token);
+            for (let i = start; i < end; i++) {
+                const term = this.sortedVocabulary[i];
+                if (term === token) continue; // Exact match already added above.
+                const ids = this.inverted.get(term);
+                if (ids) for (const id of ids) out.add(id);
             }
         }
         return out;
+    }
+
+    /**
+     * Rebuild {@link sortedVocabulary} from {@link inverted}'s current key set if a term has been added to or removed
+     * from it since the last rebuild ({@link vocabularyDirty}); otherwise a no-op. Called at the top of every prefix
+     * lookup ({@link lookupToken}) rather than eagerly on every write, so a multi-term query, or several queries in a
+     * row with no intervening index change, share one O(V log V) sort rather than paying it again per term or per
+     * keystroke -- "rebuilt at most once per query burst".
+     */
+    private ensureSortedVocabulary(): void {
+        if (!this.vocabularyDirty) return;
+        this.sortedVocabulary.length = 0;
+        for (const term of this.inverted.keys()) this.sortedVocabulary.push(term);
+        this.sortedVocabulary.sort();
+        this.vocabularyDirty = false;
+    }
+
+    /**
+     * The `[start, end)` index range within {@link sortedVocabulary} of every term that starts with `prefix`, found by
+     * two binary searches rather than one O(V) linear scan. Every indexed term is drawn from `\p{L}\p{N}_` ({@link
+     * tokenize}'s split pattern), which cannot contain the U+FFFF noncharacter, so appending it to `prefix` produces
+     * a string that every prefix-matching term sorts strictly before and every non-matching term at or after -- the
+     * standard "lower bound of prefix, lower bound of prefix + a sentinel higher than any real character" technique
+     * for a contiguous prefix range in a sorted array. Caller must have called {@link ensureSortedVocabulary} first.
+     */
+    private vocabularyRange(prefix: string): [number, number] {
+        return [this.lowerBoundVocabulary(prefix), this.lowerBoundVocabulary(prefix + "\uFFFF")];
+    }
+
+    /**
+     * The first index in {@link sortedVocabulary} whose term is `>= target`, or the array's length if none is -- a
+     * plain binary search. {@link vocabularyRange} calls it twice to bound one prefix's contiguous run.
+     */
+    private lowerBoundVocabulary(target: string): number {
+        let lo = 0;
+        let hi = this.sortedVocabulary.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (this.sortedVocabulary[mid] < target) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
     }
 
     /**
@@ -2589,8 +2661,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * would do to itself if called mid-run (a hydration loop that just wiped everything would then see its own epoch
      * as stale on its very next check and abort before finishing the wipe it was in the middle of).
      *
-     * {@link plainTextByteEstimate} is cleared here rather than in {@link resetMemory}, alongside {@link events}: it
-     * mirrors derived state of exactly that structure, so it belongs with the group hydrate populates.
+     * {@link sortedVocabulary}, {@link vocabularyDirty} and {@link plainTextByteEstimate} are cleared here rather than
+     * in {@link resetMemory}, alongside {@link inverted} and {@link events}: all three mirror derived state of
+     * exactly those two structures, so they belong with the group hydrate populates, not with the broader session
+     * reset below.
      */
     private clearIndexMaps(): void {
         this.events.clear();
@@ -2603,6 +2677,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.pendingRedactions.clear();
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;
+        this.sortedVocabulary.length = 0;
+        this.vocabularyDirty = false;
     }
 
     /**
