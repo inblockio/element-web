@@ -134,4 +134,6 @@ Message content is encrypted at rest under a key tied to the current session, wh
 
 Two limits are worth stating plainly. The index is a **recency window**, not your whole history: it holds what the crawler has reached in the most recent rooms, so old messages can be outside its reach. And because the tokeniser splits on characters that CJK text does not use, **CJK text is matched by a substring scan only**, which is slower than the term index and gets slower as the index grows.
 
+Concretely, the crawler and the amount kept in memory are both bounded: history older than 90 days, and rooms past the most-recently-active 100 (desktop) or 20 (memory-constrained devices), are not crawled, and once the in-memory or on-disk budget for a device's tier is reached, older content is left un-indexed for now rather than searched. Search states the covered date when this applies.
+
 See [Encrypted message search in the browser](web-event-index.md) for the design, the browser limits it works within, and the performance measurements behind it.
