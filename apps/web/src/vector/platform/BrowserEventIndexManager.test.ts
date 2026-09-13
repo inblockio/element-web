@@ -2427,6 +2427,22 @@ describe("BrowserEventIndexManager (increment B correctness: stats, prefix, subs
             expect(actual).toEqual(expected);
         }
     });
+
+    it("substring fallback reflects text edited moments earlier, with no per-record memo to go stale (accented text)", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$acc", "Meet at Café Zürich"), {});
+        // A fragment from the middle of the folded word "zurich" that no term starts with, so
+        // only the substring fallback can find it.
+        expect((await manager.searchEventIndex(search("uric"))).count).toBe(1);
+
+        await manager.addEventToIndex(edit("$editacc", "$acc", "Meet at Café Genève instead"), {});
+        // The old fragment is gone -- correctly, since a memo re-serving a stale fold would
+        // instead keep finding it -- and the new body's own fold-sensitive fragment (inside
+        // folded "geneve") is found instead.
+        expect((await manager.searchEventIndex(search("uric"))).count).toBe(0);
+        expect((await manager.searchEventIndex(search("nev"))).count).toBe(1);
+    });
 });
 
 /**

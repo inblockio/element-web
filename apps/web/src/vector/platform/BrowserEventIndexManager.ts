@@ -837,12 +837,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private plainTextByteEstimate = 0;
     /**
-     * Memo of {@link foldText} over each record's {@link StoredEvent.searchText}, for the substring fallback; see
-     * {@link foldedFor}. Purely derived, never persisted, and validated against the text it was computed from rather
-     * than invalidated by hand.
-     */
-    private readonly foldedSearchText = new Map<string, { src: string; folded: string }>();
-    /**
      * Ciphertext size of each event record *as it currently sits on disk*, which is what makes {@link ciphertextBytes}
      * a sum rather than a tally of everything ever written. Maintained only from inside the persistence chain, since a
      * record's size is not known until it has been encrypted, so it is empty in a memory-only session where {@link
@@ -1821,10 +1815,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
     /**
      * Remove a record from every in-memory structure at once, because they have to stay consistent or later reads break
-     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link foldedSearchText}, {@link editTargets},
-     * {@link roomOrder} (whose entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed} need
-     * not check for emptiness), and {@link plainTextByteEstimate}. {@link recordBytes} is the exception, describing
-     * what is on *disk*, where the row survives until the delete this caller queues has committed.
+     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link editTargets}, {@link roomOrder} (whose
+     * entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed} need not check for
+     * emptiness), and {@link plainTextByteEstimate}. {@link recordBytes} is the exception, describing what is on
+     * *disk*, where the row survives until the delete this caller queues has committed.
      *
      * Also drops `eventId` from {@link liveWriteBuffer}, if it is there: a redaction or removal that raced a buffered,
      * not-yet-flushed live write must win outright, not have that write land afterwards and resurrect what this call
@@ -1842,7 +1836,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.unindexTokens(eventId, existing.searchText);
         this.events.delete(eventId);
         this.plainTextByteEstimate -= existing.searchText.length + 64;
-        this.foldedSearchText.delete(eventId);
         this.liveWriteBuffer.delete(eventId);
         for (const editId of existing.editIds ?? []) this.editTargets.delete(editId);
         const list = this.roomOrder.get(existing.roomId);
@@ -1899,13 +1892,28 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * The fallback matcher: a linear scan for the query as a literal substring of stored text. Reached only when the
      * term path in {@link searchEventIndex} produced nothing, it covers what whole-word terms plus prefix matching
      * cannot reach at all -- a fragment from the middle of a word, a query whose punctuation split it into terms that
-     * never co-occur, and scripts written without word separators. The three-character floor keeps it affordable, and
-     * {@link foldedFor} memoises each record's folded text so the folding is not repeated per query. Whitespace runs in
-     * the query are collapsed to single spaces and the result trimmed. That normalises the *query* side only: stored
-     * text is folded but never whitespace-normalised, so a multi-word query matches only where the stored text
-     * separates those words by exactly single spaces -- a body holding a newline between `hello` and `world` is not
-     * found by `hello world`. The words must appear adjacent and in order; this is a substring test, not a looser
-     * second term search.
+     * never co-occur, and scripts written without word separators. The three-character floor keeps it affordable.
+     * Whitespace runs in the query are collapsed to single spaces and the result trimmed. That normalises the *query*
+     * side only: stored text is folded but never whitespace-normalised, so a multi-word query matches only where the
+     * stored text separates those words by exactly single spaces -- a body holding a newline between `hello` and
+     * `world` is not found by `hello world`. The words must appear adjacent and in order; this is a substring test,
+     * not a looser second term search.
+     *
+     * Folds each candidate's {@link StoredEvent.searchText} on demand ({@link foldText}) rather than from a
+     * per-record memo, which this increment deleted, and deliberately keeps no bounded cache in its place --
+     * `research/measurements-pr-b.md` has the numbers and the reasoning; the short version: at 200k events this
+     * measured ~2.6x slower than the memoised baseline's 48.81ms (`research/measurements-v1.md` §3.3), a real
+     * regression, not a negligible one. A bounded cache was evaluated and rejected rather than tried blindly: this
+     * method (unlike {@link searchEventIndex}'s callers of it, which may pass a `roomId`) is reached, unscoped, by a
+     * global search, and one full call already touches every resident record once -- so any cache capped well below
+     * the resident count is evicted-and-refilled within a *single* call's own scan before a second call could ever
+     * reuse it, and a cache large enough not to be is, at the sizes where this matters, indistinguishable from the
+     * unbounded per-event memo this change exists to remove (including its up to +1.4 KB/event cost for accented
+     * Latin text, `research/browser-limits-model.md` §2.4). The regression is accepted rather than chased with a
+     * cache that cannot pay for itself at this path's own worst case: substring is already the documented
+     * last-resort fallback (reached only once the term/prefix path finds nothing at all), already flagged as close
+     * to the long-task ceiling even with the memo, and the memo's memory cost scaled with every resident record
+     * whether or not it was ever substring-queried, which is the more universal cost of the two.
      */
     private substringHits(rawQuery: string, roomId?: string): Set<string> {
         const folded = foldText(rawQuery).replace(/\s+/g, " ").trim();
@@ -1913,23 +1921,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (folded.length < 3) return out;
         for (const ev of this.events.values()) {
             if (roomId && ev.roomId !== roomId) continue;
-            if (this.foldedFor(ev).includes(folded)) out.add(ev.eventId);
+            if (foldText(ev.searchText).includes(folded)) out.add(ev.eventId);
         }
         return out;
-    }
-
-    /**
-     * One record's search text, folded, from the memo. The memo stores the text it was folded from beside the result
-     * and re-folds when the two no longer match, rather than being invalidated wherever {@link StoredEvent.searchText}
-     * is written. That is why it is safe: a cache updated at each of those four assignments would be one forgotten line
-     * away from serving a stale body to the substring fallback, which fails silently.
-     */
-    private foldedFor(ev: StoredEvent): string {
-        const memo = this.foldedSearchText.get(ev.eventId);
-        if (memo && memo.src === ev.searchText) return memo.folded;
-        const folded = foldText(ev.searchText);
-        this.foldedSearchText.set(ev.eventId, { src: ev.searchText, folded });
-        return folded;
     }
 
     /**
@@ -2669,7 +2663,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private clearIndexMaps(): void {
         this.events.clear();
         this.editTargets.clear();
-        this.foldedSearchText.clear();
         this.inverted.clear();
         this.roomOrder.clear();
         this.ciphertextBytes = 0;
