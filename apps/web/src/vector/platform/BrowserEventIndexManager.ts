@@ -109,7 +109,7 @@ import BaseEventIndexManager, {
 } from "../../indexing/BaseEventIndexManager";
 import PlatformPeg from "../../PlatformPeg";
 import SettingsStore from "../../settings/SettingsStore";
-import { DAY_MS, getChunkTargetBytes, getEventIndexBounds } from "./eventIndexBounds";
+import { DAY_MS, getChunkTargetBytes, getConversionBatchPages, getEventIndexBounds } from "./eventIndexBounds";
 
 const log = logger.getChild("BrowserEventIndex");
 
@@ -876,18 +876,39 @@ function idbReq<T>(req: IDBRequest<T>): Promise<T> {
 }
 
 /**
- * Rows read per IndexedDB page during hydration ({@link BrowserEventIndexManager.hydrate}), each
- * fetched by one `getAll()` call in its own read-only transaction. Sized to keep that one call --
- * IndexedDB read plus structured-clone deserialisation, which can land in a single main-thread task
- * -- comfortably under the 50 ms long-task ceiling: measured at ~20 µs/event for `getAll` on this
- * schema at 200k rows (`research/measurements-v1.md` §3.2), so 1,000 rows is ~20 ms, leaving margin
- * for slower hardware. Revisit alongside a future chunked schema, which changes what a page reads.
+ * Rows read per IndexedDB page by the two legacy-`events`-store scans that still use it --
+ * {@link BrowserEventIndexManager.runManifestMigration} (C's self-heal) and {@link
+ * BrowserEventIndexManager.runChunkMigration} (the v2-to-v3 conversion) -- each fetched by one
+ * `getAll()` call in its own read-only transaction. Sized to keep that one call -- IndexedDB read
+ * plus structured-clone deserialisation, which can land in a single main-thread task -- comfortably
+ * under the 50 ms long-task ceiling: measured at ~20 µs/event for `getAll` on this schema at 200k
+ * rows (`research/measurements-v1.md` §3.2), so 1,000 rows is ~20 ms, leaving margin for slower
+ * hardware.
+ *
+ * **No longer read by {@link BrowserEventIndexManager.hydrate} itself** (review-pr-d.md D5):
+ * hydration walks chunks, not manifest ids one page at a time, since increment D -- see {@link
+ * HYDRATION_CHUNK_BATCH} for hydrate's own batching unit.
  *
  * @knipignore - exported so a test can seed more than one page's worth of rows without waiting on
  *     a production-sized restore; the multi-page resume branch in {@link userEventKeyRange} is
  *     otherwise never exercised by any fixture small enough to run quickly.
  */
 export const HYDRATION_PAGE_SIZE = 1000;
+
+/**
+ * Distinct chunks {@link BrowserEventIndexManager.hydrate} reads together in one read-only
+ * transaction before decrypting any of them (review-pr-d.md D5 fix; `research/SYNTHESIS.md` §3.4's
+ * own "pages of ~64 chunks (~4 MB)" recommendation). Hydration walks the full set of chunks this
+ * user has, newest-member-first, computed once from the already-resident {@link
+ * BrowserEventIndexManager.manifest}/{@link BrowserEventIndexManager.chunkMembers} with no I/O;
+ * this constant only bounds how many of that walk's chunk *reads* share one transaction, trading a
+ * larger in-flight ciphertext batch (bounded: at most this many chunks' worth, on the order of
+ * `HYDRATION_CHUNK_BATCH * CHUNK_TARGET_BYTES` plaintext once decrypted) for far fewer transactions
+ * than one-per-chunk. Every chunk in the walk is still read and decrypted **at most once** for the
+ * whole restore regardless of this number -- it is a transaction-batching knob, not a correctness
+ * or caching one.
+ */
+const HYDRATION_CHUNK_BATCH = 64;
 
 /**
  * How long one hydration slice may run before {@link yieldToEventLoop} hands control back to the
@@ -1189,55 +1210,11 @@ function heapPopMinTs(heap: TsEntry[]): TsEntry | undefined {
     return top;
 }
 
-/**
- * One page's current head in the k-way merge {@link BrowserEventIndexManager.hydrate} runs over
- * per-page-sorted manifest pages (review-pr-c.md C2-F1): which page it came from, and its position
- * within that page's own sorted-by-`ts`-descending id array, so the merge can push that page's next
- * entry back onto the heap once this one is popped.
- */
-interface ManifestMergeHead {
-    ts: number;
-    page: number;
-    pos: number;
-}
-
-/**
- * Push onto a max-heap (by `ts`) of {@link ManifestMergeHead}s -- the same array-backed binary heap
- * shape as {@link heapPushTs}, but max- rather than min-ordered: the k-way merge needs the *newest*
- * of the pages' current heads first, not the oldest, and carries page/position rather than an id.
- */
-function mergeHeapPush(heap: ManifestMergeHead[], entry: ManifestMergeHead): void {
-    heap.push(entry);
-    let i = heap.length - 1;
-    while (i > 0) {
-        const parent = (i - 1) >> 1;
-        if (heap[parent].ts >= heap[i].ts) break;
-        [heap[parent], heap[i]] = [heap[i], heap[parent]];
-        i = parent;
-    }
-}
-
-/** Pop and return the entry with the largest `ts`, or `undefined` if `heap` is empty. */
-function mergeHeapPop(heap: ManifestMergeHead[]): ManifestMergeHead | undefined {
-    if (heap.length === 0) return undefined;
-    const top = heap[0];
-    const last = heap.pop()!;
-    if (heap.length > 0) {
-        heap[0] = last;
-        let i = 0;
-        for (;;) {
-            const l = i * 2 + 1;
-            const r = i * 2 + 2;
-            let largest = i;
-            if (l < heap.length && heap[l].ts > heap[largest].ts) largest = l;
-            if (r < heap.length && heap[r].ts > heap[largest].ts) largest = r;
-            if (largest === i) break;
-            [heap[i], heap[largest]] = [heap[largest], heap[i]];
-            i = largest;
-        }
-    }
-    return top;
-}
+// The per-page-sort + k-way merge that used to live here (review-pr-c.md C2-F1) was removed when
+// BrowserEventIndexManager.hydrate stopped walking the manifest id-by-id and started walking
+// chunks instead (review-pr-d.md D5): a chunk-ordered walk needs only a sort of the (far smaller)
+// distinct-chunk-id set, not a merge over every manifest page's own sorted ids. See hydrate's own
+// docstring.
 
 /**
  * Drop the entire index database, for every user of this origin. Used only where per-user deletion cannot work or has
@@ -1892,10 +1869,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
         if (this.persistEnabled && this.db && this.dek) {
             if (!existingMeta) {
+                // manifestPageCount: 0 (and nextChunkId: 0) written right here, at creation, not left
+                // absent for a later flush to fill in: without it, a fresh v3 install closed before its
+                // first write commits leaves a meta row indistinguishable from "pre-manifest schema v2",
+                // and the next open would dispatch to runManifestMigration, which throws trying to open
+                // a transaction on the `events` store openDb never created for a fresh v3 database
+                // (review-pr-d.md D1). "A manifest exists and is empty" -- exactly what a fresh install
+                // and a just-wiped index both are -- must be representable, per MetaRecord.manifestPageCount's
+                // own docstring.
                 await this.saveMeta({
                     userId,
                     salt: encodeBase64(salt),
                     userVersion: this.userVersion,
+                    manifestPageCount: 0,
+                    nextChunkId: 0,
                 });
                 // Asked once, right here at creation, never again on a later re-open of this same
                 // index (see storagePersisted's docstring). Fire-and-forget: some browsers show a
@@ -1970,6 +1957,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userId,
                     salt: encodeBase64(salt),
                     userVersion: 0,
+                    manifestPageCount: 0,
+                    nextChunkId: this.nextChunkId,
                 });
                 this.userVersion = 0;
                 this.hydrating = false; // Nothing will hydrate after a wipe; the restore this flag guarded is over.
@@ -2050,8 +2039,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * visited. `materializeIfPending` gates on the same {@link residentBudgetExceeded} condition internally, so this
      * check is only ever an optimisation, never a correctness gate of its own.
      *
-     * @returns True if a record was removed; false when nothing matched (including a redaction just parked for later,
-     *     which has removed nothing *yet*) and also when the index is closed, which callers do not need to distinguish.
+     * A fourth case, checked once the first three have failed to resolve anything: `eventId`'s own manifest entry
+     * (never an edit's -- edits are never separately manifested, only folded into their original's record) is still
+     * {@link UNCHUNKED}, i.e. this id is a real, on-disk, not-yet-converted legacy row. {@link materializeIfPending}
+     * cannot bring such a row resident at all (its own guard returns immediately for {@link UNCHUNKED}), so without
+     * this case the redaction would silently resolve to nothing and a resumed conversion would later pack the
+     * pre-redaction content right back into a chunk -- review-pr-d.md D3, "a redaction that comes back from the
+     * dead". The legacy row is deleted directly via {@link enqueueDeleteRecord}, which now handles {@link UNCHUNKED}
+     * targets itself.
+     *
+     * @returns True if a record was removed (resident, or a legacy row deleted directly by the fourth case above);
+     *     false when nothing matched (including a redaction just parked for later, which has removed nothing *yet*)
+     *     and also when the index is closed, which callers do not need to distinguish.
      */
     public async deleteEvent(eventId: string): Promise<boolean> {
         if (this.closed) return false;
@@ -2062,6 +2061,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
         }
         if (targetId === undefined) {
+            if (this.manifest.get(eventId)?.chunkId === UNCHUNKED && this.persistEnabled && this.db && this.userId) {
+                this.enqueueDeleteRecord(this.userId, eventId);
+                return true;
+            }
             if (this.hydrating || this.residentBudgetExceeded) this.pendingRedactions.add(eventId);
             return false;
         }
@@ -3265,17 +3268,41 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * Schema v3's shape for this: rewrite the *chunk* that currently holds `targetId` without it --
      * decrypt (bounded: at most one chunk, {@link CHUNK_TARGET_BYTES} of plaintext), drop the one
      * entry, re-encrypt, write back -- or, if that was the chunk's last member, delete the chunk row
-     * outright rather than storing an empty ciphertext. A no-op if `targetId` never reached disk at
-     * all (no manifest entry -- still buffered, or its chunk is still {@link UNCHUNKED} mid
-     * conversion, in which case {@link runChunkMigrationIfNeeded} simply never converts an id
-     * {@link removeFromIndex} has already dropped from {@link events}).
+     * outright rather than storing an empty ciphertext.
+     *
+     * **A no-op only if `targetId` never reached disk at all** (no manifest entry -- still
+     * buffered). An id whose manifest entry is still {@link UNCHUNKED} (mid v2-to-v3 conversion) is
+     * NOT a no-op: its only disk copy is the legacy `events` row, and that row is deleted directly,
+     * synchronously with {@link manifestRemove} and before this method's first `await` -- so a
+     * concurrent {@link runChunkMigration} pass that re-checks the manifest for this same id (which
+     * it must, per its own docstring) sees the removal no later than the next await boundary either
+     * side of this call could land on. Earlier, this branch dropped only the manifest entry and left
+     * the legacy row for a resumed conversion to find and pack right back into a chunk -- the exact
+     * "a redaction comes back from the dead" failure review-pr-d.md D3 found: a stalled conversion
+     * left `deleteEvent` nothing resident to remove (schema v3 cannot materialize an UNCHUNKED id at
+     * all, see {@link materializeIfPending}'s own `chunkId === UNCHUNKED` guard) and the resume
+     * un-redacted it.
      */
     private enqueueDeleteRecord(userId: string, targetId: string): void {
         this.enqueuePersist(async () => {
             const dek = this.dek;
             const entry = this.manifest.get(targetId);
-            if (!entry || entry.chunkId === UNCHUNKED || !dek || !this.db) {
+            if (!entry) return; // Never reached disk at all -- still buffered only.
+            if (!dek || !this.db) {
                 this.manifestRemove(targetId);
+                return;
+            }
+            if (entry.chunkId === UNCHUNKED) {
+                this.manifestRemove(targetId);
+                if (this.db.objectStoreNames.contains("events")) {
+                    const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
+                    const meta = await this.loadMeta(userId);
+                    const tx = this.db.transaction(["events", "meta"], "readwrite");
+                    tx.objectStore("events").delete([userId, targetId]);
+                    for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+                    if (meta) tx.objectStore("meta").put({ ...meta, manifestPageCount: this.manifestPages.length });
+                    await txDone(tx);
+                }
                 return;
             }
             const chunkId = entry.chunkId;
@@ -3321,7 +3348,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             this.ciphertextBytes = newTotal;
             if (newInfo) {
                 this.chunkInfo.set(chunkId, newInfo);
-                heapPushTs(this.diskChunkHeap, { ts: newInfo.minTs, id: String(chunkId) });
+                heapPushTs(this.diskChunkHeap, { ts: newInfo.maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
             } else {
                 this.chunkInfo.delete(chunkId);
                 if (wasOpen) {
@@ -3591,7 +3618,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (!this.chunkInfo.has(chunkId)) {
             const { minTs, maxTs } = tsRangeOf(entries);
             this.chunkInfo.set(chunkId, { bytes: row.blob.ct.length + row.blob.iv.length, minTs, maxTs });
-            heapPushTs(this.diskChunkHeap, { ts: minTs, id: String(chunkId) });
+            heapPushTs(this.diskChunkHeap, { ts: maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
         }
         return entries;
     }
@@ -3788,7 +3815,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.oldestIndexedTs = newOldest;
         for (const u of chunkInfoUpdates) {
             this.chunkInfo.set(u.chunkId, { bytes: u.bytes, minTs: u.minTs, maxTs: u.maxTs });
-            heapPushTs(this.diskChunkHeap, { ts: u.minTs, id: String(u.chunkId) });
+            heapPushTs(this.diskChunkHeap, { ts: u.maxTs, id: String(u.chunkId) }); // D4: order by maxTs, not minTs.
         }
         for (const { id, stored } of live) {
             // Only now, once the write has actually committed, does this id become an eviction
@@ -3983,7 +4010,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 log.warn("EventIndex: a manifest page could not be decrypted; wiping leftover for this user");
                 this.clearIndexMaps();
                 await this.deleteUserRecords(userId);
-                await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                await this.saveMeta({
+                    userId,
+                    salt: encodeBase64(salt),
+                    userVersion: 0,
+                    manifestPageCount: 0,
+                    nextChunkId: this.nextChunkId,
+                });
                 this.userVersion = 0;
                 this.manifestLoaded = true;
                 return;
@@ -4022,7 +4055,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             );
             this.clearIndexMaps();
             await this.deleteUserRecords(userId);
-            await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+            await this.saveMeta({
+                userId,
+                salt: encodeBase64(salt),
+                userVersion: 0,
+                manifestPageCount: 0,
+                nextChunkId: this.nextChunkId,
+            });
             this.userVersion = 0;
             this.manifestLoaded = true;
             return;
@@ -4078,6 +4117,32 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         salt: Uint8Array<ArrayBuffer>,
         epoch: number,
     ): Promise<void> {
+        // A fresh v3 install, or an index just wiped by any of this class's own wipe paths, has no
+        // legacy `events` store to scan at all -- openDb only creates one for a database being
+        // upgraded from a version that could have written to it (its own docstring), never for a
+        // brand-new v3 database. Reaching this method at all (initEventIndex dispatches here
+        // whenever a meta row exists with no manifestPageCount) used to assume `events` exists and
+        // threw NotFoundError opening a transaction on a store that was never created -- on the
+        // second open of ANY freshly-created v3 database, and on every open after a wipe
+        // (review-pr-d.md D1). Give this the same short-circuit runChunkMigrationIfNeeded already
+        // has: nothing to scan means the manifest simply is empty, which must be *persisted* as
+        // such (`manifestPageCount: 0`), not left absent, or the very next open lands right back
+        // here. initEventIndex's own fresh-install save and every wipe path now write
+        // `manifestPageCount: 0` themselves too, so this branch is a backstop for any path that
+        // does not (or predates this fix on an existing installation), not the only fix.
+        if (!this.db || !this.db.objectStoreNames.contains("events")) {
+            this.manifestLoaded = true;
+            if (!this.closed && epoch === this.hydrationEpoch && this.db) {
+                const meta = await this.loadMeta(userId);
+                if (meta) {
+                    const tx = this.db.transaction("meta", "readwrite");
+                    tx.objectStore("meta").put({ ...meta, manifestPageCount: 0 });
+                    await txDone(tx);
+                }
+            }
+            return;
+        }
+
         const started = now();
         let scanned = 0;
         let afterEventId: string | undefined;
@@ -4105,7 +4170,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     );
                     this.clearIndexMaps();
                     await this.deleteUserRecords(userId);
-                    await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                    await this.saveMeta({
+                        userId,
+                        salt: encodeBase64(salt),
+                        userVersion: 0,
+                        manifestPageCount: 0,
+                        nextChunkId: this.nextChunkId,
+                    });
                     this.userVersion = 0;
                     return;
                 }
@@ -4176,18 +4247,44 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * migration chunk is always sealed immediately, on the simplifying assumption that ordinary
      * writes start their own open chunk fresh rather than trying to top up a migration-sealed one --
      * see {@link MetaRecord.nextChunkId}'s own docstring for why "open chunk" state is session-local
-     * at all), then in **one transaction** write the new chunk rows, delete the converted `events`
-     * rows and update the manifest tail -- so a crash between pages leaves a database that still
-     * opens (the version bump already happened) and resumes exactly where it left off, per {@link
-     * runChunkMigrationIfNeeded}'s own docstring.
+     * at all).
      *
-     * The exact byte total and oldest timestamp are derived from {@link chunkInfo} once the whole
-     * scan completes, never accumulated as a pass-local running total -- the C4-F1 lesson
-     * (review-pr-c.md): a concurrent write's own {@link flushLiveWrites} already folds its
-     * contribution into {@link ciphertextBytes}/{@link oldestIndexedTs} correctly, and a pass-local
-     * total assigned at the end would silently clobber it. {@link chunkInfo} is authoritative for
-     * every chunk this session knows about regardless of who wrote it, so deriving fresh from it is
-     * exact and immune to ordering against any write racing this scan.
+     * **Batched commits (review-pr-d.md D6).** Converted chunks, the legacy rows they replace and
+     * the manifest pages that changed are buffered in memory across up to {@link
+     * getConversionBatchPages} outer pages, then written together in **one transaction** -- not one
+     * transaction per outer page, the original shape. The reason: `manifestAdd` dirties an id's
+     * *existing* page (it never moves an id to a new page), and a v2 database that already carries
+     * increment C's manifest has its pages filled in *arrival* order, uncorrelated with the
+     * ascending-`eventId` order this scan reads in. Committing every outer page therefore dirtied,
+     * re-encrypted and rewrote every manifest page on every commit -- `conversionPages x
+     * manifestPages` re-encrypts, measured at ~64s of pure crypto on top of an already-measured 88s
+     * conversion at 200k, for a population (any account that has ever run increment C) that is not
+     * an edge case but the norm. Batching several outer pages together amortises that dirty-page
+     * rewrite over more converted rows, at the honestly-stated cost of a coarser durability unit: a
+     * crash loses at most one batch's worth of progress (bounded, never more -- see {@link
+     * getConversionBatchPages}'s own docstring), not at most one outer page's worth, but a database
+     * that still opens and resumes exactly where the last *committed* batch left off either way, per
+     * {@link runChunkMigrationIfNeeded}'s own docstring. `chunkInfo`/`diskChunkHeap`/`manifest` are
+     * still updated the moment each chunk is *built*, before its batch commits -- the same
+     * "applied optimistically, before the caller's write transaction has committed" trade-off
+     * {@link manifestAdd}'s own docstring already documents and accepts for every other write path
+     * in this class, merely with a longer window here.
+     *
+     * **Never converts an id no longer in the manifest (review-pr-d.md D3).** A concurrent
+     * redaction ({@link enqueueDeleteRecord}'s {@link UNCHUNKED} branch) removes a still-legacy id's
+     * manifest entry -- and deletes its `events` row -- synchronously, before its own first
+     * `await`, specifically so this loop can detect it: after every decrypt (the one genuinely
+     * async step per row), this re-checks `manifest.get(id)?.chunkId === UNCHUNKED` before packing
+     * the row into a chunk, and skips (never re-files) an id that check no longer confirms. The
+     * row's own legacy key is still queued for deletion either way -- it must leave `events`
+     * regardless of whether this pass is the one that converts it or a redaction beat it there.
+     *
+     * **Byte total and oldest timestamp are derived once, authoritatively, after the scan
+     * completes** ({@link deriveAuthoritativeDiskAccounting}) -- never from {@link chunkInfo}, which
+     * review-pr-d.md D2 found regressed review-pr-c.md's C4-F1 lesson in a new form: `chunkInfo`
+     * "only ever contains chunks this *session* has written or decrypted at least once" (its own
+     * docstring), so a conversion *resumed* in a later session understated the true total by
+     * whatever the earlier session had already committed -- 95% understated in the measured repro.
      */
     private async runChunkMigration(
         userId: string,
@@ -4197,6 +4294,44 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     ): Promise<void> {
         const started = now();
         let converted = 0;
+        const chunkTargetBytes = getChunkTargetBytes();
+        const batchPages = Math.max(1, getConversionBatchPages());
+
+        // Accumulated across up to `batchPages` outer pages before one commit; see this method's
+        // own docstring (D6). Cleared together by flushBatch, below.
+        let pendingChunkRecords: ChunkRecord[] = [];
+        let pendingDeleteKeys: Array<[string, string]> = [];
+        let pagesSinceFlush = 0;
+
+        // Commit whatever is currently buffered, in one transaction, and clear the buffers.
+        // Returns false if there is nothing left to do this session (db gone from under us).
+        const flushBatch = async (): Promise<boolean> => {
+            if (pendingChunkRecords.length === 0 && pendingDeleteKeys.length === 0) {
+                pagesSinceFlush = 0;
+                return true;
+            }
+            if (!this.db) return false;
+            const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
+            const meta = await this.loadMeta(userId);
+            const tx2 = this.db.transaction(["events", "chunks", "meta"], "readwrite");
+            const evStore = tx2.objectStore("events");
+            for (const key of pendingDeleteKeys) evStore.delete(key);
+            const chunkStore = tx2.objectStore("chunks");
+            for (const rec of pendingChunkRecords) chunkStore.put(rec);
+            for (const rec of manifestRecords) tx2.objectStore("meta").put(rec);
+            if (meta) {
+                tx2.objectStore("meta").put({
+                    ...meta,
+                    manifestPageCount: this.manifestPages.length,
+                    nextChunkId: this.nextChunkId,
+                });
+            }
+            await txDone(tx2);
+            pendingChunkRecords = [];
+            pendingDeleteKeys = [];
+            pagesSinceFlush = 0;
+            return true;
+        };
 
         for (;;) {
             if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
@@ -4209,13 +4344,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             if (this.closed || epoch !== this.hydrationEpoch) return;
             if (rows.length === 0) break;
 
-            const chunkTargetBytes = getChunkTargetBytes();
             const pending: Array<[string, StoredEvent]> = [];
             let pendingBytes = 2; // "[" + "]"
             const sealed: Array<Array<[string, StoredEvent]>> = [];
             let sliceStart = now();
             for (const row of rows) {
                 if (this.closed || epoch !== this.hydrationEpoch) return;
+                // Queued for deletion regardless of what happens below: every row read here must
+                // leave the legacy store, whether this pass converts it or finds it already gone.
+                pendingDeleteKeys.push([userId, row.eventId]);
                 let stored: StoredEvent;
                 try {
                     stored = await decryptJson<StoredEvent>(dek, row.blob, `${userId}|${row.eventId}`);
@@ -4225,11 +4362,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     );
                     this.clearIndexMaps();
                     await this.deleteUserRecords(userId);
-                    await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                    await this.saveMeta({
+                        userId,
+                        salt: encodeBase64(salt),
+                        userVersion: 0,
+                        manifestPageCount: 0,
+                        nextChunkId: this.nextChunkId,
+                    });
                     this.userVersion = 0;
                     return;
                 }
                 if (this.closed || epoch !== this.hydrationEpoch) return;
+                // D3: re-check the manifest fresh, right after the one genuinely async step (the
+                // decrypt above). A concurrent redaction may have removed this id's manifest entry
+                // -- or, in principle, some other path already converted it -- while that decrypt
+                // was in flight; either way it must not be packed into a fresh chunk and manifested
+                // again, which is exactly the "redaction comes back from the dead" failure.
+                if (this.manifest.get(stored.eventId)?.chunkId !== UNCHUNKED) continue;
                 const entryJson = JSON.stringify([stored.eventId, stored]);
                 if (pending.length > 0 && pendingBytes + entryJson.length + 1 > chunkTargetBytes) {
                     sealed.push(pending.splice(0, pending.length));
@@ -4247,61 +4396,109 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 }
             }
             if (pending.length > 0) sealed.push(pending);
-            if (sealed.length === 0) {
-                if (rows.length < HYDRATION_PAGE_SIZE) break;
-                continue;
-            }
 
-            const chunkRecords: ChunkRecord[] = [];
             for (const entries of sealed) {
                 const chunkId = this.allocateChunkId();
                 const entryMap = new Map(entries);
                 const blob = await encryptBinary(dek, entries, chunkAad(userId, chunkId));
-                chunkRecords.push({ userId, chunkId, blob });
+                pendingChunkRecords.push({ userId, chunkId, blob });
                 const { minTs, maxTs } = tsRangeOf(entryMap);
                 this.chunkInfo.set(chunkId, { bytes: blob.ct.length + blob.iv.length, minTs, maxTs });
-                heapPushTs(this.diskChunkHeap, { ts: minTs, id: String(chunkId) });
+                // Ordered by maxTs, not minTs (review-pr-d.md D4): see enforceDiskBudget's own
+                // docstring for why a chunk's newest member, not its oldest, is what an eviction
+                // pass must compare chunks by.
+                heapPushTs(this.diskChunkHeap, { ts: maxTs, id: String(chunkId) });
                 for (const [id, ev] of entryMap) this.manifestAdd(id, ev.originServerTs, ev.roomId, chunkId);
             }
 
-            const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
-            const meta = await this.loadMeta(userId);
-            const tx2 = this.db.transaction(["events", "chunks", "meta"], "readwrite");
-            const evStore = tx2.objectStore("events");
-            for (const row of rows) evStore.delete([userId, row.eventId]);
-            const chunkStore = tx2.objectStore("chunks");
-            for (const rec of chunkRecords) chunkStore.put(rec);
-            for (const rec of manifestRecords) tx2.objectStore("meta").put(rec);
-            if (meta) {
-                tx2.objectStore("meta").put({
-                    ...meta,
-                    manifestPageCount: this.manifestPages.length,
-                    nextChunkId: this.nextChunkId,
-                });
+            const lastPage = rows.length < HYDRATION_PAGE_SIZE;
+            pagesSinceFlush++;
+            if (pagesSinceFlush >= batchPages || lastPage) {
+                if (!(await flushBatch())) return;
             }
-            await txDone(tx2);
-            if (rows.length < HYDRATION_PAGE_SIZE) break;
+            if (lastPage) break;
         }
 
+        if (!(await flushBatch())) return;
         if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
-        // C4-F1's derivation (review-pr-c.md), now over chunkInfo: authoritative for every chunk this
-        // session knows about, so it is exact and immune to ordering against any concurrent write.
-        this.ciphertextBytes = Array.from(this.chunkInfo.values()).reduce((a, b) => a + b.bytes, 0);
-        let exactOldestTs: number | undefined;
-        for (const info of this.chunkInfo.values()) {
-            if (exactOldestTs === undefined || info.minTs < exactOldestTs) exactOldestTs = info.minTs;
+
+        await this.deriveAuthoritativeDiskAccounting(userId);
+        if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+
+        // Defensive, not expected to fire (D1/D3 are fixed, and this scan only stops here on
+        // success): if a legacy row somehow still exists, say so rather than silently declaring
+        // victory. runChunkMigrationIfNeeded's own cheap check will simply try again next open.
+        if (this.db.objectStoreNames.contains("events")) {
+            const tx = this.db.transaction("events", "readonly");
+            const anyLeft = await idbReq(tx.objectStore("events").index("byUser").getKey(userId));
+            await txDone(tx);
+            if (anyLeft !== undefined) {
+                log.warn("EventIndex: chunk migration's scan finished but a legacy row remains; will retry next open");
+            }
         }
+
+        if (this.persistEnabled) await this.enforceDiskBudget(userId);
+        log.info(`EventIndex: chunk migration converted ${converted} events in ${(now() - started).toFixed(1)}ms`);
+    }
+
+    /**
+     * Exact `Math.min` of every {@link manifest} entry's `originServerTs`, or `undefined` if the
+     * manifest is empty. Cheap and authoritative with no I/O: {@link manifest} is resident for the
+     * life of the session for every id on disk, regardless of the hydration/hot-window budget (its
+     * own docstring) -- a single in-memory pass is therefore already exact, unlike deriving the same
+     * figure from any partial, session-local structure. Shared by {@link
+     * deriveAuthoritativeDiskAccounting} (D2) and {@link deleteRecordsForDiskBudget} (D4), both of
+     * which used to *assume* a new floor from what they themselves just touched rather than asking
+     * what is actually still on disk.
+     */
+    private manifestOldestTs(): number | undefined {
+        let oldest: number | undefined;
+        for (const entry of this.manifest.values()) {
+            if (oldest === undefined || entry.ts < oldest) oldest = entry.ts;
+        }
+        return oldest;
+    }
+
+    /**
+     * Recompute {@link ciphertextBytes} and {@link oldestIndexedTs} from the authoritative, durable
+     * structures -- a full sum over this user's persisted `chunks` rows for the byte total, {@link
+     * manifestOldestTs} for the timestamp floor -- and persist both. Called once, at the very end of
+     * a {@link runChunkMigration} session that completed its own scan (an interrupted one returns
+     * before ever reaching this).
+     *
+     * **Replaces C4-F1's `chunkInfo`-derivation, which review-pr-d.md D2 found regressed the same
+     * lesson in a new form.** {@link chunkInfo} "only ever contains chunks this *session* has
+     * written or decrypted at least once" (its own docstring) -- exact for a conversion that runs
+     * start to finish in one session, silently wrong for one that resumes a previous session's
+     * partial work, since the resuming session's own `chunkInfo` starts empty and knows nothing
+     * about the chunks the *earlier* session already committed. Measured 95% understated on a
+     * resumed 200k-event conversion. Reading the actual `chunks` rows back is correct regardless of
+     * how many sessions the conversion took, and cheap: a chunk holds on the order of {@link
+     * CHUNK_TARGET_BYTES} of plaintext, so even a disk-budget-sized account has on the order of a
+     * few thousand chunk rows, not hundreds of thousands of events -- the same "cheap enough not to
+     * need slicing" cost class {@link userChunkKeyRange}'s own docstring already established for
+     * enumerating them, and only the ciphertext length of each row is read here, never its content
+     * (no decrypt).
+     */
+    private async deriveAuthoritativeDiskAccounting(userId: string): Promise<void> {
+        if (!this.db || !this.dek) return;
+        const dek = this.dek;
+        const tx = this.db.transaction("chunks", "readonly");
+        const rows = (await idbReq(tx.objectStore("chunks").getAll(userChunkKeyRange(userId)))) as ChunkRecord[];
+        await txDone(tx);
+        let totalBytes = 0;
+        for (const row of rows) totalBytes += row.blob.ct.length + row.blob.iv.length;
+        const exactOldestTs = this.manifestOldestTs();
+
+        this.ciphertextBytes = totalBytes;
         this.oldestIndexedTs = exactOldestTs;
         const oldestIndexedTsRecord = await this.prepareOldestIndexedTsWrite(userId, dek, exactOldestTs);
         const meta = await this.loadMeta(userId);
-        const tx3 = this.db.transaction("meta", "readwrite");
-        if (oldestIndexedTsRecord) tx3.objectStore("meta").put(oldestIndexedTsRecord);
-        if (meta) tx3.objectStore("meta").put({ ...meta, diskBytes: this.ciphertextBytes });
-        await txDone(tx3);
-
-        if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
-        if (this.persistEnabled) await this.enforceDiskBudget(userId);
-        log.info(`EventIndex: chunk migration converted ${converted} events in ${(now() - started).toFixed(1)}ms`);
+        if (!this.db) return;
+        const tx2 = this.db.transaction("meta", "readwrite");
+        if (oldestIndexedTsRecord) tx2.objectStore("meta").put(oldestIndexedTsRecord);
+        if (meta) tx2.objectStore("meta").put({ ...meta, diskBytes: totalBytes });
+        await txDone(tx2);
     }
 
     /**
@@ -4311,32 +4508,47 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * class threat model's note on why a non-IndexedDB `await` inside a live transaction is the one
      * mistake to avoid here above all others.
      *
-     * **Read order comes from {@link manifest}, not from the store's own key order.** This method
-     * first awaits {@link chunkMigrationReadyPromise} (every manifest entry's `ts`/`roomId`/`chunkId`
-     * is known and real by the time this line resumes -- self-healed via {@link runManifestMigration}
-     * if this database had no manifest at all, converted via {@link runChunkMigrationIfNeeded} if it
-     * had one but was still schema v2 underneath), sorts every manifest id by `originServerTs`
-     * descending once, and reads in that order, in pages of {@link HYDRATION_PAGE_SIZE} ids.
+     * **Walks chunks, not manifest entries (review-pr-d.md D5 rewrite).** An earlier version of
+     * this method walked {@link manifest} id-by-id in pages of {@link HYDRATION_PAGE_SIZE}, grouping
+     * each page's ids by chunk and caching decrypted chunks *for that page only*
+     * (`decryptedChunks`, scoped inside the page loop). Because manifest order (ts-descending) is
+     * uncorrelated with chunk packing (arrival order -- see {@link CHUNK_TARGET_BYTES}'s own
+     * docstring on crawl locality), a single chunk's ~47 members are typically scattered across many
+     * pages, so the same chunk was re-read and re-decrypted once per page that touched it: measured
+     * at 13.3x redundant chunk reads at 200k/desktop-tier, 39,475 chunk transactions against ~2,960
+     * chunks that actually exist, each parse yielding on average 3.3 useful (admitted) events out of
+     * ~47 decrypted -- a 2.2-2.6x hydration regression versus the previous schema.
      *
-     * **Read by chunk, not by event** (this increment's own change over C's per-id `get()`s): each
-     * page's ids are grouped by their manifest `chunkId` first -- typically far fewer distinct chunks
-     * than ids, since one chunk holds on the order of {@link CHUNK_TARGET_BYTES} / one event's worth
-     * of entries -- and each needed chunk is decrypted once ({@link decryptChunkOnce}, sharing an
-     * in-flight decrypt with a concurrent {@link materializeIfPending} pull for the same chunk) in
-     * its own read-only transaction, released before the decrypt runs. Only *then* does a second,
-     * synchronous pass over the page's ids fold each one ({@link materializeRow}) out of whichever
-     * decrypted chunk holds it -- which is also what keeps the in-flight "ciphertext awaiting
-     * decrypt" footprint small: at most `neededChunks` chunks' worth at a time, not a whole page's
-     * worth of individual rows, the point behind this increment's own peak-heap proof requirement.
-     * This is deliberately *not* the old ascending-`eventId` paged `getAll()` -- see
-     * `HYDRATION_KEY_ORDER`'s own docstring for why that order is not recency, and
-     * `research/review-pr-c.md` C-F1 for what happened once hydration started stopping early against
-     * it (the resident set was an arbitrary, often oldest-first, slice of the disk, the opposite of
-     * what "newest-first" is supposed to mean).
+     * This version inverts the walk: compute the full **set of distinct chunks** this user has from
+     * {@link manifest}/{@link chunkMembers} (both fully resident already, for every id on disk,
+     * regardless of hydration -- no I/O to learn this), each chunk's own newest member `ts`
+     * (`chunkMaxTs`, a single in-memory pass, sliced), sort that (far smaller) chunk-id set
+     * newest-first once, and then visit each chunk **exactly once, ever, for the whole restore**:
+     * read it (batched, up to {@link HYDRATION_CHUNK_BATCH} chunks sharing one read-only
+     * transaction, decrypted only after that transaction settles -- the same "no non-IndexedDB await
+     * inside a live transaction" discipline every read in this file follows), admit its
+     * still-non-resident members newest-first, and move on. No chunk cache is needed because none is
+     * possible: a chunk this walk has already visited is never looked at again, by construction, so
+     * there is nothing to re-read even without one. A chunk another caller ({@link
+     * materializeIfPending}, racing this run for the same id) is already decrypting is awaited
+     * instead of re-read, the same dedup {@link decryptChunkOnce} gives a single-chunk caller.
+     *
+     * **Ordering chunks by `maxTs` is the same key {@link enforceDiskBudget} now evicts by
+     * (review-pr-d.md D4's fix)**, so the chunk this run visits *last* (if it stops early at the
+     * resident budget) and the chunk a disk-budget pass would delete *first* are, by construction,
+     * drawn from the same end of the same ordering -- hydration's hot window and the disk-budget
+     * floor point the same direction.
+     *
+     * **Restores (most of) the pre-chunking budget-before-decrypt property.** Schema v2/increment C
+     * checked the hot-window budget *before* decrypting each row, so a row this run was never going
+     * to keep resident was never decrypted at all; per-chunk decryption cannot preserve that exactly
+     * (a whole chunk is the smallest unit this schema can read), but checking the budget before
+     * *each chunk* -- not merely once per page of up to 1,000 ids, the previous shape -- bounds the
+     * overshoot to at most one chunk's worth of wasted decrypt, not one page's.
      *
      * Sliced at {@link HYDRATION_SLICE_DEADLINE_MS} exactly as before, so a large restore never
-     * produces one long main-thread task regardless of how many pages it takes. Every resumption
-     * point -- the top of the loop, after each chunk decrypt, after each row, after each yield --
+     * produces one long main-thread task regardless of how many chunks it takes. Every resumption
+     * point -- the top of the walk, after each chunk decrypt, after each row, after each yield --
      * re-checks {@link closed} and the epoch this run was started with, and returns without touching
      * {@link db} the moment either has moved on: see {@link resetMemory}, which is what moves the
      * epoch on.
@@ -4347,7 +4559,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * and {@link HYDRATION_SLICE_DEADLINE_MS}'s own accounting only checks *after* a row completes, so
      * it would otherwise inflate one row's task by the merge's full cost, invisibly). This loop flushes
      * a deferred merge itself instead, at the two points already outside any row's own task: right
-     * after a slice's {@link yieldToEventLoop} and at each page boundary.
+     * after a slice's {@link yieldToEventLoop} and at each chunk-batch boundary.
      *
      * A row whose id is already in {@link events} is skipped rather than overwritten (a live event
      * or a crawler batch got there first and is authoritative), and one no longer inside its chunk at
@@ -4379,132 +4591,146 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             await this.chunkMigrationReadyPromise;
             if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
 
-            // review-pr-c.md C2-F1: a single `Array.from(...).sort()` over the *whole* manifest was
-            // one unsliced synchronous task -- 563ms at 200k entries, 2,083ms at 500k, 11-42x the
-            // 50ms ceiling increment A's proof requirement set, with two `Map.get` calls inside every
-            // comparison on top. Replaced by a per-page sort (sliced across this method's own 30ms
-            // deadline, exactly like {@link loadManifest}'s own per-page loop) plus a bounded k-way
-            // merge over the sorted pages' heads ({@link mergeHeapPush}/{@link mergeHeapPop}): pages
-            // are already the unit `manifestAdd` groups entries into, so sorting one page (at most
-            // {@link MANIFEST_PAGE_SIZE} entries) is cheap and interruptible, and the merge only ever
-            // does O(log P) work (P = page count, in the low hundreds even at disk-budget scale) per
-            // id produced -- never one task proportional to the whole manifest. `[id, ts]` pairs are
-            // sorted on the number directly, not via a comparator that calls back into `manifest`,
-            // which is itself the other half of C2-F1's fix (3.4-4.4x fewer cache-unfriendly lookups).
-            //
-            // This does *not* lean on {@link loadManifest}'s own "newest page first" disk-read order
-            // for correctness -- it cannot: `manifestAdd` fills pages in *arrival* order, which tracks
-            // recency for live events but not for a multi-room backward crawl (review-pr-c.md's own
-            // `loadManifest` docstring), so a later-filled page is not guaranteed to hold newer
-            // content than an earlier one, and the merge below is a genuine k-way merge across every
-            // page rather than a page-index-ordered concatenation. `manifest` is a snapshot read here
-            // exactly as before (a write landing mid-merge is simply not reflected in *this* run's
-            // order), and this run's own `events.has()` skip means it is never overwritten either way.
-            const sortedPageIds = new Map<number, string[]>();
-            const sortedManifestPage = (page: number): string[] => {
-                let ids = sortedPageIds.get(page);
-                if (ids) return ids;
-                const pairs: Array<[string, number]> = [];
-                for (const id of this.manifestPages[page]) pairs.push([id, this.manifest.get(id)?.ts ?? 0]);
-                pairs.sort((a, b) => b[1] - a[1]); // Descending by the number, not a Map lookup.
-                ids = pairs.map((pair) => pair[0]);
-                sortedPageIds.set(page, ids);
-                return ids;
-            };
-
-            const mergeHeap: ManifestMergeHead[] = [];
+            // Compute this run's walk order: every chunk this user has, newest-member-first, from
+            // manifest/chunkMembers alone -- no I/O, no chunk decrypted merely to learn its own
+            // timestamps. Sliced across this method's own 30ms deadline, the same cost class
+            // review-pr-c.md C2-F1 already sliced its own whole-manifest pass at; see hydrate's own
+            // docstring for why this replaced a per-page sort plus k-way merge over manifest ids.
+            const chunkMaxTs = new Map<number, number>();
             let seedSliceStart = now();
-            for (let page = 0; page < this.manifestPages.length; page++) {
+            for (const [chunkId, members] of this.chunkMembers) {
                 if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
-                if (this.manifestPages[page].size > 0) {
-                    const ids = sortedManifestPage(page);
-                    mergeHeapPush(mergeHeap, { ts: this.manifest.get(ids[0])?.ts ?? 0, page, pos: 0 });
+                let max = -Infinity;
+                for (const id of members) {
+                    const ts = this.manifest.get(id)?.ts;
+                    if (ts !== undefined && ts > max) max = ts;
                 }
+                if (max > -Infinity) chunkMaxTs.set(chunkId, max);
+                // Checked every chunk, not gated behind a count threshold: there are far fewer
+                // chunks than events (thousands, not hundreds of thousands), but each one costs a
+                // pass over its own membership (tens of ids), so a fixed-count gate here could let
+                // real elapsed time run well past the deadline before ever looking -- the same
+                // per-item check {@link loadManifest}'s own per-page loop uses, just at chunk
+                // granularity instead of page granularity.
                 if (now() - seedSliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
                     await yieldToEventLoop();
                     if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
                     seedSliceStart = now();
                 }
             }
-            // Pop the merge's next id, newest-`ts`-first across every page, and push that page's own
-            // next entry in its place -- the standard k-way merge shape, O(log P) per call.
-            const nextMergedId = (): string | undefined => {
-                const head = mergeHeapPop(mergeHeap);
-                if (!head) return undefined;
-                const ids = sortedManifestPage(head.page);
-                const id = ids[head.pos];
-                if (head.pos + 1 < ids.length) {
-                    mergeHeapPush(mergeHeap, {
-                        ts: this.manifest.get(ids[head.pos + 1])?.ts ?? 0,
-                        page: head.page,
-                        pos: head.pos + 1,
-                    });
-                }
-                return id;
-            };
+            const sortedChunkIds = Array.from(chunkMaxTs.entries())
+                .sort((a, b) => b[1] - a[1])
+                .map((pair) => pair[0]);
 
-            for (;;) {
+            for (let i = 0; i < sortedChunkIds.length; i += HYDRATION_CHUNK_BATCH) {
                 if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
                 const dek = this.dek;
-
-                const pageIds: string[] = [];
-                while (pageIds.length < HYDRATION_PAGE_SIZE) {
-                    const id = nextMergedId();
-                    if (id === undefined) break;
-                    if (!this.events.has(id)) pageIds.push(id);
+                // Checked before each batch of chunk reads, not only once per page of ids the old
+                // shape managed: bounds the decrypt-past-budget overshoot to at most one batch's
+                // worth of chunks rather than a whole 1,000-id page's worth (see hydrate's own
+                // docstring, "restores most of the budget-before-decrypt property").
+                if (this.residentByteEstimate() >= bounds.hotWindowBytes) {
+                    this.residentBudgetExceeded = true;
+                    log.info(`EventIndex: hydration stopped at the resident budget after ${hydratedCount} events`);
+                    return;
                 }
-                if (pageIds.length === 0 && mergeHeap.length === 0) break; // Manifest fully consumed.
-                if (pageIds.length === 0) continue; // Every id in range was already resident.
+                const group = sortedChunkIds.slice(i, i + HYDRATION_CHUNK_BATCH);
 
-                // Read by CHUNK, not by event, but interleaved with materializing rather than a
-                // separate decrypt-everything-first pass: a chunk is decrypted the first time one of
-                // this page's ids needs it (cached in decryptedChunks for the rest of the page, so
-                // still exactly one decrypt per distinct chunk -- far fewer than one per event, each
-                // chunk holding on the order of CHUNK_TARGET_BYTES / one event's worth of entries,
-                // which is also what keeps the in-flight "ciphertext awaiting decrypt" footprint
-                // small -- see CHUNK_TARGET_BYTES' own docstring and this increment's own proof
-                // requirement on peak heap during restore), and each of ITS ids is materialized right
-                // after, in ts-descending order, before moving to the next id's chunk. This preserves
-                // the pre-chunking streaming behaviour exactly: a decrypt failure partway through a
-                // page still leaves everything materialized from ids processed earlier IN THAT SAME
-                // PAGE (and any earlier page) resident right up until the wipe below discards it, the
-                // same "drops what it already loaded" contract schema v2's per-row loop had.
-                // decryptChunkOnce shares a decrypt already in flight from a concurrent
-                // materializeIfPending pull for the same chunk.
-                const decryptedChunks = new Map<number, Map<string, StoredEvent>>();
+                // A chunk another caller (materializeIfPending, racing this run for the same id) is
+                // already decrypting is awaited, not re-read; everything else is fetched together in
+                // ONE read-only transaction, decrypted only after it settles.
+                const inFlight = new Map<number, Promise<Map<string, StoredEvent>>>();
+                const toFetch: number[] = [];
+                for (const chunkId of group) {
+                    const attempt = this.materializingChunks.get(chunkId);
+                    if (attempt) inFlight.set(chunkId, attempt);
+                    else toFetch.push(chunkId);
+                }
+
+                const fetchedRows = new Map<number, ChunkRecord>();
+                if (toFetch.length > 0) {
+                    const db = this.db;
+                    const tx = db.transaction("chunks", "readonly");
+                    const store = tx.objectStore("chunks");
+                    const reqs = toFetch.map((chunkId) => ({ chunkId, req: store.get([userId, chunkId]) }));
+                    await txDone(tx);
+                    if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
+                    for (const { chunkId, req } of reqs) {
+                        const row = req.result as ChunkRecord | undefined;
+                        if (row) fetchedRows.set(chunkId, row);
+                    }
+                }
+
                 let sliceStart = now();
-                for (const id of pageIds) {
+                for (const chunkId of group) {
                     if (this.closed || epoch !== this.hydrationEpoch) return;
-                    const chunkId = this.manifest.get(id)?.chunkId;
-                    let chunkEntries = chunkId !== undefined ? decryptedChunks.get(chunkId) : undefined;
-                    if (!chunkEntries && chunkId !== undefined && chunkId !== UNCHUNKED) {
+
+                    let chunkEntries: Map<string, StoredEvent>;
+                    const shared = inFlight.get(chunkId);
+                    if (shared) {
                         try {
-                            chunkEntries = await this.decryptChunkOnce(userId, dek, chunkId);
+                            chunkEntries = await shared;
                         } catch {
+                            continue; // The in-flight owner already reports/handles its own failure.
+                        }
+                    } else {
+                        const row = fetchedRows.get(chunkId);
+                        if (!row) continue; // Gone (disk budget/redaction) between the snapshot above and this read.
+                        // Registered before the decrypt starts, exactly like decryptChunkOnce, so a
+                        // concurrent materializeIfPending pull for the same id shares this attempt
+                        // instead of issuing its own single-chunk read.
+                        const attempt = (async (): Promise<Map<string, StoredEvent>> =>
+                            new Map(
+                                await decryptBinaryJson<Array<[string, StoredEvent]>>(
+                                    dek,
+                                    row.blob,
+                                    chunkAad(userId, chunkId),
+                                ),
+                            ))();
+                        this.materializingChunks.set(chunkId, attempt);
+                        try {
+                            chunkEntries = await attempt;
+                        } catch {
+                            this.materializingChunks.delete(chunkId);
                             log.warn(
                                 "EventIndex: stored ciphertext could not be decrypted; wiping leftover for this user",
                             );
                             this.clearIndexMaps();
                             await this.deleteUserRecords(userId);
-                            await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                            await this.saveMeta({
+                                userId,
+                                salt: encodeBase64(salt),
+                                userVersion: 0,
+                                manifestPageCount: 0,
+                                nextChunkId: this.nextChunkId,
+                            });
                             this.userVersion = 0;
                             return;
                         }
-                        if (this.closed || epoch !== this.hydrationEpoch) return;
-                        decryptedChunks.set(chunkId, chunkEntries);
-                        // Decrypt is the one genuinely slow step here; the deadline is checked right
-                        // after it, not just at the row-level checks below, so a page whose ids are
-                        // spread across many distinct chunks cannot itself exceed the slice budget.
-                        if (now() - sliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
-                            await yieldToEventLoop();
-                            if (this.closed || epoch !== this.hydrationEpoch) return;
-                            sliceStart = now();
+                        this.materializingChunks.delete(chunkId);
+                        if (!this.chunkInfo.has(chunkId)) {
+                            const { minTs, maxTs } = tsRangeOf(chunkEntries);
+                            this.chunkInfo.set(chunkId, {
+                                bytes: row.blob.ct.length + row.blob.iv.length,
+                                minTs,
+                                maxTs,
+                            });
+                            heapPushTs(this.diskChunkHeap, { ts: maxTs, id: String(chunkId) });
                         }
                     }
-                    const stored = chunkEntries?.get(id);
-                    if (!stored) continue; // Redacted since the manifest was built; nothing left to read.
+                    if (this.closed || epoch !== this.hydrationEpoch) return;
 
-                    if (!this.events.has(id)) {
+                    // Admit this chunk's members newest-first. No cache to maintain here and no
+                    // chunk read or parsed twice: the outer walk never revisits a chunkId, by
+                    // construction (D5's own target).
+                    const members = Array.from(this.chunkMembers.get(chunkId) ?? []).sort(
+                        (a, b) => (this.manifest.get(b)?.ts ?? 0) - (this.manifest.get(a)?.ts ?? 0),
+                    );
+                    for (const id of members) {
+                        if (this.events.has(id)) continue;
+                        const stored = chunkEntries.get(id);
+                        if (!stored) continue; // Redacted since the manifest was built; nothing left to read.
+
                         // Newest-first hydration stops here, at the moment adding another row would
                         // breach HOT_WINDOW_BYTES: everything from this row onward for the rest of
                         // this run stays on disk, un-hydrated -- never deleted, still reachable via
@@ -4535,17 +4761,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     }
                 }
                 longestSliceMs = Math.max(longestSliceMs, now() - sliceStart);
-                // A second safe point, for a page that ends without ever crossing the slice deadline (a small
-                // last page, most commonly): otherwise a deferred merge could sit unflushed until whatever
-                // live write happens to come along next -- see flushVocabularyMergeIfDue's own caller in
-                // indexTokens, which only re-checks when *something* is indexed, not on a timer.
+                // A second safe point, for a batch that ends without ever crossing the slice deadline
+                // (a small last batch, most commonly): otherwise a deferred merge could sit unflushed
+                // until whatever live write happens to come along next -- see
+                // flushVocabularyMergeIfDue's own caller in indexTokens, which only re-checks when
+                // *something* is indexed, not on a timer.
                 this.flushVocabularyMergeIfDue();
 
-                // Once per chunk, not once per row: cheap in the common case (one scalar comparison),
+                // Once per batch, not once per row: cheap in the common case (one scalar comparison),
                 // and disk usage only ever grows from writes, never from hydration itself decrypting
                 // pre-existing rows -- see enforceDiskBudget's own docstring -- so this exists purely
                 // to let a disk that was *already* over budget when this session started (restored
-                // from meta) self-correct as hydration's own decrypts populate diskTsHeap with
+                // from meta) self-correct as hydration's own decrypts populate diskChunkHeap with
                 // candidates, rather than waiting for an unrelated future write to trigger it.
                 if (this.persistEnabled) await this.enforceDiskBudget(userId);
                 if (this.closed || epoch !== this.hydrationEpoch) return;
@@ -4818,24 +5045,42 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * this stops there rather than guessing: the remaining excess is real, but this session does
      * not yet know which chunks account for it, and a future call (the next write, or hydration
      * reaching further) will have more information than this one does.
+     *
+     * **Ordered by each chunk's `maxTs`, not `minTs` (review-pr-d.md D4).** Chunks are not
+     * time-clustered -- a round-robin multi-room crawl packs events from many rooms, at very
+     * different points in their own timelines, into whichever chunk happens to be open at that
+     * moment -- so a chunk's oldest and newest members can be very far apart. Popping by `minTs`
+     * deleted a chunk for the age of its *oldest* member while its newest members, sometimes far
+     * newer than content in chunks left behind, died with it: a disk budget that was supposed to
+     * drop the oldest content instead dropped events newer than ones it kept, by up to the full
+     * span between a chunk's own oldest and newest member. Popping by `maxTs` means every chunk
+     * this deletes has *every* member at least as old as that chunk's own newest -- the guarantee
+     * this class can actually make at chunk granularity: **no chunk is deleted while a chunk with a
+     * strictly older `maxTs` survives.** This is honestly weaker than the old per-event guarantee
+     * ("nothing newer than a retained event is ever deleted"), which chunking cannot preserve
+     * exactly without either time-clustering chunks at write time or rewriting an evicted chunk's
+     * surviving newer members into a fresh one before dropping it -- both larger changes than this
+     * increment makes; see `research/review-pr-d.md` D4 for the full discussion of why this is the
+     * cheapest correct fix rather than the complete one. `oldestIndexedTs`, the user-visible
+     * coverage floor, is derived from the manifest *after* deletion ({@link
+     * deleteRecordsForDiskBudget}), not assumed from what was just deleted, precisely because a
+     * chunk with an older stray member can still survive even under this ordering.
      */
     private async enforceDiskBudget(userId: string): Promise<void> {
         const bounds = getEventIndexBounds();
         if (this.ciphertextBytes <= bounds.diskBudgetBytes) return;
         const toDelete: number[] = [];
         let projected = this.ciphertextBytes;
-        let deletedMaxTs: number | undefined;
         while (projected > bounds.diskBudgetBytes && this.diskChunkHeap.length > 0) {
             const top = heapPopMinTs(this.diskChunkHeap)!;
             const chunkId = Number(top.id);
             const info = this.chunkInfo.get(chunkId);
-            if (!info || info.minTs !== top.ts) continue; // Stale: gone, or its minTs moved since.
+            if (!info || info.maxTs !== top.ts) continue; // Stale: gone, or its maxTs moved since.
             toDelete.push(chunkId);
             projected -= info.bytes;
-            deletedMaxTs = deletedMaxTs === undefined ? info.maxTs : Math.max(deletedMaxTs, info.maxTs);
         }
-        if (toDelete.length === 0 || deletedMaxTs === undefined) return;
-        await this.deleteRecordsForDiskBudget(userId, toDelete, deletedMaxTs);
+        if (toDelete.length === 0) return;
+        await this.deleteRecordsForDiskBudget(userId, toDelete);
     }
 
     /**
@@ -4848,13 +5093,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * resident (old by timestamp, but not yet reached by {@link enforceResidentBudget}), memory too:
      * "drop = delete" means a resident event has no business staying resident on the strength of a
      * memory copy whose disk backing has just been pulled out from under it.
+     *
+     * **`oldestIndexedTs` is derived from {@link manifestOldestTs} after the deletions are applied
+     * in memory, never assumed from `deletedMaxTs` (review-pr-d.md D4).** Because {@link
+     * enforceDiskBudget} orders eviction by each chunk's own `maxTs` and chunks are not
+     * time-clustered, a *surviving* chunk can still hold a member older than every deleted chunk's
+     * `maxTs` -- assuming `Math.max(oldestIndexedTs, deletedMaxTs)` (the old formula) would then
+     * claim a coverage floor newer than what is actually still on disk and searchable, the "newer
+     * than {date}" `SearchWarning` text lying in the direction that hides real content. {@link
+     * manifest} already reflects every removal by the time this reads it (`manifestRemove` below
+     * runs first), so the scan is exact and free of that assumption.
      */
-    private async deleteRecordsForDiskBudget(userId: string, chunkIds: number[], deletedMaxTs: number): Promise<void> {
+    private async deleteRecordsForDiskBudget(userId: string, chunkIds: number[]): Promise<void> {
         if (!this.db || chunkIds.length === 0) return;
         let newTotal = this.ciphertextBytes;
         for (const chunkId of chunkIds) newTotal -= this.chunkInfo.get(chunkId)?.bytes ?? 0;
-        const newOldest =
-            this.oldestIndexedTs === undefined ? deletedMaxTs : Math.max(this.oldestIndexedTs, deletedMaxTs);
 
         // Maintained here too, per the manifest's own docstring: every event of a chunk genuinely
         // leaving disk must leave the manifest, or hydrate() would later try (and harmlessly fail) to
@@ -4867,6 +5120,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             if (members) evictedIds.push(...members);
         }
         for (const id of evictedIds) this.manifestRemove(id);
+        // Authoritative, post-removal: see this method's own docstring for why this must not be
+        // `Math.max(oldestIndexedTs, deletedMaxTs)`.
+        const newOldest = this.manifestOldestTs();
         const dek = this.dek;
         const manifestRecords = dek ? await this.prepareManifestPageWrites(userId, dek) : [];
         const oldestIndexedTsRecord = dek ? await this.prepareOldestIndexedTsWrite(userId, dek, newOldest) : null;

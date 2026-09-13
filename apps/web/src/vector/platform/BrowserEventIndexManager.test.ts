@@ -3927,15 +3927,29 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(resident.has(idAt(0))).toBe(false); // oldest -- the bug's own wrong answer
         });
 
-        it("the k-way merge is correct across multiple manifest pages, not just within one (review-pr-c.md C2-F1)", async () => {
+        it("hydration visits chunks newest-maxTs-first, not an artefact of arrival/chunk-id order (review-pr-c.md C2-F1, revised for review-pr-d.md D5)", async () => {
             // MANIFEST_PAGE_SIZE entries fill exactly one page in *arrival* order (manifestAdd's own
             // fill order), so N = 2.5 pages guarantees at least three pages exist. Timestamps are a
             // scrambled permutation of arrival order (ts[i] = base + (i*37 mod N), 37 coprime with
-            // every N used here) rather than tracking arrival/page order at all -- if the merge were
-            // a page-index-ordered concatenation instead of a genuine k-way merge (the mistake
-            // loadManifest's own "newest page first is a heuristic, not a guarantee" docstring warns
-            // against), a "newer" page could still hold plenty of ids that are actually older than
-            // ids sitting in an "older" page, and this shape is what would expose that.
+            // every N used here) rather than tracking arrival/page order at all -- if hydration's
+            // chunk walk were driven by arrival/chunk-id order instead of each chunk's own genuine
+            // newest-member timestamp, a "later" chunk could still hold plenty of ids that are
+            // actually older than ids sitting in an "earlier" one, and this shape is what would
+            // expose that.
+            //
+            // Since increment D (review-pr-d.md D5), hydrate() walks whole *chunks* in `maxTs`
+            // order, admitting every one of a visited chunk's members before moving on -- not a
+            // byte-exact global top-K the way the pre-chunking, per-manifest-page k-way merge this
+            // test used to pin could guarantee. Chunks pack events in *arrival* order (D5's own
+            // finding: uncorrelated with ts), so two chunks' member ranges can overlap, and the
+            // chunk-grained cut can admit a chunk's own older members alongside its newer ones ahead
+            // of a lower-maxTs chunk's own newer members -- an honestly coarser, chunk-granularity
+            // guarantee, documented on hydrate() itself. This test now asserts *that* contract
+            // exactly (derived independently from the real on-disk chunks, not merely re-run through
+            // the implementation), rather than the byte-exact ideal chunking cannot preserve without
+            // either time-clustered chunks or a full cross-chunk streaming merge -- and separately
+            // confirms the result is not simply "the first K by arrival order", so a regression to
+            // arrival/chunk-id order would still fail it.
             const n = MANIFEST_PAGE_SIZE * 2 + 500;
             const base = 10_000_000;
             const tsAt = (i: number): number => base + ((i * 37) % n);
@@ -3952,8 +3966,54 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await seed.closeEventIndex();
 
             const K = 50;
-            const sortedByTsDesc = Array.from({ length: n }, (_unused, i) => i).sort((a, b) => tsAt(b) - tsAt(a));
-            const expectedNewestIds = new Set(sortedByTsDesc.slice(0, K).map(mpId));
+
+            // Ground truth, read straight off disk (not a re-implementation of hydrate()'s own
+            // logic in the abstract): decrypt every real chunk, group by chunkId, sort chunks by
+            // their own true maxTs descending, and admit each chunk's members (ts descending within
+            // it) until K events are admitted -- exactly the contract hydrate()'s own docstring
+            // states.
+            const rawChunks = (await dumpRawStore("chunks")).filter((r: any) => r.userId === userId) as Array<{
+                userId: string;
+                chunkId: number;
+                blob: { iv: Uint8Array<ArrayBuffer>; ct: Uint8Array<ArrayBuffer> };
+            }>;
+            const metaRow = (await dumpRawStore("meta")).find((r: any) => r.userId === userId) as
+                | { salt: string }
+                | undefined;
+            expect(metaRow).toBeDefined();
+            const dek = await deriveDek(pickleKey, decodeBase64(metaRow!.salt) as Uint8Array<ArrayBuffer>, userId, DEVICE);
+            const chunks: Array<{ chunkId: number; maxTs: number; idsDesc: string[] }> = [];
+            for (const row of rawChunks) {
+                const arr = await decryptBinaryJson<Array<[string, { originServerTs: number }]>>(
+                    dek,
+                    row.blob,
+                    chunkAad(userId, row.chunkId),
+                );
+                const sorted = arr.slice().sort((a, b) => b[1].originServerTs - a[1].originServerTs);
+                chunks.push({
+                    chunkId: row.chunkId,
+                    maxTs: sorted[0][1].originServerTs,
+                    idsDesc: sorted.map((pair) => pair[0]),
+                });
+            }
+            chunks.sort((a, b) => b.maxTs - a.maxTs);
+            // Admit one member at a time, walking chunks newest-maxTs-first and each chunk's own
+            // members newest-first, stopping at exactly K -- member-precise *within* the walk order,
+            // matching hydrate()'s own per-member budget check exactly (it does not admit a whole
+            // chunk unconditionally; only the walk *order* is chunk-grained).
+            const expectedNewestIds: string[] = [];
+            outer: for (const chunk of chunks) {
+                for (const id of chunk.idsDesc) {
+                    if (expectedNewestIds.length >= K) break outer;
+                    expectedNewestIds.push(id);
+                }
+            }
+            expect(expectedNewestIds).toHaveLength(K); // sanity: the corpus is big enough
+
+            // Not simply "the first K by arrival order" -- proves the chunk walk is genuinely
+            // ts-driven, not an accidental fallback to arrival/chunk-id order.
+            const firstKByArrival = new Set(Array.from({ length: K }, (_unused, i) => mpId(i)));
+            expect(new Set(expectedNewestIds)).not.toEqual(firstKByArrival);
 
             // hotWindowBytes gates hydrated events alone (review-pr-c.md C2-F2, corrected in the
             // third pass): the manifest has its own separate ceiling and does not eat into this.
@@ -3964,7 +4024,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
 
             const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: K + 10 }));
             const resident = new Set(resultIds(hit));
-            expect(resident).toEqual(expectedNewestIds);
+            expect(resident).toEqual(new Set(expectedNewestIds));
         });
 
         it("the seed loop yields at the slice deadline while building the k-way merge, not just the row loop (review-pr-c.md C3-N1/ME5)", async () => {

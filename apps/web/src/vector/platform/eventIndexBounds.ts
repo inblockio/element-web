@@ -187,6 +187,45 @@ export function setChunkTargetBytesOverrideForTesting(override: number | null): 
     chunkTargetBytesOverrideForTesting = override;
 }
 
+/**
+ * How many outer conversion pages (each up to `HYDRATION_PAGE_SIZE` legacy rows,
+ * `BrowserEventIndexManager.runChunkMigration`) to accumulate in memory before one v2-to-v3
+ * conversion batch is committed to disk. review-pr-d.md D6: a v2 database that already carries a
+ * manifest (every account that has ever run increment C) has its manifest pages filled in
+ * *arrival* order, uncorrelated with the ascending-`eventId` order conversion scans in, so
+ * committing every single outer page can dirty -- and therefore re-encrypt and rewrite -- every
+ * manifest page on every commit: `conversionPages x manifestPages` re-encrypts, measured at ~64s
+ * of pure crypto on top of an 88s conversion at 200k. Batching amortises that to roughly
+ * `conversionPages / CONVERSION_BATCH_PAGES` full-manifest rewrites instead of one per page.
+ *
+ * The honest cost of this: a crash loses at most one batch's worth of conversion progress (up to
+ * `CONVERSION_BATCH_PAGES * HYDRATION_PAGE_SIZE` events, not the whole session, and never more --
+ * legacy rows are only ever deleted in the same transaction their chunks and manifest pages commit
+ * in) rather than at most one outer page's worth, a coarser but still strictly bounded unit of
+ * durability; see `runChunkMigration`'s own docstring for the full trade-off.
+ *
+ * @knipignore - exported for tests, which override it to a small value so a fixture far smaller
+ *     than 10 real conversion pages can still exercise more than one batch boundary.
+ */
+export const CONVERSION_BATCH_PAGES = 10;
+
+/** Test-only override for {@link getConversionBatchPages}; `null` means "use {@link CONVERSION_BATCH_PAGES}". */
+let conversionBatchPagesOverrideForTesting: number | null = null;
+
+/** The conversion batch size in effect right now: {@link CONVERSION_BATCH_PAGES} unless a test has overridden it. */
+export function getConversionBatchPages(): number {
+    return conversionBatchPagesOverrideForTesting ?? CONVERSION_BATCH_PAGES;
+}
+
+/**
+ * Test-only hook: force {@link getConversionBatchPages} to a specific value, or pass `null` to
+ * clear the override. Never called from production code.
+ * @knipignore - exported for tests
+ */
+export function setConversionBatchPagesOverrideForTesting(override: number | null): void {
+    conversionBatchPagesOverrideForTesting = override;
+}
+
 const DESKTOP_BOUNDS: EventIndexBounds = {
     tier: "desktop",
     hotWindowBytes: 128 * 1024 * 1024,
