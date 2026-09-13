@@ -3621,12 +3621,9 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             const sortedByTsDesc = Array.from({ length: n }, (_unused, i) => i).sort((a, b) => tsAt(b) - tsAt(a));
             const expectedNewestIds = new Set(sortedByTsDesc.slice(0, K).map(mpId));
 
-            // Budget = K events' worth *plus* the full n-entry manifest's own share (review-pr-c.md
-            // C2-F2: residentByteEstimate() counts manifest.size too, and the whole corpus of n is
-            // manifested at reopen regardless of how many are hydrated).
-            setEventIndexBoundsOverrideForTesting({
-                hotWindowBytes: BYTES_PER_EVENT * K + MANIFEST_BYTES_PER_ENTRY_ESTIMATE * n,
-            });
+            // hotWindowBytes gates hydrated events alone (review-pr-c.md C2-F2, corrected in the
+            // third pass): the manifest has its own separate ceiling and does not eat into this.
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: BYTES_PER_EVENT * K });
             const reloaded = track(new BrowserEventIndexManager());
             await reloaded.initEventIndex(userId, DEVICE);
             await reloaded.waitForHydration();
@@ -3649,14 +3646,19 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(stats.manifestBytes).toBe(5 * MANIFEST_BYTES_PER_ENTRY_ESTIMATE);
         });
 
-        it("the manifest's own bytes count against the hot window, shrinking admitted events rather than being exempt (review-pr-c.md C2-F2)", async () => {
-            // A budget sized for exactly 20 events' worth with NO manifest headroom added: if the
-            // manifest's MANIFEST_BYTES_PER_ENTRY_ESTIMATE * 40 entries were (wrongly) exempt from
-            // this check, all 20 would fit; since it counts, fewer than 20 must.
+        it("the budget split is what admits the hot count: hotWindowBytes gates events alone, the manifest never eats into it (review-pr-c.md C2-F2, corrected)", async () => {
+            // A budget sized for exactly 20 events' worth, with NO manifest headroom added: unlike
+            // the intermediate (now-reverted) revision that summed the manifest into this same
+            // check, all 20 must fit regardless of how large the manifest itself is (40 entries
+            // here, double the admitted event count) -- the manifest has its own separate ceiling
+            // (eventIndexBounds.ts's manifestCeilingBytes) and never shrinks this one.
             const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20, 40);
             const stats = await reloaded.getStats();
-            expect(stats.eventCount).toBeLessThan(20);
+            expect(stats.eventCount).toBe(20);
             expect(stats.manifestBytes).toBe(40 * MANIFEST_BYTES_PER_ENTRY_ESTIMATE);
+            // "the hot window has excluded something" -- true here even though the exclusion is
+            // entirely events being left un-hydrated, nothing to do with the crawl bounds.
+            expect(stats.windowed).toBe(true);
         });
 
         it("a live insert over budget evicts the oldest resident event; the row survives on disk", async () => {
@@ -3681,6 +3683,42 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             const onDisk = await dumpRawStore("events");
             expect(onDisk.some((r: any) => r.eventId === idAt(0))).toBe(true); // ...and never deleted.
             expect(onDisk.length).toBe(10);
+        });
+
+        it("the searchable-date floor (oldestResidentTs) follows the resident set forward after an eviction, unlike oldestIndexedTs (SearchWarning correction)", async () => {
+            // Until increment E's cold scan, a row outside the resident set is on disk but not
+            // searchable -- so the "Search covers messages newer than {date}" line must move
+            // forward with the resident set on an eviction, not stay pinned to the disk floor
+            // (oldestIndexedTs), which an eviction (RAM-only, never a disk delete) never touches.
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: BYTES_PER_EVENT * 5 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+
+            for (const ev of budgetCorpus(5)) {
+                await manager.addEventToIndex(ev, {});
+                await manager.commitLiveEvents();
+            }
+            const beforeEviction = await manager.getStats();
+            expect(beforeEviction.oldestResidentTs).toBe(1_000_000); // idAt(0)'s own ts
+
+            // Two more, one at a time, each over budget: the first evicts idAt(0) (ts 1_000_000,
+            // coincidentally the same as the pre-eviction floor, so this step alone would not prove
+            // movement); the second evicts idAt(1) (ts 1_000_001), which *does* move the floor --
+            // neither ever deletes anything from disk.
+            const corpus7 = budgetCorpus(7);
+            await manager.addEventToIndex(corpus7[5], {});
+            await manager.commitLiveEvents();
+            await manager.addEventToIndex(corpus7[6], {});
+            await manager.commitLiveEvents();
+
+            const afterEviction = await manager.getStats();
+            expect(afterEviction.oldestResidentTs).toBe(1_000_001); // idAt(1)'s own ts -- moved forward
+            expect(afterEviction.oldestIndexedTs).toBe(1_000_000); // disk floor unmoved -- idAt(0)/idAt(1) still on disk
+            const onDiskIds = new Set((await dumpRawStore("events")).map((r: any) => r.eventId));
+            expect(onDiskIds.has(idAt(0))).toBe(true);
+            expect(onDiskIds.has(idAt(1))).toBe(true);
+            expect(onDiskIds.size).toBe(7); // nothing deleted -- an eviction is RAM-only
         });
 
         it("on-demand materialization of an evicted/un-hydrated row still reaches its redaction", async () => {
@@ -3732,16 +3770,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             // deferred batch's own minimum into the reported floor, this call would report id19's
             // ts (newer) as the new oldestResidentTs even though id39 (older) remains resident --
             // see enforceResidentBudget's `deferredMinTs` and oldestResidentTs's own docstring.
-            //
-            // Budget = 20 events' worth *plus* the full 40-entry manifest's own share (review-pr-c.md
-            // C2-F2: residentByteEstimate() now counts manifest.size too, and the whole corpus of 40
-            // is manifested at reopen regardless of how many are hydrated) -- otherwise fewer than 20
-            // would fit and this test's own "the original 20"/"id19" framing would no longer hold.
-            const reloaded = await seedAndReopen(
-                BYTES_PER_EVENT * 20 + MANIFEST_BYTES_PER_ENTRY_ESTIMATE * BUDGET_N,
-                BUDGET_N,
-                oldTailCorpus,
-            );
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 20, BUDGET_N, oldTailCorpus);
             const oldTailCorpusTs = (i: number): number => 2_000_000 - i;
 
             const before = await reloaded.getStats();

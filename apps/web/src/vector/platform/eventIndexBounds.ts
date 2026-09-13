@@ -16,29 +16,34 @@ Please see LICENSE files in the repository root for full details.
  * (`plainTextByteEstimate`, `ciphertextBytes`), and the event counts in the basis column below are
  * approximations for intuition only, not the actual gate.
  *
- * **How the hot window and the encrypted recency manifest coexist (review-pr-c.md C2-F2).** The
- * manifest ({@link BrowserEventIndexManager}'s own field of that name) tracks every row on *disk*,
- * not just the resident ones, and is never evicted -- so at a tier's own `diskBudgetBytes`-implied
- * population it can reach a real fraction of `hotWindowBytes` on its own:
+ * **How the hot window and the encrypted recency manifest coexist (review-pr-c.md C2-F2, corrected
+ * in the third pass).** The manifest ({@link BrowserEventIndexManager}'s own field of that name)
+ * tracks every row on *disk*, not just the resident ones, and is never evicted. It is its own
+ * resident tier, next to the hot window, **not** a tax on it: `hotWindowBytes` gates hydrated
+ * *events* alone (`RESIDENT_BYTES_PER_EVENT_ESTIMATE * events.size`, checked by
+ * `BrowserEventIndexManager.residentByteEstimate()`), so 200k events at the small tier still admit
+ * roughly the same ~49k hydrated events as before the manifest existed, and 500k at the desktop
+ * tier roughly ~131k. The manifest gets a separate, explicit ceiling instead
+ * (`manifestCeilingBytes` below), derived from `diskBudgetBytes`: **the manifest cannot exceed the
+ * events the disk budget admits**, so its worst case is exactly that event count times {@link
+ * MANIFEST_BYTES_PER_ENTRY_ESTIMATE}, self-enforcing via {@link
+ * BrowserEventIndexManager.enforceDiskBudget} rather than a runtime check of its own:
  *
- * | tier | `hotWindowBytes` | `diskBudgetBytes` | events at that budget | manifest for them | left for actual events |
+ * | tier | `hotWindowBytes` (events) | `diskBudgetBytes` | events at that budget | `manifestCeilingBytes` (worst case, ~157 B/entry) | tier's total resident (hot window + manifest ceiling) |
  * |---|---|---|---|---|---|
- * | small | 48 MiB | 128 MiB | ~170k | ~26 MiB (170k x 160 B) | ~22 MiB (~22k events) |
- * | desktop | 128 MiB | 512 MiB | ~700k | ~107 MiB (700k x 160 B) | ~21 MiB (~21k events) |
+ * | small | 48 MiB | 128 MiB | ~170k | ~25.5 MiB (170k x 157 B) | ~73.5 MiB |
+ * | desktop | 128 MiB | 512 MiB | ~700k | ~104.8 MiB (700k x 157 B) | ~232.8 MiB |
  *
- * `BrowserEventIndexManager.residentByteEstimate()` counts *both* terms against the same
- * `hotWindowBytes` (`MANIFEST_BYTES_PER_ENTRY_ESTIMATE * manifest.size`, alongside
- * `RESIDENT_BYTES_PER_EVENT_ESTIMATE * events.size`) rather than exempting the manifest -- an
- * earlier revision of this increment did exempt it, which the review caught as a silent +54%
- * (small tier) / +75% (desktop) overshoot of the documented budget once a long-lived index's
- * manifest actually reached that scale. **The manifest's own share is never shrunk to make room**
- * (it cannot be -- {@link BrowserEventIndexManager}'s `manifest` field docstring explains why it
- * must survive eviction): what shrinks, automatically, as the manifest grows toward this worst
- * case over a session's lifetime, is how many *events* {@link BrowserEventIndexManager.hydrate}
- * keeps resident out of what remains of `hotWindowBytes` -- never the reverse. This is a real,
- * intentional trade-off, not hidden in a "~50k events"/"~140k events" event-count intuition that
- * would otherwise silently stop holding once a manifest this large exists; the numbers above are
- * the honest ones for that state.
+ * (An intermediate revision of this fix summed the manifest's cost *into* `hotWindowBytes`'s own
+ * check instead of giving it this separate ceiling; that shrank admitted events to ~21k/~54k at the
+ * two proof sizes measured -- correct that the memory cost must not be invisible, wrong that hot,
+ * instantly-searchable content should be what pays for it. See `measurements-pr-c.md` §10.2/§11.)
+ *
+ * **The manifest's own share is never shrunk to make room** (it cannot be -- {@link
+ * BrowserEventIndexManager}'s `manifest` field docstring explains why it must survive eviction):
+ * `manifestCeilingBytes` is a documented worst-case figure the manifest's own growth is bounded by
+ * through `diskBudgetBytes`, not a second budget `enforceResidentBudget` separately checks or
+ * evicts against.
  */
 
 /** One of the two platform tiers a bound set is chosen for; see {@link deviceMemoryTier}. */
@@ -48,21 +53,36 @@ export type EventIndexTier = "desktop" | "small";
 export interface EventIndexBounds {
     readonly tier: EventIndexTier;
     /**
-     * Byte budget for the *resident* (hydrated-into-memory) set, checked against
-     * `plainTextByteEstimate`. Basis: 3% (desktop) / 5% (small) of Chromium's old-generation heap
-     * budget; SYNTHESIS.md §1.6/§3.7. Desktop 128 MiB (~140k events at 0.9 KB/event *when the
-     * manifest is small*), small tier 48 MiB (~50k events, same caveat) -- see the module
-     * docstring's table for what these numbers shrink to once the manifest itself has grown to a
-     * tier's own disk-budget-implied scale (review-pr-c.md C2-F2).
+     * Byte budget for the *resident* (hydrated-into-memory) set of **events**, checked against
+     * `BrowserEventIndexManager.residentByteEstimate()` (`RESIDENT_BYTES_PER_EVENT_ESTIMATE *
+     * events.size` -- events alone, not the manifest; see {@link manifestCeilingBytes} and the
+     * module docstring's own section on why the two are separate tiers, review-pr-c.md C2-F2's
+     * corrected reading). Basis: 3% (desktop) / 5% (small) of Chromium's old-generation heap
+     * budget; SYNTHESIS.md §1.6/§3.7. Desktop 128 MiB (~140k events at 0.9 KB/event), small tier
+     * 48 MiB (~50k events).
      */
     readonly hotWindowBytes: number;
     /**
      * Byte budget for the *on-disk* ciphertext footprint, checked against `ciphertextBytes` (exact
      * ciphertext accounting, excludes IndexedDB's own per-record/store overhead). Basis: pending
      * V10's on-disk multiplier; SYNTHESIS.md §3.7. Desktop 512 MiB (~700k events), small tier 128
-     * MiB (~170k events).
+     * MiB (~170k events). Also the basis {@link manifestCeilingBytes} is derived from: the manifest
+     * cannot exceed the events this budget admits.
      */
     readonly diskBudgetBytes: number;
+    /**
+     * Documented worst-case byte figure for the encrypted recency manifest's own resident cost
+     * (review-pr-c.md C2-F2, corrected) -- the events `diskBudgetBytes` admits for this tier, times
+     * `MANIFEST_BYTES_PER_ENTRY_ESTIMATE`'s own ~157 B/entry worst case (`BrowserEventIndexManager`
+     * measured 136.7-171.1 B/event across proof sizes and page sizes; see that constant's own
+     * docstring). **Not enforced by a runtime check of its own** -- the manifest's growth is
+     * already self-bounded by `diskBudgetBytes` via `enforceDiskBudget` (one manifest entry per
+     * disk row; a row leaving disk removes its entry too), so this field exists to make the
+     * resulting worst case *visible* rather than to gate anything a second time. Add this to
+     * `hotWindowBytes` for a tier's total worst-case resident figure (see the module docstring's
+     * table). Desktop ~104.8 MiB (700k x 157 B), small tier ~25.5 MiB (170k x 157 B).
+     */
+    readonly manifestCeilingBytes: number;
     /**
      * How far back, in days from the current wall-clock time, the crawler is allowed to fetch
      * history for one room; see {@link BrowserEventIndexManager.shouldCrawl}. Same for both tiers:
@@ -85,6 +105,8 @@ const DESKTOP_BOUNDS: EventIndexBounds = {
     tier: "desktop",
     hotWindowBytes: 128 * 1024 * 1024,
     diskBudgetBytes: 512 * 1024 * 1024,
+    // ~700k events (this tier's own diskBudgetBytes-implied population) x ~157 B/entry worst case.
+    manifestCeilingBytes: 700_000 * 157,
     crawlWindowDays: 90,
     crawlRoomCap: 100,
 };
@@ -93,6 +115,8 @@ const SMALL_BOUNDS: EventIndexBounds = {
     tier: "small",
     hotWindowBytes: 48 * 1024 * 1024,
     diskBudgetBytes: 128 * 1024 * 1024,
+    // ~170k events (this tier's own diskBudgetBytes-implied population) x ~157 B/entry worst case.
+    manifestCeilingBytes: 170_000 * 157,
     crawlWindowDays: 90,
     crawlRoomCap: 20,
 };

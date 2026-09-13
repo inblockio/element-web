@@ -89,16 +89,21 @@ const LOADING_POLL_MS = 1000;
  *     room — the property a `WarningKind.Files` caller wants instead, the checkpoint-based signal
  *     never having applied to it. `windowed`: true once a crawl bound or a byte budget has excluded
  *     or dropped something the index would otherwise cover ({@link IIndexStats.windowed}); absent
- *     from a backend that does not report it, same convention as `loading`. `oldestIndexedTs`: the
- *     date before which coverage is not guaranteed, when known, for the "Search covers messages
- *     newer than {date}" line — `undefined` on a backend that does not report it, or before this
- *     session has learned one.
+ *     from a backend that does not report it, same convention as `loading`. `oldestSearchableTs`:
+ *     the date before which a result is not guaranteed *findable by a query right now*, when known,
+ *     for the "Search covers messages newer than {date}" line — `undefined` on a backend that does
+ *     not report it, or before this session has learned one. Sourced from {@link
+ *     IIndexStats.oldestResidentTs}, not {@link IIndexStats.oldestIndexedTs}: until increment E
+ *     adds the streamed cold scan, a row outside the resident (hot-window) set is on disk but not
+ *     searchable, so `oldestIndexedTs` (a disk guarantee) would overstate what a query can actually
+ *     see today. Revisit this choice when E lands — the cold scan is what would make
+ *     `oldestIndexedTs` the correct source again.
  */
 function useIsIndexIncomplete(
     index: EventIndex | null,
     scope?: SearchScope,
     roomId?: string,
-): { incomplete: boolean; loading: boolean; windowed: boolean; oldestIndexedTs?: number } {
+): { incomplete: boolean; loading: boolean; windowed: boolean; oldestSearchableTs?: number } {
     const readCheckpoints = useCallback((): { relevant: boolean; anyOutstanding: boolean } => {
         if (!index) return { relevant: false, anyOutstanding: false };
         const { crawlingRooms } = index.crawlingRooms();
@@ -121,7 +126,9 @@ function useIsIndexIncomplete(
     // existing convention for every signal here) rather than adding a second timer for a pair of
     // properties that, once true, are expected to stay true or only become more true.
     const [windowed, setWindowed] = useState<boolean>(false);
-    const [oldestIndexedTs, setOldestIndexedTs] = useState<number | undefined>(undefined);
+    // oldestResidentTs, not oldestIndexedTs: see this hook's own docstring for why (until
+    // increment E's cold scan, only the resident set is actually searchable).
+    const [oldestSearchableTs, setOldestSearchableTs] = useState<number | undefined>(undefined);
 
     // Shared between the subscription effect below and the poll effect further down, so a tick
     // from either agrees with the other about which answer is current; a ref rather than a
@@ -154,7 +161,7 @@ function useIsIndexIncomplete(
             if (current !== generationRef.current) return;
             isLoading = Boolean(stats?.loading);
             setWindowed(Boolean(stats?.windowed));
-            setOldestIndexedTs(stats?.oldestIndexedTs);
+            setOldestSearchableTs(stats?.oldestResidentTs);
         } catch (e) {
             // A backend whose getStats() rejects is not evidence either way; log and treat it as
             // not loading rather than let the rejection go unhandled (this function is always
@@ -194,7 +201,7 @@ function useIsIndexIncomplete(
             setIncomplete(false);
             setLoading(false);
             setWindowed(false);
-            setOldestIndexedTs(undefined);
+            setOldestSearchableTs(undefined);
             return;
         }
 
@@ -228,7 +235,7 @@ function useIsIndexIncomplete(
         return () => clearInterval(poll);
     }, [index, loading, update]);
 
-    return { incomplete, loading, windowed, oldestIndexedTs };
+    return { incomplete, loading, windowed, oldestSearchableTs };
 }
 
 export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, scope, roomId }: IProps): JSX.Element {
@@ -237,7 +244,7 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
         incomplete: indexIncomplete,
         loading: indexLoading,
         windowed: indexWindowed,
-        oldestIndexedTs,
+        oldestSearchableTs,
     } = useIsIndexIncomplete(eventIndex, scope, roomId);
 
     // An all-rooms search merges hits from every locally-indexed encrypted room, regardless of
@@ -263,14 +270,15 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
         // A crawl bound or a byte budget has excluded or dropped something (SYNTHESIS.md §4's
         // degradation policy, step 3): state the date rather than let old messages go quietly
         // unfindable. Only shown once the index is not actively (re)building (the branch above),
-        // and only when a date is actually known -- see oldestIndexedTs's own docstring for why
-        // `windowed` and "a date is known" are two separate conditions.
-        if (indexWindowed && oldestIndexedTs !== undefined && kind === WarningKind.Search) {
+        // and only when a date is actually known -- see useIsIndexIncomplete's own docstring for
+        // why `windowed` and "a date is known" are two separate conditions, and for why this reads
+        // oldestSearchableTs (sourced from oldestResidentTs) rather than oldestIndexedTs.
+        if (indexWindowed && oldestSearchableTs !== undefined && kind === WarningKind.Search) {
             return (
                 <div className="mx_SearchWarning" role="status">
                     <span>
                         {_t("seshat|warning_kind_search_windowed", {
-                            date: formatFullDateNoTime(new Date(oldestIndexedTs)),
+                            date: formatFullDateNoTime(new Date(oldestSearchableTs)),
                         })}
                     </span>
                 </div>

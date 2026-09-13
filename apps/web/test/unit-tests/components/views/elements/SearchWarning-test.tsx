@@ -41,7 +41,9 @@ class FakeEventIndex {
 
     /** Settable after construction; see the "windowed" describe block below. */
     public windowed = false;
-    public oldestIndexedTs: number | undefined = undefined;
+    // oldestResidentTs, not oldestIndexedTs: SearchWarning's date line now sources from the
+    // resident (searchable) floor, not the disk one -- see useIsIndexIncomplete's own docstring.
+    public oldestResidentTs: number | undefined = undefined;
 
     /** getStats() rejects once, then answers normally; see "treats a getStats() failure as not loading". */
     public getStatsFailsOnce = false;
@@ -70,7 +72,7 @@ class FakeEventIndex {
         roomCount: number;
         loading: boolean;
         windowed: boolean;
-        oldestIndexedTs: number | undefined;
+        oldestResidentTs: number | undefined;
     }> {
         if (this.getStatsFailsOnce) {
             this.getStatsFailsOnce = false;
@@ -82,7 +84,7 @@ class FakeEventIndex {
             roomCount: 0,
             loading: this.loading,
             windowed: this.windowed,
-            oldestIndexedTs: this.oldestIndexedTs,
+            oldestResidentTs: this.oldestResidentTs,
         };
     }
 
@@ -560,7 +562,7 @@ describe("<SearchWarning />", () => {
             it('shows "Search covers messages newer than {date}" when windowed and a date is known', async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = true;
-                index.oldestIndexedTs = WINDOWED_TS;
+                index.oldestResidentTs = WINDOWED_TS;
                 setIndex(index);
 
                 const { queryByText } = render(
@@ -579,7 +581,7 @@ describe("<SearchWarning />", () => {
             it("does not show the windowed line when nothing has been excluded", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = false;
-                index.oldestIndexedTs = WINDOWED_TS; // a date being known is not sufficient on its own
+                index.oldestResidentTs = WINDOWED_TS; // a date being known is not sufficient on its own
                 setIndex(index);
 
                 const { queryByText, container } = render(
@@ -599,7 +601,7 @@ describe("<SearchWarning />", () => {
             it("does not show the windowed line when windowed but no date is known yet", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = true;
-                index.oldestIndexedTs = undefined; // windowed without a date is not enough either
+                index.oldestResidentTs = undefined; // windowed without a date is not enough either
                 setIndex(index);
 
                 const { queryByText, container } = render(
@@ -619,7 +621,7 @@ describe("<SearchWarning />", () => {
             it("never shows the windowed line for WarningKind.Files", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = true;
-                index.oldestIndexedTs = WINDOWED_TS;
+                index.oldestResidentTs = WINDOWED_TS;
                 setIndex(index);
 
                 const { queryByText } = render(<SearchWarning isRoomEncrypted={true} kind={WarningKind.Files} />);
@@ -632,7 +634,7 @@ describe("<SearchWarning />", () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.loading = true;
                 index.windowed = true;
-                index.oldestIndexedTs = WINDOWED_TS;
+                index.oldestResidentTs = WINDOWED_TS;
                 setIndex(index);
 
                 const { queryByText } = render(

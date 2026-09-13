@@ -44,6 +44,7 @@ describe("getEventIndexBounds", () => {
             tier: "desktop",
             hotWindowBytes: 128 * 1024 * 1024,
             diskBudgetBytes: 512 * 1024 * 1024,
+            manifestCeilingBytes: 700_000 * 157,
             crawlWindowDays: 90,
             crawlRoomCap: 100,
         });
@@ -56,6 +57,7 @@ describe("getEventIndexBounds", () => {
             tier: "small",
             hotWindowBytes: 48 * 1024 * 1024,
             diskBudgetBytes: 128 * 1024 * 1024,
+            manifestCeilingBytes: 170_000 * 157,
             crawlWindowDays: 90,
             crawlRoomCap: 20,
         });

@@ -731,20 +731,25 @@ export const RESIDENT_BYTES_PER_EVENT_ESTIMATE = 1024;
 
 /**
  * Flat per-entry resident-byte estimate for {@link BrowserEventIndexManager.manifest} (an id, a
- * number and a room id, plus `Map`/`Set` overhead), used by {@link
- * BrowserEventIndexManager.residentByteEstimate} to count the manifest *into* `HOT_WINDOW_BYTES`
- * rather than exempting it -- review-pr-c.md C2-F2: the manifest covers every row on **disk**, not
- * just the resident ones, so at a tier's own `diskBudgetBytes` it can reach a real fraction of the
- * hot window on its own (`research/measurements-pr-c.md` §9 measured 136.7 B/event at 200k, small
- * tier, and 138.1 B/event at 500k, desktop -- close to constant across a 2.5x scale change, the
- * same "per-entry, not proportional to anything else" shape {@link
- * RESIDENT_BYTES_PER_EVENT_ESTIMATE} already assumes for events). 160 rounds that measured range up
- * for headroom, the same convention. Counting it *inside* the same budget `hydrate()`/{@link
- * enforceResidentBudget} already check means the manifest is never itself evicted or truncated to
- * make room (it cannot be -- see {@link manifest}'s own docstring on why it must survive eviction)
- * -- what shrinks as the manifest grows toward a tier's disk-budget-implied worst case is the
- * number of *events* that fit in what is left of `hotWindowBytes`, never the manifest's own share.
- * See `eventIndexBounds.ts`'s module docstring for the worst-case numbers this implies per tier.
+ * number and a room id, plus `Map`/`Set` overhead), used by {@link EventIndexBounds}'s own
+ * `manifestCeilingBytes` and by {@link BrowserEventIndexManager.getStats}' `manifestBytes` --
+ * **not** by {@link BrowserEventIndexManager.residentByteEstimate}, which checks `HOT_WINDOW_BYTES`
+ * for hydrated events alone (review-pr-c.md C2-F2's second pass: an intermediate revision summed
+ * this into that same check, which shrank admitted events by more than half at both proof sizes
+ * measurements-pr-c.md §10.2 reports -- corrected in §11: the manifest is its own resident tier
+ * with its own ceiling, never a tax on the hot window). `research/measurements-pr-c.md` measured
+ * 136.7-138.1 B/event at §9's page size (10k entries/page) and 136.8-171.1 B/event at §10/§11's
+ * smaller page size (1k entries/page, review-pr-c.md C2-F3 -- more, smaller `Set`s cost slightly
+ * more fixed overhead in aggregate), i.e. roughly constant across a 2.5x scale change either way,
+ * the same "per-entry, not proportional to anything else" shape {@link
+ * RESIDENT_BYTES_PER_EVENT_ESTIMATE} already assumes for events. 160 rounds that measured range up
+ * for headroom, the same convention.
+ *
+ * **Planned follow-up, not yet built** (see {@link BrowserEventIndexManager.manifest}'s own
+ * docstring): a compact representation -- fixed-width ids in one concatenated byte buffer plus
+ * typed arrays for `ts`, rather than boxed objects and JS strings in a `Map` -- targeting under
+ * 60 B/entry, which would let a tier admit a proportionally larger manifest (and, if ever revisited,
+ * a smaller `manifestCeilingBytes`) for the same memory cost.
  * @knipignore - exported for tests, for the same reason {@link RESIDENT_BYTES_PER_EVENT_ESTIMATE} is.
  */
 export const MANIFEST_BYTES_PER_ENTRY_ESTIMATE = 160;
@@ -1313,18 +1318,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * ({@link enforceResidentBudget}), which is the entire point -- a row leaving the resident set
      * must not look, to this map, like it left disk.
      *
-     * **Memory cost, and why it counts *inside* `HOT_WINDOW_BYTES` (review-pr-c.md C2-F2):**
-     * {@link MANIFEST_BYTES_PER_ENTRY_ESTIMATE} per entry, included in {@link residentByteEstimate}
-     * alongside the resident event count. An earlier revision of this docstring (and this
-     * increment's own commit message) claimed the manifest was exempted from the hot-window budget
-     * -- it was not: `residentByteEstimate()` counted only `events.size`, so the manifest's real
-     * memory cost was simply missing from the check entirely, a silent overshoot the review measured
-     * at +54%/+75% of `hotWindowBytes` once a session's manifest reached a tier's own
-     * `diskBudgetBytes`-implied population (~170k events small tier, ~700k desktop; see
-     * `eventIndexBounds.ts`'s module docstring for the numbers). The manifest is still never itself
-     * evicted or truncated to make room -- it cannot be, per the two questions above -- so counting
-     * it inside the same budget means it is the *event* count that shrinks as the manifest grows
-     * toward that worst case, never the manifest's own share.
+     * **Memory cost, tracked in its own resident tier, not inside `HOT_WINDOW_BYTES`
+     * (review-pr-c.md C2-F2, corrected):** {@link MANIFEST_BYTES_PER_ENTRY_ESTIMATE} per entry,
+     * reported via {@link getStats}' `manifestBytes` and bounded, per tier, by {@link
+     * EventIndexBounds.manifestCeilingBytes} (`eventIndexBounds.ts`'s own module docstring has the
+     * worst-case numbers per tier and the "manifest ceiling + hot window = total resident" figure).
+     * An earlier revision of this fix (review-pr-c.md's own second pass, C2-F2) summed this cost
+     * *into* {@link residentByteEstimate} alongside `events.size`, checked against the same
+     * `HOT_WINDOW_BYTES` -- correct that the manifest's real memory cost must not be invisible, but
+     * the wrong tier for it to count against: `HOT_WINDOW_BYTES` is the "instantly searchable"
+     * tier's own budget, and folding the manifest into it shrank admitted events by more than half
+     * at both proof sizes (measurements-pr-c.md §10.2), which guts what the hot window exists to
+     * guarantee. The manifest is still never itself evicted or truncated to make room -- it cannot
+     * be, per the two questions above -- it simply has its own accounting and its own ceiling now,
+     * self-enforcing because the manifest cannot exceed the events {@link
+     * EventIndexBounds.diskBudgetBytes} admits.
+     *
+     * **Planned follow-up, not yet built:** a compact manifest representation -- fixed-width ids
+     * concatenated into one byte buffer plus typed (`Float64Array`/similar) arrays for `ts`, rather
+     * than a `Map<string, ManifestEntry>` of individually-boxed objects and JS strings -- targeting
+     * under 60 B/entry, well below {@link MANIFEST_BYTES_PER_ENTRY_ESTIMATE}'s current 160.
      *
      * Kept as `Map<eventId, ManifestEntry>` rather than a structure pre-sorted by `originServerTs`:
      * inserts (overwhelmingly the common operation, one per write) are O(1); {@link hydrate} reads
@@ -4178,18 +4191,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     /**
      * The resident-set byte estimate `hydrate()`/{@link enforceResidentBudget} check against
      * `HOT_WINDOW_BYTES`; see {@link RESIDENT_BYTES_PER_EVENT_ESTIMATE}'s docstring for why this is
-     * a flat per-event figure rather than {@link plainTextByteEstimate}. Includes {@link manifest}'s
-     * own resident cost ({@link MANIFEST_BYTES_PER_ENTRY_ESTIMATE} per entry) as of review-pr-c.md
-     * C2-F2 -- previously exempted here despite the manifest's docstring and the commit message both
-     * claiming otherwise, which the review caught as a real, silent overshoot (+54%/+75% of
-     * `hotWindowBytes` at a tier's own disk-budget-implied population). O(1): both `events.size` and
-     * `manifest.size` are `Map`s' own maintained counts.
+     * a flat per-event figure rather than {@link plainTextByteEstimate}. `HOT_WINDOW_BYTES` gates
+     * *hydrated events only* -- it is `SYNTHESIS.md`'s "instantly searchable" tier, and the
+     * coordinator's correction to review-pr-c.md C2-F2 restored that meaning: an intermediate
+     * revision counted {@link manifest}'s own resident cost in here too, which shrank admitted
+     * events from ~49k to ~21k at 200k/small tier (measurements-pr-c.md §10.2) -- correct in the
+     * narrow sense that the manifest's real memory cost was no longer invisible, but the wrong
+     * *tier* for it to count against: the manifest is its own resident tier, with its own ceiling
+     * (`eventIndexBounds.ts`'s `manifestCeilingBytes`), not a tax on the hot window. See {@link
+     * getStats}' `manifestBytes` for the manifest's own accounting, tracked and reported but never
+     * summed into this method. O(1): `events.size` is a `Map`'s own maintained count.
      */
     private residentByteEstimate(): number {
-        return (
-            this.events.size * RESIDENT_BYTES_PER_EVENT_ESTIMATE +
-            this.manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE
-        );
+        return this.events.size * RESIDENT_BYTES_PER_EVENT_ESTIMATE;
     }
 
     /**
