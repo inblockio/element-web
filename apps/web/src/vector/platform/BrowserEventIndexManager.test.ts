@@ -1561,6 +1561,67 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         }
     });
 
+    it("materializes rows from a good chunk before a later, undecryptable chunk wipes them too (review-pr-d.md D-R8)", async () => {
+        // The invariant hydrate()'s own docstring claims and the test above (a single corrupted
+        // chunk) cannot pin: a decrypt failure partway through a restore does not silently skip
+        // just the bad chunk -- everything materialized from chunks visited *before* it stays
+        // genuinely resident right up until the wipe clears it too, rather than never having been
+        // processed at all (e.g. a buggy "check every chunk decrypts before materializing any of
+        // them" implementation would also end up empty after a wipe, indistinguishable from the
+        // outside without this spy).
+        setChunkTargetBytesOverrideForTesting(250); // forces the two events below into separate chunks
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$goodNewer", "zqpartial good wording", { origin_server_ts: 2000 }), {});
+        await manager.commitLiveEvents();
+        await manager.addEventToIndex(msg("$badOlder", "zqpartial bad wording", { origin_server_ts: 1000 }), {});
+        await manager.commitLiveEvents();
+        const rawChunks = await dumpRawStore("chunks");
+        expect(rawChunks).toHaveLength(2); // genuinely two chunks, one per event
+        await manager.closeEventIndex();
+
+        // Corrupt only the OLDER event's chunk. hydrate() walks newest-chunk-first, so $goodNewer's
+        // chunk is visited (and materialized) before $badOlder's chunk is even attempted. Identify
+        // it by decrypting each raw row and corrupting whichever one does NOT hold $goodNewer.
+        for (const row of rawChunks) {
+            const decrypted = await decryptBinaryJson<Array<[string, any]>>(
+                await deriveDek(pickleKey!, decodeBase64((await dumpRawStore("meta"))[0].salt), userId, DEVICE),
+                row.blob,
+                chunkAad(row.userId, row.chunkId),
+            );
+            if (!decrypted.some(([id]) => id === "$goodNewer")) {
+                await withRawDb(async (db) => {
+                    const store = db.transaction("chunks", "readwrite").objectStore("chunks");
+                    const fresh = await idbPromise(store.get([row.userId, row.chunkId]));
+                    fresh.blob.ct = crypto.getRandomValues(new Uint8Array(64));
+                    await idbPromise(store.put(fresh));
+                });
+            }
+        }
+
+        const materializeSpy = vi.spyOn(BrowserEventIndexManager.prototype as any, "materializeRow");
+        try {
+            const reloaded = new BrowserEventIndexManager();
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+
+            // The good row really was processed (not skipped because a later chunk would fail) --
+            // this is the "resident right up until the wipe" property the docstring claims.
+            const materializedIds = materializeSpy.mock.calls.map((args: any[]) => args[1]?.eventId);
+            expect(materializedIds).toContain("$goodNewer");
+
+            // ... and then the wipe took it, and everything else, with it -- same outcome as the
+            // single-corrupted-chunk test above, now proven to follow genuine partial processing
+            // rather than an early bail that never touched the good chunk at all.
+            expect((await reloaded.getStats()).eventCount).toBe(0);
+            expect((await reloaded.searchEventIndex(search("zqpartial"))).count).toBe(0);
+            expect(await reloaded.isEventIndexEmpty()).toBe(true);
+            await reloaded.closeEventIndex();
+        } finally {
+            materializeSpy.mockRestore();
+        }
+    });
+
     it("closes the previous connection when re-initialising", async () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
@@ -4306,6 +4367,56 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
                 expect((await third.getStats()).oldestIndexedTs).toBe(after.oldestIndexedTs);
             } finally {
                 restoreDecrypt();
+            }
+        });
+
+        it("opening the index never bulk-reads the chunks store for disk-byte accounting (review-pr-d.md D-R3)", async () => {
+            // The online conversion was the only caller of the old, deleted
+            // deriveAuthoritativeDiskAccounting, which read every chunk row (ciphertext included)
+            // into memory with one getAll() over the whole store, once per run. With it gone,
+            // ciphertextBytes is exact and incremental by construction (every write/redaction/
+            // eviction path updates meta.diskBytes in the same transaction that changes the
+            // underlying chunk row), so `size` is available the instant `initEventIndex` has read
+            // `meta` -- synchronously within that call, before the manifest phase or hydration ever
+            // starts. Spied at the getAll() granularity specifically (not get()): hydrate's own,
+            // separate per-chunk get() reads (to materialize events, not to derive byte totals) are
+            // legitimate and may race this test's own assertions, but a whole-store getAll() on
+            // "chunks" would only ever come from an accounting-derivation step like the deleted one.
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            for (const ev of budgetCorpus(50)) {
+                await seed.addEventToIndex(ev, {});
+            }
+            await seed.commitLiveEvents();
+            const before = await seed.getStats();
+            expect(before.size).toBeGreaterThan(0);
+            await seed.closeEventIndex();
+
+            const realGetAll = IDBObjectStore.prototype.getAll;
+            let chunksGetAllCalls = 0;
+            const getAllSpy = vi.spyOn(IDBObjectStore.prototype, "getAll").mockImplementation(function (
+                this: IDBObjectStore,
+                ...args: Parameters<IDBObjectStore["getAll"]>
+            ): IDBRequest {
+                if (this.name === "chunks") chunksGetAllCalls++;
+                return realGetAll.apply(this, args);
+            });
+            try {
+                const reloaded = track(new BrowserEventIndexManager());
+                await reloaded.initEventIndex(userId, DEVICE);
+                // The exact-byte total is already correct the instant initEventIndex returns --
+                // before waitForManifest, let alone waitForHydration -- because it was restored
+                // from meta.diskBytes synchronously, not derived by reading any chunk.
+                const statsAtOpen = await reloaded.getStats();
+                expect(statsAtOpen.size).toBe(before.size);
+                expect(chunksGetAllCalls).toBe(0); // no whole-store read has had any reason to run yet
+                await reloaded.waitForHydration(); // let the (legitimate, per-chunk get()) restore finish
+                expect(chunksGetAllCalls).toBe(0); // still zero: restore never getAll()s "chunks" either
+                await reloaded.closeEventIndex();
+            } finally {
+                getAllSpy.mockRestore();
             }
         });
     });
