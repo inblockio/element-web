@@ -690,6 +690,20 @@ const LIVE_WRITE_FLUSH_INTERVAL_MS = 5000;
 const LIVE_WRITE_BUFFER_MAX = 300;
 
 /**
+ * How many terms {@link BrowserEventIndexManager.pendingVocabulary} may hold before {@link
+ * BrowserEventIndexManager.indexTokens} merges it into {@link BrowserEventIndexManager.sortedVocabulary}
+ * ({@link BrowserEventIndexManager.mergeVocabularyDelta}) -- see that field's docstring for the incident
+ * (`research/review-pr-b.md` B-F1) this exists to fix. A fixed constant rather than a function of V (e.g.
+ * `sqrt(V)`, the review's other suggestion): easier to reason about and to test, and the amortised cost either
+ * choice buys is dominated by the same O(V) merge pass regardless -- a fixed threshold just makes how often that
+ * pass runs a constant the reader can see directly rather than one they have to compute. At the corpus's own
+ * Heaps'-law rate (~0.15 new terms/event at V=61k, n=200k, `research/browser-limits-model.md` §6.1), this merges
+ * roughly once per 13,000 indexed events; each merge is one linear pass over the whole vocabulary (a few ms at
+ * V=200k, `research/measurements-pr-b.md` §5), never inside a query.
+ */
+const VOCABULARY_MERGE_THRESHOLD = 2000;
+
+/**
  * Current time in milliseconds, monotonic where available. A one-line wrapper purely so every
  * hydration timing call site reads the same way; `performance` is present in every environment this
  * file runs in (every real browser, and happy-dom in the unit tests), so there is no fallback to
@@ -829,21 +843,29 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private readonly inverted = new Map<string, Set<string>>();
     /**
-     * Every term currently in {@link inverted}, sorted, for {@link lookupToken}'s prefix path to binary-search
-     * instead of walking the whole vocabulary. Rebuilt lazily by {@link ensureSortedVocabulary} rather than kept in
-     * sync on every insert: a term's sort position never changes while it exists, so nothing here needs to move
-     * until a term is *added* or *removed* from {@link inverted}'s key set, which {@link vocabularyDirty} tracks.
+     * The **base** of the sorted vocabulary: every term that was in {@link inverted}'s key set as of the last merge
+     * ({@link mergeVocabularyDelta}), sorted, for {@link lookupToken}'s prefix path to binary-search. Never re-sorted
+     * from scratch on a read: a term newly added to {@link inverted} goes into {@link pendingVocabulary} instead, and
+     * only moves here in a bounded, write-triggered merge -- see that field and {@link mergeVocabularyDelta} for why.
+     * May contain a term whose posting set has since emptied (a "ghost" -- see {@link unindexTokens}); harmless,
+     * because {@link lookupToken} looks the term back up in {@link inverted} and skips it if the posting is gone.
      */
-    private readonly sortedVocabulary: string[] = [];
+    private sortedVocabulary: string[] = [];
     /**
-     * True when {@link inverted}'s key set has changed (a term added or its posting set emptied) since {@link
-     * sortedVocabulary} was last rebuilt. Checked, and cleared, by {@link ensureSortedVocabulary} -- set by {@link
-     * indexTokens} and {@link unindexTokens} only, and only on the add/remove-a-key edge, never on an existing term
-     * merely gaining or losing a posting. This is what makes the rebuild "at most once per query burst": several
-     * prefix lookups in the same {@link searchEventIndex} call, or several calls with no intervening write, share one
-     * rebuild.
+     * Terms added to {@link inverted}'s key set since {@link sortedVocabulary} was last merged, in insertion order
+     * (not sorted). This is the fix for B-F1 (`research/review-pr-b.md`): the previous design re-sorted the *entire*
+     * vocabulary from scratch on the first prefix query after any write, which measured at 25ms at this corpus's own
+     * V (61,346 terms at 200k events) and 107ms at V=200,000 -- a long-task violation on every keystroke during
+     * hydration or a crawler batch, both of which dirty the vocabulary on nearly every write. Kept small instead:
+     * {@link lookupToken}'s prefix path binary-searches {@link sortedVocabulary} *and* linearly scans this delta (at
+     * most {@link VOCABULARY_MERGE_THRESHOLD} terms, a fixed, small, insert-rate-independent cost -- see that
+     * constant), and {@link indexTokens} merges this into the base with one O(V) pass ({@link mergeVocabularyDelta})
+     * only once this list reaches that threshold, never as a side effect of a read. A term never needs to be removed
+     * from this list on a redaction: {@link unindexTokens} intentionally does nothing to either vocabulary structure
+     * (see its docstring), and a term that was pending, then fully redacted before ever being merged, is simply a
+     * ghost once it does merge, exactly as tolerated in {@link sortedVocabulary}'s own docstring.
      */
-    private vocabularyDirty = false;
+    private readonly pendingVocabulary: string[] = [];
     /**
      * Room id -> that room's record ids, ordered by `origin_server_ts` ascending. The ordering is an invariant,
      * maintained by {@link insertRoomOrder} and repaired by {@link reindexRoomOrder}; {@link contextFor} and {@link
@@ -1895,9 +1917,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * the *same text it was indexed with* -- which is why {@link upsertEvent} unindexes before it overwrites
      * `searchText`, never after.
      *
-     * Sets {@link vocabularyDirty} exactly when a *new* term enters {@link inverted}'s key set, never when an existing
-     * term merely gains another posting: that is the only edge {@link sortedVocabulary} needs to hear about, since a
-     * term's sort position is a property of the string alone and cannot change while it stays in the map.
+     * Pushes a *new* term (one not already in {@link inverted}'s key set) onto {@link pendingVocabulary} rather than
+     * re-sorting {@link sortedVocabulary} from scratch; merges that delta into the base, in one bounded O(V) pass,
+     * once it reaches {@link VOCABULARY_MERGE_THRESHOLD} ({@link mergeVocabularyDelta}) -- on this write path, never
+     * as a side effect of a read. See `pendingVocabulary`'s own docstring for the incident this replaced.
      */
     private indexTokens(eventId: string, text: string): void {
         for (const token of tokenize(text)) {
@@ -1905,7 +1928,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             if (!set) {
                 set = new Set();
                 this.inverted.set(token, set);
-                this.vocabularyDirty = true;
+                this.pendingVocabulary.push(token);
+                if (this.pendingVocabulary.length >= VOCABULARY_MERGE_THRESHOLD) this.mergeVocabularyDelta();
             }
             set.add(eventId);
         }
@@ -1913,11 +1937,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
     /**
      * Remove a record's terms from the inverted index, passing the exact text the record was indexed with; see {@link
-     * indexTokens}. A term whose posting set empties is deleted rather than left behind: {@link lookupToken} walks the
-     * entire vocabulary on every prefix query, so dead terms would make queries progressively slower for the life of
-     * the session -- and, since this increment, would also linger in {@link sortedVocabulary} as a term with an empty
-     * posting set, so this sets {@link vocabularyDirty} on exactly that edge for the same reason {@link indexTokens}
-     * does on the opposite one.
+     * indexTokens}. A term whose posting set empties is deleted from {@link inverted} rather than left behind, so a
+     * redaction cannot make an unrelated exact-term lookup (`this.inverted.get(token)`) find a dead posting set -- but
+     * deliberately does **not** touch {@link sortedVocabulary} or {@link pendingVocabulary}: {@link lookupToken}'s
+     * prefix path re-looks-up every candidate term in `inverted` and skips one whose posting is gone (a "ghost"), so a
+     * stale entry in either vocabulary structure changes no result, only costs one wasted `Map.get()` -- and per
+     * `research/review-pr-b.md`'s B-N3, invalidating on this edge was never load-bearing even under the previous
+     * design; this increment removes it rather than keep paying to detect an edge nothing needs detected.
      */
     private unindexTokens(eventId: string, text: string): void {
         for (const token of tokenize(text)) {
@@ -1926,7 +1952,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             set.delete(eventId);
             if (set.size === 0) {
                 this.inverted.delete(token);
-                this.vocabularyDirty = true;
             }
         }
     }
@@ -1992,9 +2017,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      *
      * @param prefix - When true, indexed terms that *start with* `token` match as well as the exact term, so typing
      *     "mess" already finds "message". Answered by binary-searching {@link sortedVocabulary} for the contiguous
-     *     range of terms starting with `token` ({@link vocabularyRange}) rather than walking the whole vocabulary,
-     *     which is why the caller passes false for single-character terms; the inner length check repeats that
-     *     condition, so the prefix walk is unreachable for one-character terms.
+     *     range of terms starting with `token` ({@link vocabularyRange}), plus a linear scan of {@link
+     *     pendingVocabulary} (at most {@link VOCABULARY_MERGE_THRESHOLD} terms) for anything indexed since the last
+     *     merge -- see that field's docstring for why a bounded scan of the unmerged delta, rather than a full
+     *     rebuild here, is what keeps this method's cost independent of write rate. The caller passes false for
+     *     single-character terms, since walking either structure for a one-character prefix is not worth it; the
+     *     inner length check repeats that condition, so the prefix walk is unreachable for one-character terms.
      */
     private lookupToken(token: string, prefix: boolean): Set<string> {
         if (!prefix) return new Set(this.inverted.get(token) ?? []);
@@ -2002,11 +2030,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const exact = this.inverted.get(token);
         if (exact) for (const id of exact) out.add(id);
         if (token.length >= 2) {
-            this.ensureSortedVocabulary();
             const [start, end] = this.vocabularyRange(token);
             for (let i = start; i < end; i++) {
                 const term = this.sortedVocabulary[i];
                 if (term === token) continue; // Exact match already added above.
+                const ids = this.inverted.get(term);
+                if (ids) for (const id of ids) out.add(id);
+            }
+            for (const term of this.pendingVocabulary) {
+                if (term === token || !term.startsWith(token)) continue;
                 const ids = this.inverted.get(term);
                 if (ids) for (const id of ids) out.add(id);
             }
@@ -2015,18 +2047,31 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Rebuild {@link sortedVocabulary} from {@link inverted}'s current key set if a term has been added to or removed
-     * from it since the last rebuild ({@link vocabularyDirty}); otherwise a no-op. Called at the top of every prefix
-     * lookup ({@link lookupToken}) rather than eagerly on every write, so a multi-term query, or several queries in a
-     * row with no intervening index change, share one O(V log V) sort rather than paying it again per term or per
-     * keystroke -- "rebuilt at most once per query burst".
+     * Merge {@link pendingVocabulary} into {@link sortedVocabulary} with one linear-time pass (sort the small delta,
+     * then merge two sorted sequences), replacing the O(V log V) full re-sort this class used to do on every prefix
+     * query once any write had touched the vocabulary (`research/review-pr-b.md` B-F1: measured at 25ms at V=61,346,
+     * 107ms at V=200,000 -- run on *every* keystroke during hydration or a crawler batch, since both dirty the
+     * vocabulary on nearly every write). Called only from {@link indexTokens}, only once {@link pendingVocabulary}
+     * reaches {@link VOCABULARY_MERGE_THRESHOLD} -- a write-path decision, never triggered by a read, so a query never
+     * pays this cost as a side effect of asking a question. A no-op if the delta is empty (defensive; the one caller
+     * never invokes this with an empty delta, but nothing here assumes that).
      */
-    private ensureSortedVocabulary(): void {
-        if (!this.vocabularyDirty) return;
-        this.sortedVocabulary.length = 0;
-        for (const term of this.inverted.keys()) this.sortedVocabulary.push(term);
-        this.sortedVocabulary.sort();
-        this.vocabularyDirty = false;
+    private mergeVocabularyDelta(): void {
+        if (this.pendingVocabulary.length === 0) return;
+        this.pendingVocabulary.sort();
+        const base = this.sortedVocabulary;
+        const delta = this.pendingVocabulary;
+        const merged: string[] = new Array(base.length + delta.length);
+        let i = 0;
+        let j = 0;
+        let k = 0;
+        while (i < base.length && j < delta.length) {
+            merged[k++] = base[i] <= delta[j] ? base[i++] : delta[j++];
+        }
+        while (i < base.length) merged[k++] = base[i++];
+        while (j < delta.length) merged[k++] = delta[j++];
+        this.sortedVocabulary = merged;
+        this.pendingVocabulary.length = 0;
     }
 
     /**
@@ -2035,7 +2080,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * tokenize}'s split pattern), which cannot contain the U+FFFF noncharacter, so appending it to `prefix` produces
      * a string that every prefix-matching term sorts strictly before and every non-matching term at or after -- the
      * standard "lower bound of prefix, lower bound of prefix + a sentinel higher than any real character" technique
-     * for a contiguous prefix range in a sorted array. Caller must have called {@link ensureSortedVocabulary} first.
+     * for a contiguous prefix range in a sorted array. Only covers {@link sortedVocabulary} (the merged base); {@link
+     * lookupToken} scans {@link pendingVocabulary} (the unmerged delta) separately, linearly.
      */
     private vocabularyRange(prefix: string): [number, number] {
         return [this.lowerBoundVocabulary(prefix), this.lowerBoundVocabulary(prefix + "\uFFFF")];
@@ -2715,8 +2761,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * would do to itself if called mid-run (a hydration loop that just wiped everything would then see its own epoch
      * as stale on its very next check and abort before finishing the wipe it was in the middle of).
      *
-     * {@link sortedVocabulary}, {@link vocabularyDirty} and {@link plainTextByteEstimate} are cleared here rather than
-     * in {@link resetMemory}, alongside {@link inverted} and {@link events}: all three mirror derived state of
+     * {@link sortedVocabulary}, {@link pendingVocabulary} and {@link plainTextByteEstimate} are cleared here rather
+     * than in {@link resetMemory}, alongside {@link inverted} and {@link events}: all three mirror derived state of
      * exactly those two structures, so they belong with the group hydrate populates, not with the broader session
      * reset below.
      */
@@ -2732,7 +2778,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;
         this.sortedVocabulary.length = 0;
-        this.vocabularyDirty = false;
+        this.pendingVocabulary.length = 0;
     }
 
     /**

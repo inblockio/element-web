@@ -879,6 +879,39 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect((await manager.searchEventIndex(search("fresh"))).count).toBe(1);
     });
 
+    it("B13 (review-pr-b.md): the crawler's refresh branch persists the improved body, not just the memory copy", async () => {
+        // review-pr-b.md's B-F1 fix reworked addHistoricEvents' write path from a per-event
+        // schedulePersistEvent call to an accumulated `dirty` set flushed once per batch -- three
+        // new places to forget to mark a record dirty. The existing "refreshes a stale body" test
+        // above only asserts the in-memory searchEventIndex result, which is updated regardless of
+        // whether the id was ever added to `dirty`: it cannot tell a persisted refresh from one that
+        // silently reverts on the next session. This test closes exactly that gap by reloading from
+        // disk.
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const stale = msg("$b13hist", "stale wording for review");
+        expect(await manager.addHistoricEvents([{ event: stale, profile: {} }], null, null)).toBe(false);
+
+        const refreshed = msg("$b13hist", "refreshed wording for review");
+        expect(await manager.addHistoricEvents([{ event: refreshed, profile: {} }], null, null)).toBe(false);
+        // Already true in memory -- the existing test's assertion -- but not the point of this one.
+        expect((await manager.searchEventIndex(search("refreshed"))).count).toBe(1);
+
+        await manager.commitLiveEvents();
+        await manager.closeEventIndex();
+
+        const reloaded = new BrowserEventIndexManager();
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        try {
+            // The disk copy must be the refreshed body, not the stale one the crawler first saw.
+            expect((await reloaded.searchEventIndex(search("stale"))).count).toBe(0);
+            expect((await reloaded.searchEventIndex(search("refreshed"))).count).toBe(1);
+        } finally {
+            await reloaded.closeEventIndex();
+        }
+    });
+
     it("keeps the edited body when the original arrives afterwards", async () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
@@ -2393,6 +2426,85 @@ describe("BrowserEventIndexManager (batched writes)", () => {
         expect((await inspectRawDb()).events).toHaveLength(15);
         txSpy.mockRestore();
     });
+
+    it("B14 (review-pr-b.md): the 300-event size threshold flushes automatically, without waiting for commitLiveEvents or the timer", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction");
+        const eventsTxCalls = (): number =>
+            txSpy.mock.calls.filter(
+                (call) => call[0] === "events" || (Array.isArray(call[0]) && call[0].includes("events")),
+            ).length;
+
+        // No explicit commitLiveEvents() anywhere in this test, and nowhere near the 5s timer:
+        // the only thing that can flush anything below is the size threshold itself. Its own
+        // encrypt-then-put work is asynchronous (crypto.subtle.encrypt per buffered record), so
+        // this polls briefly for each automatic flush to actually land rather than assuming it is
+        // instantaneous relative to the next loop iteration -- a real race the first version of
+        // this test lost (0 transactions observed immediately after the loop, despite the buffer
+        // itself correctly draining to 50, proving the flush had been *triggered*, just not yet
+        // *landed* on disk).
+        for (let i = 0; i < 300; i++) {
+            await manager.addEventToIndex(msg(`$b14-${i}`, `buffer threshold body ${i}`), {});
+        }
+        for (let guard = 0; eventsTxCalls() < 1 && guard < 200; guard++) await sleep(4);
+        expect(eventsTxCalls()).toBe(1);
+
+        for (let i = 300; i < 600; i++) {
+            await manager.addEventToIndex(msg(`$b14-${i}`, `buffer threshold body ${i}`), {});
+        }
+        for (let guard = 0; eventsTxCalls() < 2 && guard < 200; guard++) await sleep(4);
+        expect(eventsTxCalls()).toBe(2);
+
+        // The last 50 are under the threshold: still nothing new flushes without an explicit
+        // commit or the (5s, unreached here) timer.
+        for (let i = 600; i < 650; i++) {
+            await manager.addEventToIndex(msg(`$b14-${i}`, `buffer threshold body ${i}`), {});
+        }
+        expect(eventsTxCalls()).toBe(2);
+
+        await manager.commitLiveEvents();
+        expect((await inspectRawDb()).events).toHaveLength(650);
+        txSpy.mockRestore();
+    });
+
+    it("B12 (review-pr-b.md): liveWriteBuffer is always a subset of events, through a randomized live/crawl/redact mix", async () => {
+        // The invariant the whole buffer design rests on, checked directly rather than only through
+        // its consequences: every id ever buffered for a live write is, by construction
+        // (schedulePersistEvent refuses to buffer an id not in `events`; removeFromIndex drops the
+        // id from the buffer as it deletes the record), already resident. A white-box check of the
+        // private fields, deliberately: the alternative is re-deriving the same proof indirectly
+        // through disk state after every one of 150 random operations, which tests the *consequence*
+        // of the invariant rather than the invariant itself.
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const liveIds: string[] = [];
+        let seq = 0;
+        for (let round = 0; round < 150; round++) {
+            const op = Math.random();
+            if (op < 0.4) {
+                const id = `$b12live${seq++}`;
+                await manager.addEventToIndex(msg(id, `b12 live body ${id}`), {});
+                liveIds.push(id);
+            } else if (op < 0.6 && liveIds.length > 0) {
+                const idx = Math.floor(Math.random() * liveIds.length);
+                const [id] = liveIds.splice(idx, 1);
+                await manager.deleteEvent(id);
+            } else if (op < 0.85) {
+                const id = `$b12crawl${seq++}`;
+                await manager.addHistoricEvents([{ event: msg(id, `b12 crawl body ${id}`), profile: {} }], null, null);
+            } else {
+                await manager.commitLiveEvents();
+            }
+
+            const buffer = (manager as unknown as { liveWriteBuffer: Set<string> }).liveWriteBuffer;
+            const events = (manager as unknown as { events: Map<string, unknown> }).events;
+            for (const bufferedId of buffer) {
+                expect(events.has(bufferedId)).toBe(true);
+            }
+        }
+        await manager.commitLiveEvents();
+    });
 });
 
 describe("BrowserEventIndexManager (increment B correctness: stats, prefix, substring)", () => {
@@ -2518,6 +2630,44 @@ describe("BrowserEventIndexManager (increment B correctness: stats, prefix, subs
         // round trip preserved both characters exactly.
         expect((await manager.searchEventIndex(search('aive" bac'))).count).toBe(1);
         expect((await manager.searchEventIndex(search("k\\sla"))).count).toBe(1);
+    });
+
+    it("pins the bounded per-query cost: the vocabulary merges on the write path, not inside a query, and not for a small delta (review-pr-b.md B-F1)", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+
+        // Seed past VOCABULARY_MERGE_THRESHOLD (2,000) distinct terms first, so the base
+        // vocabulary has already been through at least one real merge by the time the measured
+        // section below starts -- this is the "V is already large" precondition the fix has to
+        // hold under, not a toy vocabulary too small to show the old O(V log V) cost at all.
+        for (let i = 0; i < 2200; i++) {
+            await manager.addEventToIndex(msg(`$seed${i}`, `zqvocab${i}`), {});
+        }
+
+        const mergeSpy = vi.spyOn(manager as unknown as { mergeVocabularyDelta: () => void }, "mergeVocabularyDelta");
+        const callsBefore = mergeSpy.mock.calls.length;
+
+        // A small follow-up batch of brand-new terms, comfortably under the threshold (at most
+        // ~200 were left pending from seeding, +50 here is nowhere near 2,000): this must never
+        // trigger a merge, and a prefix query against it must still be fast and correct, served
+        // from the unmerged delta's bounded linear scan rather than forcing a rebuild of the
+        // (now large) base -- the specific bug review-pr-b.md B-F1 found and this fix removes.
+        for (let i = 0; i < 50; i++) {
+            await manager.addEventToIndex(msg(`$fresh${i}`, `zqfreshterm${i}`), {});
+        }
+        expect(mergeSpy.mock.calls.length).toBe(callsBefore);
+
+        const t0 = performance.now();
+        const hit = await manager.searchEventIndex(search("zqfreshterm4", { limit: 10 }));
+        const elapsed = performance.now() - t0;
+        expect(hit.count).toBeGreaterThan(0); // found via the unmerged delta's linear scan
+        expect(elapsed).toBeLessThan(20); // bounded: no O(V log V) re-sort of a 2,200+-term base
+
+        // The base (merged before the spy started watching) is still fully searchable too.
+        const hitOld = await manager.searchEventIndex(search("zqvocab4", { limit: 10 }));
+        expect(hitOld.count).toBeGreaterThan(0);
+
+        mergeSpy.mockRestore();
     });
 });
 
