@@ -2336,6 +2336,50 @@ describe("BrowserEventIndexManager (batched writes)", () => {
     });
 });
 
+describe("BrowserEventIndexManager (increment B correctness: stats, prefix, substring)", () => {
+    const DEVICE = "DEVICE1";
+    let manager: BrowserEventIndexManager;
+    let userCounter = 0;
+    let userId: string;
+
+    beforeEach(() => {
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        // No IndexedDB stubbing and no pickle key: these tests are about the in-memory index
+        // only, matching the (at scale) describe's rationale for skipping persistence.
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue(null) });
+        userId = `@incb${++userCounter}:example.org`;
+        manager = new BrowserEventIndexManager();
+    });
+
+    afterEach(async () => {
+        await manager.closeEventIndex();
+        vi.restoreAllMocks();
+    });
+
+    it("getStats is O(1): never iterates a Map's values to compute eventCount/roomCount, even at 5000 events", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const rooms = ["!o1:example.org", "!o2:example.org", "!o3:example.org"];
+        for (let i = 0; i < 5000; i++) {
+            await manager.addEventToIndex(
+                msg(`$o${i}`, `stats body ${i}`, { room_id: rooms[i % rooms.length], origin_server_ts: i }),
+                {},
+            );
+        }
+
+        const valuesSpy = vi.spyOn(Map.prototype, "values");
+        const callsBefore = valuesSpy.mock.calls.length;
+        const stats = await manager.getStats();
+        // No Map anywhere was iterated via .values() to answer this -- the old implementation's
+        // `for (const ev of this.events.values())` is exactly the call this would catch.
+        expect(valuesSpy.mock.calls.length).toBe(callsBefore);
+        valuesSpy.mockRestore();
+
+        expect(stats.eventCount).toBe(5000);
+        expect(stats.roomCount).toBe(rooms.length);
+    });
+});
+
 /**
  * The corpus the scale tests below run against, built once and re-indexed per test. Every
  * assertion's expected hit set is a filter over *this array*, so nothing has to be counted by

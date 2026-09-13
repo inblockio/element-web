@@ -811,6 +811,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private ciphertextBytes = 0;
     /**
+     * Running total of {@link StoredEvent.searchText} length (plus a flat 64 bytes/record), for {@link
+     * estimatePlainSize} -- the `size` stat's fallback when nothing is persisted. Maintained incrementally, the same
+     * way {@link ciphertextBytes} is, rather than recomputed by scanning {@link events}: see {@link getStats}, which
+     * is called roughly every 3s while the Security panel is open and must not cost O(n). Every site that changes a
+     * record's `searchText` -- {@link upsertEvent}'s four cases, {@link addHistoricEvents}' refresh branch, {@link
+     * materializeRow}, {@link removeFromIndex} -- adjusts this by the same delta it applies to {@link inverted} via
+     * {@link indexTokens}/{@link unindexTokens}, so the two can never drift independently of each other.
+     */
+    private plainTextByteEstimate = 0;
+    /**
      * Memo of {@link foldText} over each record's {@link StoredEvent.searchText}, for the substring fallback; see
      * {@link foldedFor}. Purely derived, never persisted, and validated against the text it was computed from rather
      * than invalidated by hand.
@@ -1186,11 +1196,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * not yet the eventual total: both climb as {@link hydrate} decrypts more of the disk store, rather than reporting
      * the final numbers before they are true. `loading` is what tells a caller these are still climbing.
      *
-     * `roomCount` is {@link roomOrder}'s own size, not a walk of {@link events}: `roomOrder` already holds exactly one
-     * entry per room with at least one resident event, its own entry deleted the moment a room's last one goes (see
-     * {@link removeFromIndex}), so re-deriving the same count by visiting every event is redundant work, and at scale
-     * not free -- measured at 8.9-15.3 ms at 200k resident events, synchronous and uninterruptible, on a path
-     * `useIsIndexIncomplete` now calls on every checkpoint change while a `SearchWarning` is mounted.
+     * O(1): this is called roughly every 3s while the Security panel is open (and now, per `useIsIndexIncomplete`, on
+     * every checkpoint change while a `SearchWarning` is mounted), so it must not scan {@link events}. `eventCount` is
+     * {@link events}' own `size` (a `Map` tracks its count already); `roomCount` is {@link roomOrder}'s own `size`
+     * rather than a fresh `Set` built by walking every resident event's `roomId` -- correct because {@link
+     * removeFromIndex} deletes a room's entry outright once its last event goes, so `roomOrder`'s key count is
+     * always exactly the count of rooms with at least one resident event, the same value the old scan computed, and
+     * re-deriving it by visiting every event was measured at 8.9-15.3 ms at 200k resident events, synchronous and
+     * uninterruptible; `size` is {@link ciphertextBytes} or the incrementally-maintained {@link estimatePlainSize},
+     * neither of which scan anything either.
      */
     public async getStats(): Promise<IIndexStats> {
         return {
@@ -1408,6 +1422,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 const nextFile = eventHasFile(incoming);
                 if (nextText !== existing.searchText || nextFile !== existing.hasFile) {
                     this.unindexTokens(existing.eventId, existing.searchText);
+                    this.plainTextByteEstimate += nextText.length - existing.searchText.length;
                     existing.searchText = nextText;
                     existing.hasFile = nextFile;
                     existing.event = incoming;
@@ -1675,11 +1690,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // the original's, which is what keeps results pointing at the visible message.
         if (existing && origId) {
             this.unindexTokens(existing.eventId, existing.searchText);
+            const previousTextLength = existing.searchText.length;
             existing.event = {
                 ...existing.event,
                 content: incoming.content,
             };
             existing.searchText = extractSearchText(existing.event);
+            this.plainTextByteEstimate += existing.searchText.length - previousTextLength;
             existing.edited = true;
             existing.profile = profile ?? existing.profile;
             existing.hasFile = eventHasFile(existing.event);
@@ -1721,6 +1738,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             edited: Boolean(origId),
         };
         this.events.set(targetId, stored);
+        this.plainTextByteEstimate += stored.searchText.length + 64;
         if (origId) this.rememberEdit(stored, ev.event_id);
         this.indexTokens(targetId, stored.searchText);
         this.insertRoomOrder(stored);
@@ -1787,10 +1805,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
     /**
      * Remove a record from every in-memory structure at once, because they have to stay consistent or later reads break
-     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link foldedSearchText}, {@link editTargets}
-     * and {@link roomOrder} (whose entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed}
-     * need not check for emptiness). {@link recordBytes} is the exception, describing what is on *disk*, where the row
-     * survives until the delete this caller queues has committed.
+     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link foldedSearchText}, {@link editTargets},
+     * {@link roomOrder} (whose entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed} need
+     * not check for emptiness), and {@link plainTextByteEstimate}. {@link recordBytes} is the exception, describing
+     * what is on *disk*, where the row survives until the delete this caller queues has committed.
      *
      * Also drops `eventId` from {@link liveWriteBuffer}, if it is there: a redaction or removal that raced a buffered,
      * not-yet-flushed live write must win outright, not have that write land afterwards and resurrect what this call
@@ -1807,6 +1825,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (!existing) return;
         this.unindexTokens(eventId, existing.searchText);
         this.events.delete(eventId);
+        this.plainTextByteEstimate -= existing.searchText.length + 64;
         this.foldedSearchText.delete(eventId);
         this.liveWriteBuffer.delete(eventId);
         for (const editId of existing.editIds ?? []) this.editTargets.delete(editId);
@@ -2370,6 +2389,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         }
 
         this.events.set(stored.eventId, stored);
+        this.plainTextByteEstimate += stored.searchText.length + 64;
         for (const editId of stored.editIds ?? []) this.editTargets.set(editId, stored.eventId);
         this.indexTokens(stored.eventId, stored.searchText);
         this.insertRoomOrder(stored);
@@ -2510,11 +2530,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * A rough in-memory size for {@link getStats}, used when nothing has been persisted: the searchable text plus a
      * flat 64 bytes per record. It exists so the settings panel shows a plausible figure rather than "0 bytes", and no
      * decision depends on the number.
+     *
+     * O(1): returns {@link plainTextByteEstimate}, a running total maintained incrementally at every site that adds,
+     * changes or removes a record's `searchText` -- the same "track it, do not scan for it" treatment {@link
+     * ciphertextBytes} already gets from {@link recordBytes} -- rather than summing {@link events} fresh on every
+     * call, which {@link getStats} cannot afford at the roughly-every-3s cadence it is called at while the Security
+     * panel is open.
      */
     private estimatePlainSize(): number {
-        let n = 0;
-        for (const ev of this.events.values()) n += ev.searchText.length + 64;
-        return n;
+        return this.plainTextByteEstimate;
     }
 
     /**
@@ -2533,6 +2557,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * wipe what it has built so far without invalidating its own epoch, which the epoch-bumping {@link resetMemory}
      * would do to itself if called mid-run (a hydration loop that just wiped everything would then see its own epoch
      * as stale on its very next check and abort before finishing the wipe it was in the middle of).
+     *
+     * {@link plainTextByteEstimate} is cleared here rather than in {@link resetMemory}, alongside {@link events}: it
+     * mirrors derived state of exactly that structure, so it belongs with the group hydrate populates.
      */
     private clearIndexMaps(): void {
         this.events.clear();
@@ -2544,6 +2571,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.recordBytes.clear();
         this.pendingRedactions.clear();
         this.hydrationFailure = undefined;
+        this.plainTextByteEstimate = 0;
     }
 
     /**
