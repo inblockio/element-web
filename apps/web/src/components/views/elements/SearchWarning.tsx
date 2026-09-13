@@ -160,8 +160,18 @@ function useIsIndexIncomplete(
 
         // Nothing is queued for this room yet, but the index may hold nothing for it at all.
         // `undefined` means there is no index manager to ask, which is not evidence either way.
-        const indexed = await index.isRoomIndexed(roomId);
-        if (current === generationRef.current) setIncomplete(indexed === false);
+        try {
+            const indexed = await index.isRoomIndexed(roomId);
+            if (current === generationRef.current) setIncomplete(indexed === false);
+        } catch (e) {
+            // Seshat's isRoomIndexed is a native call and can reject; the browser backend's cannot
+            // (a pure in-memory Map read), but update() is invoked as `void update()` from the
+            // changedCheckpoint handler and from the LOADING_POLL_MS interval above, neither of
+            // which has a catch of its own, so a rejection here would otherwise be unhandled on a
+            // 1s repeat. Not evidence either way: leave whatever `incomplete` already holds.
+            if (current !== generationRef.current) return;
+            logger.warn("SearchWarning: isRoomIndexed() failed; leaving the previous answer in place", e);
+        }
     }, [index, scope, roomId, readCheckpoints]);
 
     useEffect(() => {
