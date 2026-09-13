@@ -4977,6 +4977,124 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         expect((await reloaded.getStats()).oldestIndexedTs).toBe(survivorFloor);
     }, 30000);
 
+    it("a same-session disk-budget eviction after a partial redaction orders by the rewritten chunk's new maxTs, not its minTs", async () => {
+        // review-pr-d.md's second-pass mutation campaign (N5): enqueueDeleteRecord's own
+        // heapPushTs call after rewriting a chunk is a separate site from the D4 test above (which
+        // exercises a *fresh read*, via hydrate/readChunkEntries) and was not independently pinned.
+        // Chunk A gets three members (ts 100/200/9000); redacting the newest leaves [100, 200] --
+        // minTs=100, maxTs=200, genuinely different. Chunk B is a single member at ts=150, strictly
+        // between them: under the correct maxTs ordering chunk A (200) outranks chunk B (150), so a
+        // budget that can only keep one evicts B; under the minTs mutant, chunk A's pushed value
+        // (100) would rank *below* chunk B (150), evicting A instead -- the opposite chunk.
+        setChunkTargetBytesOverrideForTesting(100_000); // large: A's three events all stay in one open chunk
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        await seed.addEventToIndex(msg("$rd100", "zqreorder low", { room_id: "!a:x", origin_server_ts: 100 }), {});
+        await seed.commitLiveEvents();
+        await seed.addEventToIndex(msg("$rd200", "zqreorder mid", { room_id: "!a:x", origin_server_ts: 200 }), {});
+        await seed.commitLiveEvents();
+        await seed.addEventToIndex(msg("$rd9000", "zqreorder high", { room_id: "!a:x", origin_server_ts: 9000 }), {});
+        await seed.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toHaveLength(1); // all three in one (still "open") chunk
+        await seed.closeEventIndex(); // chunk A's row is durable; nothing will ever be "open" over it again
+
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        expect(await reloaded.deleteEvent("$rd9000")).toBe(true);
+        await reloaded.commitLiveEvents(); // waits on the same persistChain enqueueDeleteRecord queued onto
+
+        // Chunk B: a fresh chunk (this session's own open chunk, distinct from chunk A) with the
+        // single event at ts=150.
+        await reloaded.addEventToIndex(
+            msg("$rd150", "zqreorder needle", { room_id: "!b:x", origin_server_ts: 150 }),
+            {},
+        );
+        await reloaded.commitLiveEvents();
+        const rawBefore = await dumpRawStore("chunks");
+        expect(rawBefore).toHaveLength(2); // chunk A (rewritten, 2 members) + chunk B (1 member)
+
+        // Budget admits one chunk but not both, from the sizes above -- a generous margin absorbs
+        // the small size a second write below (needed to actually trigger a flush) adds to chunk B.
+        const singleMax = Math.max(...rawBefore.map((r: any) => r.blob.ct.length + r.blob.iv.length));
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: singleMax + 300 });
+
+        // commitLiveEvents() alone would be a no-op here (nothing buffered, so flushLiveWrites --
+        // and the enforceDiskBudget call at its end -- never runs); a second write into chunk B
+        // (still this session's open chunk, ts kept below chunk A's own maxTs of 200 so the ranking
+        // under test is unaffected) is what actually triggers the flush that checks the budget.
+        await reloaded.addEventToIndex(msg("$rdtrigger", "x", { room_id: "!b:x", origin_server_ts: 151 }), {});
+        await reloaded.commitLiveEvents();
+
+        const survivingIds = new Set((await dumpRawStore("chunks")).map((r: any) => r.chunkId));
+        expect(survivingIds.size).toBe(1); // exactly one of the two was evicted
+        const survivingEntries = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        const survivingEventIds = new Set(survivingEntries.map((r: any) => r.eventId));
+        // Chunk A (maxTs 200) must outrank chunk B (maxTs 151): B is evicted, A survives.
+        expect(survivingEventIds.has("$rd100")).toBe(true);
+        expect(survivingEventIds.has("$rd200")).toBe(true);
+        expect(survivingEventIds.has("$rd150")).toBe(false);
+        expect(survivingEventIds.has("$rdtrigger")).toBe(false);
+    });
+
+    it("a live edit landing on an already-sealed chunk re-pushes that chunk's new maxTs, not its minTs", async () => {
+        // review-pr-d.md's second-pass mutation campaign (N6): flushLiveWrites' own heapPushTs call
+        // for a rewritten *sealed* chunk (an id whose manifest entry already names a chunk other
+        // than the currently-open one) is a third, separate site from both the D4 test (a fresh
+        // read) and the test above (a redaction rewrite). An edit does not change its target's own
+        // originServerTs, so a chunk's ts range cannot change via an edit alone -- the mutant is
+        // pinned here by giving the sealed chunk a wide, asymmetric ts range up front and confirming
+        // the *edited* chunk still outranks a narrower, newer-*looking* rival by its true maxTs.
+        setChunkTargetBytesOverrideForTesting(100_000);
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        await seed.addEventToIndex(msg("$ed100", "zqeditbody low", { room_id: "!a:x", origin_server_ts: 100 }), {});
+        await seed.commitLiveEvents();
+        await seed.addEventToIndex(msg("$ed9000", "zqeditbody high", { room_id: "!a:x", origin_server_ts: 9000 }), {});
+        await seed.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toHaveLength(1); // chunk A: ts range [100, 9000]
+        await seed.closeEventIndex();
+
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        // Chunk B: a single event at ts=150, this session's own fresh open chunk.
+        await reloaded.addEventToIndex(
+            msg("$ed150", "zqeditbody needle", { room_id: "!b:x", origin_server_ts: 150 }),
+            {},
+        );
+        await reloaded.commitLiveEvents();
+        const rawBefore = await dumpRawStore("chunks");
+        expect(rawBefore).toHaveLength(2);
+
+        // Set the budget to admit one chunk but not both, from the sizes *before* the edit (a
+        // generous margin absorbs the small size delta the edit's own body text adds to chunk A):
+        // enforceDiskBudget must run inside the SAME flush the edit itself triggers below (chunk
+        // B's own heap entry, pushed when $ed150 was added above, is left untouched by this flush --
+        // heap entries tolerate staleness by design -- so this is exactly the write path this
+        // mutant targets, not a fresh read).
+        const singleMax = Math.max(...rawBefore.map((r: any) => r.blob.ct.length + r.blob.iv.length));
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: singleMax + 100 });
+
+        // An edit to $ed100 (chunk A's own OLDEST member, still named as living in chunk A): rewrites
+        // chunk A in place via flushLiveWrites' "sealedUpdates" path -- chunk A is not this session's
+        // open chunk (chunk B is) -- re-pushing chunk A's (unchanged) ts range, [100, 9000], and
+        // running enforceDiskBudget inline at the end of this same flush.
+        await reloaded.addEventToIndex(edit("$ed100edit", "$ed100", "zqeditbody low, edited"), {});
+        await reloaded.commitLiveEvents();
+
+        const survivingEntries = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        const survivingEventIds = new Set(survivingEntries.map((r: any) => r.eventId));
+        // Chunk A's true maxTs (9000) must outrank chunk B's (150): B is evicted, A survives intact,
+        // edited content included.
+        expect(survivingEventIds.has("$ed100")).toBe(true);
+        expect(survivingEventIds.has("$ed9000")).toBe(true);
+        expect(survivingEventIds.has("$ed150")).toBe(false);
+        expect((await reloaded.searchEventIndex(search("edited"))).count).toBe(1);
+    });
+
     // ---------------------------------------------------------------------------------- D5
     it("hydration reads and decrypts each chunk at most once across the whole restore (review-pr-d.md D5)", async () => {
         // ~4 events per chunk, arrival order deliberately uncorrelated with timestamp order (what a
