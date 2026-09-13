@@ -70,6 +70,39 @@ export interface IIndexStats {
      * here and every caller must treat "not present" the same as `false`.
      */
     loading?: boolean;
+    /**
+     * True once a crawl bound (a recency window or a room cap) or a byte budget (the resident hot
+     * window or the on-disk footprint) has excluded or dropped something that would otherwise be
+     * indexed. Optional and absent means "not windowed" (or "backend does not track this"), the
+     * same convention as {@link loading}. Drives {@link SearchWarning}'s "Search covers messages
+     * newer than {date}" line together with {@link oldestIndexedTs}.
+     */
+    windowed?: boolean;
+    /**
+     * The oldest event timestamp (`origin_server_ts`, epoch ms) this backend still guarantees is
+     * covered on disk, or `undefined` while nothing is known yet. Only ever moves *forward* (more
+     * recent) when something bounded is dropped, and *backward* (older) when an older event is
+     * newly discovered -- never a promise that this is the literal oldest surviving row, only that
+     * nothing older than it is guaranteed findable. See `BrowserEventIndexManager`'s docstring on
+     * its own field of the same name for why a backend bounded by disk space cannot always know the
+     * exact figure without a full scan.
+     */
+    oldestIndexedTs?: number;
+    /**
+     * A floor on the oldest event timestamp currently *resident* (hydrated into memory), or
+     * `undefined` while nothing is resident or the backend does not track this: the same
+     * guarantee-floor reading as {@link oldestIndexedTs}, not necessarily the literal minimum.
+     * Expected, but not contractually guaranteed by this interface, to read `>= oldestIndexedTs`
+     * when both are known -- everything resident is necessarily also on disk (or on its way there).
+     */
+    oldestResidentTs?: number;
+    /**
+     * The answer from a one-time `navigator.storage.persist()` request made when this backend's
+     * index was first created, or `undefined` if it was never asked (no such API, a backend that
+     * does not use it, or a session that opened an index created earlier and so never re-asked).
+     * Informational only for the settings UI; nothing reads this to change behaviour.
+     */
+    storagePersisted?: boolean;
 }
 
 /**
@@ -230,6 +263,22 @@ export default abstract class BaseEventIndexManager {
      */
     public async addCrawlerCheckpoint(checkpoint: ICrawlerCheckpoint): Promise<void> {
         throw new Error("Unimplemented");
+    }
+
+    /**
+     * Whether the crawler should still spend a request crawling `checkpoint`, or decline it; see
+     * {@link EventIndex.crawlerFunc} (consulted before every `createMessagesRequest`) and {@link
+     * EventIndex.addInitialCheckpoints} (consulted before a fresh checkpoint is even persisted).
+     * The default is always yes: only a manager enforcing a crawl bound -- a recency window, a room
+     * cap -- needs to say no, and declining is handled by the caller exactly like having crawled to
+     * completion: the checkpoint is removed, not retried, so a manager that returns `false` must
+     * not also expect to see this checkpoint again.
+     *
+     * @param checkpoint The checkpoint about to be crawled.
+     * @returns `true` to proceed as before; `false` to decline it.
+     */
+    public async shouldCrawl(checkpoint: ICrawlerCheckpoint): Promise<boolean> {
+        return true;
     }
 
     /**

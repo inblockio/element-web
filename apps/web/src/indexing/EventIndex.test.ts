@@ -48,6 +48,7 @@ describe("EventIndex", () => {
             loadCheckpoints: vi.fn(),
             removeCrawlerCheckpoint: vi.fn(),
             isEventIndexEmpty: vi.fn().mockResolvedValue(false),
+            shouldCrawl: vi.fn().mockResolvedValue(true),
         } as any as Mocked<BaseEventIndexManager>;
         mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
 
@@ -102,6 +103,7 @@ describe("EventIndex", () => {
             addCrawlerCheckpoint: vi.fn(),
             removeCrawlerCheckpoint: vi.fn(),
             commitLiveEvents: vi.fn(),
+            shouldCrawl: vi.fn().mockResolvedValue(true),
         } as any as Mocked<BaseEventIndexManager>;
         mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
 
@@ -165,6 +167,52 @@ describe("EventIndex", () => {
             roomId: "!room2:id",
             token: "token2",
             direction: Direction.Forward,
+        });
+    });
+
+    it("declines a checkpoint outside the crawl bound instead of crawling it, and does not spin on it", async () => {
+        const mockIndexingManager = {
+            loadCheckpoints: vi.fn(),
+            removeCrawlerCheckpoint: vi.fn().mockResolvedValue(undefined),
+            isEventIndexEmpty: vi.fn().mockResolvedValue(false),
+            // room1 is outside the bound (e.g. the crawl window, or the room cap); room2 is not.
+            shouldCrawl: vi.fn().mockImplementation(async (cp: ICrawlerCheckpoint) => cp.roomId !== "!room1:id"),
+        } as any as Mocked<BaseEventIndexManager>;
+        mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
+
+        const room1 = { roomId: "!room1:id" } as any as Room;
+        const room2 = { roomId: "!room2:id" } as any as Room;
+        const mockClient = getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            createMessagesRequest: vi.fn(),
+            ...mockClientMethodsRooms([room1, room2]),
+        });
+
+        vi.spyOn(SettingsStore, "getValueAt").mockImplementation((_level, settingName): any => {
+            if (settingName === "crawlerSleepTime") return 0;
+            return undefined;
+        });
+
+        mockIndexingManager.loadCheckpoints.mockResolvedValue([
+            { roomId: "!room1:id", token: "token1", direction: Direction.Backward } as ICrawlerCheckpoint,
+            { roomId: "!room2:id", token: "token2", direction: Direction.Forward } as ICrawlerCheckpoint,
+        ]);
+
+        const indexer = new EventIndex();
+        await indexer.init();
+        indexer.startCrawler();
+
+        // room1's checkpoint is declined and removed without ever spending a request on it; the
+        // crawler moves straight on to room2 instead of getting stuck re-offering the same
+        // declined checkpoint.
+        const mock2 = mockCreateMessagesRequest(mockClient);
+        await mock2.called;
+        expect(mockClient.createMessagesRequest).toHaveBeenCalledWith("!room2:id", "token2", 100, "f");
+        expect(mockClient.createMessagesRequest).not.toHaveBeenCalledWith("!room1:id", "token1", 100, "b");
+        expect(mockIndexingManager.removeCrawlerCheckpoint).toHaveBeenCalledWith({
+            roomId: "!room1:id",
+            token: "token1",
+            direction: Direction.Backward,
         });
     });
 });

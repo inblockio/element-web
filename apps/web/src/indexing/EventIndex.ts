@@ -68,6 +68,17 @@ export default class EventIndex extends EventEmitter {
 
     /**
      * A list of checkpoints which are awaiting processing by the crawler, once it has done with `currentCheckpoint`.
+     *
+     * Processed FIFO (`shift`/`push`), which is round-robin across rooms but not breadth-first *by
+     * week* the way SYNTHESIS.md §3.5 (element-meta#3252's recommendation) would prefer. That
+     * reordering was evaluated for this increment and deferred rather than implemented here: a
+     * checkpoint carries only an opaque, server-assigned pagination `token` (see {@link
+     * ICrawlerCheckpoint}) with no notion of "how many weeks back" it represents, so ordering by
+     * week would need either a schema change recording each room's crawl progress as a timestamp
+     * (increment D's chunked schema territory; the same limitation {@link
+     * BrowserEventIndexManager}'s `HYDRATION_KEY_ORDER` already documents for hydration order) or an
+     * extra request per checkpoint just to *learn* its age before deciding where to queue it,
+     * neither of which fits in a small, current-schema change. FIFO is left as is.
      */
     private crawlerCheckpoints: ICrawlerCheckpoint[] = [];
 
@@ -163,6 +174,13 @@ export default class EventIndex extends EventEmitter {
                     return;
                 }
                 this.logger.debug(`addInitialCheckpoints: Adding initial checkpoints for room ${room.roomId}`);
+
+                // Same crawl bound as crawlerFunc's own check, consulted here too so a room the
+                // manager would decline never gets a checkpoint persisted for it in the first
+                // place. Checked once per room: both directions share the same bound.
+                if (!(await indexManager.shouldCrawl({ roomId: room.roomId, token, direction: Direction.Backward }))) {
+                    return;
+                }
 
                 const backCheckpoint: ICrawlerCheckpoint = {
                     roomId: room.roomId,
@@ -487,6 +505,20 @@ export default class EventIndex extends EventEmitter {
             // a sync with limited room timelines happens, so go back to sleep.
             if (checkpoint === undefined) {
                 idle = true;
+                continue;
+            }
+
+            // The manager may enforce a crawl bound (a recency window, a room cap; see
+            // BaseEventIndexManager.shouldCrawl). Declining is handled the same way as having
+            // caught up with this room's history: the checkpoint is removed, not retried, so it
+            // does not spin here forever.
+            if (!(await indexManager.shouldCrawl(checkpoint))) {
+                this.logger.debug("Declining checkpoint outside the crawl bound", JSON.stringify(checkpoint));
+                try {
+                    await indexManager.removeCrawlerCheckpoint(checkpoint);
+                } catch (e) {
+                    this.logger.warn(`Error removing declined checkpoint ${JSON.stringify(checkpoint)}:`, e);
+                }
                 continue;
             }
 
