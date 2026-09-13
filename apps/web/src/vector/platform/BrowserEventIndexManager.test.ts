@@ -23,6 +23,7 @@ import {
     encryptJson,
     eventHasFile,
     extractSearchText,
+    HYDRATION_PAGE_SIZE,
     isBrowserEventIndexEnabled,
     isWebEventIndexSupported,
     replacedEventId,
@@ -136,6 +137,30 @@ function slowDownDecrypt(ms: number): () => void {
 /** A short real-timer pause, for polling loops that wait on a background hydration run. */
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Widen the window between "materializeIfPending has read its row" and "materializeIfPending
+ * hands that row to materializeOnce" by padding the very transaction the real `get()` runs in
+ * with extra dummy requests -- against the `events` store only, so `hydrate()`'s own bulk pages
+ * (opened with `getAll`, never `get`) are untouched. The real `get()` still resolves at its normal
+ * time (`idbReq()` is unaffected); only `txDone()`, which waits for the transaction's `oncomplete`,
+ * is delayed, because a transaction with more outstanding requests takes longer to settle. This is
+ * a race-widening tool for regression tests, not a bug in the production code it drives.
+ */
+function padEventsStoreGetTransaction(pad: number): () => void {
+    const realGet = IDBObjectStore.prototype.get;
+    const spy = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (
+        this: IDBObjectStore,
+        ...args: Parameters<IDBObjectStore["get"]>
+    ): IDBRequest {
+        const req = realGet.apply(this, args);
+        if (this.name === "events") {
+            for (let i = 0; i < pad; i++) realGet.call(this, ["@nobody:example.org", `$pad${i}`]);
+        }
+        return req;
+    });
+    return () => spy.mockRestore();
 }
 
 describe("BrowserEventIndex helpers", () => {
@@ -1671,6 +1696,398 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
                 restore();
             }
         });
+
+        // Adversarial-review regressions (review-pr-a.md, 2026-09-13). Each test's id below (R1,
+        // R2, ...) matches the repro that found it, so the review and the fix stay traceable to
+        // each other.
+
+        it("R1: a live re-delivery landing exactly as hydrate() finishes its own attempt for the same row does not duplicate it in roomOrder", async () => {
+            // materializeOnce() de-duplicates only against an *in-flight* attempt; if hydrate()'s
+            // own attempt for a row settles during materializeIfPending()'s two awaits (its get()
+            // request settling, then its transaction's txDone()), the in-flight map entry is
+            // already gone by the time materializeIfPending checks it, and without a residency
+            // re-check afterwards it would call materializeOnce() a second time regardless.
+            const ids = await seed(6);
+            const restoreDecrypt = slowDownDecrypt(8);
+            const restorePad = padEventsStoreGetTransaction(4000);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                while ((await reloaded.getStats()).eventCount === 0) await sleep(2);
+                const residentBefore = (await reloaded.getStats()).eventCount;
+                const target = ids[residentBefore]; // the row hydrate() is about to decrypt next
+
+                // A live re-delivery of that same event. Not awaited yet: by the time this call's
+                // own get() resolves, hydrate()'s own attempt for `target` may already have
+                // settled underneath it, thanks to the padded transaction widening the window.
+                const live = reloaded.addEventToIndex(
+                    msg(target, `zqnbmarker body ${residentBefore}`, {
+                        room_id: room,
+                        origin_server_ts: residentBefore,
+                    }),
+                    {},
+                );
+
+                await reloaded.waitForHydration();
+                await live;
+                await reloaded.commitLiveEvents();
+
+                expect((await reloaded.getStats()).eventCount).toBe(ids.length);
+                const order = await roomTimelineOrder(reloaded, "zqnbmarker", room, ids.length + 5);
+                expect(order).toEqual(ids);
+                expect(new Set(order).size).toBe(order.length); // no duplicates
+
+                await reloaded.closeEventIndex();
+            } finally {
+                restorePad();
+                restoreDecrypt();
+            }
+        });
+
+        it("R2: closeEventIndex landing during addEventToIndex's await does not resurrect the event afterwards", async () => {
+            await seed(6);
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                while ((await reloaded.getStats()).eventCount === 0) await sleep(2);
+
+                // A live event arrives; it is now inside materializeIfPending()'s await.
+                const live = reloaded.addEventToIndex(msg("$fresh", "zqsecret plaintext", { room_id: room }), {});
+                await reloaded.closeEventIndex();
+                await live;
+
+                expect((await reloaded.getStats()).eventCount).toBe(0);
+                const hits = await reloaded.searchEventIndex(search("zqsecret"));
+                expect(hits.count).toBe(0);
+            } finally {
+                restore();
+            }
+        });
+
+        it("R2b: closeEventIndex landing mid-batch stops the rest of addHistoricEvents from landing after teardown", async () => {
+            await seed(6);
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                while ((await reloaded.getStats()).eventCount === 0) await sleep(2);
+
+                const batch = [0, 1, 2, 3].map((i) => ({
+                    event: msg(`$crawl${i}`, `zqcrawl body ${i}`, { room_id: room, origin_server_ts: 500 + i }),
+                    profile: {},
+                }));
+                const crawl = reloaded.addHistoricEvents(batch, null, null);
+                await reloaded.closeEventIndex();
+                const allAlready = await crawl;
+
+                expect(allAlready).toBe(false);
+                expect((await reloaded.getStats()).eventCount).toBe(0);
+            } finally {
+                restore();
+            }
+        });
+
+        it("R3: a connection closed by another tab's onversionchange fails hydrate() without an unhandled rejection", async () => {
+            await seed(6);
+            const restore = slowDownDecrypt(8);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                const realTx = IDBDatabase.prototype.transaction;
+                let armed = false;
+                const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                    this: IDBDatabase,
+                    names,
+                    mode,
+                    ...rest
+                ) {
+                    if (armed && names === "events" && mode !== "readwrite") {
+                        // Exactly what a live handle does after another tab fires
+                        // `versionchange`: the connection is closed but `this.db` is still set.
+                        throw new DOMException("The database connection is closing.", "InvalidStateError");
+                    }
+                    return realTx.call(this, names, mode, ...rest);
+                });
+                armed = true;
+                await reloaded.initEventIndex(userId, DEVICE);
+                // Nothing in production ever attaches a handler to this promise; a rejection here
+                // would surface as an unhandled rejection. It must resolve instead.
+                await expect(reloaded.waitForHydration()).resolves.toBeUndefined();
+                expect((await reloaded.getStats()).loading).toBe(false);
+                txSpy.mockRestore();
+            } finally {
+                restore();
+            }
+        });
+
+        it("R4: materializeIfPending does not throw synchronously into addEventToIndex when the handle is closing", async () => {
+            await seed(6);
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                while ((await reloaded.getStats()).eventCount === 0) await sleep(2);
+                const realTx = IDBDatabase.prototype.transaction;
+                const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                    this: IDBDatabase,
+                    names,
+                    mode,
+                    ...rest
+                ) {
+                    if (names === "events" && mode !== "readwrite") {
+                        throw new DOMException("The database connection is closing.", "InvalidStateError");
+                    }
+                    return realTx.call(this, names, mode, ...rest);
+                });
+                // A live timeline event now reaches a manager whose handle another tab closed.
+                // EventIndex.addLiveEventToIndex awaits this with no catch of its own, so a
+                // rejection here would reach a RoomEvent.Timeline handler unhandled.
+                await expect(
+                    reloaded.addEventToIndex(msg("$live2", "zqlive body", { room_id: room }), {}),
+                ).resolves.toBeUndefined();
+                txSpy.mockRestore();
+            } finally {
+                restore();
+            }
+        });
+
+        it("R8: pendingRedactions is drained once hydration ends", async () => {
+            await seed(4);
+            const restore = slowDownDecrypt(15);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                while ((await reloaded.getStats()).eventCount === 0) await sleep(2);
+                // A redaction naming an id nothing on disk or in memory resolves to.
+                expect(await reloaded.deleteEvent("$never-seen-edit")).toBe(false);
+                await reloaded.waitForHydration();
+                expect([...(reloaded as unknown as { pendingRedactions: Set<string> }).pendingRedactions]).toEqual([]);
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("materializeOnce runs at most one decrypt for two concurrent attempts at the same row", async () => {
+            // Direct unit test of materializeOnce's own de-duplication contract, independent of
+            // any higher-level race: two callers wanting the same not-yet-resident row at once
+            // must share one decrypt, not run two. The idempotent insert inside materializeRow
+            // (belt-and-braces for a future caller that bypasses this layer) would still stop a
+            // duplicate *insert*, but it does nothing about a wasted second *decrypt* -- counting
+            // decrypt() calls is what isolates this layer specifically.
+            await seed(1);
+            const restore = slowDownDecrypt(20);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                await reloaded.waitForHydration();
+
+                const rows = await dumpRawStore("events");
+                expect(rows).toHaveLength(1);
+                const priv = reloaded as unknown as {
+                    dek: CryptoKey;
+                    hydrationEpoch: number;
+                    events: Map<string, unknown>;
+                    materializeOnce: (userId: string, dek: CryptoKey, row: unknown, epoch: number) => Promise<void>;
+                };
+                // Simulate the narrow window where two callers have each independently found this
+                // row not yet resident: it is already hydrated, so remove it from `events` only,
+                // without touching the disk row materializeOnce will re-read.
+                priv.events.delete(rows[0].eventId);
+
+                const decryptSpy = vi.spyOn(crypto.subtle, "decrypt");
+                const before = decryptSpy.mock.calls.length;
+                await Promise.all([
+                    priv.materializeOnce(userId, priv.dek, rows[0], priv.hydrationEpoch),
+                    priv.materializeOnce(userId, priv.dek, rows[0], priv.hydrationEpoch),
+                ]);
+                expect(decryptSpy.mock.calls.length - before).toBe(1);
+                decryptSpy.mockRestore();
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("R9: a redaction of an edit parked before its original is hydrated still drops the record on arrival", async () => {
+            // The pendingRedactions/redactedByPendingEdit mechanism only matters while the
+            // original has not been hydrated yet; the pre-existing "still resolves a redacted
+            // edit after a reload" test drives the redaction *after* waitForHydration(), so it
+            // never reaches this path at all.
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            await manager.addEventToIndex(
+                msg("$r9orig", "zqredacttarget original body", { room_id: room, origin_server_ts: 1 }),
+                {},
+            );
+            await manager.addEventToIndex(edit("$r9edit", "$r9orig", "zqredacttarget edited body", 2), {});
+            await manager.commitLiveEvents();
+            await manager.closeEventIndex();
+
+            const restore = slowDownDecrypt(30);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                // The only record for this user; hydrate() cannot have decrypted it yet (decrypt
+                // is slowed down and nothing has been awaited since initEventIndex returned).
+                expect(await reloaded.deleteEvent("$r9edit")).toBe(false); // parked, not yet resolvable
+                await reloaded.waitForHydration();
+
+                expect((await reloaded.searchEventIndex(search("zqredacttarget"))).count).toBe(0);
+                expect((await reloaded.getStats()).eventCount).toBe(0);
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("materializeIfPending preserves a disk-resident hasFile flag a live re-delivery's own data would not carry", async () => {
+            // Direct test of materializeIfPending's documented contract: without pulling the disk
+            // copy in first, a live re-delivery upserts as brand new using only its own data, and
+            // upsertEvent's "duplicate of an unedited record" case would never get a chance to
+            // preserve what the disk copy already held.
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            await manager.addEventToIndex(
+                msg("$r10", "zqfilemarker report", {
+                    room_id: room,
+                    origin_server_ts: 1,
+                    content: {
+                        msgtype: "m.file",
+                        body: "report.pdf",
+                        url: "mxc://example.org/abc",
+                        filename: "report.pdf",
+                    },
+                }),
+                {},
+            );
+            await manager.commitLiveEvents();
+            await manager.closeEventIndex();
+
+            const restore = slowDownDecrypt(30);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                // A live re-delivery of the same id, plain text, no file -- redelivered before
+                // hydrate() has decrypted the disk row. If materializeIfPending pulled that row in
+                // first, this is upsertEvent's "duplicate of an unedited record" case (nothing to
+                // do); if it did not, this creates a fresh record from only this call's own data.
+                await reloaded.addEventToIndex(
+                    msg("$r10", "zqfilemarker report", { room_id: room, origin_server_ts: 1 }),
+                    {},
+                );
+                await reloaded.waitForHydration();
+
+                const files = await reloaded.loadFileEvents({ roomId: room, limit: 10 });
+                expect(files.map((f) => f.event.event_id)).toEqual(["$r10"]);
+                await reloaded.closeEventIndex();
+            } finally {
+                restore();
+            }
+        });
+
+        it("hydrate() releases each page's transaction before decrypting any of its rows", async () => {
+            // Direct test of the file's own stated most-important invariant. Captures the first
+            // page's transaction; the moment the first decrypt call fires, that transaction must
+            // already be inactive (its request queue drained, oncomplete fired), which a `get()`
+            // issued against it right then will refuse with TransactionInactiveError.
+            await seed(3);
+            const realTransaction = IDBDatabase.prototype.transaction;
+            let capturedTx: IDBTransaction | undefined;
+            const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                this: IDBDatabase,
+                names,
+                mode,
+                ...rest
+            ) {
+                const tx = realTransaction.call(this, names, mode, ...rest);
+                if (!capturedTx && names === "events" && mode !== "readwrite") capturedTx = tx;
+                return tx;
+            });
+
+            let inactiveAtFirstDecrypt: boolean | undefined;
+            const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+            const decryptSpy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+                if (inactiveAtFirstDecrypt === undefined && capturedTx) {
+                    try {
+                        capturedTx.objectStore("events").get(["@nobody:example.org", "$probe"]);
+                        inactiveAtFirstDecrypt = false; // the transaction accepted a new request: still active
+                    } catch {
+                        inactiveAtFirstDecrypt = true; // refused: already inactive, as the invariant requires
+                    }
+                }
+                return realDecrypt(...(args as Parameters<typeof realDecrypt>));
+            });
+
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                await reloaded.waitForHydration();
+                expect(inactiveAtFirstDecrypt).toBe(true);
+                await reloaded.closeEventIndex();
+            } finally {
+                decryptSpy.mockRestore();
+                txSpy.mockRestore();
+            }
+        });
+
+        it("yields between slices when a page's rows take longer than the slice deadline", async () => {
+            // Direct test that a slice deadline actually causes a yield: without it, hydrate()'s
+            // per-row loop would never call setTimeout at all. scheduler.yield does not exist in
+            // this test environment, so yieldToEventLoop() always takes the setTimeout(0) path.
+            await seed(6);
+            const restore = slowDownDecrypt(12); // 6 rows * 12ms > the 30ms slice deadline
+            const zeroDelayTimeouts: number[] = [];
+            const realSetTimeout = globalThis.setTimeout;
+            const timeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+                fn: (...args: unknown[]) => void,
+                delay?: number,
+                ...args: unknown[]
+            ) => {
+                if (delay === 0 || delay === undefined) zeroDelayTimeouts.push(1);
+                return realSetTimeout(fn, delay, ...args);
+            }) as typeof setTimeout);
+            try {
+                const reloaded = new BrowserEventIndexManager();
+                await reloaded.initEventIndex(userId, DEVICE);
+                await reloaded.waitForHydration();
+                expect(zeroDelayTimeouts.length).toBeGreaterThan(0);
+                await reloaded.closeEventIndex();
+            } finally {
+                timeoutSpy.mockRestore();
+                restore();
+            }
+        });
+
+        it("resumes correctly across more than one hydration page", async () => {
+            // Direct test of the multi-page resume branch in userEventKeyRange (afterEventId set):
+            // never exercised by any other fixture, all of which stay under HYDRATION_PAGE_SIZE.
+            const total = HYDRATION_PAGE_SIZE + 50;
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            const ids: string[] = [];
+            for (let i = 0; i < total; i++) {
+                const id = `$pg${String(i).padStart(5, "0")}`;
+                ids.push(id);
+                await manager.addEventToIndex(
+                    msg(id, `zqpagemarker body ${i}`, { room_id: room, origin_server_ts: i }),
+                    {},
+                );
+            }
+            await manager.commitLiveEvents();
+            await manager.closeEventIndex();
+
+            const reloaded = new BrowserEventIndexManager();
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+
+            const stats = await reloaded.getStats();
+            expect(stats.eventCount).toBe(total);
+            const order = await roomTimelineOrder(reloaded, "zqpagemarker", room, total + 5);
+            expect(order).toEqual(ids);
+            expect(new Set(order).size).toBe(order.length);
+            await reloaded.closeEventIndex();
+        });
     });
 });
 
@@ -2148,8 +2565,9 @@ describe("BrowserEventIndexManager (at scale)", () => {
 /**
  * The same properties over a warm start rather than a live index, at a size where encrypting and
  * decrypting every record is affordable. This is the path the scale tests above deliberately skip:
- * `loadAllForUser` rebuilds the inverted index and the room order from ciphertext, and sorts each
- * room once instead of inserting record by record.
+ * `hydrate()` rebuilds the inverted index and the room order from ciphertext, one row at a time via
+ * binary-search insertion (`insertRoomOrder`), which is stable with respect to arrival order and so
+ * produces the same final ordering a bulk "collect then sort each room once" pass would have.
  */
 const RELOAD_EVENT_COUNT = 300;
 const RELOAD_ROOMS = ["!warm0:example.org", "!warm1:example.org", "!warm2:example.org"];
@@ -2216,8 +2634,8 @@ describe("BrowserEventIndexManager (a persisted index at scale)", () => {
             // only a live insert would have filled.
             expect((await reloaded.searchEventIndex(search("armentry150"))).count).toBe(1);
 
-            // `loadAllForUser` sorts each room once on the way in rather than inserting record by
-            // record, so this is the assertion that the two agree about what ordered means.
+            // `hydrate()` inserts record by record via binary search rather than sorting each room
+            // once in bulk, so this is the assertion that the two agree about what ordered means.
             expect(await roomTimelineOrder(reloaded, "warm", RELOAD_ROOMS[0], RELOAD_EVENT_COUNT)).toEqual(
                 expectedRoomOrder,
             );

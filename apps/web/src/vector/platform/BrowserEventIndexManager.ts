@@ -592,8 +592,12 @@ function idbReq<T>(req: IDBRequest<T>): Promise<T> {
  * -- comfortably under the 50 ms long-task ceiling: measured at ~20 µs/event for `getAll` on this
  * schema at 200k rows (`research/measurements-v1.md` §3.2), so 1,000 rows is ~20 ms, leaving margin
  * for slower hardware. Revisit alongside a future chunked schema, which changes what a page reads.
+ *
+ * @knipignore - exported so a test can seed more than one page's worth of rows without waiting on
+ *     a production-sized restore; the multi-page resume branch in {@link userEventKeyRange} is
+ *     otherwise never exercised by any fixture small enough to run quickly.
  */
-const HYDRATION_PAGE_SIZE = 1000;
+export const HYDRATION_PAGE_SIZE = 1000;
 
 /**
  * How long one hydration slice may run before {@link yieldToEventLoop} hands control back to the
@@ -797,11 +801,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private db: IDBDatabase | null = null;
 
     /**
-     * True from the point {@link initEventIndex} starts a hydration run until {@link hydrate}
-     * finishes it (successfully, aborted by teardown, or by wiping a corrupt index) -- or never true
-     * at all, if there was nothing to hydrate. Surfaced on {@link getStats}' `loading` so {@link
-     * SearchWarning}'s `useIsIndexIncomplete` can keep showing the existing "results may be
-     * incomplete" line while it is set.
+     * True from the top of {@link initEventIndex} -- before key derivation, before it is known whether there is
+     * even anything to restore -- until either a hydration run finishes (successfully, aborted by teardown, or by
+     * wiping a corrupt index) or `initEventIndex` determines there is nothing to hydrate and clears this itself.
+     * Set this early, rather than only once {@link hydrate} starts, specifically so {@link materializeIfPending}
+     * is not a no-op during `initEventIndex`'s own earlier awaits (`openDb`, key derivation, checkpoint load) --
+     * `closed`/`userId` are already set by then, so a write landing in that window would otherwise pass its guard
+     * and upsert a disk-resident id as brand new. Surfaced on {@link getStats}' `loading` so {@link
+     * SearchWarning}'s `useIsIndexIncomplete` can keep showing the existing "results may be incomplete" line while
+     * it is set.
      */
     private hydrating = false;
 
@@ -823,6 +831,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * public {@link waitForHydration} wrapper.
      */
     private hydrationPromise: Promise<void> = Promise.resolve();
+
+    /**
+     * Set by {@link hydrate}'s outer catch when a run fails for a reason other than a bad row (which wipes and
+     * returns instead): most realistically another tab's `onversionchange` closing this connection mid-page-read.
+     * Read only by {@link hydrate} itself, to skip its own success log line, and cleared by {@link clearIndexMaps} so
+     * a fresh session never inherits a previous one's failure. This is the "stats" a failed run's outcome is
+     * recorded in -- the field instrumentation log line already required by this increment, now honest about a run
+     * that did not finish cleanly rather than silently printing as if it had.
+     */
+    private hydrationFailure: unknown = undefined;
 
     /**
      * Redactions naming an `m.replace` event whose original has not been hydrated yet. An edit is
@@ -892,6 +910,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.persistEnabled = false;
         this.userId = userId;
         this.closed = false;
+        // Set eagerly, not left for hydrate() to set on its own first await: openDb/loadMeta/deriveKey/
+        // loadCrawlerCheckpoints below are themselves await points, and closed/userId are already set, so a write
+        // path landing in this window would otherwise pass its guard, find materializeIfPending() a no-op (gated on
+        // this very flag), and upsert a disk-resident id as brand new. Cleared on whichever path below does not go
+        // on to start a hydration run; hydrate() itself re-sets it (redundantly, harmlessly) at its own top.
+        this.hydrating = true;
 
         const pickleKey = await PlatformPeg.get()?.getPickleKey(userId, deviceId);
         let salt = crypto.getRandomValues(new Uint8Array(32));
@@ -970,6 +994,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userVersion: 0,
                 });
                 this.userVersion = 0;
+                this.hydrating = false; // Nothing will hydrate after a wipe; the restore this flag guarded is over.
             } else {
                 // Deliberately not awaited -- see the docstring above. hydrationPromise exists only so tests
                 // (and, per §6 of the increment this implements, field instrumentation) have something to
@@ -977,6 +1002,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 const epoch = this.hydrationEpoch;
                 this.hydrationPromise = this.hydrate(userId, salt, epoch);
             }
+        } else {
+            // Memory-only (no IndexedDB, or no pickle key): there is nothing on disk to restore, so the window
+            // this.hydrating opened at the top of this method closes here, with nothing having hydrated.
+            this.hydrating = false;
         }
     }
 
@@ -1004,12 +1033,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * roomOrder} once hydration *does* reach it, and persist a version missing whatever the disk copy already held (a
      * prior edit's `editIds`, say).
      *
+     * `materializeIfPending` is the first genuine interleaving point this method has ever had, and its own guards only
+     * protect *itself* -- they say nothing about what runs after it returns. So `closed` (and `userId`, cleared on the
+     * same teardown paths) is re-checked immediately afterwards: without that, a `closeEventIndex()`/`deleteEventIndex()`
+     * landing during the await resolves, clears every map via `resetMemory()`, and this method would then carry on to
+     * `upsertEvent` a plaintext event straight into the maps teardown just emptied.
+     *
      * @param profile - The sender's display name and avatar *at the time of this event*, so a result can be rendered
      *     without the room being loaded.
      */
     public async addEventToIndex(ev: IMatrixEvent, profile: IMatrixProfile): Promise<void> {
         if (this.closed || !this.userId || !this.featureEnabled()) return;
         await this.materializeIfPending(this.targetId(ev));
+        if (this.closed || !this.userId) return;
         this.upsertEvent(ev, profile);
         this.schedulePersistEvent(this.targetId(ev));
     }
@@ -1091,14 +1127,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * `eventCount` and `roomCount` are exact for what is resident *right now*, which while {@link loading} is true is
      * not yet the eventual total: both climb as {@link hydrate} decrypts more of the disk store, rather than reporting
      * the final numbers before they are true. `loading` is what tells a caller these are still climbing.
+     *
+     * `roomCount` is {@link roomOrder}'s own size, not a walk of {@link events}: `roomOrder` already holds exactly one
+     * entry per room with at least one resident event, its own entry deleted the moment a room's last one goes (see
+     * {@link removeFromIndex}), so re-deriving the same count by visiting every event is redundant work, and at scale
+     * not free -- measured at 8.9-15.3 ms at 200k resident events, synchronous and uninterruptible, on a path
+     * `useIsIndexIncomplete` now calls on every checkpoint change while a `SearchWarning` is mounted.
      */
     public async getStats(): Promise<IIndexStats> {
-        const rooms = new Set<string>();
-        for (const ev of this.events.values()) rooms.add(ev.roomId);
         return {
             size: this.ciphertextBytes || this.estimatePlainSize(),
             eventCount: this.events.size,
-            roomCount: rooms.size,
+            roomCount: this.roomOrder.size,
             loading: this.hydrating,
         };
     }
@@ -1251,6 +1291,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * has not decrypted it yet. Without that, this method would both duplicate {@link roomOrder}'s entry for the id
      * once hydration does reach it and persist a version regressing whatever the disk copy already held.
      *
+     * The loop re-checks {@link closed} after every `materializeIfPending` await, for the same reason {@link
+     * addEventToIndex} does: that call is the loop's only interleaving point, its own guards protect only itself, and a
+     * teardown landing between two events must stop the batch rather than upsert into maps `resetMemory()` just
+     * cleared. Ending the batch there and returning `false` is safe by the contract below -- it is exactly what an
+     * empty batch or a shut labs gate already does.
+     *
      * @returns True only if every event in the batch was already indexed *and* nothing about it changed. The crawler
      *     uses this to stop crawling backwards through a room it has covered, so a false negative costs a redundant
      *     page while a false positive would silently truncate history. An empty batch returns false, as does one
@@ -1274,6 +1320,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         for (const { event, profile } of events) {
             const id = this.targetId(event);
             await this.materializeIfPending(id);
+            if (this.closed) return false;
             const existing = this.events.get(id);
             const isReplace = replacedEventId(event) !== null;
             if (existing && !isReplace && existing.edited === false) {
@@ -1475,6 +1522,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * removeCrawlerCheckpoint}, {@link closeEventIndex}, {@link deleteEventIndex}), because turning the feature off
      * must stop the writing without disarming the wiping. {@link setUserVersion} is not gated either, since it rewrites
      * one number in an existing `meta` row. Reads are left alone.
+     *
+     * One named exception to "every method that grows the index": {@link hydrate} itself does not re-check this on
+     * each row, because it is *decrypting what {@link initEventIndex} already committed to restoring* under a gate
+     * that was live at the moment `initEventIndex` checked it, not adding anything new. A flag flip mid-hydration
+     * (`Lifecycle.clearStorage()` clears the setting's storage before it reaches {@link deleteEventIndex}, so there
+     * is a real window) leaves a run already in flight decrypting for slightly longer than the setting has been off
+     * -- bounded by `deleteEventIndex`'s epoch bump, which still stops it -- rather than aborting mid-page.
      */
     private featureEnabled(reason?: string): boolean {
         if (isBrowserEventIndexEnabled()) return true;
@@ -1591,10 +1645,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * so the position is found by binary search and spliced in; appending and re-sorting instead costs a full sort per
      * indexed event, O(n^2 log n) comparisons to build one room's list, on the main thread inside the awaited login
      * path. The search is for the *upper* bound, so a tied timestamp lands where a stable "append, then sort" put it.
-     * There is deliberately no "already present?" check: it would be a linear scan on the hot path, and it would be
-     * dead code. {@link upsertEvent} only reaches here when {@link events} held nothing for the id, {@link
-     * reindexRoomOrder} splices the id out immediately before re-inserting it, and a warm start does not come through
-     * here at all -- {@link loadAllForUser} appends every row and sorts each room's list once.
+     *
+     * There is deliberately no "already present?" check here -- it would be a linear scan on every insert -- so
+     * every caller is responsible for calling this at most once per id. {@link upsertEvent} only reaches here when
+     * {@link events} held nothing for the id, and {@link reindexRoomOrder} splices the id out immediately before
+     * re-inserting it. Hydration's warm start goes through this on every single row it materializes ({@link
+     * materializeRow}), not around it -- there is no longer a separate bulk "append everything, sort each room once"
+     * path -- so `materializeRow` itself carries the one Map-lookup guard (`events.has()` before its own `set`) that
+     * keeps a bug reaching this function from becoming a silent duplicate rather than a caller's own mistake to fix.
      */
     private insertRoomOrder(stored: StoredEvent): void {
         let list = this.roomOrder.get(stored.roomId);
@@ -2023,14 +2081,37 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
                 if (rows.length < HYDRATION_PAGE_SIZE) break;
             }
+        } catch (e) {
+            // Anything not already handled inside the loop above -- most realistically db.transaction()/idbReq()/
+            // txDone() throwing because another tab's onversionchange closed this connection out from underneath an
+            // in-flight page read (openDb installs db.onversionchange = () => db.close()). Recorded, not rethrown:
+            // this.hydrationPromise must never reject, since production code never awaits it (see initEventIndex),
+            // and an unhandled rejection here would surface as untriaged noise where, before this method existed,
+            // EventIndexPeg.initEventIndex's own try/catch turned the equivalent failure into `this.error` plus a
+            // disabled index. The index is left exactly as far hydrated as it got, the same graceful-degradation
+            // policy every other failure path in this class already follows.
+            this.hydrationFailure = e;
+            log.warn("EventIndex: hydration failed; leaving the index partially hydrated", e);
         } finally {
-            if (epoch === this.hydrationEpoch) this.hydrating = false;
+            if (epoch === this.hydrationEpoch) {
+                this.hydrating = false;
+                // Any redaction still parked here named an edit whose original this run never reached (the row
+                // does not exist, or decrypting it failed independently of this run's own error path above).
+                // clearIndexMaps() would silently absorb these on the next reset regardless, but logging first
+                // makes a redaction that this run could not act on visible rather than incidental.
+                if (this.pendingRedactions.size > 0) {
+                    log.debug(`EventIndex: ${this.pendingRedactions.size} redaction(s) never found their original`);
+                    this.pendingRedactions.clear();
+                }
+            }
         }
 
-        log.info(
-            `EventIndex: hydration finished in ${(now() - started).toFixed(1)}ms, ${hydratedCount} events, ` +
-                `longest slice ${longestSliceMs.toFixed(1)}ms, key order ${HYDRATION_KEY_ORDER}`,
-        );
+        if (!this.hydrationFailure) {
+            log.info(
+                `EventIndex: hydration finished in ${(now() - started).toFixed(1)}ms, ${hydratedCount} events, ` +
+                    `longest slice ${longestSliceMs.toFixed(1)}ms, key order ${HYDRATION_KEY_ORDER}`,
+            );
+        }
     }
 
     /**
@@ -2060,6 +2141,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private async materializeRow(userId: string, dek: CryptoKey, row: EventRecord, epoch: number): Promise<void> {
         const stored = await decryptJson<StoredEvent>(dek, row.blob, `${userId}|${row.eventId}`);
         if (this.closed || epoch !== this.hydrationEpoch) return;
+        // Belt-and-braces idempotency: every caller is meant to check residency before reaching here
+        // ({@link hydrate}'s loop, {@link materializeOnce}'s in-flight de-duplication,
+        // {@link materializeIfPending}'s own re-check), but this guard is what makes a future caller
+        // that forgets a fail-safe rather than a silent room-order duplicate -- one Map lookup.
+        if (this.events.has(stored.eventId)) return;
 
         const redactedByPendingEdit = (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id));
         if (redactedByPendingEdit) {
@@ -2124,6 +2210,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * could be pending), this session has nothing persisted to read from, or the targeted `get()` finds no row
      * (genuinely new, or already handled by something else). Not itself sliced -- unlike {@link hydrate}'s own
      * paging, this is one record, and the cost is paid once per id, only while hydration is running.
+     *
+     * Two things are re-checked after the two awaits below, and both matter: `closed`/`epoch` (a teardown or
+     * re-initialisation landing mid-call must not resurrect a record into an index that has moved on -- the class of
+     * bug {@link addEventToIndex}'s own post-await check exists for) and residency (`this.events.has(targetId)` again
+     * -- the id can have finished materializing *during* this call, via {@link hydrate}'s own loop reaching the same
+     * row concurrently, in which case {@link materializeOnce}'s in-flight de-duplication map no longer has an entry
+     * for it by the time this resumes, and without this second check {@link materializeRow} would run a second time
+     * and duplicate the id in {@link roomOrder}, which has no "already present?" check of its own).
      */
     private async materializeIfPending(targetId: string): Promise<void> {
         if (this.events.has(targetId)) return;
@@ -2132,13 +2226,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const userId = this.userId;
         const dek = this.dek;
         const epoch = this.hydrationEpoch;
-        const tx = this.db.transaction("events", "readonly");
-        const row = (await idbReq(tx.objectStore("events").get([userId, targetId]))) as EventRecord | undefined;
-        await txDone(tx);
-        // A teardown or re-initialisation could have landed while the get() above was in flight;
-        // re-check rather than resurrect a record into an index that has moved on. materializeRow()
-        // repeats this same check of its own after its (slower) decrypt await, for the same reason.
+        let row: EventRecord | undefined;
+        try {
+            const tx = this.db.transaction("events", "readonly");
+            row = (await idbReq(tx.objectStore("events").get([userId, targetId]))) as EventRecord | undefined;
+            await txDone(tx);
+        } catch (e) {
+            // A handle closed out from underneath us by another tab's onversionchange (openDb installs
+            // db.onversionchange = () => db.close()) throws synchronously from transaction()/get() -- straight into
+            // whichever live write path called this method, e.g. addEventToIndex from a RoomEvent.Timeline handler
+            // with no catch of its own. Treat any such failure the same as "no row on disk": conservative, and
+            // exactly this function's existing contract for "nothing to pull in".
+            log.debug("EventIndex: materializeIfPending could not read the disk row; treating it as absent", e);
+            return;
+        }
+        // A teardown or re-initialisation, or a concurrent materialize attempt for this same id (see the docstring
+        // above), could have landed while the read above was in flight; re-check both rather than resurrect a
+        // record into an index that has moved on, or duplicate one already materialized by someone else in the
+        // meantime. materializeRow() repeats the closed/epoch half of this on its own, for the same reason.
         if (this.closed || epoch !== this.hydrationEpoch) return;
+        if (this.events.has(targetId)) return;
         if (!row) return; // Genuinely new, or raced with a delete; nothing left to pull in.
         try {
             await this.materializeOnce(userId, dek, row, epoch);
@@ -2212,6 +2319,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.ciphertextBytes = 0;
         this.recordBytes.clear();
         this.pendingRedactions.clear();
+        this.hydrationFailure = undefined;
     }
 
     /**
