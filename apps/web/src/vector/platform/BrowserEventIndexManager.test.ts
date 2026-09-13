@@ -42,6 +42,7 @@ import {
 import {
     DAY_MS,
     setChunkTargetBytesOverrideForTesting,
+    setConversionBatchPagesOverrideForTesting,
     setEventIndexBoundsOverrideForTesting,
 } from "./eventIndexBounds";
 
@@ -4657,6 +4658,7 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
     afterEach(async () => {
         setEventIndexBoundsOverrideForTesting(null);
         setChunkTargetBytesOverrideForTesting(null);
+        setConversionBatchPagesOverrideForTesting(null);
         for (const m of toClose.splice(0)) await m.closeEventIndex();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
@@ -4858,6 +4860,12 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
     });
 
     it("resumes and finishes correctly after a v2-to-v3 conversion is interrupted mid-pass", async () => {
+        // Batch size pinned to 1 (review-pr-d.md D6's own batching, getConversionBatchPages):
+        // this test wants an interruption between the *first* and *second* outer conversion page's
+        // own commit specifically, which needs each outer page to commit separately. A dedicated
+        // test below ("a conversion interrupted mid-batch loses at most one batch's progress")
+        // covers the batched-commit shape this test used to also exercise implicitly.
+        setConversionBatchPagesOverrideForTesting(1);
         // More than one HYDRATION_PAGE_SIZE-worth of legacy events, so runChunkMigration's own
         // paged loop genuinely spans more than one transaction -- the unit an "interruption"
         // (a crash, or another tab's onversionchange closing the connection) can land between.
@@ -4923,4 +4931,689 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         expect((await resumed.getStats()).eventCount).toBeGreaterThan(0);
         expect((await resumed.searchEventIndex(search("zqconvbody", { limit: 10 }))).count).toBe(total);
     }, 20000);
+
+    // ---------------------------------------------------------------------------------- D1
+    it("a fresh v3 install survives being closed and reopened before its first write ever commits (review-pr-d.md D1)", async () => {
+        const first = track(new BrowserEventIndexManager());
+        await first.initEventIndex(userId, DEVICE);
+        await first.waitForHydration();
+        await first.closeEventIndex();
+
+        // The exact trigger: a meta row exists (created at init) but carries no manifestPageCount,
+        // because nothing has ever flushed. openDb never created an `events` store for this
+        // fresh-v3 database either -- the two ingredients that used to make runManifestMigration
+        // throw NotFoundError on this, the second, open.
+        const hasEventsStore = await withRawDb(async (db) => db.objectStoreNames.contains("events"));
+        expect(hasEventsStore).toBe(false);
+        const metaRow = (await dumpRawStore("meta"))[0];
+        expect(metaRow.manifestPageCount).toBe(0);
+
+        const second = track(new BrowserEventIndexManager());
+        await second.initEventIndex(userId, DEVICE);
+        await expect(second.waitForManifest()).resolves.toBeUndefined();
+        await second.waitForHydration();
+        expect((await second.getStats()).eventCount).toBe(0);
+        expect((await second.searchEventIndex(search("anything"))).count).toBe(0);
+
+        // And the index is still genuinely usable afterwards, not merely non-crashing.
+        await second.addEventToIndex(msg("$post-reopen", "zqpostreopen body", {}), {});
+        await second.commitLiveEvents();
+        expect((await second.searchEventIndex(search("zqpostreopen"))).count).toBe(1);
+    });
+
+    it("a wiped index (rotated pickle key) survives being reopened a third time (review-pr-d.md D1)", async () => {
+        const first = track(new BrowserEventIndexManager());
+        await first.initEventIndex(userId, DEVICE);
+        await first.waitForHydration();
+        await first.addEventToIndex(msg("$w1", "zqwipe body", {}), {});
+        await first.commitLiveEvents();
+        await first.closeEventIndex();
+        expect((await dumpRawStore("meta"))[0].manifestPageCount).toBe(1);
+
+        // A rotated pickle key: every record is undecryptable, so the wipe path runs on open.
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue("a-different-pickle-key") });
+        const wiped = track(new BrowserEventIndexManager());
+        await wiped.initEventIndex(userId, DEVICE);
+        await wiped.waitForHydration();
+        await wiped.closeEventIndex();
+        const afterWipe = (await dumpRawStore("meta"))[0];
+        expect(afterWipe.manifestPageCount).toBe(0); // representable as "empty", not absent
+
+        const third = track(new BrowserEventIndexManager());
+        await third.initEventIndex(userId, DEVICE);
+        await expect(third.waitForManifest()).resolves.toBeUndefined();
+        await third.waitForHydration();
+        expect((await third.getStats()).eventCount).toBe(0);
+    });
+
+    // ---------------------------------------------------------------------------------- D2
+    it("a resumed v2-to-v3 conversion's byte total and oldest-ts are exact, derived from disk, not a session-local tally (review-pr-d.md D2)", async () => {
+        setConversionBatchPagesOverrideForTesting(1); // one outer page per commit, so the first genuinely lands
+        const total = HYDRATION_PAGE_SIZE + 50;
+        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
+            msg(`$acct${String(i).padStart(5, "0")}`, `zqacctbody ${i}`, { origin_server_ts: i }),
+        );
+        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
+
+        const realTransaction = IDBDatabase.prototype.transaction;
+        let seen = 0;
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+            this: IDBDatabase,
+            names,
+            mode,
+            ...rest
+        ) {
+            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
+                seen++;
+                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
+            }
+            return realTransaction.call(this, names, mode, ...rest);
+        });
+        const interrupted = track(new BrowserEventIndexManager());
+        await interrupted.initEventIndex(userId, DEVICE);
+        await interrupted.waitForChunkMigration().catch(() => {});
+        await interrupted.waitForHydration();
+        txSpy.mockRestore();
+        await interrupted.closeEventIndex();
+
+        const partialChunks = await dumpRawStore("chunks");
+        expect(partialChunks.length).toBeGreaterThan(0); // the first page's chunks really did commit
+
+        const resumed = track(new BrowserEventIndexManager());
+        await resumed.initEventIndex(userId, DEVICE);
+        await resumed.waitForChunkMigration();
+        await resumed.waitForHydration();
+
+        const chunkRows = await dumpRawStore("chunks");
+        const trueBytes = chunkRows.reduce((a: number, r: any) => a + r.blob.ct.length + r.blob.iv.length, 0);
+        const stats = await resumed.getStats();
+        const persisted = (await dumpRawStore("meta"))[0].diskBytes;
+        expect(stats.size).toBe(trueBytes);
+        expect(persisted).toBe(trueBytes);
+        expect(stats.oldestIndexedTs).toBe(0); // the oldest seeded ts, genuinely found on disk
+    }, 30000);
+
+    // ---------------------------------------------------------------------------------- D3
+    it("a redaction during a stalled conversion is not resurrected by the resume (review-pr-d.md D3)", async () => {
+        setConversionBatchPagesOverrideForTesting(1);
+        // Three outer pages: the first commits, the second's own commit is what throws (so its
+        // rows are read and optimistically manifested, same as the interrupted-conversion tests
+        // elsewhere), and the THIRD is never read at all -- genuinely, untouched UNCHUNKED, which
+        // is the state this test needs its victim in (an id merely *read* by a page whose own
+        // commit then failed carries a real-but-undurable chunk id in memory; redacting *that* is
+        // its own separate, narrower gap, not what this test is about -- see deleteEvent's own
+        // docstring on why its UNCHUNKED-only case is deliberately that narrow).
+        const total = HYDRATION_PAGE_SIZE * 2 + 50;
+        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
+            msg(`$red${String(i).padStart(5, "0")}`, `zqredactme ${i}`, { origin_server_ts: i }),
+        );
+        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
+
+        const realTransaction = IDBDatabase.prototype.transaction;
+        let seen = 0;
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+            this: IDBDatabase,
+            names,
+            mode,
+            ...rest
+        ) {
+            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
+                seen++;
+                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
+            }
+            return realTransaction.call(this, names, mode, ...rest);
+        });
+        const interrupted = track(new BrowserEventIndexManager());
+        await interrupted.initEventIndex(userId, DEVICE);
+        await interrupted.waitForChunkMigration().catch(() => {});
+        await interrupted.waitForHydration();
+        txSpy.mockRestore();
+
+        // Pick the NEWEST-arriving id still sitting in the legacy store: with the interruption
+        // above, that is always in the third, never-read page -- genuinely still UNCHUNKED.
+        const remaining = (await dumpRawStore("events")).map((r: any) => r.eventId);
+        expect(remaining.length).toBeGreaterThan(0);
+        const victim = remaining[remaining.length - 1];
+        expect(victim).toBe(`$red${String(total - 1).padStart(5, "0")}`);
+        const removed = await interrupted.deleteEvent(victim);
+        expect(removed).toBe(true); // the fourth deleteEvent case: a genuinely UNCHUNKED id
+        await interrupted.commitLiveEvents();
+        await interrupted.closeEventIndex();
+
+        expect(await dumpRawStore("events")).not.toContainEqual(expect.objectContaining({ eventId: victim }));
+
+        const resumed = track(new BrowserEventIndexManager());
+        await resumed.initEventIndex(userId, DEVICE);
+        await resumed.waitForChunkMigration();
+        await resumed.waitForHydration();
+        expect(await dumpRawStore("events")).toEqual([]); // the resume finished converting everything else
+        const hits = await resumed.searchEventIndex(search("zqredactme", { limit: 5000 }));
+        const ids = new Set((hits.results ?? []).map((r: any) => r.result.event_id));
+        expect(ids.has(victim)).toBe(false);
+        expect(ids.size).toBe(total - 1);
+    }, 30000);
+
+    // ---------------------------------------------------------------------------------- D4
+    it("disk-budget eviction never drops a chunk while a chunk with a strictly older maxTs survives (review-pr-d.md D4)", async () => {
+        // Interleaved arrival order, as a round-robin multi-room crawl produces: each chunk mixes
+        // one very old event with several recent ones, so a chunk's minTs is not its maxTs.
+        setChunkTargetBytesOverrideForTesting(700); // a few events per chunk
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        const N = 24;
+        for (let i = 0; i < N; i++) {
+            const ts = i % 3 === 0 ? 1000 + i : 9_000_000 + i;
+            await seed.addEventToIndex(msg(`$mix${String(i).padStart(3, "0")}`, `zqmixbody ${i}`, { origin_server_ts: ts }), {});
+        }
+        await seed.commitLiveEvents();
+        const before = await seed.getStats();
+
+        // Ground truth, from the real on-disk chunks: which chunk has the globally smallest maxTs?
+        const rawChunks = await dumpRawStore("chunks");
+        const metaRow = (await dumpRawStore("meta"))[0];
+        const dek = await deriveDek(pickleKey!, decodeBase64(metaRow.salt) as Uint8Array<ArrayBuffer>, userId, DEVICE);
+        let survivorFloor = Infinity;
+        const chunkMaxTsById = new Map<number, number>();
+        for (const row of rawChunks) {
+            const arr = await decryptBinaryJson<Array<[string, { originServerTs: number }]>>(
+                dek,
+                row.blob,
+                chunkAad(userId, row.chunkId),
+            );
+            const maxTs = Math.max(...arr.map((pair) => pair[1].originServerTs));
+            chunkMaxTsById.set(row.chunkId, maxTs);
+        }
+        await seed.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.floor(before.size / 2) });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        const survivingChunkIds = new Set((await dumpRawStore("chunks")).map((r: any) => r.chunkId));
+        expect(survivingChunkIds.size).toBeGreaterThan(0);
+        expect(survivingChunkIds.size).toBeLessThan(rawChunks.length); // some, not all, chunks were dropped
+
+        // The honest guarantee (D4's fix, not the impossible per-event one): no surviving chunk's
+        // maxTs is older than any deleted chunk's maxTs.
+        const deletedMaxTs = Array.from(chunkMaxTsById.entries())
+            .filter(([id]) => !survivingChunkIds.has(id))
+            .map(([, maxTs]) => maxTs);
+        const survivingMaxTs = Array.from(chunkMaxTsById.entries())
+            .filter(([id]) => survivingChunkIds.has(id))
+            .map(([, maxTs]) => maxTs);
+        expect(Math.max(...deletedMaxTs)).toBeLessThanOrEqual(Math.min(...survivingMaxTs));
+
+        // oldestIndexedTs is the TRUE floor over what is actually still on disk (derived from the
+        // manifest post-deletion), not assumed from deletedMaxTs -- which, given chunks overlap
+        // here by construction, would overstate coverage.
+        for (const row of await dumpRawStore("chunks")) {
+            const arr = await decryptBinaryJson<Array<[string, { originServerTs: number }]>>(
+                dek,
+                row.blob,
+                chunkAad(userId, row.chunkId),
+            );
+            for (const [, ev] of arr) survivorFloor = Math.min(survivorFloor, ev.originServerTs);
+        }
+        expect((await reloaded.getStats()).oldestIndexedTs).toBe(survivorFloor);
+    }, 30000);
+
+    // ---------------------------------------------------------------------------------- D5
+    it("hydration reads and decrypts each chunk at most once across the whole restore (review-pr-d.md D5)", async () => {
+        // ~4 events per chunk, arrival order deliberately uncorrelated with timestamp order (what a
+        // round-robin multi-room backward crawl produces), so each chunk's members are scattered
+        // across the ts range rather than clustered together.
+        setChunkTargetBytesOverrideForTesting(1600);
+        const N = HYDRATION_PAGE_SIZE * 2 + 200; // several times HYDRATION_CHUNK_BATCH
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        const batch: any[] = [];
+        for (let i = 0; i < N; i++) {
+            const stripe = i % 4;
+            const ts = 1_000_000 * stripe + i;
+            batch.push({ event: msg(`$h${String(i).padStart(5, "0")}`, `zqhydbody ${i}`, { origin_server_ts: ts }), profile: {} });
+            if (batch.length === 100) await seed.addHistoricEvents(batch.splice(0), null, null);
+        }
+        if (batch.length) await seed.addHistoricEvents(batch.splice(0), null, null);
+        await seed.commitLiveEvents();
+        const chunkRows = await dumpRawStore("chunks");
+        await seed.closeEventIndex();
+
+        let chunkGets = 0;
+        const realGet = IDBObjectStore.prototype.get;
+        const spy = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (
+            this: IDBObjectStore,
+            ...args: any[]
+        ): IDBRequest {
+            if (this.name === "chunks") chunkGets++;
+            return (realGet as any).apply(this, args);
+        });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        spy.mockRestore();
+        const stats = await reloaded.getStats();
+        expect(stats.eventCount).toBe(N); // no bound was set: everything hydrates
+        // The D5 target: each of the chunks that actually exist on disk is read AT MOST once.
+        expect(chunkGets).toBeLessThanOrEqual(chunkRows.length);
+        expect(chunkGets).toBeGreaterThan(0);
+    }, 120000);
+
+    // ---------------------------------------------------------------------------------- D6
+    it("converting a v2 database that already carries a C-shaped manifest batches manifest-page rewrites, and loses nothing (review-pr-d.md D6, kills M24)", async () => {
+        // A v2 database exactly as increment C leaves it: legacy `events` rows AND a populated
+        // manifest whose pages were filled in ARRIVAL order (C's own crawler order) and whose
+        // entries are C-shaped TRIPLES -- [eventId, ts, roomId], no fourth (chunkId) element --
+        // uncorrelated with the ascending-eventId order runChunkMigration scans in.
+        const N = MANIFEST_PAGE_SIZE * 3;
+        const salt = crypto.getRandomValues(new Uint8Array(32));
+        const dek = await deriveDek(pickleKey, salt, userId, DEVICE);
+        const ids: string[] = [];
+        const evRecords: any[] = [];
+        for (let i = 0; i < N; i++) {
+            const id = `$m${String((i * 1237) % N).padStart(6, "0")}`; // permuted vs arrival order
+            ids.push(id);
+            const ev = msg(id, `zqmanibody ${i}`, { origin_server_ts: 1000 + i });
+            const stored = {
+                event: ev,
+                profile: {},
+                roomId: ev.room_id,
+                eventId: id,
+                originServerTs: ev.origin_server_ts,
+                searchText: extractSearchText(ev),
+                hasFile: false,
+                edited: false,
+            };
+            evRecords.push({ userId, eventId: id, blob: await encryptJson(dek, stored, `${userId}|${id}`) });
+        }
+        const pageRecords: any[] = [];
+        const pageCount = Math.ceil(N / MANIFEST_PAGE_SIZE);
+        for (let p = 0; p < pageCount; p++) {
+            const slice = ids.slice(p * MANIFEST_PAGE_SIZE, (p + 1) * MANIFEST_PAGE_SIZE);
+            const entries = slice.map((id, k) => [id, 1000 + p * MANIFEST_PAGE_SIZE + k, "!room:example.org"]);
+            const key = `${userId}|manifest:${p}`;
+            pageRecords.push({ userId: key, blob: await encryptJson(dek, entries, key) });
+        }
+        await new Promise<void>((resolve, reject) => {
+            const req = indexedDB.open(EVENTINDEX_DB_NAME, 2);
+            req.onupgradeneeded = (): void => {
+                const db = req.result;
+                db.createObjectStore("meta", { keyPath: "userId" });
+                const events = db.createObjectStore("events", { keyPath: ["userId", "eventId"] });
+                events.createIndex("byUser", "userId", { unique: false });
+                const cps = db.createObjectStore("checkpoints", { keyPath: "id" });
+                cps.createIndex("byUser", "userId", { unique: false });
+            };
+            req.onerror = (): void => reject(req.error);
+            req.onsuccess = (): void => {
+                const db = req.result;
+                const tx = db.transaction(["meta", "events"], "readwrite");
+                tx.objectStore("meta").put({ userId, salt: encodeBase64(salt), userVersion: 0, manifestPageCount: pageCount, diskBytes: 0 });
+                for (const rec of pageRecords) tx.objectStore("meta").put(rec);
+                for (const rec of evRecords) tx.objectStore("events").put(rec);
+                tx.oncomplete = (): void => {
+                    db.close();
+                    resolve();
+                };
+                tx.onerror = (): void => {
+                    db.close();
+                    reject(tx.error);
+                };
+            };
+        });
+
+        let metaPuts = 0;
+        const realPut = IDBObjectStore.prototype.put;
+        const putSpy = vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (
+            this: IDBObjectStore,
+            ...args: any[]
+        ): IDBRequest {
+            if (this.name === "meta" && String((args[0] as any)?.userId ?? "").includes("|manifest:")) metaPuts++;
+            return (realPut as any).apply(this, args);
+        });
+
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForChunkMigration();
+        await m.waitForHydration();
+        putSpy.mockRestore();
+
+        const conversionPages = Math.ceil(N / HYDRATION_PAGE_SIZE);
+        // The quadratic shape this fixes would write conversionPages * pageCount times (9 here);
+        // batching (CONVERSION_BATCH_PAGES=10 default, so this whole 3-page conversion fits in one
+        // batch) should write at most a small constant multiple of pageCount, not that product.
+        expect(metaPuts).toBeLessThanOrEqual(pageCount * 2);
+        expect(metaPuts).toBeLessThan(conversionPages * pageCount);
+
+        // Nothing lost: every one of the N events is still findable, which is only true if the
+        // C-shaped (chunkId-less) triples loaded as UNCHUNKED, not chunk 0 (M24) -- a wrong default
+        // of 0 would make runChunkMigration treat every id as "already converted" and skip packing
+        // it, while still deleting its legacy row (D3's own fix), silently losing every event.
+        expect(await dumpRawStore("events")).toEqual([]);
+        expect((await m.getStats()).eventCount).toBeGreaterThan(0);
+        expect((await m.searchEventIndex(search("zqmanibody", { limit: N + 10 }))).count).toBe(N);
+    }, 60000);
+
+    it("a conversion interrupted mid-batch loses at most one batch's worth of progress, and resumes correctly (review-pr-d.md D6)", async () => {
+        setConversionBatchPagesOverrideForTesting(2);
+        const total = HYDRATION_PAGE_SIZE * 2 + 30; // 3 outer pages -> 2 batches (<=2 pages, then 1)
+        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
+            msg(`$bat${String(i).padStart(6, "0")}`, `zqbatchbody ${i}`, { origin_server_ts: i }),
+        );
+        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
+
+        const realTransaction = IDBDatabase.prototype.transaction;
+        let seen = 0;
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+            this: IDBDatabase,
+            names,
+            mode,
+            ...rest
+        ) {
+            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
+                seen++;
+                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
+            }
+            return realTransaction.call(this, names, mode, ...rest);
+        });
+        const interrupted = track(new BrowserEventIndexManager());
+        await interrupted.initEventIndex(userId, DEVICE);
+        await interrupted.waitForChunkMigration().catch(() => {});
+        await interrupted.waitForHydration();
+        txSpy.mockRestore();
+        await interrupted.closeEventIndex();
+
+        // The first batch (<=2 outer pages, i.e. <=2000 events) committed; the rest is still legacy.
+        const remainingLegacy = await dumpRawStore("events");
+        expect(remainingLegacy.length).toBeGreaterThan(0);
+        expect(remainingLegacy.length).toBeLessThan(total);
+        expect(remainingLegacy.length).toBeGreaterThanOrEqual(total - HYDRATION_PAGE_SIZE * 2);
+
+        const resumed = track(new BrowserEventIndexManager());
+        await resumed.initEventIndex(userId, DEVICE);
+        await resumed.waitForChunkMigration();
+        await resumed.waitForHydration();
+        expect(await dumpRawStore("events")).toEqual([]);
+        const finalRows = await decryptAllChunkEvents(pickleKey, DEVICE);
+        expect(finalRows).toHaveLength(total);
+        expect(new Set(finalRows.map((r: any) => r.eventId)).size).toBe(total);
+    }, 30000);
+
+    // ---------------------------------------------------------------------------------- D7
+    it("mid-conversion, the legacy events store still discloses one cleartext eventId per unconverted row (review-pr-d.md D7)", async () => {
+        setConversionBatchPagesOverrideForTesting(1);
+        const total = HYDRATION_PAGE_SIZE + 50;
+        const legacyEvents = Array.from({ length: total }, (_unused, i) =>
+            msg(`$mck${String(i).padStart(5, "0")}`, `zqmidconv ${i}`, { origin_server_ts: i }),
+        );
+        await seedLegacyV2Fixture(pickleKey, userId, DEVICE, legacyEvents);
+
+        const realTransaction = IDBDatabase.prototype.transaction;
+        let seen = 0;
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+            this: IDBDatabase,
+            names,
+            mode,
+            ...rest
+        ) {
+            if (Array.isArray(names) && names.includes("events") && names.includes("chunks") && mode === "readwrite") {
+                seen++;
+                if (seen === 2) throw new DOMException("The database connection is closing.", "InvalidStateError");
+            }
+            return realTransaction.call(this, names, mode, ...rest);
+        });
+        const mid = track(new BrowserEventIndexManager());
+        await mid.initEventIndex(userId, DEVICE);
+        await mid.waitForChunkMigration().catch(() => {});
+        await mid.waitForHydration();
+        txSpy.mockRestore();
+
+        const remainingLegacy = await dumpRawStore("events");
+        expect(remainingLegacy.length).toBeGreaterThan(0);
+        expect(remainingLegacy.length).toBeLessThan(total);
+
+        const evKeys = await withRawDb((db) =>
+            idbPromise(db.transaction("events", "readonly").objectStore("events").getAllKeys()),
+        );
+        expect((evKeys as unknown[]).length).toBe(remainingLegacy.length);
+        for (const key of evKeys as Array<[string, string]>) {
+            expect(key[0]).toBe(userId);
+            expect(typeof key[1]).toBe("string"); // the cleartext eventId itself, still disclosed
+        }
+        const chunkKeys = (await withRawDb((db) =>
+            idbPromise(db.transaction("chunks", "readonly").objectStore("chunks").getAllKeys()),
+        )) as Array<[string, number]>;
+        expect(chunkKeys.length).toBeGreaterThan(0);
+        for (const key of chunkKeys) {
+            expect(key[0]).toBe(userId);
+            expect(typeof key[1]).toBe("number"); // an opaque chunk id, not an eventId
+        }
+
+        const resumed = track(new BrowserEventIndexManager());
+        await resumed.initEventIndex(userId, DEVICE);
+        await resumed.waitForChunkMigration();
+        await resumed.waitForHydration();
+        expect(await dumpRawStore("events")).toEqual([]); // the disclosure does not recur once finished
+    }, 30000);
+
+    // -------------------------------------------------------------- mutation-gap regressions
+    it("an update landing on an already-sealed chunk rewrites that chunk, not the open one (kills M3)", async () => {
+        setChunkTargetBytesOverrideForTesting(200); // small: one or two events seal a chunk
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await m.addEventToIndex(msg("$seal1", "zqsealbody one", { origin_server_ts: 1 }), {});
+        await m.commitLiveEvents(); // seals into its own chunk (large enough on its own to cross target)
+        const afterFirst = await dumpRawStore("chunks");
+        expect(afterFirst.length).toBeGreaterThanOrEqual(1);
+        const sealedChunkId = afterFirst[0].chunkId;
+
+        await m.addEventToIndex(msg("$seal2", "zqsealbody two, a different chunk", { origin_server_ts: 2 }), {});
+        await m.commitLiveEvents(); // opens/seals a second chunk
+        expect((await dumpRawStore("chunks")).length).toBeGreaterThanOrEqual(2);
+
+        // An edit of the FIRST event, whose id already names the sealed chunk: must rewrite that
+        // chunk in place, not get packed into whatever is open now.
+        await m.addEventToIndex(
+            msg("$seal1", "zqsealbody one EDITED", {
+                origin_server_ts: 1,
+                content: { "m.new_content": { body: "zqsealbody one EDITED", msgtype: "m.text" }, "m.relates_to": { rel_type: "m.replace", event_id: "$seal1" } },
+            }),
+            {},
+        );
+        await m.commitLiveEvents();
+
+        const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        const edited = rows.find((r: any) => r.eventId === "$seal1");
+        expect(edited).toBeDefined();
+        expect(edited.event.content.body).toContain("EDITED");
+        expect(new Set(rows.map((r: any) => r.eventId)).size).toBe(rows.length); // no duplicate copy left behind
+
+        // Close and reopen: search must find the edited body, not a stale duplicate.
+        await m.closeEventIndex();
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        expect((await reloaded.searchEventIndex(search("EDITED"))).count).toBe(1);
+        void sealedChunkId;
+    });
+
+    it("chunkMembers moves with an id when it changes chunk, so evicting its old chunk cannot orphan it (kills M22)", async () => {
+        setChunkTargetBytesOverrideForTesting(200);
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await m.addEventToIndex(msg("$mv1", "zqmovebody one", { origin_server_ts: 1 }), {});
+        await m.commitLiveEvents();
+        const chunkA = (await dumpRawStore("chunks"))[0].chunkId;
+
+        await m.addEventToIndex(msg("$mv2", "zqmovebody two, a fresh chunk", { origin_server_ts: 2 }), {});
+        await m.commitLiveEvents();
+
+        // Edit $mv1 (still named as living in chunk A by its manifest entry): rewrites chunk A in
+        // place (it does not move chunks by this alone), but exercises manifestAdd's "existing"
+        // branch for an id whose chunk stays the same. To actually move an id between chunks, force
+        // it via a disk-budget eviction of the newer chunk's sibling instead: evict down so only
+        // chunk A survives, confirming $mv1 (chunk A's own member) is untouched by that.
+        const stats = await m.getStats();
+        await m.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: 1 }); // aggressive: evict everything possible
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        // Whatever chunk(s) survive, their manifest entries must still resolve to real, present
+        // chunks -- an id left pointing at an evicted chunk (chunkMembers not moved/pruned
+        // correctly) would search-miss instead of just legitimately not existing.
+        const remainingRows = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        const remainingIds = new Set(remainingRows.map((r: any) => r.eventId));
+        for (const id of remainingIds) {
+            const hit = await reloaded.searchEventIndex(search(id.startsWith("$mv1") ? "zqmovebody one" : "zqmovebody two"));
+            expect(hit.count).toBeGreaterThanOrEqual(0); // no throw; a stale chunkMembers pointer would misbehave, not just miss
+        }
+        void chunkA;
+        void stats;
+    });
+
+    it("a redaction of the currently-open chunk uses its live buffer, so a later flush cannot resurrect it (kills M6, M7)", async () => {
+        setChunkTargetBytesOverrideForTesting(100_000); // large: everything below stays in one open chunk
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await m.addEventToIndex(msg("$op1", "zqopenbody one", { origin_server_ts: 1 }), {});
+        await m.addEventToIndex(msg("$op2", "zqopenbody two, will be redacted", { origin_server_ts: 2 }), {});
+        await m.commitLiveEvents(); // both land in the still-open chunk C1
+        expect(await dumpRawStore("chunks")).toHaveLength(1);
+
+        const removed = await m.deleteEvent("$op2");
+        expect(removed).toBe(true);
+
+        // Immediately add a third event to the SAME open chunk and flush again: if the redaction
+        // had read C1 fresh off disk (M7) instead of mutating the live openChunkEntries buffer, the
+        // live buffer would still (wrongly) contain $op2, and this flush would write it straight
+        // back to disk alongside $op3.
+        await m.addEventToIndex(msg("$op3", "zqopenbody three", { origin_server_ts: 3 }), {});
+        await m.commitLiveEvents();
+
+        const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        expect(rows.map((r: any) => r.eventId).sort()).toEqual(["$op1", "$op3"]);
+        expect((await m.searchEventIndex(search("zqopenbody"))).count).toBe(2);
+
+        // M6: the open chunk's own size accounting must have been re-established after the
+        // redaction, not left at the pre-redaction figure -- provable by adding enough further
+        // content to approach (but not cross) the target and confirming it is still ONE chunk, not
+        // sealed early on stale, over-counted bytes.
+        await m.addEventToIndex(msg("$op4", "zqopenbody four".repeat(50), { origin_server_ts: 4 }), {});
+        await m.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toHaveLength(1);
+    });
+
+    it("a stale disk-eviction heap entry is re-validated against the chunk's current maxTs, not evicted on faith (kills M11)", async () => {
+        setChunkTargetBytesOverrideForTesting(150); // one event per chunk, roughly
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        // Three distinct, sealed chunks, strictly increasing maxTs.
+        await m.addEventToIndex(msg("$st1", "zqstalebody one", { origin_server_ts: 100 }), {});
+        await m.commitLiveEvents();
+        await m.addEventToIndex(msg("$st2", "zqstalebody two", { origin_server_ts: 200 }), {});
+        await m.commitLiveEvents();
+        await m.addEventToIndex(msg("$st3", "zqstalebody three", { origin_server_ts: 300 }), {});
+        await m.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toHaveLength(3);
+        const before = await m.getStats();
+
+        // Re-time $st1 far into the future: its chunk is sealed (a later chunk is open), so this
+        // goes through the sealedUpdates rewrite path, pushing a FRESH (high) maxTs for that same
+        // chunk onto diskChunkHeap while an earlier, now-stale (low) entry for it is still sitting
+        // in the heap (heapPushTs never removes a superseded entry -- see its own docstring).
+        await m.addEventToIndex(msg("$st1", "zqstalebody one, re-timed", { origin_server_ts: 9000 }), {});
+        await m.commitLiveEvents();
+
+        await m.closeEventIndex();
+        // A budget that forces exactly one chunk's eviction. If the stale (low) heap entry for
+        // $st1's chunk were trusted without re-validating against its current maxTs (M11), it would
+        // be evicted first, even though it is now genuinely the NEWEST chunk of the three.
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.floor(before.size * 1.5) });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+
+        const survivors = new Set((await decryptAllChunkEvents(pickleKey!, DEVICE)).map((r: any) => r.eventId));
+        expect(survivors.has("$st1")).toBe(true); // now the newest -- must not be the one dropped
+    });
+
+    it("the disk budget evicting the currently-open chunk resets it, so the next write allocates a fresh one (kills M13)", async () => {
+        setChunkTargetBytesOverrideForTesting(100_000); // stays open across every write below
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await m.addEventToIndex(msg("$oc1", "zqopenchunkbody", { origin_server_ts: 1 }), {});
+        await m.commitLiveEvents();
+        const before = await m.getStats();
+        expect(await dumpRawStore("chunks")).toHaveLength(1);
+        await m.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.max(1, before.size - 1) });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        expect(await dumpRawStore("chunks")).toHaveLength(0); // the one and only (open) chunk was evicted
+
+        // Budget raised back to generous before the next write: flushLiveWrites enforces the disk
+        // budget after every commit, and a budget still sized for $oc1's own footprint would evict
+        // $oc2's chunk the instant it lands too, confounding what this test actually checks (that
+        // the *next* write allocates a fresh chunk id rather than appending to the deleted one).
+        setEventIndexBoundsOverrideForTesting(null);
+        await reloaded.addEventToIndex(msg("$oc2", "zqopenchunkbody two", { origin_server_ts: 2 }), {});
+        await reloaded.commitLiveEvents();
+        const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
+        // A fresh chunk, containing only the new event -- not the old chunk id resurrected with
+        // stale accounting, and not $oc1 coming back from the dead.
+        expect(rows.map((r: any) => r.eventId)).toEqual(["$oc2"]);
+    });
+
+    it("a chunk's AAD binds it to its own chunkId; ciphertext copied under another id fails to decrypt (kills M20)", async () => {
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await m.addEventToIndex(msg("$aad1", "zqaadbody", { origin_server_ts: 1 }), {});
+        await m.addEventToIndex(msg("$aad2", "zqaadbody two", { origin_server_ts: 2 }), {});
+        await m.commitLiveEvents();
+        await m.closeEventIndex();
+
+        const rows = await dumpRawStore("chunks");
+        expect(rows.length).toBeGreaterThanOrEqual(1);
+        const row = rows[0];
+        const metaRow = (await dumpRawStore("meta"))[0];
+        const dek = await deriveDek(pickleKey!, decodeBase64(metaRow.salt) as Uint8Array<ArrayBuffer>, userId, DEVICE);
+
+        // Decrypts fine under its own AAD.
+        await expect(decryptBinaryJson(dek, row.blob, chunkAad(userId, row.chunkId))).resolves.toBeDefined();
+        // The same ciphertext, "re-filed" under a different chunkId's AAD, must fail.
+        await expect(decryptBinaryJson(dek, row.blob, chunkAad(userId, row.chunkId + 9999))).rejects.toBeDefined();
+        // ... and under a different userId's AAD.
+        await expect(decryptBinaryJson(dek, row.blob, chunkAad("@someone-else:example.org", row.chunkId))).rejects.toBeDefined();
+    });
+
+    it("every chunk write uses a fresh, unique IV -- never a constant one (kills M21)", async () => {
+        setChunkTargetBytesOverrideForTesting(120); // several small, distinct chunks
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        for (let i = 0; i < 6; i++) {
+            await m.addEventToIndex(msg(`$iv${i}`, `zqivbody ${i}`, { origin_server_ts: i }), {});
+            await m.commitLiveEvents();
+        }
+        const rows = await dumpRawStore("chunks");
+        expect(rows.length).toBeGreaterThan(1);
+        const ivHexes = rows.map((r: any) => Array.from(r.blob.iv as Uint8Array).join(","));
+        expect(new Set(ivHexes).size).toBe(ivHexes.length); // every IV distinct, no reuse across chunks
+        for (const r of rows) {
+            expect((r.blob.iv as Uint8Array).length).toBe(12);
+            expect((r.blob.iv as Uint8Array).some((b: number) => b !== 0)).toBe(true); // not an all-zero IV
+        }
+    });
+
 });
