@@ -185,6 +185,34 @@ interface MetaRecord {
      * exact semantics (a guarantee floor, not necessarily the literal minimum surviving row).
      */
     oldestIndexedTs?: number;
+    /**
+     * Number of manifest pages currently persisted for this user (see {@link ManifestPageRecord}),
+     * so {@link BrowserEventIndexManager.loadManifest} knows how many `manifest:<page>` rows to
+     * read without a range query. `undefined` means "this database pre-dates the manifest" (schema
+     * v2 written before this increment, still on the wire in production as of this writing) and is
+     * exactly the signal {@link BrowserEventIndexManager.initEventIndex} uses to run {@link
+     * BrowserEventIndexManager.runManifestMigration} instead of {@link
+     * BrowserEventIndexManager.loadManifest} -- see `research/review-pr-c.md` C-F5. `0` (present,
+     * zero pages) means a manifest exists and is simply empty, which is different and must not
+     * trigger a re-migration.
+     */
+    manifestPageCount?: number;
+}
+
+/**
+ * One page of the encrypted recency manifest: every `{eventId, originServerTs, roomId}` triple this
+ * session knows is on disk, chunked into pages of at most `MANIFEST_PAGE_SIZE` entries so that no
+ * single write ever has to re-encrypt the whole manifest. Stored in the *same* `meta` object store
+ * as {@link MetaRecord} -- not a new object store, so no `EVENTINDEX_DB_VERSION` bump and no reset
+ * -- keyed by {@link manifestPageKey} (`${userId}|manifest:${page}`), which is also the AAD, same
+ * discipline as every other record in this file. The plaintext underneath `blob` is a JSON array of
+ * `[eventId, originServerTs, roomId]` triples; see {@link BrowserEventIndexManager.manifest}'s own
+ * docstring for why this exists and what it is used for.
+ */
+interface ManifestPageRecord {
+    /** `${userId}|manifest:${page}`; see {@link manifestPageKey}. */
+    userId: string;
+    blob: EncryptedBlob;
 }
 
 /**
@@ -699,20 +727,20 @@ const HYDRATION_SLICE_DEADLINE_MS = 30;
 export const RESIDENT_BYTES_PER_EVENT_ESTIMATE = 1024;
 
 /**
- * Traversal order for {@link BrowserEventIndexManager.hydrate}'s paged reads over the *current*
- * (v2, unchunked) schema: ascending primary key, i.e. ascending `eventId` for one user, which is
- * what `IDBObjectStore.getAll()` over a key range returns for free, one page-sized read at a time.
+ * Traversal order for {@link BrowserEventIndexManager.runManifestMigration}'s paged *full* scan
+ * over the current (v2, unchunked) schema's primary key: ascending, i.e. ascending `eventId` for
+ * one user, which is what `IDBObjectStore.getAll()` over a key range returns for free, one
+ * page-sized read at a time.
  *
- * This is **not** recency order, and deliberately does not pretend to be. Matrix event ids are
- * opaque, server-assigned strings with no guaranteed relationship to `origin_server_ts`, and schema
- * v2 keeps no plaintext timestamp column to sort by at all -- it was removed as metadata leakage
- * (see the class threat model). Genuine newest-first hydration needs a schema whose on-disk key
- * already reflects recency; reversing this constant would not get there, because without such a
- * key, "the last N rows by key" can only be read by stepping a cursor one row at a time, which
- * reintroduces exactly the per-record-transaction cost this file's write path already had to be
- * fixed to avoid. It is kept as its own named constant, rather than inlined into {@link
- * userEventKeyRange}, so that the day a recency-ordered key exists -- a chunked schema keyed by
- * `maxTs`, per SYNTHESIS.md §3.4/§3.6 -- this is the one line that changes.
+ * **No longer {@link BrowserEventIndexManager.hydrate}'s own read order** -- that is the fix for
+ * `research/review-pr-c.md` C-F1, and it reads newest-`originServerTs`-first from {@link
+ * BrowserEventIndexManager.manifest} instead, exactly because this order is **not** recency order
+ * and never pretended to be: Matrix event ids are opaque, server-assigned strings with no
+ * guaranteed relationship to `origin_server_ts`, and schema v2 keeps no plaintext timestamp column
+ * to sort by at all -- it was removed as metadata leakage (see the class threat model). This
+ * constant survives only for the one remaining consumer that has no choice but to visit every row
+ * once, in whatever order the store offers cheaply, before any ordering by age is even possible:
+ * the migration pass that builds the manifest in the first place from a pre-manifest database.
  */
 const HYDRATION_KEY_ORDER = "ascending" as const;
 
@@ -814,6 +842,22 @@ function ciphertextByteLength(ct: string): number {
 }
 
 /**
+ * Entries per manifest page ({@link ManifestPageRecord}) before a new page is started. ~10k triples
+ * of a short string id, a number and a room id JSON-encode to roughly 0.5 MB of plaintext -- small
+ * enough that re-encrypting one page on a write that touches it is cheap, large enough that even a
+ * disk-budget-sized manifest (hundreds of thousands of entries) stays a few dozen pages, not
+ * thousands of tiny ones.
+ * @knipignore - exported for tests, so a fixture can cross a page boundary without seeding a
+ *     production-sized manifest.
+ */
+export const MANIFEST_PAGE_SIZE = 10_000;
+
+/** The primary key -- and AAD -- of one manifest page's record in the `meta` store; see {@link ManifestPageRecord}. */
+function manifestPageKey(userId: string, page: number): string {
+    return `${userId}|manifest:${page}`;
+}
+
+/**
  * One candidate for eviction/deletion by age: a record id and the `originServerTs` it was pushed
  * onto a heap with. Kept as the *value pushed*, not a live reference, because both heaps below
  * tolerate staleness by design -- see {@link heapPushTs}.
@@ -821,6 +865,12 @@ function ciphertextByteLength(ct: string): number {
 interface TsEntry {
     ts: number;
     id: string;
+}
+
+/** One entry of {@link BrowserEventIndexManager.manifest}: everything the manifest knows about one on-disk id. */
+interface ManifestEntry {
+    ts: number;
+    roomId: string;
 }
 
 /**
@@ -1132,6 +1182,106 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * `initEventIndex` never fails because of it, and a denial is not retried.
      */
     private storagePersisted: boolean | undefined;
+
+    /**
+     * The encrypted recency manifest: `originServerTs`/`roomId` for **every** `events` row this
+     * user has on disk, resident for the life of the session regardless of the resident (hot-window)
+     * budget -- it is the identity layer `research/review-pr-c.md`'s fix asks for, realised on the
+     * *current* schema rather than waiting for increment D's recency-keyed chunked store. It exists
+     * to answer two questions the resident set (`events`/`roomOrder`) cannot answer once eviction
+     * has run, because eviction only ever removes from the resident set, never from disk, and this
+     * does not shrink on eviction:
+     *
+     * 1. **What order should {@link hydrate} read rows in to make the resident set genuinely the
+     *    newest, not an artefact of ascending `eventId` order** ({@link HYDRATION_KEY_ORDER}'s own
+     *    docstring already says that order is not recency; review-pr-c.md C-F1 is what happens once
+     *    hydration stops early against it). {@link hydrate} sorts this map's entries by
+     *    `originServerTs` descending once, and reads disk rows in that order.
+     * 2. **How far a room's crawl has gone, and how it ranks against other rooms, in a way eviction
+     *    cannot mutate** (C-F2/C-F3: the previous design asked `roomOrder`, which eviction edits by
+     *    design). {@link manifestOldestByRoom}/{@link manifestNewestByRoom} answer this from the
+     *    manifest instead.
+     *
+     * Persisted as AES-GCM pages in the *existing* `meta` store ({@link ManifestPageRecord},
+     * {@link MANIFEST_PAGE_SIZE} entries each) -- no new object store, no `EVENTINDEX_DB_VERSION`
+     * bump, no reset. Maintained on every write commit ({@link flushLiveWrites}), redaction
+     * ({@link enqueueDeleteRecord}) and disk-budget deletion ({@link deleteRecordsForDiskBudget}),
+     * via {@link manifestAdd}/{@link manifestRemove}; **not** touched by RAM-only eviction
+     * ({@link enforceResidentBudget}), which is the entire point -- a row leaving the resident set
+     * must not look, to this map, like it left disk.
+     *
+     * **Memory cost, and why it is deliberately not part of `HOT_WINDOW_BYTES`:** roughly 100
+     * B/event (a short id, a number, a room id, plus `Map`/`Set` overhead) -- accounted in {@link
+     * getStats}' `size` fallback and in {@link residentByteEstimate}'s own docstring, but *outside*
+     * the hot-window budget, because it is not optional the way hydrated content is: without it,
+     * neither the ordering fix nor the crawl-bound fix this field exists for is possible. On the
+     * small tier, at the 128 MiB `DISK_BUDGET_BYTES` a manifest could in principle describe (though
+     * the small tier's own budget is 128 MiB total, not 512, so its own manifest is smaller in
+     * practice), 100 B/event over ~170k events is ~17 MB -- a meaningful fraction of the 48 MiB
+     * `HOT_WINDOW_BYTES` on that tier, named here rather than left implicit.
+     *
+     * Kept as `Map<eventId, ManifestEntry>` rather than a structure pre-sorted by `originServerTs`:
+     * inserts (overwhelmingly the common operation, one per write) are O(1); {@link hydrate} pays
+     * one O(n log n) sort once per hydration run, not once per insert, which is the trade this
+     * class already made for {@link residentHeap}/{@link diskTsHeap} and is cheap in absolute terms
+     * even at hundreds of thousands of entries (a plain-object array sort, not a crypto operation).
+     */
+    private readonly manifest = new Map<string, ManifestEntry>();
+    /**
+     * `manifest`'s entries chunked into on-disk pages, by page index; the persistence unit for
+     * {@link ManifestPageRecord}. A `Set`, not an array, so removing an id from a page ({@link
+     * manifestRemove}) is O(1) rather than an O(page size) splice -- disk-budget deletion can remove
+     * many ids from the manifest in one pass, and a splice-based page would make that O(page size)
+     * per id.
+     */
+    private readonly manifestPages: Set<string>[] = [];
+    /** id -> the page (index into {@link manifestPages}) it currently lives in. */
+    private readonly manifestEntryPage = new Map<string, number>();
+    /** Pages changed since the last time they were written; {@link prepareManifestPageWrites} drains this. */
+    private readonly manifestDirtyPages = new Set<number>();
+    /**
+     * roomId -> ids in {@link manifest} for that room. Exists for {@link manifestOldestByRoom}/
+     * {@link manifestNewestByRoom} to know when a room's floor/ceiling must be cleared outright
+     * (the set becomes empty) versus merely stale (some, not all, of a room's entries removed --
+     * see {@link manifestRemove}'s docstring for why leaving a floor stale in that case is the safe
+     * direction, not a bug).
+     */
+    private readonly manifestRoomIds = new Map<string, Set<string>>();
+    /**
+     * roomId -> the oldest `originServerTs` this session has ever recorded in the manifest for that
+     * room, i.e. how far that room's crawl has gone -- what {@link shouldCrawl}'s window check
+     * reads instead of `roomOrder` (C-F2). A floor in the same sense as {@link oldestIndexedTs}:
+     * only ever pulled *backward* (older) by {@link manifestAdd}'s `Math.min`, and deliberately
+     * **not** recomputed when some (not all) of a room's entries are removed, so a disk-budget
+     * deletion of this room's oldest rows cannot make its own crawl window creep backward again and
+     * re-open the fetch-write-delete treadmill C-F2 named. Cleared only when {@link
+     * manifestRoomIds} for that room becomes empty (nothing left to have a floor about).
+     */
+    private readonly manifestOldestByRoom = new Map<string, number>();
+    /**
+     * roomId -> the newest `originServerTs` this session has ever recorded in the manifest for that
+     * room -- what {@link roomsByManifestRecency} ranks rooms by for `CRAWL_ROOM_CAP` (C-F3),
+     * instead of `roomOrder`'s last (resident) entry. Pulled *forward* (newer) by `Math.max` on
+     * every {@link manifestAdd}, and, symmetrically with {@link manifestOldestByRoom}, left stale
+     * rather than recomputed on a partial removal.
+     */
+    private readonly manifestNewestByRoom = new Map<string, number>();
+    /**
+     * True once this session's manifest is fully populated -- either {@link loadManifest} finished
+     * decrypting every persisted page, or {@link runManifestMigration} finished building one from
+     * scratch. {@link shouldCrawl} treats "not yet loaded" as "cannot judge, let it through" (the
+     * same conservative default as "room never seen"), and {@link hydrate} awaits {@link
+     * manifestReadyPromise} before it reads the first row, so hydration never sorts a partial view.
+     */
+    private manifestLoaded = false;
+    /**
+     * Settles once the manifest phase (load-existing-pages or migrate-from-scratch) of the most
+     * recent {@link initEventIndex} finishes; {@link hydrate} awaits it internally, and {@link
+     * waitForManifest} exposes it to tests/the perf harness so the manifest phase's own duration can
+     * be measured separately from the rest of hydration, per this increment's proof requirements.
+     */
+    private manifestReadyPromise: Promise<void> = Promise.resolve();
+
     /**
      * Record ids whose current in-memory state has not yet been written to disk, for live writes; see {@link
      * schedulePersistEvent}. Never holds a crawler-batch id: {@link addHistoricEvents} writes its whole batch as one
@@ -1361,12 +1511,27 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 });
                 this.userVersion = 0;
                 this.hydrating = false; // Nothing will hydrate after a wipe; the restore this flag guarded is over.
-            } else {
-                // Deliberately not awaited -- see the docstring above. hydrationPromise exists only so tests
-                // (and, per §6 of the increment this implements, field instrumentation) have something to
-                // observe; production code must never depend on it settling.
+            } else if (this.dek) {
+                // Deliberately not awaited -- see the docstring above. hydrationPromise/manifestReadyPromise
+                // exist only so tests (and, per §6 of the increment this implements, field instrumentation)
+                // have something to observe; production code must never depend on either settling.
                 const epoch = this.hydrationEpoch;
+                const dek = this.dek;
+                // manifestPageCount absent means this database pre-dates the manifest (review-pr-c.md
+                // C-F5's population): self-heal via one full scan rather than trust a diskBytes of 0.
+                // Present (even 0) means a manifest already exists and should simply be loaded.
+                this.manifestReadyPromise =
+                    existingMeta?.manifestPageCount === undefined
+                        ? this.runManifestMigration(userId, dek, salt, epoch)
+                        : this.loadManifest(userId, dek, existingMeta.manifestPageCount, salt, epoch);
                 this.hydrationPromise = this.hydrate(userId, salt, epoch);
+            } else {
+                // this.dek was cleared by a concurrent closeEventIndex()/deleteEventIndex() landing in
+                // the await above (loadCrawlerCheckpoints); hydrate()/the manifest phase would each
+                // check this and return immediately anyway, but starting neither is more honest than
+                // starting a run that would do nothing, and still closes the window this.hydrating
+                // opened at the top of this method -- otherwise it would never clear on this path.
+                this.hydrating = false;
             }
         } else {
             // Memory-only (no IndexedDB, or no pickle key): there is nothing on disk to restore, so the window
@@ -1834,30 +1999,50 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * The crawl bound; see {@link BaseEventIndexManager.shouldCrawl}. Two independent reasons to
-     * decline, either sufficient on its own (`research/SYNTHESIS.md` §3.5): the checkpoint's room
-     * has fallen out of the top `CRAWL_ROOM_CAP` rooms by most recent indexed activity, or this
-     * room's crawl has already reached `CRAWL_WINDOW_DAYS` back.
+     * The crawl bound; see {@link BaseEventIndexManager.shouldCrawl}. Three independent reasons to
+     * decline, each sufficient on its own (`research/SYNTHESIS.md` §3.5):
      *
-     * Both questions are answered from {@link roomOrder}/{@link events} alone -- this session's own
-     * indexed activity, live and crawled -- never from `MatrixClientPeg`: a room with nothing
-     * indexed for it yet cannot be ranked or windowed, so it is let through rather than guessed at,
-     * and gets a real answer the next time its checkpoint comes up for a room that by then has at
-     * least one indexed event (its own live traffic, most commonly, arriving well before the
-     * crawler gets to it).
+     * 1. This room's crawl has already reached `CRAWL_WINDOW_DAYS` back, per {@link
+     *    manifestOldestByRoom} -- **not** {@link roomOrder}, which is the resident set and which
+     *    eviction edits: answering this from `roomOrder` let a room's own eviction erase how far its
+     *    crawl had gone, so the window check would pass again and the crawler would walk backwards
+     *    past the window it had already satisfied (`research/review-pr-c.md` C-F2, "fetch, write,
+     *    delete, repeat"). The manifest does not shrink on eviction, only on an actual disk delete,
+     *    so this floor survives exactly the case that broke the previous version.
+     * 2. The checkpoint's room has fallen out of the top `CRAWL_ROOM_CAP` rooms by most recent
+     *    *manifest* activity ({@link roomsByManifestRecency}), again not resident activity: a fully
+     *    evicted room has no `roomOrder` entry at all and used to fall through to "cannot be ranked,
+     *    let it through" -- exactly the rooms the cap exists to exclude, since the least recently
+     *    active rooms are the ones eviction reaches first (C-F3).
+     * 3. `clientRoomRank` (supplied only by {@link EventIndex.addInitialCheckpoints}, for a fresh
+     *    index with no manifest activity for any room yet to rank by) is at or past `CRAWL_ROOM_CAP`
+     *    (C-F4): without this, the cap could never decline anything on the one path that seeds every
+     *    room's very first checkpoint, because nothing has been indexed for *any* room yet.
+     *
+     * A room with no manifest entries and no `clientRoomRank` (every caller except
+     * `addInitialCheckpoints`, for a room genuinely never seen) cannot be ranked or windowed by
+     * either signal, and is let through rather than guessed at -- the same conservative default as
+     * before, now also the default while {@link manifestLoaded} is still false (a checkpoint asked
+     * about before the manifest has finished loading gets a real answer next time it comes up).
      */
-    public async shouldCrawl(checkpoint: ICrawlerCheckpoint): Promise<boolean> {
-        const list = this.roomOrder.get(checkpoint.roomId);
-        if (!list || list.length === 0) return true;
-
+    public async shouldCrawl(checkpoint: ICrawlerCheckpoint, clientRoomRank?: number): Promise<boolean> {
         const bounds = getEventIndexBounds();
-        const oldestTs = this.events.get(list[0])?.originServerTs ?? 0;
-        if (oldestTs > 0 && Date.now() - oldestTs > bounds.crawlWindowDays * DAY_MS) {
-            this.crawlBoundDeclined = true;
-            return false;
+        const roomIds = this.manifestLoaded ? this.manifestRoomIds.get(checkpoint.roomId) : undefined;
+
+        if (roomIds && roomIds.size > 0) {
+            const oldestTs = this.manifestOldestByRoom.get(checkpoint.roomId) ?? 0;
+            if (oldestTs > 0 && Date.now() - oldestTs > bounds.crawlWindowDays * DAY_MS) {
+                this.crawlBoundDeclined = true;
+                return false;
+            }
+            if (this.roomsByManifestRecency().indexOf(checkpoint.roomId) >= bounds.crawlRoomCap) {
+                this.crawlBoundDeclined = true;
+                return false;
+            }
+            return true;
         }
 
-        if (this.roomsByRecency().indexOf(checkpoint.roomId) >= bounds.crawlRoomCap) {
+        if (clientRoomRank !== undefined && clientRoomRank >= bounds.crawlRoomCap) {
             this.crawlBoundDeclined = true;
             return false;
         }
@@ -1865,16 +2050,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Every room with at least one resident event, ordered by that room's most recently indexed
-     * event first. The ranking {@link shouldCrawl} enforces `CRAWL_ROOM_CAP` against. `O(R log R)`
-     * in the number of *rooms*, not events -- {@link roomOrder}'s per-room lists are already sorted,
-     * so this only ever reads each list's last element -- and is only ever called once per
-     * checkpoint the crawler is about to spend a request on, never per event.
+     * Every room with at least one manifest entry, ordered by that room's most recently *indexed*
+     * (ever, on disk, per {@link manifestNewestByRoom}) event first. The ranking {@link
+     * shouldCrawl} enforces `CRAWL_ROOM_CAP` against; survives eviction because the manifest does
+     * (see {@link manifest}'s own docstring). `O(R log R)` in the number of *rooms* the manifest
+     * knows about, not events, and only ever called once per checkpoint the crawler is about to
+     * spend a request on, never per event.
      */
-    private roomsByRecency(): string[] {
+    private roomsByManifestRecency(): string[] {
         const withTs: Array<[roomId: string, ts: number]> = [];
-        for (const [roomId, ids] of this.roomOrder) {
-            withTs.push([roomId, this.events.get(ids[ids.length - 1])?.originServerTs ?? 0]);
+        for (const [roomId, ids] of this.manifestRoomIds) {
+            if (ids.size === 0) continue;
+            withTs.push([roomId, this.manifestNewestByRoom.get(roomId) ?? 0]);
         }
         withTs.sort((a, b) => b[1] - a[1]);
         return withTs.map(([roomId]) => roomId);
@@ -2566,10 +2753,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             // single record's age, and an ordinary redaction is neither of those things -- see
             // oldestIndexedTs's own docstring, and deleteRecordsForDiskBudget's for the case that
             // *does* update it.
+            const dek = this.dek;
+            this.manifestRemove(targetId);
+            const manifestRecords = dek ? await this.prepareManifestPageWrites(userId, dek) : [];
             const meta = await this.loadMeta(userId);
             const tx = this.db!.transaction(["events", "meta"], "readwrite");
             tx.objectStore("events").delete([userId, targetId]);
-            if (meta) tx.objectStore("meta").put({ ...meta, diskBytes: newTotal });
+            for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+            if (meta) {
+                tx.objectStore("meta").put({
+                    ...meta,
+                    diskBytes: newTotal,
+                    manifestPageCount: this.manifestPages.length,
+                });
+            }
             await txDone(tx);
             this.ciphertextBytes = newTotal;
             this.recordBytes.delete(targetId);
@@ -2645,6 +2842,108 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * Add or update one id in {@link manifest}, and every derived structure alongside it: the
+     * page it belongs to (a fresh page if the current last one is full), the per-room id set, and
+     * the per-room oldest/newest floors (`Math.min`/`Math.max`, so both only ever move toward more
+     * coverage). Called for a genuinely new id or for one whose `ts`/`roomId` changed (an original
+     * arriving after its edit re-times a record; a room id never changes for a given event, but the
+     * update path is the same either way).
+     *
+     * **Applied optimistically, before the caller's write transaction has committed** -- the same
+     * trade-off {@link flushLiveWrites} and {@link deleteRecordsForDiskBudget} make for the reasons
+     * given at each call site: computing the *would-be* page contents to encrypt has to happen
+     * before the transaction opens (encryption is not an IndexedDB operation), and undoing a
+     * speculative manifest add on a rare transaction failure would need a full dry-run/commit split
+     * this class does not otherwise have. The failure mode if a write is ever rejected (quota,
+     * mainly) is a harmless phantom manifest entry for a row that never landed: {@link hydrate}'s
+     * per-id `get()` simply finds nothing and skips it, and the entry very rarely affects a crawl
+     * decision materially given how large the windows/caps it feeds are relative to one record.
+     */
+    private manifestAdd(id: string, ts: number, roomId: string): void {
+        if (!this.manifest.has(id)) {
+            let page = this.manifestPages.length - 1;
+            if (page < 0 || this.manifestPages[page].size >= MANIFEST_PAGE_SIZE) {
+                page = this.manifestPages.length;
+                this.manifestPages.push(new Set());
+            }
+            this.manifestPages[page].add(id);
+            this.manifestEntryPage.set(id, page);
+            this.manifestDirtyPages.add(page);
+            let rooms = this.manifestRoomIds.get(roomId);
+            if (!rooms) {
+                rooms = new Set();
+                this.manifestRoomIds.set(roomId, rooms);
+            }
+            rooms.add(id);
+        } else {
+            const page = this.manifestEntryPage.get(id);
+            if (page !== undefined) this.manifestDirtyPages.add(page);
+        }
+        this.manifest.set(id, { ts, roomId });
+        this.manifestOldestByRoom.set(roomId, Math.min(this.manifestOldestByRoom.get(roomId) ?? Infinity, ts));
+        this.manifestNewestByRoom.set(roomId, Math.max(this.manifestNewestByRoom.get(roomId) ?? -Infinity, ts));
+    }
+
+    /**
+     * Remove one id from {@link manifest} and its page, for a row genuinely leaving disk (a
+     * redaction or a disk-budget deletion -- never RAM-only eviction, which must not call this: see
+     * {@link manifest}'s own docstring for why). Deliberately does **not** recompute {@link
+     * manifestOldestByRoom}/{@link manifestNewestByRoom} from the room's remaining entries unless
+     * the room's manifest set becomes empty -- see those fields' own docstrings for why leaving a
+     * floor/ceiling stale after a *partial* removal is the safe direction (it can only make
+     * `shouldCrawl` decline a *little* more readily than strictly necessary, never less), while a
+     * full rescan on every deletion would cost O(room size) on a path {@link enforceDiskBudget} can
+     * call many times in one pass.
+     */
+    private manifestRemove(id: string): void {
+        const entry = this.manifest.get(id);
+        if (!entry) return;
+        this.manifest.delete(id);
+        const page = this.manifestEntryPage.get(id);
+        if (page !== undefined) {
+            this.manifestPages[page]?.delete(id);
+            this.manifestEntryPage.delete(id);
+            this.manifestDirtyPages.add(page);
+        }
+        const rooms = this.manifestRoomIds.get(entry.roomId);
+        if (rooms) {
+            rooms.delete(id);
+            if (rooms.size === 0) {
+                this.manifestRoomIds.delete(entry.roomId);
+                this.manifestOldestByRoom.delete(entry.roomId);
+                this.manifestNewestByRoom.delete(entry.roomId);
+            }
+        }
+    }
+
+    /**
+     * Encrypt every page {@link manifestDirtyPages} currently names, ready to `put()` into the
+     * `meta` store, and clear that set. Must be called -- and its result awaited -- **before** the
+     * caller's transaction opens, the same discipline every other encrypt in this class follows:
+     * `encryptJson` is not an IndexedDB operation, and awaiting one inside a live transaction lets
+     * it auto-close before a later `put()` in the same batch runs.
+     */
+    private async prepareManifestPageWrites(userId: string, dek: CryptoKey): Promise<ManifestPageRecord[]> {
+        const pages = Array.from(this.manifestDirtyPages);
+        this.manifestDirtyPages.clear();
+        const records: ManifestPageRecord[] = [];
+        for (const page of pages) {
+            const ids = this.manifestPages[page];
+            const entries: Array<[string, number, string]> = [];
+            if (ids) {
+                for (const id of ids) {
+                    const entry = this.manifest.get(id);
+                    if (entry) entries.push([id, entry.ts, entry.roomId]);
+                }
+            }
+            const key = manifestPageKey(userId, page);
+            const blob = await encryptJson(dek, entries, key);
+            records.push({ userId: key, blob });
+        }
+        return records;
+    }
+
+    /**
      * Queue one encrypted, batched write of `ids` onto the persistence chain -- shared by the crawler-batch path
      * ({@link addHistoricEvents}, which calls this once per batch, immediately) and the live-write buffer ({@link
      * flushLiveWriteBufferNow}, which accumulates ids across calls first). `userId` and the DEK are captured here, at
@@ -2690,13 +2989,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // afterwards -- however it got queued -- writes nothing rather than reviving a session that has moved on.
         if (this.closed || !this.db) return;
         const records: EventRecord[] = [];
-        const sizes: Array<[string, number, number]> = []; // [id, ciphertext bytes, originServerTs]
+        const sizes: Array<[string, number, number, string]> = []; // [id, ciphertext bytes, originServerTs, roomId]
         for (const id of ids) {
             const stored = this.events.get(id);
             if (!stored) continue; // Deleted since being buffered; nothing left to write.
             const blob = await encryptJson(dek, stored, `${userId}|${id}`);
             records.push({ userId, eventId: id, blob });
-            sizes.push([id, ciphertextByteLength(blob.ct), stored.originServerTs]);
+            sizes.push([id, ciphertextByteLength(blob.ct), stored.originServerTs, stored.roomId]);
         }
         if (records.length === 0) return;
 
@@ -2708,12 +3007,24 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             newTotal += bytes - (this.recordBytes.get(id) ?? 0);
             newOldest = newOldest === undefined ? ts : Math.min(newOldest, ts);
         }
+        // Maintained on every write commit, per the manifest's own docstring: this is what keeps
+        // hydration ordering and the crawl bound correct across a restart and across eviction.
+        for (const [id, , ts, roomId] of sizes) this.manifestAdd(id, ts, roomId);
+        const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
         const meta = await this.loadMeta(userId);
 
         const tx = this.db.transaction(["events", "meta"], "readwrite");
         const store = tx.objectStore("events");
         for (const rec of records) store.put(rec);
-        if (meta) tx.objectStore("meta").put({ ...meta, diskBytes: newTotal, oldestIndexedTs: newOldest });
+        for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+        if (meta) {
+            tx.objectStore("meta").put({
+                ...meta,
+                diskBytes: newTotal,
+                oldestIndexedTs: newOldest,
+                manifestPageCount: this.manifestPages.length,
+            });
+        }
         await txDone(tx);
 
         // Only once the whole batch has committed, and replacing each record's previous contribution rather than
@@ -2833,39 +3144,251 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Decrypt everything this user has on disk into memory, in the background, without ever awaiting anything but an
-     * IndexedDB request or {@link yieldToEventLoop} between two decrypts -- see {@link initEventIndex}, which starts
-     * this without awaiting it, and the class threat model's note on why a non-IndexedDB `await` inside a live
-     * transaction is the one mistake to avoid here above all others.
+     * Resolve once the manifest phase (this method, or {@link runManifestMigration}) started by the
+     * most recent {@link initEventIndex} has finished. Exists for the same reason {@link
+     * waitForHydration} does -- a deterministic point for tests, and this increment's own proof
+     * requirement to report the manifest phase's duration separately from the rest of hydration --
+     * and the same warning applies: production code must never call this.
+     * @knipignore - exported for tests
+     */
+    public async waitForManifest(): Promise<void> {
+        await this.manifestReadyPromise;
+    }
+
+    /**
+     * Decrypt every persisted manifest page for this user, newest-page-first, into {@link manifest}
+     * and its derived structures. "Newest page first" is a heuristic, not a guarantee -- pages are
+     * sealed in insertion order ({@link manifestAdd}), and insertion order tracks recency well for
+     * live events but not for a backward crawler batch, which inserts progressively *older* content
+     * over time -- so the true newest-first guarantee {@link hydrate} relies on comes from sorting
+     * the *complete*, in-memory manifest once every page has loaded, not from this method's read
+     * order; reading newest-page-first only means a caller that inspected partial state mid-load
+     * would see a bias toward recent entries sooner, which nothing here currently does.
      *
-     * Paged: each page is read with one `getAll()` over {@link userEventKeyRange} in its own read-only transaction,
-     * which is allowed to settle ({@link txDone}) *before* anything in it is decrypted, because decryption is not an
-     * IndexedDB operation and awaiting one inside a live transaction lets it auto-close out from underneath the rest
-     * of the page. Sliced: work inside a page is further cut at {@link HYDRATION_SLICE_DEADLINE_MS}, yielding between
-     * slices, so a large restore never produces one long main-thread task regardless of how many pages it takes.
+     * Sliced at {@link HYDRATION_SLICE_DEADLINE_MS} between pages, same discipline as {@link
+     * hydrate}: manifest entries are tiny (an id, a number, a room id) so this is expected to be
+     * fast in absolute terms even at hundreds of thousands of entries, but "fast" is not "zero", and
+     * this must not produce one long task any more than hydration itself may.
      *
-     * Every resumption point -- the top of the loop, after each transaction settles, after each row, after each yield
-     * -- re-checks {@link closed} and the epoch this run was started with, and returns without touching {@link db} the
-     * moment either has moved on. That is what makes teardown and re-initialisation safe against a hydration run left
-     * over from a previous session: see {@link resetMemory}, which is what moves the epoch on.
+     * A page that fails to **decrypt** gets the same response {@link hydrate}'s own failure path
+     * gives an unreadable event row: wipe this user's index, in memory and on disk, and reset to
+     * `userVersion` 0. This has to be a wipe, not a "treat as empty and carry on": a rotated pickle
+     * key or a new device id looks identical from here, and if it were tolerated silently, {@link
+     * hydrate} would go on to read its (now-empty) candidate list from an *empty* manifest and never
+     * attempt a single event-row decrypt itself -- the one thing that used to surface a rotated key
+     * at all before this increment. A page that merely fails to **read** (an IndexedDB-level error,
+     * e.g. another tab's `onversionchange` closing this connection mid-page) is treated as absent
+     * instead, the same conservative response {@link materializeIfPending} gives the same class of
+     * error: not evidence of a bad key, just nothing usable from that one request.
+     */
+    private async loadManifest(
+        userId: string,
+        dek: CryptoKey,
+        pageCount: number,
+        salt: Uint8Array<ArrayBuffer>,
+        epoch: number,
+    ): Promise<void> {
+        const started = now();
+        let sliceStart = now();
+        for (let page = pageCount - 1; page >= 0; page--) {
+            if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+            const key = manifestPageKey(userId, page);
+            let row: ManifestPageRecord | undefined;
+            try {
+                const tx = this.db.transaction("meta", "readonly");
+                row = (await idbReq(tx.objectStore("meta").get(key))) as ManifestPageRecord | undefined;
+                await txDone(tx);
+            } catch (e) {
+                log.warn(`EventIndex: could not read manifest page ${page}; treating it as absent`, e);
+                continue;
+            }
+            if (this.closed || epoch !== this.hydrationEpoch) return;
+            if (!row) continue;
+            let entries: Array<[string, number, string]>;
+            try {
+                entries = await decryptJson<Array<[string, number, string]>>(dek, row.blob, key);
+            } catch {
+                log.warn("EventIndex: a manifest page could not be decrypted; wiping leftover for this user");
+                this.clearIndexMaps();
+                await this.deleteUserRecords(userId);
+                await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                this.userVersion = 0;
+                this.manifestLoaded = true;
+                return;
+            }
+            if (this.closed || epoch !== this.hydrationEpoch) return;
+            while (this.manifestPages.length <= page) this.manifestPages.push(new Set());
+            for (const [id, ts, roomId] of entries) {
+                this.manifestPages[page].add(id);
+                this.manifestEntryPage.set(id, page);
+                this.manifest.set(id, { ts, roomId });
+                let rooms = this.manifestRoomIds.get(roomId);
+                if (!rooms) {
+                    rooms = new Set();
+                    this.manifestRoomIds.set(roomId, rooms);
+                }
+                rooms.add(id);
+                this.manifestOldestByRoom.set(roomId, Math.min(this.manifestOldestByRoom.get(roomId) ?? Infinity, ts));
+                this.manifestNewestByRoom.set(roomId, Math.max(this.manifestNewestByRoom.get(roomId) ?? -Infinity, ts));
+            }
+            if (now() - sliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
+                await yieldToEventLoop();
+                if (this.closed || epoch !== this.hydrationEpoch) return;
+                sliceStart = now();
+            }
+        }
+        this.manifestLoaded = true;
+        log.info(
+            `EventIndex: manifest loaded in ${(now() - started).toFixed(1)}ms, ${this.manifest.size} entries, ${pageCount} pages`,
+        );
+    }
+
+    /**
+     * Self-healing migration for a database that pre-dates the manifest (`MetaRecord.manifestPageCount`
+     * absent -- schema v2 written before this increment; production already has such users as of
+     * this writing). Runs the *old* full, paged, ascending-`eventId` scan {@link
+     * HYDRATION_KEY_ORDER} describes, decrypting every row **only** to extract `{eventId,
+     * originServerTs, roomId}` (into the manifest, via {@link manifestAdd}) and its ciphertext
+     * length -- never to materialize it into {@link events}/{@link roomOrder}. This also fixes
+     * `research/review-pr-c.md` C-F5 (`ciphertextBytes` opening at zero for exactly this
+     * population) as a side effect of the same full pass: the exact byte total and the oldest
+     * timestamp seen are accumulated and persisted alongside the manifest once the scan completes,
+     * so accounting is exact from the very next open, not merely "eventually, if hydration happens
+     * to reach every row" (which bounded hydration may never do again).
      *
-     * Each row's own {@link materializeRow} indexes with {@link indexTokens}' `deferMerge` set, so a vocabulary merge
-     * that becomes due mid-row never runs as part of that row's task (`research/review-pr-b.md` B2-F1: the merge
-     * alone can cost tens of milliseconds at realistic V, and {@link HYDRATION_SLICE_DEADLINE_MS}'s own accounting
-     * only checks *after* a row completes, so it would otherwise inflate one row's task by the merge's full cost,
-     * invisibly). This loop flushes a deferred merge itself instead, at the two points already outside any row's own
-     * task: right after a slice's {@link yieldToEventLoop} and at each page boundary.
+     * No schema reset: `EVENTINDEX_DB_VERSION` does not change, and no row is rewritten, only read.
+     * Off {@link initEventIndex}'s own start path -- started, like {@link hydrate}, without being
+     * awaited there -- so `initEventIndex()` itself stays exactly as flat as before regardless of
+     * how much history this pass has to scan; {@link hydrate} is what awaits {@link
+     * manifestReadyPromise} (which this settles) before it reads its first row, so the *first*
+     * hydration on a migrating database pays for both passes in sequence rather than racing this
+     * one, but nothing on the app-start path waits for either. This scan never calls {@link
+     * materializeRow} -- unlike {@link hydrate}'s own loop, it has no vocabulary merge to defer
+     * (`research/review-pr-b.md` B2-F1 applies to {@link hydrate}, not to this method).
      *
-     * A row whose id is already in {@link events} is skipped rather than overwritten: a live event or a crawler batch
-     * that named this id got there first and is authoritative (see {@link materializeIfPending}, which is what a write
-     * path calls to pull a not-yet-hydrated row in early instead of racing this loop for it), so the disk copy this
-     * loop is holding is superseded and must not regress it or duplicate its entry in {@link roomOrder}.
+     * A row that fails to decrypt gets the same response {@link hydrate}'s own failure path gives:
+     * wipe this user's index, in memory (there is nothing in {@link events} yet to lose) and on
+     * disk, and reset to `userVersion` 0, because a rotated pickle key looks identical from here.
+     */
+    private async runManifestMigration(
+        userId: string,
+        dek: CryptoKey,
+        salt: Uint8Array<ArrayBuffer>,
+        epoch: number,
+    ): Promise<void> {
+        const started = now();
+        let scanned = 0;
+        let totalBytes = 0;
+        let oldestTs: number | undefined;
+        let afterEventId: string | undefined;
+
+        for (;;) {
+            if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+            const db = this.db;
+            const tx = db.transaction("events", "readonly");
+            const range = userEventKeyRange(userId, afterEventId);
+            const rows = (await idbReq(tx.objectStore("events").getAll(range, HYDRATION_PAGE_SIZE))) as EventRecord[];
+            await txDone(tx);
+            if (this.closed || epoch !== this.hydrationEpoch) return;
+            if (rows.length === 0) break;
+            afterEventId = rows[rows.length - 1].eventId;
+
+            let sliceStart = now();
+            for (const row of rows) {
+                if (this.closed || epoch !== this.hydrationEpoch) return;
+                let stored: StoredEvent;
+                try {
+                    stored = await decryptJson<StoredEvent>(dek, row.blob, `${userId}|${row.eventId}`);
+                } catch {
+                    log.warn(
+                        "EventIndex: stored ciphertext could not be decrypted during manifest migration; wiping leftover for this user",
+                    );
+                    this.clearIndexMaps();
+                    await this.deleteUserRecords(userId);
+                    await this.saveMeta({ userId, salt: encodeBase64(salt), userVersion: 0 });
+                    this.userVersion = 0;
+                    return;
+                }
+                if (this.closed || epoch !== this.hydrationEpoch) return;
+                this.manifestAdd(stored.eventId, stored.originServerTs, stored.roomId);
+                totalBytes += ciphertextByteLength(row.blob.ct);
+                oldestTs = oldestTs === undefined ? stored.originServerTs : Math.min(oldestTs, stored.originServerTs);
+                scanned++;
+
+                const elapsedInSlice = now() - sliceStart;
+                if (elapsedInSlice >= HYDRATION_SLICE_DEADLINE_MS) {
+                    await yieldToEventLoop();
+                    if (this.closed || epoch !== this.hydrationEpoch) return;
+                    sliceStart = now();
+                }
+            }
+            if (rows.length < HYDRATION_PAGE_SIZE) break;
+        }
+
+        this.ciphertextBytes = totalBytes;
+        this.oldestIndexedTs = oldestTs;
+        const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
+        const meta = await this.loadMeta(userId);
+        const tx = this.db.transaction("meta", "readwrite");
+        for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+        if (meta) {
+            tx.objectStore("meta").put({
+                ...meta,
+                diskBytes: totalBytes,
+                oldestIndexedTs: oldestTs,
+                manifestPageCount: this.manifestPages.length,
+            });
+        }
+        await txDone(tx);
+        this.manifestLoaded = true;
+        log.info(
+            `EventIndex: manifest migration scanned ${scanned} events in ${(now() - started).toFixed(1)}ms, ` +
+                `key order ${HYDRATION_KEY_ORDER}`,
+        );
+    }
+
+    /**
+     * Decrypt this user's disk rows into memory, in the background, newest-`originServerTs`-first,
+     * without ever awaiting anything but an IndexedDB request or {@link yieldToEventLoop} between
+     * two decrypts -- see {@link initEventIndex}, which starts this without awaiting it, and the
+     * class threat model's note on why a non-IndexedDB `await` inside a live transaction is the one
+     * mistake to avoid here above all others.
      *
-     * A row that fails to decrypt reproduces the old, fully-synchronous {@link initEventIndex}'s failure response --
-     * wipe this user's index, in memory and on disk, and reset to `userVersion` 0 -- because that is what a rotated
-     * pickle key or a new device id looks like from the inside, and both remain possible mid-hydration. Whatever this
-     * run had already hydrated is included in the wipe, which is why it is a caller-visible reset ({@link
-     * clearIndexMaps}) rather than something the caller has to notice and clean up after.
+     * **Read order comes from {@link manifest}, not from the store's own key order.** This method
+     * first awaits {@link manifestReadyPromise} (the manifest is either freshly loaded from its own
+     * persisted pages, or just built from scratch by {@link runManifestMigration} -- either way, by
+     * the time this line resumes, every id this user has on disk and its `originServerTs` are
+     * known), sorts every manifest id by `originServerTs` descending once, and reads rows in that
+     * order, in chunks of {@link HYDRATION_PAGE_SIZE}: one read-only transaction per chunk, issuing
+     * one `get()` per id in the chunk (all before anything is awaited, so the transaction cannot
+     * auto-close between them), `Promise.all`, then `txDone`. This is deliberately *not* the old
+     * ascending-`eventId` paged `getAll()` -- see `HYDRATION_KEY_ORDER`'s own docstring for why that
+     * order is not recency, and `research/review-pr-c.md` C-F1 for what happened once hydration
+     * started stopping early against it (the resident set was an arbitrary, often oldest-first,
+     * slice of the disk, the opposite of what "newest-first" is supposed to mean).
+     *
+     * Sliced at {@link HYDRATION_SLICE_DEADLINE_MS} exactly as before, so a large restore never
+     * produces one long main-thread task regardless of how many chunks it takes. Every resumption
+     * point -- the top of the loop, after each transaction settles, after each row, after each yield
+     * -- re-checks {@link closed} and the epoch this run was started with, and returns without
+     * touching {@link db} the moment either has moved on: see {@link resetMemory}, which is what
+     * moves the epoch on.
+     *
+     * Each row's own {@link materializeRow} indexes with {@link indexTokens}' `deferMerge` set, so a
+     * vocabulary merge that becomes due mid-row never runs as part of that row's task
+     * (`research/review-pr-b.md` B2-F1: the merge alone can cost tens of milliseconds at realistic V,
+     * and {@link HYDRATION_SLICE_DEADLINE_MS}'s own accounting only checks *after* a row completes, so
+     * it would otherwise inflate one row's task by the merge's full cost, invisibly). This loop flushes
+     * a deferred merge itself instead, at the two points already outside any row's own task: right
+     * after a slice's {@link yieldToEventLoop} and at each page boundary.
+     *
+     * A row whose id is already in {@link events} is skipped rather than overwritten (a live event
+     * or a crawler batch got there first and is authoritative), and one no longer on disk at all
+     * (`get()` resolves `undefined`, a redaction having raced ahead of this run reaching it) is
+     * simply skipped -- neither is an error. A row that fails to decrypt reproduces the old,
+     * fully-synchronous {@link initEventIndex}'s failure response -- wipe this user's index, in
+     * memory and on disk, and reset to `userVersion` 0 -- because that is what a rotated pickle key
+     * or a new device id looks like from the inside, and both remain possible mid-hydration.
      *
      * @param userId - Captured at the call site rather than read from `this.userId`, so a logout or a re-
      *     initialisation for a different user cannot redirect a page this loop already has in flight.
@@ -2877,35 +3400,50 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         let longestSliceMs = 0;
         let hydratedCount = 0;
         // Read once per run, not per row: an override set mid-run by a test is not a case this needs
-        // to react to, and re-reading it 1000 times per page would be pure waste in production.
+        // to react to, and re-reading it 1000 times per row would be pure waste in production.
         const bounds = getEventIndexBounds();
 
-        // No up-front "is there anything to hydrate?" check: the first page read below answers that on its own
-        // (an empty result ends the loop immediately, at the cost of one bounded getAll() call, never proportional
-        // to n), which is the same reasoning that keeps initEventIndex() from listing every id before this even
-        // starts -- see loadCrawlerCheckpoints's docstring.
         this.hydrating = true;
 
         try {
-            let afterEventId: string | undefined;
-            for (;;) {
+            await this.manifestReadyPromise;
+            if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
+
+            // One O(n log n) sort, once per hydration run, not once per insert -- the same trade
+            // {@link residentHeap}/{@link diskTsHeap} already make. `manifest` is a snapshot read
+            // here (a `Map`'s insertion order is irrelevant once sorted), so a write landing mid-sort
+            // cannot corrupt it; it would just not be reflected in *this* run's order, and this
+            // run's own `events.has()` skip means it is never overwritten either way.
+            const sortedIds = Array.from(this.manifest.keys());
+            sortedIds.sort((a, b) => (this.manifest.get(b)?.ts ?? 0) - (this.manifest.get(a)?.ts ?? 0));
+
+            let i = 0;
+            while (i < sortedIds.length) {
                 if (this.closed || epoch !== this.hydrationEpoch || !this.db || !this.dek) return;
                 const dek = this.dek;
                 const db = this.db;
 
+                const chunkIds: string[] = [];
+                while (chunkIds.length < HYDRATION_PAGE_SIZE && i < sortedIds.length) {
+                    const id = sortedIds[i++];
+                    if (!this.events.has(id)) chunkIds.push(id);
+                }
+                if (chunkIds.length === 0) continue; // Every id in range was already resident.
+
                 const tx = db.transaction("events", "readonly");
-                const range = userEventKeyRange(userId, afterEventId);
-                const rows = (await idbReq(
-                    tx.objectStore("events").getAll(range, HYDRATION_PAGE_SIZE),
-                )) as EventRecord[];
+                const store = tx.objectStore("events");
+                // Every get() is issued synchronously, before anything here is awaited, so the
+                // transaction cannot auto-close between them -- the same discipline a paged getAll()
+                // gave for free, now spelled out explicitly for a batch of targeted reads instead.
+                const gets = chunkIds.map((id) => idbReq(store.get([userId, id])));
+                const rows = (await Promise.all(gets)) as Array<EventRecord | undefined>;
                 await txDone(tx);
                 if (this.closed || epoch !== this.hydrationEpoch) return;
-                if (rows.length === 0) break;
-                afterEventId = rows[rows.length - 1].eventId;
 
                 let sliceStart = now();
                 for (const row of rows) {
                     if (this.closed || epoch !== this.hydrationEpoch) return;
+                    if (!row) continue; // Deleted since the manifest was built; nothing left to read.
 
                     if (!this.events.has(row.eventId)) {
                         // Newest-first hydration stops here, at the moment adding another row would
@@ -2914,6 +3452,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                         // materializeIfPending on demand or the streamed cold scan increment E adds.
                         // A hard stop rather than "decrypt then immediately evict", so a row this
                         // run was never going to keep resident is never needlessly decrypted at all.
+                        // Because rows are now visited newest-first, the rows left un-hydrated when
+                        // this fires are genuinely the oldest, not an artefact of key order (C-F1).
                         if (this.residentByteEstimate() >= bounds.hotWindowBytes) {
                             this.residentBudgetExceeded = true;
                             log.info(
@@ -2956,7 +3496,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // indexTokens, which only re-checks when *something* is indexed, not on a timer.
                 this.flushVocabularyMergeIfDue();
 
-                // Once per page, not once per row: cheap in the common case (one scalar comparison),
+                // Once per chunk, not once per row: cheap in the common case (one scalar comparison),
                 // and disk usage only ever grows from writes, never from hydration itself decrypting
                 // pre-existing rows -- see enforceDiskBudget's own docstring -- so this exists purely
                 // to let a disk that was *already* over budget when this session started (restored
@@ -2964,8 +3504,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // candidates, rather than waiting for an unrelated future write to trigger it.
                 if (this.persistEnabled) await this.enforceDiskBudget(userId);
                 if (this.closed || epoch !== this.hydrationEpoch) return;
-
-                if (rows.length < HYDRATION_PAGE_SIZE) break;
             }
         } catch (e) {
             // Anything not already handled inside the loop above -- most realistically db.transaction()/idbReq()/
@@ -2995,7 +3533,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (!this.hydrationFailure) {
             log.info(
                 `EventIndex: hydration finished in ${(now() - started).toFixed(1)}ms, ${hydratedCount} events, ` +
-                    `longest slice ${longestSliceMs.toFixed(1)}ms, key order ${HYDRATION_KEY_ORDER}`,
+                    `longest slice ${longestSliceMs.toFixed(1)}ms, order manifest-ts-desc`,
             );
         }
     }
@@ -3297,11 +3835,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const newOldest =
             this.oldestIndexedTs === undefined ? deletedMaxTs : Math.max(this.oldestIndexedTs, deletedMaxTs);
 
+        // Maintained here too, per the manifest's own docstring: a row genuinely leaving disk must
+        // leave the manifest, or hydrate() would later try (and harmlessly fail) to read a row that
+        // is no longer there, and shouldCrawl's per-room floors would still count it.
+        for (const id of ids) this.manifestRemove(id);
+        const dek = this.dek;
+        const manifestRecords = dek ? await this.prepareManifestPageWrites(userId, dek) : [];
+
         const meta = await this.loadMeta(userId);
         const tx = this.db.transaction(["events", "meta"], "readwrite");
         const store = tx.objectStore("events");
         for (const id of ids) store.delete([userId, id]);
-        if (meta) tx.objectStore("meta").put({ ...meta, diskBytes: newTotal, oldestIndexedTs: newOldest });
+        for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+        if (meta) {
+            tx.objectStore("meta").put({
+                ...meta,
+                diskBytes: newTotal,
+                oldestIndexedTs: newOldest,
+                manifestPageCount: this.manifestPages.length,
+            });
+        }
         await txDone(tx);
 
         this.ciphertextBytes = newTotal;
@@ -3315,10 +3868,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Delete every row belonging to one user: events, checkpoints and the `meta` row. Per-user rather than per-database
-     * because the database is shared by every account that has signed in to this origin. The `meta` row goes too, and
-     * with it the salt, so the next {@link initEventIndex} derives a *different* DEK and any row that somehow survived
-     * is unreadable afterwards.
+     * Delete every row belonging to one user: events, checkpoints, the `meta` row and every
+     * manifest page ({@link ManifestPageRecord}). Per-user rather than per-database because the
+     * database is shared by every account that has signed in to this origin. The `meta` row goes
+     * too, and with it the salt, so the next {@link initEventIndex} derives a *different* DEK and
+     * any row that somehow survived is unreadable afterwards -- including a manifest page, which is
+     * exactly why those must be deleted explicitly rather than left as orphaned ciphertext nothing
+     * will ever be able to open again: {@link manifestPageKey} embeds `userId` as a plain string
+     * prefix, not as a separate indexed column, so `IDBKeyRange.bound` over that prefix is what
+     * finds them all without needing to know how many pages exist.
      */
     private async deleteUserRecords(userId: string): Promise<void> {
         if (!this.db) return;
@@ -3335,7 +3893,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         await txDone(cpTx);
 
         const metaTx = this.db.transaction("meta", "readwrite");
-        metaTx.objectStore("meta").delete(userId);
+        const metaStore = metaTx.objectStore("meta");
+        metaStore.delete(userId);
+        const manifestPrefix = `${userId}|manifest:`;
+        // ￿ is not a character any page index's decimal digits can produce, so this bound
+        // catches every "${userId}|manifest:<n>" key and nothing else -- the same technique
+        // vocabularyRange uses for a contiguous prefix range in a sorted key space.
+        const manifestKeys = await idbReq(
+            metaStore.getAllKeys(IDBKeyRange.bound(manifestPrefix, manifestPrefix + "￿")),
+        );
+        for (const key of manifestKeys) metaStore.delete(key);
         await txDone(metaTx);
     }
 
@@ -3425,6 +3992,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.residentBudgetExceeded = false;
         this.diskBudgetDropped = false;
         this.crawlBoundDeclined = false;
+        this.manifest.clear();
+        this.manifestPages.length = 0;
+        this.manifestEntryPage.clear();
+        this.manifestDirtyPages.clear();
+        this.manifestRoomIds.clear();
+        this.manifestOldestByRoom.clear();
+        this.manifestNewestByRoom.clear();
+        this.manifestLoaded = false;
         this.pendingRedactions.clear();
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;

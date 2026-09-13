@@ -1169,8 +1169,19 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         expect((await manager.searchEventIndex(search("legacy"))).count).toBe(0);
 
         // meta survives, because its salt is what keeps the derived key usable -- minus the
-        // `deviceId` column, which nothing ever read.
-        expect(Object.keys((await dumpRawStore("meta"))[0]).sort()).toEqual(["salt", "userId", "userVersion"]);
+        // `deviceId` column, which nothing ever read. `diskBytes`/`manifestPageCount`/
+        // `oldestIndexedTs` are new: the v1->v2 wipe leaves manifestPageCount undefined, which is
+        // exactly the "pre-manifest database" signal runManifestMigration self-heals from -- it
+        // runs (over zero rows, events having just been cleared) and persists its own empty
+        // result, so a *third* open does not pay for a migration scan all over again.
+        expect(Object.keys((await dumpRawStore("meta"))[0]).sort()).toEqual([
+            "diskBytes",
+            "manifestPageCount",
+            "oldestIndexedTs",
+            "salt",
+            "userId",
+            "userVersion",
+        ]);
         expect(await manager.getUserVersion()).toBe(3);
 
         // Nothing v1 wrote in the clear survives anywhere in the database.
@@ -1696,7 +1707,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
 
         it("search during hydration returns what is resident so far, and never throws", async () => {
             const ids = await seed(8);
-            const lastId = ids[ids.length - 1]; // highest eventId; hydrated last (ascending order)
+            const lastId = ids[0]; // lowest ts; hydrated last now that hydration reads newest-ts-first
             const restore = slowDownDecrypt(15);
             try {
                 const reloaded = new BrowserEventIndexManager();
@@ -1708,9 +1719,9 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
                     await sleep(4);
                 }
                 // Not yet reached: no throw, just nothing found for it yet.
-                await expect(
-                    reloaded.searchEventIndex(search(`zqnbmarker body ${ids.length - 1}`)),
-                ).resolves.toMatchObject({ count: 0 });
+                await expect(reloaded.searchEventIndex(search(`zqnbmarker body 0`))).resolves.toMatchObject({
+                    count: 0,
+                });
                 // What has loaded so far is already searchable.
                 const partial = await reloaded.searchEventIndex(search("zqnbmarker"));
                 expect(partial.count).toBeGreaterThan(0);
@@ -1738,8 +1749,10 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
                 // hydration run that is genuinely still in flight rather than one that never started.
                 while ((await reloaded.getStats()).eventCount === 0) await sleep(4);
 
-                // Re-deliver the *last* (ascending-order, so hydrated last) event live, exactly as the
-                // timeline might redeliver a message the crawler has already indexed.
+                // Re-deliver the highest-ts event live, exactly as the timeline might redeliver a
+                // message the crawler has already indexed. Whether it has been hydrated yet or not
+                // by this point, the dedup guarantee under test (materializeIfPending's residency
+                // re-check, upsertEvent's own idempotency) has to hold either way.
                 await reloaded.addEventToIndex(
                     msg(lastId, `zqnbmarker body ${ids.length - 1}`, {
                         room_id: room,
@@ -3436,6 +3449,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await manager.waitForHydration();
             const old = Date.now() - 2 * DAY_MS;
             await manager.addEventToIndex(msg("$old", "hi", { room_id: "!r:x", origin_server_ts: old }), {});
+            await manager.commitLiveEvents(); // shouldCrawl now reads the manifest, built at write-commit
 
             expect(await manager.shouldCrawl({ roomId: "!r:x", token: "t", direction: Direction.Backward })).toBe(
                 false,
@@ -3449,6 +3463,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await manager.waitForHydration();
             const recent = Date.now() - 1 * DAY_MS;
             await manager.addEventToIndex(msg("$recent", "hi", { room_id: "!r:x", origin_server_ts: recent }), {});
+            await manager.commitLiveEvents();
 
             expect(await manager.shouldCrawl({ roomId: "!r:x", token: "t", direction: Direction.Backward })).toBe(true);
         });
@@ -3472,12 +3487,74 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             const now = Date.now();
             await manager.addEventToIndex(msg("$a", "hi", { room_id: "!a:x", origin_server_ts: now - 1000 }), {});
             await manager.addEventToIndex(msg("$b", "hi", { room_id: "!b:x", origin_server_ts: now }), {});
+            await manager.commitLiveEvents();
 
             // !b is more recently active than !a; with a cap of 1, only !b is inside the bound.
             expect(await manager.shouldCrawl({ roomId: "!b:x", token: "t", direction: Direction.Backward })).toBe(true);
             expect(await manager.shouldCrawl({ roomId: "!a:x", token: "t", direction: Direction.Backward })).toBe(
                 false,
             );
+        });
+
+        it("the crawl-window decline survives the record it was based on being evicted from RAM (review-pr-c.md C-F2)", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlWindowDays: 1, hotWindowBytes: BYTES_PER_EVENT * 3 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+
+            const old = Date.now() - 2 * DAY_MS;
+            await manager.addEventToIndex(msg("$old", "oldmarker", { room_id: "!r:x", origin_server_ts: old }), {});
+            await manager.commitLiveEvents();
+
+            const cp = { roomId: "!r:x", token: "t", direction: Direction.Backward };
+            expect(await manager.shouldCrawl(cp)).toBe(false);
+
+            // Push enough new, unrelated, durable events to evict $old from residency (the budget
+            // above fits only ~3 records). Each is flushed individually so it is durable -- and
+            // therefore a legal eviction target -- before the next one needs room.
+            for (let i = 0; i < 6; i++) {
+                await manager.addEventToIndex(
+                    msg(`$fresh${i}`, "freshmarker", { room_id: "!other:x", origin_server_ts: Date.now() + i }),
+                    {},
+                );
+                await manager.commitLiveEvents();
+            }
+            // Confirm this test actually exercised eviction, not a budget that happened not to bite.
+            expect((await manager.searchEventIndex(search("oldmarker"))).count).toBe(0);
+
+            // The old bug: shouldCrawl read roomOrder (the resident set), so evicting $old made
+            // list[0] undefined and the room looked never-crawled again, flipping this to true.
+            expect(await manager.shouldCrawl(cp)).toBe(false);
+        });
+
+        it("the room-cap decline survives a fully-evicted room having no resident events left (review-pr-c.md C-F3)", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlRoomCap: 1, hotWindowBytes: BYTES_PER_EVENT * 3 });
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+            const now = Date.now();
+            await manager.addEventToIndex(msg("$a", "amarker", { room_id: "!a:x", origin_server_ts: now - 1000 }), {});
+            await manager.commitLiveEvents();
+            await manager.addEventToIndex(msg("$b", "bmarker", { room_id: "!b:x", origin_server_ts: now }), {});
+            await manager.commitLiveEvents();
+
+            const cpA = { roomId: "!a:x", token: "t", direction: Direction.Backward };
+            expect(await manager.shouldCrawl(cpA)).toBe(false); // !a is outside the cap of 1
+
+            // Push enough new, durable events (in a third room, so ranking is unaffected) to evict
+            // *every* resident event from both !a and !b, so !a's roomOrder entry disappears
+            // entirely -- the old bug's "cannot be ranked, let it through" exemption.
+            for (let i = 0; i < 6; i++) {
+                await manager.addEventToIndex(
+                    msg(`$fresh${i}`, "freshmarker", { room_id: "!c:x", origin_server_ts: now + 1000 + i }),
+                    {},
+                );
+                await manager.commitLiveEvents();
+            }
+            expect((await manager.searchEventIndex(search("amarker"))).count).toBe(0); // !a evicted
+            expect((await manager.searchEventIndex(search("bmarker"))).count).toBe(0); // !b evicted too
+
+            expect(await manager.shouldCrawl(cpA)).toBe(false); // still declined, per the manifest
         });
     });
 
@@ -3492,6 +3569,25 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             // Every row is still on disk regardless of whether it was hydrated.
             const onDisk = await dumpRawStore("events");
             expect(onDisk.length).toBe(BUDGET_N);
+        });
+
+        it("the resident set after a restart is exactly the NEWEST N, not an artefact of id order (review-pr-c.md C-F1)", async () => {
+            // The reviewer's own repro shape: budgetCorpus's ids ascend with ts, so the newest N by
+            // timestamp are the highest-numbered ids -- the *opposite* end from ascending eventId
+            // order, which is what a manifest-free hydration used to keep (the ten OLDEST).
+            const reloaded = await seedAndReopen(BYTES_PER_EVENT * 10, 40);
+            const stats2 = await reloaded.getStats();
+            const kept = stats2.eventCount;
+            expect(kept).toBeGreaterThan(0);
+            expect(kept).toBeLessThan(40);
+
+            const resident = await residentIds(reloaded);
+            const expectedNewest = new Set(Array.from({ length: kept }, (_unused, i) => idAt(40 - 1 - i)));
+            expect(resident).toEqual(expectedNewest);
+            // Explicitly the reviewer's own assertion shape: the newest ids are present, the
+            // oldest (what the bug used to keep) are not.
+            expect(resident.has(idAt(39))).toBe(true); // newest
+            expect(resident.has(idAt(0))).toBe(false); // oldest -- the bug's own wrong answer
         });
 
         it("a live insert over budget evicts the oldest resident event; the row survives on disk", async () => {
@@ -3533,6 +3629,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             const targetId = idAt(BUDGET_N - 1);
             const removed = await reloaded.deleteEvent(targetId);
             expect(removed).toBe(true); // not a silent no-op that would leave content on disk
+            await reloaded.commitLiveEvents(); // await the persist chain the delete was queued on
 
             const onDisk = await dumpRawStore("events");
             expect(onDisk.some((r: any) => r.eventId === targetId)).toBe(false);
@@ -3628,6 +3725,129 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             } finally {
                 restoreDecrypt();
             }
+        });
+    });
+
+    describe("manifest consistency", () => {
+        it("redaction clears a room's manifest entry, reverting shouldCrawl to 'never seen'", async () => {
+            setEventIndexBoundsOverrideForTesting({ crawlRoomCap: 0 }); // declines any ranked room
+            const manager = track(new BrowserEventIndexManager());
+            await manager.initEventIndex(userId, DEVICE);
+            await manager.waitForHydration();
+
+            await manager.addEventToIndex(
+                msg("$redact", "x", { room_id: "!redact:x", origin_server_ts: Date.now() }),
+                {},
+            );
+            await manager.commitLiveEvents();
+            const cp = { roomId: "!redact:x", token: "t", direction: Direction.Backward };
+            expect(await manager.shouldCrawl(cp)).toBe(false); // has a manifest entry; cap 0 ranks and declines it
+
+            await manager.deleteEvent("$redact");
+            await manager.commitLiveEvents();
+            expect(await manager.shouldCrawl(cp)).toBe(true); // manifest entry gone -- back to "never seen"
+        });
+
+        it("disk-budget deletion clears a room's manifest entry once its last row is gone", async () => {
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            const now = 5_000_000;
+            // !keep:x is newest, so disk-budget deletion (oldest-first) takes !drop:x whole.
+            await seed.addEventToIndex(msg("$drop", "x", { room_id: "!drop:x", origin_server_ts: now }), {});
+            await seed.commitLiveEvents();
+            await seed.addEventToIndex(msg("$keep", "x", { room_id: "!keep:x", origin_server_ts: now + 1000 }), {});
+            await seed.commitLiveEvents();
+            const beforeDrop = await seed.getStats(); // both rows now on disk; size is the exact total
+            await seed.closeEventIndex();
+
+            // A budget that fits only the newer of the two records, forcing !drop:x's row out.
+            setEventIndexBoundsOverrideForTesting({
+                diskBudgetBytes: beforeDrop.size - 1,
+                crawlRoomCap: 0,
+            });
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+
+            expect(await dumpRawStore("events")).not.toContainEqual(expect.objectContaining({ eventId: "$drop" }));
+            expect(await dumpRawStore("events")).toContainEqual(expect.objectContaining({ eventId: "$keep" }));
+
+            const cpDrop = { roomId: "!drop:x", token: "t", direction: Direction.Backward };
+            const cpKeep = { roomId: "!keep:x", token: "t", direction: Direction.Backward };
+            expect(await reloaded.shouldCrawl(cpDrop)).toBe(true); // !drop's manifest entry is gone
+            expect(await reloaded.shouldCrawl(cpKeep)).toBe(false); // !keep still has one; cap 0 declines it
+        });
+    });
+
+    describe("manifest migration (review-pr-c.md C-F5)", () => {
+        it("builds a correct manifest and exact byte total from a pre-manifest (schema v2) fixture", async () => {
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            const corpus = budgetCorpus(10);
+            for (const ev of corpus) {
+                await seed.addEventToIndex(ev, {});
+                await seed.commitLiveEvents();
+            }
+            const before = await seed.getStats();
+            await seed.closeEventIndex();
+
+            // Simulate a database schema v2 wrote before this increment existed: strip every
+            // increment-C field this session's own writes just added to `meta`, and delete the
+            // manifest pages those same writes created, so `manifestPageCount` really is absent
+            // the way it would be for a production v2 user today (review-pr-c.md's own framing).
+            await withRawDb(async (db) => {
+                const tx = db.transaction("meta", "readwrite");
+                const store = tx.objectStore("meta");
+                const row = await idbPromise(store.get(userId));
+                store.put({ userId: row.userId, salt: row.salt, userVersion: row.userVersion });
+                const manifestKeys = await idbPromise(
+                    store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
+                );
+                for (const key of manifestKeys) store.delete(key);
+                await new Promise<void>((resolve, reject) => {
+                    tx.oncomplete = (): void => resolve();
+                    tx.onerror = (): void => reject(tx.error);
+                });
+            });
+            expect(await dumpRawStore("meta")).toEqual([{ userId, salt: expect.any(String), userVersion: 0 }]);
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForManifest();
+            await reloaded.waitForHydration();
+
+            const after = await reloaded.getStats();
+            expect(after.size).toBe(before.size); // exact byte total rebuilt by the migration scan
+            expect(after.eventCount).toBe(corpus.length); // small corpus, well under any budget
+
+            // The manifest itself was rebuilt, not just the byte total: shouldCrawl's per-room
+            // floor (sourced from the manifest, C-F2's fix) already has an answer for this room
+            // immediately, from data the migration scan alone produced.
+            setEventIndexBoundsOverrideForTesting({ crawlWindowDays: 1 });
+            expect(await reloaded.shouldCrawl({ roomId: ROOM, token: "t", direction: Direction.Backward })).toBe(false); // budgetCorpus's ts (1_000_000-ish) is far more than a day old
+
+            const rawMeta = (await dumpRawStore("meta"))[0];
+            expect(rawMeta.manifestPageCount).toBeGreaterThanOrEqual(1);
+            expect(rawMeta.diskBytes).toBe(before.size);
+
+            // A *further* reopen must not re-run the migration: manifestPageCount is now present,
+            // so this open takes loadManifest's (page-count-driven) path, not another full scan --
+            // confirmed by the fixture's own events being untouched, and by the page count staying
+            // exactly what the migration pass wrote (a re-migration would rebuild it from the same
+            // events and land on the same number by coincidence, but would also mean a change to
+            // either path silently regressed the "no full scan on a second open" guarantee is not
+            // caught here; the disk-budget describe block above already asserts a third reopen's
+            // `getStats()` is correct *before* `waitForHydration()`, which is the same property).
+            await reloaded.closeEventIndex();
+            const third = track(new BrowserEventIndexManager());
+            await third.initEventIndex(userId, DEVICE);
+            await third.waitForManifest();
+            const thirdMeta = (await dumpRawStore("meta"))[0];
+            expect(thirdMeta.manifestPageCount).toBe(rawMeta.manifestPageCount);
         });
     });
 
