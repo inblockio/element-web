@@ -25,6 +25,7 @@ import {
     extractSearchText,
     flattenCopy,
     HYDRATION_PAGE_SIZE,
+    HYDRATION_SLICE_DEADLINE_MS,
     isBrowserEventIndexEnabled,
     isWebEventIndexSupported,
     MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
@@ -3633,6 +3634,75 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(resident).toEqual(expectedNewestIds);
         });
 
+        it("the seed loop yields at the slice deadline while building the k-way merge, not just the row loop (review-pr-c.md C3-N1/ME5)", async () => {
+            // review-pr-c.md's third pass: mutant ME5 (delete the seed loop's own
+            // HYDRATION_SLICE_DEADLINE_MS yield) survived the whole suite -- nothing pinned it,
+            // even though it is the one mechanism C2-F1's whole fix rests on (without it the seed
+            // loop is one unsliced task again, exactly the bug C2-F1 fixed, just moved one loop
+            // over). A real fixture large enough to cross 30ms of *real* per-page-sort time needs on
+            // the order of 200 pages (200k entries) -- already proven at real-Chromium/Node scale in
+            // measurements-pr-c.md §10.1/§11 (31.9ms/31.6ms at 200k/500k) -- so this test forces the
+            // same code path deterministically instead, via a mocked clock, at unit-test scale.
+            const pageCount = 3;
+            const n = MANIFEST_PAGE_SIZE * pageCount;
+            const idAtSeed = (i: number): string => `$sl${String(i).padStart(6, "0")}`;
+
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            for (let i = 0; i < n; i++) {
+                await seed.addEventToIndex(
+                    msg(idAtSeed(i), "x", { room_id: ROOM, origin_server_ts: 8_000_000 + i }),
+                    {},
+                );
+            }
+            await seed.commitLiveEvents();
+            await seed.closeEventIndex();
+
+            // A hot window that admits nothing at all: hydrate()'s row loop then returns at its own
+            // resident-budget check on the very first candidate row, *before* that loop's own
+            // (separate, pre-existing, unaffected-by-ME5) yield check is ever reached -- so any
+            // *extra* yield observed below, beyond loadManifest's own baseline (next comment),
+            // can only have come from the seed loop this test targets.
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: 0 });
+
+            // performance.now() always reports the slice deadline as already elapsed, so every
+            // per-page check in *both* loops that read it fires a yield -- deterministic, no real
+            // 30ms wait needed. This reopen goes through loadManifest (manifestPageCount is already
+            // set from the seed session), which has its own, separate, pre-existing per-page yield
+            // -- unaffected by ME5 -- contributing exactly `pageCount` yields on its own regardless
+            // of this test's mutation target; empirically confirmed (3 calls with ME5's mutation
+            // applied, 6 without, for pageCount=3). So the signal this test actually checks is
+            // "more than loadManifest's own baseline", which only holds when hydrate()'s *own* seed
+            // loop also yields. yieldToEventLoop's fallback (this environment has no
+            // scheduler.yield) is setTimeout(fn, 0); the global spy is the only reliable interception
+            // point here (spying on the exported function itself does not catch this module's own
+            // internal calls to it, under this project's ESM test transform).
+            let fakeMs = 0;
+            const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => {
+                fakeMs += HYDRATION_SLICE_DEADLINE_MS + 1;
+                return fakeMs;
+            });
+            const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+            nowSpy.mockRestore();
+
+            const zeroDelayCalls = timeoutSpy.mock.calls.filter(([, delay]) => delay === 0).length;
+            timeoutSpy.mockRestore();
+            expect(zeroDelayCalls).toBeGreaterThan(pageCount); // more than loadManifest's own baseline alone
+
+            // Still correct across however many forced yields fired: the resident budget of 0 is
+            // still honoured (nothing hydrated), and the manifest itself still loaded completely
+            // (a room with a manifest entry is still ranked/declinable by shouldCrawl -- see
+            // roomsByManifestRecency -- which a seed loop that silently dropped pages would break).
+            expect((await reloaded.getStats()).eventCount).toBe(0);
+            expect(await reloaded.shouldCrawl({ roomId: ROOM, token: "t", direction: Direction.Backward })).toBe(false); // budgetCorpus-era ts (8_000_000-ish) is far more than CRAWL_WINDOW_DAYS old
+        });
+
         it("getStats().manifestBytes reports the manifest's own share (review-pr-c.md C2-F2)", async () => {
             setEventIndexBoundsOverrideForTesting(null);
             const manager = track(new BrowserEventIndexManager());
@@ -4022,6 +4092,78 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await third.waitForManifest();
             const thirdMeta = (await dumpRawStore("meta"))[0];
             expect(thirdMeta.manifestPageCount).toBe(rawMeta.manifestPageCount);
+        });
+
+        it("a pre-manifest fixture over its disk budget is brought under budget after the migration pass, oldest first (review-pr-c.md C3-F1)", async () => {
+            // review-pr-c.md C3-F1: runManifestMigration built the manifest and the exact byte
+            // total, but not recordBytes/recordTs/diskTsHeap -- the three structures
+            // enforceDiskBudget needs to pick and delete a victim -- so a migrated database's disk
+            // usage got stuck at whatever it was, however far over budget, forever. This is exactly
+            // the state today's prod (pre-increment-C) users are in on their first post-upgrade open.
+            setEventIndexBoundsOverrideForTesting(null);
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            const corpus = budgetCorpus(40);
+            for (const ev of corpus) {
+                await seed.addEventToIndex(ev, {});
+                await seed.commitLiveEvents();
+            }
+            const before = await seed.getStats();
+            await seed.closeEventIndex();
+
+            // Same pre-manifest strip as the test above: no manifestPageCount, no manifest pages,
+            // no encrypted oldestIndexedTs row -- a genuine schema-v2-only database.
+            await withRawDb(async (db) => {
+                const tx = db.transaction("meta", "readwrite");
+                const store = tx.objectStore("meta");
+                const row = await idbPromise(store.get(userId));
+                store.put({ userId: row.userId, salt: row.salt, userVersion: row.userVersion });
+                const manifestKeys = await idbPromise(
+                    store.getAllKeys(IDBKeyRange.bound(`${userId}|manifest:`, `${userId}|manifest:￿`)),
+                );
+                for (const key of manifestKeys) store.delete(key);
+                store.delete(`${userId}|oldestIndexedTs`);
+                await new Promise<void>((resolve, reject) => {
+                    tx.oncomplete = (): void => resolve();
+                    tx.onerror = (): void => reject(tx.error);
+                });
+            });
+
+            // A budget well under the fixture's real footprint -- roughly a third of it, so more
+            // than one row must go -- forcing the migration path (not the live-write path E4(a) of
+            // the review's own repro already covers) to actually shrink disk usage. The hot window
+            // is deliberately much smaller than the corpus too (5 of 40): materializeRow() also
+            // populates recordBytes/recordTs/diskTsHeap for whatever it hydrates, so a hot window
+            // generous enough to hydrate every row would let hydration itself backfill the very
+            // structures this test exists to prove the *migration* pass populates, masking the bug
+            // this repro's own E4(b) needed a small hot window (50 of 600) to expose.
+            const diskBudgetBytes = Math.floor(before.size / 3);
+            setEventIndexBoundsOverrideForTesting({ diskBudgetBytes, hotWindowBytes: BYTES_PER_EVENT * 5 });
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForManifest();
+            await reloaded.waitForHydration();
+
+            const after = await reloaded.getStats();
+            expect(after.size).toBeLessThanOrEqual(diskBudgetBytes); // no longer stuck over budget
+            expect(after.windowed).toBe(true);
+
+            // Oldest-first: the ids dropped are a contiguous prefix of the ascending-ts corpus, the
+            // newest one is never among them.
+            const onDiskIds = new Set((await dumpRawStore("events")).map((r: any) => r.eventId));
+            expect(onDiskIds.size).toBeLessThan(40);
+            expect(onDiskIds.has(idAt(39))).toBe(true); // newest survives
+            expect(onDiskIds.has(idAt(0))).toBe(false); // oldest is gone
+            let seenSurvivor = false;
+            for (let i = 0; i < 40; i++) {
+                const present = onDiskIds.has(idAt(i));
+                if (present) seenSurvivor = true;
+                // Once a survivor is seen, every id at or after it must also survive (ascending ts,
+                // oldest-first deletion) -- a gap in the middle would mean deletion did not go
+                // oldest-first.
+                if (seenSurvivor) expect(present).toBe(true);
+            }
         });
     });
 

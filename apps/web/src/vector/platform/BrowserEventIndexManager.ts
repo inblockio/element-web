@@ -700,8 +700,10 @@ export const HYDRATION_PAGE_SIZE = 1000;
  * How long one hydration slice may run before {@link yieldToEventLoop} hands control back to the
  * event loop; see SYNTHESIS.md §3.4/§3.7 (`SLICE_DEADLINE_MS`). Comfortably under the 50 ms
  * long-task threshold that {@link BrowserEventIndexManager.hydrate} must never exceed.
+ * @knipignore - exported for tests, so a test can assert against this value directly (e.g. a mocked
+ *     clock forcing the deadline to have elapsed) rather than duplicating the literal `30`.
  */
-const HYDRATION_SLICE_DEADLINE_MS = 30;
+export const HYDRATION_SLICE_DEADLINE_MS = 30;
 
 /**
  * The resident cost of one indexed event, for checking {@link
@@ -3513,8 +3515,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 }
                 if (this.closed || epoch !== this.hydrationEpoch) return;
                 this.manifestAdd(stored.eventId, stored.originServerTs, stored.roomId);
-                totalBytes += ciphertextByteLength(row.blob.ct);
+                const bytes = ciphertextByteLength(row.blob.ct);
+                totalBytes += bytes;
                 oldestTs = oldestTs === undefined ? stored.originServerTs : Math.min(oldestTs, stored.originServerTs);
+                // review-pr-c.md C3-F1: without these three, enforceDiskBudget has no candidate to
+                // evict for any row this session has not otherwise touched -- recordBytes/recordTs
+                // are its "is this durable, and how old" test, diskTsHeap is what it pops from. This
+                // scan already decrypts every row and has both numbers in hand; populate them here so
+                // a migrated database's disk budget is enforceable immediately, not only for whatever
+                // subset bounded hydration happens to materialise afterward.
+                this.recordBytes.set(stored.eventId, bytes);
+                this.recordTs.set(stored.eventId, stored.originServerTs);
+                heapPushTs(this.diskTsHeap, { ts: stored.originServerTs, id: stored.eventId });
                 scanned++;
 
                 const elapsedInSlice = now() - sliceStart;
@@ -3547,6 +3559,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         }
         await txDone(tx);
         this.manifestLoaded = true;
+        // review-pr-c.md C3-F1: recordBytes/recordTs/diskTsHeap are now populated for every row this
+        // scan visited (not only whatever subset hydrate() later happens to materialize), so the
+        // budget can be enforced right here, immediately, rather than waiting on hydrate()'s own
+        // once-per-chunk call to reach a point in its loop it may never reach at all -- a hot window
+        // smaller than one hydration chunk (HYDRATION_PAGE_SIZE) makes hydrate() return at the
+        // resident-budget check before its own enforceDiskBudget call is ever reached, which would
+        // otherwise leave a migrated, over-budget database stuck exactly as C3-F1 found it even
+        // after this pass has everything it needs to fix it.
+        if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+        if (this.persistEnabled) await this.enforceDiskBudget(userId);
         log.info(
             `EventIndex: manifest migration scanned ${scanned} events in ${(now() - started).toFixed(1)}ms, ` +
                 `key order ${HYDRATION_KEY_ORDER}`,
