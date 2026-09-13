@@ -101,6 +101,92 @@ export interface EventIndexBounds {
 /** One day, in milliseconds; the unit {@link EventIndexBounds.crawlWindowDays} is expressed in. */
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Target plaintext size, in bytes, of one packed chunk of events (schema v3; see
+ * `BrowserEventIndexManager.ts`'s own "Storage layout" section) before it is sealed and a new one is
+ * started. A chunk's plaintext is JSON, so this is a target on the serialised `[eventId, StoredEvent]`
+ * array's own byte length, checked against as entries are packed in -- the sealed chunk usually ends
+ * up a little over this figure (whatever single entry pushed it past the target stays in), never
+ * under it except for the very last, still-open chunk.
+ *
+ * **Basis.** Two real thresholds bound the useful range, both independent of this feature's own
+ * choices:
+ *
+ * 1. Chromium's IndexedDB backing store keeps a value inline in its own record up to a size in the
+ *    tens of kilobytes, past which it is written out-of-line as a separate blob file on disk with an
+ *    extra filesystem round trip per read -- `research/browser-limits-model.md`'s IndexedDB-value-
+ *    storage section (increment-D handover) puts that boundary at 64&nbsp;KiB. A chunk sized *at* or
+ *    *above* that line risks paying the extra round trip on every read; this increment stays clear of
+ *    it rather than depend on where exactly a given Chromium version draws it.
+ * 2. AES-GCM's own per-call cost is dominated by a small fixed dispatch overhead at very small inputs
+ *    and becomes throughput-bound above roughly 16&nbsp;KiB -- so a target much below that amortises
+ *    poorly, and past the several-tens-of-KiB range the amortisation is mostly already spent.
+ *
+ * **Measured, not merely modelled**, by `~/.cache/eventindex-perf-d/chunk-size-sweep.mjs` (real
+ * Node WebCrypto, the same AES-GCM implementation family Chromium uses, over a 50,000-event synthetic
+ * corpus shaped like this feature's own `StoredEvent` -- encrypted-room fields included -- averaging
+ * 981&nbsp;B of plaintext JSON per event) sweeping exactly the candidates this constant's own basis
+ * asks for, 16/32/48/64/96&nbsp;KiB:
+ *
+ * | target | events/chunk | ciphertext overhead | encrypt (µs/event) | decrypt (µs/event) | one-chunk point-lookup |
+ * |---|---|---|---|---|---|
+ * | 16 KiB | 15.3 | 0.18% | 12.62 | 12.32 | 0.19 ms |
+ * | 32 KiB | 31.2 | 0.09% | 8.48 | 8.09 | 0.25 ms |
+ * | **48 KiB** | **47.1** | **0.06%** | **7.06** | **6.58** | **0.31 ms** |
+ * | 64 KiB | 63.0 | 0.04% | 5.93 | 6.79 | 0.41 ms |
+ * | 96 KiB | 94.7 | 0.03% | 5.18 | 5.54 | 0.48 ms |
+ *
+ * Throughput keeps improving past 48&nbsp;KiB (as amortisation theory predicts), but the gains are
+ * small and, past 48 KiB, noisy in the wrong direction for decrypt (64 KiB measures *worse* than 48
+ * KiB there, run-to-run GC jitter on a difference this small) -- while every candidate at or past
+ * 64&nbsp;KiB sits at or over threshold 1 above (a sealed chunk is target-plus-one-entry, so a 64 KiB
+ * *target* produces chunks that measure slightly *over* 64 KiB on disk, i.e. squarely in the
+ * externalised-blob range that number 1 warns about). The one-chunk point-lookup cost ({@link
+ * BrowserEventIndexManager.materializeIfPending}'s own bounded read) rises monotonically with target
+ * size as expected, but every candidate measured is well under a millisecond -- two orders of
+ * magnitude inside the 50 ms long-task ceiling -- so it does not meaningfully constrain the choice
+ * either way at these sizes. Net: the measured optimum **matches the original 48 KiB estimate** (the
+ * point where most of the throughput gain has already been captured, comfortably clear of the
+ * externalisation threshold, mean chunk population 47 events -- within the "roughly 50-90 events"
+ * estimate the increment's own design brief gave), so it is kept as the default rather than moved.
+ *
+ * @knipignore - exported for tests, that read it directly to size a fixture relative to a chunk
+ *     boundary; production code reads {@link getChunkTargetBytes} instead, which is the one that
+ *     can actually be overridden ({@link setChunkTargetBytesOverrideForTesting}) -- this constant
+ *     itself never changes, so a test cannot cross a chunk boundary with a *small* fixture by
+ *     reading this alone, only by overriding what production code reads.
+ */
+export const CHUNK_TARGET_BYTES = 48 * 1024;
+
+/**
+ * Test-only override for {@link getChunkTargetBytes}, the same shape as {@link
+ * setEventIndexBoundsOverrideForTesting}: `null` (the default) means "use {@link
+ * CHUNK_TARGET_BYTES}", any other number shrinks (or grows) the target a test's fixture seals
+ * against, so a chunk-boundary-crossing scenario (a redaction/disk-budget-eviction test needing two
+ * *different* chunks, say) can use a handful of records instead of enough to fill a real 48 KiB
+ * chunk. Production code never calls the setter.
+ */
+let chunkTargetBytesOverrideForTesting: number | null = null;
+
+/**
+ * The chunk-sealing target in effect right now: {@link CHUNK_TARGET_BYTES} unless a test has
+ * overridden it. Called fresh every time rather than cached, the same convention {@link
+ * getEventIndexBounds} follows and for the same reason: every call site already treats this as
+ * cheap.
+ */
+export function getChunkTargetBytes(): number {
+    return chunkTargetBytesOverrideForTesting ?? CHUNK_TARGET_BYTES;
+}
+
+/**
+ * Test-only hook: force {@link getChunkTargetBytes} to a specific value, or pass `null` to clear
+ * the override and go back to {@link CHUNK_TARGET_BYTES}. Never called from production code.
+ * @knipignore - exported for tests
+ */
+export function setChunkTargetBytesOverrideForTesting(override: number | null): void {
+    chunkTargetBytesOverrideForTesting = override;
+}
+
 const DESKTOP_BOUNDS: EventIndexBounds = {
     tier: "desktop",
     hotWindowBytes: 128 * 1024 * 1024,
