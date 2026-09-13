@@ -23,6 +23,7 @@ import {
     encryptJson,
     eventHasFile,
     extractSearchText,
+    flattenCopy,
     HYDRATION_PAGE_SIZE,
     isBrowserEventIndexEnabled,
     isWebEventIndexSupported,
@@ -245,6 +246,17 @@ describe("BrowserEventIndex helpers", () => {
         expect(eventHasFile(msg("$1", "hi"))).toBe(false);
         expect(eventHasFile(msg("$2", "file", { content: { url: "mxc://s/a" } }))).toBe(true);
         expect(eventHasFile(msg("$3", "http", { content: { url: "https://x" } }))).toBe(false);
+    });
+
+    it("flattenCopy round-trips ordinary and JSON-special text losslessly", () => {
+        // flattenCopy's whole job is to break any reference the value might otherwise retain to a
+        // much larger backing buffer (see its docstring in BrowserEventIndexManager.ts); this is
+        // the correctness check for the round trip itself, including characters JSON must escape
+        // to survive it -- quotes, backslashes and control characters a message body can
+        // legitimately contain.
+        for (const raw of ["Café Zürich", 'She said "naïve"', "back\\slash", "line\nbreak", "tab\ttab", ""]) {
+            expect(flattenCopy(raw)).toEqual(raw);
+        }
     });
 
     it("encrypts to non-plaintext and decrypts with the same key only", async () => {
@@ -2475,20 +2487,37 @@ describe("BrowserEventIndexManager (increment B correctness: stats, prefix, subs
         }
     });
 
-    it("substring fallback reflects text edited moments earlier, with no per-record memo to go stale (accented text)", async () => {
+    it("substring fallback reflects text edited moments earlier, and the folded-text memo does not go stale (accented text)", async () => {
         await manager.initEventIndex(userId, DEVICE);
         await manager.waitForHydration();
         await manager.addEventToIndex(msg("$acc", "Meet at Café Zürich"), {});
         // A fragment from the middle of the folded word "zurich" that no term starts with, so
-        // only the substring fallback can find it.
+        // only the substring fallback can find it -- and the first call here is also what fills
+        // foldedFor's memo for this record.
         expect((await manager.searchEventIndex(search("uric"))).count).toBe(1);
 
         await manager.addEventToIndex(edit("$editacc", "$acc", "Meet at Café Genève instead"), {});
-        // The old fragment is gone -- correctly, since a memo re-serving a stale fold would
-        // instead keep finding it -- and the new body's own fold-sensitive fragment (inside
-        // folded "geneve") is found instead.
+        // The old fragment is gone -- correctly, since a memo re-serving the stale fold from
+        // before the edit would instead keep finding it -- and the new body's own fold-sensitive
+        // fragment (inside folded "geneve") is found instead. Only possible because foldedFor()
+        // re-folds when the record's searchText no longer matches what the memo entry was
+        // computed from, rather than serving the entry unconditionally.
         expect((await manager.searchEventIndex(search("uric"))).count).toBe(0);
         expect((await manager.searchEventIndex(search("nev"))).count).toBe(1);
+    });
+
+    it("substring fallback still finds text through JSON-special characters the flattening memo round-trips", async () => {
+        // flattenCopy stores JSON.parse(JSON.stringify(searchText)) in the memo; this is the
+        // end-to-end check that quotes, backslashes and control characters -- which a message
+        // body can legitimately contain, and which JSON must escape to round-trip -- still come
+        // back out exactly, not mangled, once served from the memo.
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$special", 'She said "naïve" back\\slash déjà vu'), {});
+        // "aïve\" bac" spans the closing quote and the backslash -- only reachable if the memo's
+        // round trip preserved both characters exactly.
+        expect((await manager.searchEventIndex(search('aive" bac'))).count).toBe(1);
+        expect((await manager.searchEventIndex(search("k\\sla"))).count).toBe(1);
     });
 });
 

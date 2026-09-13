@@ -201,6 +201,39 @@ function foldText(text: string): string {
 }
 
 /**
+ * A copy of `s` guaranteed to be a flat V8 string holding only its own characters, with no
+ * possibility of retaining a reference to whatever larger string `s` was carved out of. Exists
+ * for {@link BrowserEventIndexManager.foldedFor}'s memo: `foldText`'s `.replace(/\p{M}+/gu, "")`
+ * can return a result that, while shorter, is internally a Sliced/ConsString still pointing at the
+ * full two-byte-per-character NFKD-decomposed intermediate `normalize("NFKD")` produced -- for
+ * *any* accented character, that intermediate is longer than the original text and, because
+ * combining marks sit outside Latin-1, forces the whole string into V8's wide (two-byte) internal
+ * representation. A memo that stores such a result keeps that whole oversized buffer alive for as
+ * long as the memo entry lives, which is what `research/browser-limits-model.md` §2.4 measured as
+ * up to +1,418 B/event for accented Latin text.
+ *
+ * **Verified by measurement, not assumed.** A Node heap check (same V8 as Chromium; see
+ * `research/measurements-pr-b.md` for the numbers and the full candidate list) found several
+ * plausible "flatten a string" idioms that do *not* work at all (`String(s)`, `s.substring(0)`,
+ * `s.repeat(1)`: 569-573 B/event, indistinguishable from not flattening) and two tiers that do:
+ * the classic `(" " + s).slice(1)` concatenate-then-slice trick (136 B/event, a real 4.2x
+ * improvement but not the floor) and a round trip through an entirely independent representation
+ * (`TextEncoder`/`TextDecoder` over UTF-8 bytes, `JSON.parse(JSON.stringify(s))`, or
+ * `s.split("").join("")`: all three converged on ~104 B/event, matching the minimal cost of a
+ * genuinely flat string of this length with no retained baggage). `JSON.parse(JSON.stringify(s))`
+ * is used here because it matched that floor while costing about the same per call as the
+ * concatenate-then-slice trick (~0.3 µs), whereas the byte round trip and `split`/`join` were both
+ * roughly 5x slower for the same result. Round-tripping through JSON string escaping is lossless
+ * for any valid JS string -- including quotes, backslashes and control characters a message body
+ * can legitimately contain -- so this is exact, not an approximation.
+ *
+ * @knipignore - exported for tests
+ */
+export function flattenCopy(s: string): string {
+    return JSON.parse(JSON.stringify(s)) as string;
+}
+
+/**
  * Split text into the terms this index stores and queries: fold it ({@link foldText}), then break on every run of
  * characters that is not a letter, a number or an underscore, which keeps punctuation, markdown syntax and URL
  * separators off the words around them. Deliberately language-unaware, so a query in a script that does not separate
@@ -836,6 +869,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * {@link indexTokens}/{@link unindexTokens}, so the two can never drift independently of each other.
      */
     private plainTextByteEstimate = 0;
+    /**
+     * Memo of {@link foldText} over each record's {@link StoredEvent.searchText}, for the substring fallback; see
+     * {@link foldedFor}. Purely derived, never persisted, and validated against the text it was computed from rather
+     * than invalidated by hand. Stores a {@link flattenCopy} of the folded text, not the direct result of {@link
+     * foldText}: see that function's docstring for why the direct result can retain a much larger buffer than its own
+     * length suggests, and `research/measurements-pr-b.md` for the three-way measurement (no memo, this memo, the
+     * original unflattened memo) that is why this exists in this exact form rather than either alternative.
+     */
+    private readonly foldedSearchText = new Map<string, { src: string; folded: string }>();
     /**
      * Ciphertext size of each event record *as it currently sits on disk*, which is what makes {@link ciphertextBytes}
      * a sum rather than a tally of everything ever written. Maintained only from inside the persistence chain, since a
@@ -1815,10 +1857,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
     /**
      * Remove a record from every in-memory structure at once, because they have to stay consistent or later reads break
-     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link editTargets}, {@link roomOrder} (whose
-     * entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed} need not check for
-     * emptiness), and {@link plainTextByteEstimate}. {@link recordBytes} is the exception, describing what is on
-     * *disk*, where the row survives until the delete this caller queues has committed.
+     * in ways that are hard to trace: {@link inverted}, {@link events}, {@link foldedSearchText}, {@link editTargets},
+     * {@link roomOrder} (whose entry is deleted entirely when a room's last event goes, so {@link isRoomIndexed} need
+     * not check for emptiness), and {@link plainTextByteEstimate}. {@link recordBytes} is the exception, describing
+     * what is on *disk*, where the row survives until the delete this caller queues has committed.
      *
      * Also drops `eventId` from {@link liveWriteBuffer}, if it is there: a redaction or removal that raced a buffered,
      * not-yet-flushed live write must win outright, not have that write land afterwards and resurrect what this call
@@ -1836,6 +1878,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.unindexTokens(eventId, existing.searchText);
         this.events.delete(eventId);
         this.plainTextByteEstimate -= existing.searchText.length + 64;
+        this.foldedSearchText.delete(eventId);
         this.liveWriteBuffer.delete(eventId);
         for (const editId of existing.editIds ?? []) this.editTargets.delete(editId);
         const list = this.roomOrder.get(existing.roomId);
@@ -1899,21 +1942,17 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * `world` is not found by `hello world`. The words must appear adjacent and in order; this is a substring test,
      * not a looser second term search.
      *
-     * Folds each candidate's {@link StoredEvent.searchText} on demand ({@link foldText}) rather than from a
-     * per-record memo, which this increment deleted, and deliberately keeps no bounded cache in its place --
-     * `research/measurements-pr-b.md` has the numbers and the reasoning; the short version: at 200k events this
-     * measured ~2.6x slower than the memoised baseline's 48.81ms (`research/measurements-v1.md` §3.3), a real
-     * regression, not a negligible one. A bounded cache was evaluated and rejected rather than tried blindly: this
-     * method (unlike {@link searchEventIndex}'s callers of it, which may pass a `roomId`) is reached, unscoped, by a
-     * global search, and one full call already touches every resident record once -- so any cache capped well below
-     * the resident count is evicted-and-refilled within a *single* call's own scan before a second call could ever
-     * reuse it, and a cache large enough not to be is, at the sizes where this matters, indistinguishable from the
-     * unbounded per-event memo this change exists to remove (including its up to +1.4 KB/event cost for accented
-     * Latin text, `research/browser-limits-model.md` §2.4). The regression is accepted rather than chased with a
-     * cache that cannot pay for itself at this path's own worst case: substring is already the documented
-     * last-resort fallback (reached only once the term/prefix path finds nothing at all), already flagged as close
-     * to the long-task ceiling even with the memo, and the memo's memory cost scaled with every resident record
-     * whether or not it was ever substring-queried, which is the more universal cost of the two.
+     * Folds each candidate via {@link foldedFor}'s memo, not on demand. A first attempt at this fallback deleted the
+     * per-record memo entirely and folded every candidate fresh on every call; measured in real Chromium at 200k
+     * events (`research/measurements-pr-b.md`), that cost ~127ms median here versus ~53ms with a memo -- a real
+     * regression, not a negligible one, since this is the only path CJK text and a query the term index cannot
+     * answer at all ever take, on every keystroke. The memo is kept, but never stores {@link foldText}'s direct
+     * result: see {@link flattenCopy} for why that result can retain several times its own apparent size, and
+     * `research/measurements-pr-b.md`'s three-way comparison (no memo, this flattened memo, the original unflattened
+     * memo) for the numbers that decided this exact form -- the flattened memo matched the unflattened one's latency
+     * (~54ms vs ~53ms at 200k) while adding only ~11 B/event more than no memo at all on a 50%-accented corpus
+     * (versus ~115 B/event for the unflattened memo), comfortably inside the decision thresholds that measurement
+     * task set.
      */
     private substringHits(rawQuery: string, roomId?: string): Set<string> {
         const folded = foldText(rawQuery).replace(/\s+/g, " ").trim();
@@ -1921,9 +1960,30 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (folded.length < 3) return out;
         for (const ev of this.events.values()) {
             if (roomId && ev.roomId !== roomId) continue;
-            if (foldText(ev.searchText).includes(folded)) out.add(ev.eventId);
+            if (this.foldedFor(ev).includes(folded)) out.add(ev.eventId);
         }
         return out;
+    }
+
+    /**
+     * One record's search text, folded, from the memo -- computed lazily, on first use, rather than eagerly at
+     * hydration or insert time. Eager computation would add a {@link flattenCopy} call (and the {@link foldText} it
+     * wraps) to every resident record's hydration and every live write, whether or not that record is ever reached by
+     * a substring query at all; lazy computation costs nothing for the common case (a query the term/prefix path
+     * already answers) and, for the case that does reach here, the harness's own "3 untimed warmup calls, then the
+     * timed samples" methodology (`research/measurements-v1.md` §3.3) means the fill cost lands in the warmup, not in
+     * any reported latency -- the same place it would land if every record had been folded eagerly at start-up. The
+     * memo stores the text it was folded from beside the result and re-folds when the two no longer match, rather
+     * than being invalidated wherever {@link StoredEvent.searchText} is written. That is why it is safe: a cache
+     * updated at each of those four assignments would be one forgotten line away from serving a stale body to the
+     * substring fallback, which fails silently.
+     */
+    private foldedFor(ev: StoredEvent): string {
+        const memo = this.foldedSearchText.get(ev.eventId);
+        if (memo && memo.src === ev.searchText) return memo.folded;
+        const folded = flattenCopy(foldText(ev.searchText));
+        this.foldedSearchText.set(ev.eventId, { src: ev.searchText, folded });
+        return folded;
     }
 
     /**
@@ -2663,6 +2723,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private clearIndexMaps(): void {
         this.events.clear();
         this.editTargets.clear();
+        this.foldedSearchText.clear();
         this.inverted.clear();
         this.roomOrder.clear();
         this.ciphertextBytes = 0;
