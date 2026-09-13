@@ -160,12 +160,18 @@ export default class EventIndex extends EventEmitter {
             Boolean(await client.getCrypto()?.isEncryptionEnabledInRoom(room.roomId)),
         );
 
+        // Ranked by the client's own recency (Room.getLastActiveTimestamp()) -- Element's stated
+        // policy of crawling the most recently active rooms first -- because on a fresh index none
+        // of these rooms has any crawled history of its own yet for the manager to rank by itself;
+        // see BaseEventIndexManager.shouldCrawl's `clientRoomRank` param (review-pr-c.md C-F4).
+        const rankedRooms = [...encryptedRooms].sort((a, b) => b.getLastActiveTimestamp() - a.getLastActiveTimestamp());
+
         this.logger.debug("addInitialCheckpoints: starting");
 
         // Gather the prev_batch tokens and create checkpoints for
         // our message crawler.
         await Promise.all(
-            encryptedRooms.map(async (room): Promise<void> => {
+            rankedRooms.map(async (room, rank): Promise<void> => {
                 const timeline = room.getLiveTimeline();
                 const token = timeline.getPaginationToken(Direction.Backward);
 
@@ -178,7 +184,12 @@ export default class EventIndex extends EventEmitter {
                 // Same crawl bound as crawlerFunc's own check, consulted here too so a room the
                 // manager would decline never gets a checkpoint persisted for it in the first
                 // place. Checked once per room: both directions share the same bound.
-                if (!(await indexManager.shouldCrawl({ roomId: room.roomId, token, direction: Direction.Backward }))) {
+                if (
+                    !(await indexManager.shouldCrawl(
+                        { roomId: room.roomId, token, direction: Direction.Backward },
+                        rank,
+                    ))
+                ) {
                     return;
                 }
 
@@ -493,32 +504,33 @@ export default class EventIndex extends EventEmitter {
                 this.emitNewCheckpoint();
             }
 
-            await sleep(sleepTime);
-
-            if (cancelled) {
-                break;
-            }
-
-            const checkpoint = this.crawlerCheckpoints.shift();
-
-            /// There is no checkpoint available currently, one may appear if
-            // a sync with limited room timelines happens, so go back to sleep.
-            if (checkpoint === undefined) {
-                idle = true;
-                continue;
-            }
-
-            // The manager may enforce a crawl bound (a recency window, a room cap; see
-            // BaseEventIndexManager.shouldCrawl). Declining is handled the same way as having
-            // caught up with this room's history: the checkpoint is removed, not retried, so it
-            // does not spin here forever.
-            if (!(await indexManager.shouldCrawl(checkpoint))) {
+            // Drain checkpoints outside the crawl bound (BaseEventIndexManager.shouldCrawl) before
+            // the sleep below, not one per loop iteration: declining is handled the same way as
+            // having caught up with this room's history (the checkpoint is removed, not retried,
+            // so it does not spin), but paying the sleep between each decline cost roughly two
+            // crawlerSleepTimes per out-of-bound room, head-of-line-blocking every in-bound
+            // checkpoint behind a possibly large declined backlog (review-pr-c.md C-F4).
+            let checkpoint = this.crawlerCheckpoints.shift();
+            while (checkpoint !== undefined && !(await indexManager.shouldCrawl(checkpoint))) {
                 this.logger.debug("Declining checkpoint outside the crawl bound", JSON.stringify(checkpoint));
                 try {
                     await indexManager.removeCrawlerCheckpoint(checkpoint);
                 } catch (e) {
                     this.logger.warn(`Error removing declined checkpoint ${JSON.stringify(checkpoint)}:`, e);
                 }
+                checkpoint = this.crawlerCheckpoints.shift();
+            }
+
+            await sleep(sleepTime);
+
+            if (cancelled) {
+                break;
+            }
+
+            /// There is no checkpoint available currently, one may appear if
+            // a sync with limited room timelines happens, so go back to sleep.
+            if (checkpoint === undefined) {
+                idle = true;
                 continue;
             }
 

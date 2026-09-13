@@ -27,6 +27,8 @@ import {
     SyncState,
 } from "matrix-js-sdk/src/matrix";
 
+import * as sdkUtils from "matrix-js-sdk/src/utils";
+
 import EventIndex from "./EventIndex.ts";
 import {
     emitPromise,
@@ -112,12 +114,14 @@ describe("EventIndex", () => {
             getLiveTimeline: () => ({
                 getPaginationToken: () => "token1",
             }),
+            getLastActiveTimestamp: () => 1,
         } as any as Room;
         const room2 = {
             roomId: "!room2:id",
             getLiveTimeline: () => ({
                 getPaginationToken: () => "token2",
             }),
+            getLastActiveTimestamp: () => 2,
         } as any as Room;
         const mockCrypto = {
             isEncryptionEnabledInRoom: vi.fn().mockResolvedValue(true),
@@ -214,6 +218,122 @@ describe("EventIndex", () => {
             token: "token1",
             direction: Direction.Backward,
         });
+    });
+
+    it("drains every declined checkpoint before sleeping once, not once per decline (review-pr-c.md C-F4)", async () => {
+        // Three checkpoints, the first two outside the crawl bound. The old code slept
+        // crawlerSleepTime between *each* decline, head-of-line-blocking room3's in-bound
+        // checkpoint behind the declined backlog; the fix drains room1+room2 in one pass and
+        // sleeps exactly once, immediately before room3 is processed.
+        const sleepSpy = vi.spyOn(sdkUtils, "sleep").mockResolvedValue(undefined);
+
+        const mockIndexingManager = {
+            loadCheckpoints: vi.fn(),
+            removeCrawlerCheckpoint: vi.fn().mockResolvedValue(undefined),
+            isEventIndexEmpty: vi.fn().mockResolvedValue(false),
+            shouldCrawl: vi.fn().mockImplementation(async (cp: ICrawlerCheckpoint) => cp.roomId === "!room3:id"),
+        } as any as Mocked<BaseEventIndexManager>;
+        mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
+
+        const room1 = { roomId: "!room1:id" } as any as Room;
+        const room2 = { roomId: "!room2:id" } as any as Room;
+        const room3 = { roomId: "!room3:id" } as any as Room;
+        const mockClient = getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            createMessagesRequest: vi.fn(),
+            ...mockClientMethodsRooms([room1, room2, room3]),
+        });
+
+        vi.spyOn(SettingsStore, "getValueAt").mockImplementation((_level, settingName): any => {
+            if (settingName === "crawlerSleepTime") return 0;
+            return undefined;
+        });
+
+        mockIndexingManager.loadCheckpoints.mockResolvedValue([
+            { roomId: "!room1:id", token: "token1", direction: Direction.Backward } as ICrawlerCheckpoint,
+            { roomId: "!room2:id", token: "token2", direction: Direction.Backward } as ICrawlerCheckpoint,
+            { roomId: "!room3:id", token: "token3", direction: Direction.Forward } as ICrawlerCheckpoint,
+        ]);
+
+        const indexer = new EventIndex();
+        await indexer.init();
+        indexer.startCrawler();
+
+        const mock3 = mockCreateMessagesRequest(mockClient);
+        await mock3.called;
+
+        expect(mockClient.createMessagesRequest).toHaveBeenCalledWith("!room3:id", "token3", 100, "f");
+        expect(mockIndexingManager.removeCrawlerCheckpoint).toHaveBeenCalledWith(
+            expect.objectContaining({ roomId: "!room1:id" }),
+        );
+        expect(mockIndexingManager.removeCrawlerCheckpoint).toHaveBeenCalledWith(
+            expect.objectContaining({ roomId: "!room2:id" }),
+        );
+        // The one sleep that precedes processing room3 -- none spent between the two declines.
+        expect(sleepSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("ranks initial checkpoints by the client's own recency and declines rooms past the cap (review-pr-c.md C-F4)", async () => {
+        // A manager whose shouldCrawl behaves the way BrowserEventIndexManager's does for a fresh
+        // index: nothing has any manifest activity yet, so the *only* signal it can decline on is
+        // the caller-supplied clientRoomRank -- a cap of 1 here, so only the single most recently
+        // active room should ever see addCrawlerCheckpoint.
+        const mockIndexingManager = {
+            loadCheckpoints: vi.fn().mockResolvedValue([]),
+            isEventIndexEmpty: vi.fn().mockResolvedValue(true),
+            addCrawlerCheckpoint: vi.fn(),
+            removeCrawlerCheckpoint: vi.fn(),
+            commitLiveEvents: vi.fn(),
+            shouldCrawl: vi.fn().mockImplementation(async (_cp: ICrawlerCheckpoint, rank?: number) => {
+                return rank === undefined || rank < 1;
+            }),
+        } as any as Mocked<BaseEventIndexManager>;
+        mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
+
+        // Deliberately out of recency order in client.getRooms()'s own return order, so this also
+        // proves addInitialCheckpoints does its own sort rather than trusting call order.
+        const rooms = [
+            {
+                roomId: "!old:id",
+                getLiveTimeline: () => ({ getPaginationToken: () => "t" }),
+                getLastActiveTimestamp: () => 1,
+            },
+            {
+                roomId: "!newest:id",
+                getLiveTimeline: () => ({ getPaginationToken: () => "t" }),
+                getLastActiveTimestamp: () => 3,
+            },
+            {
+                roomId: "!middle:id",
+                getLiveTimeline: () => ({ getPaginationToken: () => "t" }),
+                getLastActiveTimestamp: () => 2,
+            },
+        ] as any as Room[];
+        const mockCrypto = { isEncryptionEnabledInRoom: vi.fn().mockResolvedValue(true) };
+        getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            createMessagesRequest: vi.fn(),
+            getCrypto: () => mockCrypto as any,
+            ...mockClientMethodsRooms(rooms),
+        });
+
+        const indexer = new EventIndex();
+        await indexer.init();
+        await indexer.addInitialCheckpoints();
+
+        expect(mockIndexingManager.addCrawlerCheckpoint).toHaveBeenCalledWith(
+            expect.objectContaining({ roomId: "!newest:id" }),
+        );
+        expect(mockIndexingManager.addCrawlerCheckpoint).not.toHaveBeenCalledWith(
+            expect.objectContaining({ roomId: "!middle:id" }),
+        );
+        expect(mockIndexingManager.addCrawlerCheckpoint).not.toHaveBeenCalledWith(
+            expect.objectContaining({ roomId: "!old:id" }),
+        );
+        // Every shouldCrawl call for these rooms was ranked, never left to the "no signal" default.
+        for (const call of mockIndexingManager.shouldCrawl.mock.calls) {
+            expect(call[1]).not.toBeUndefined();
+        }
     });
 });
 

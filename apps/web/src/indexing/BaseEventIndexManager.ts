@@ -275,9 +275,15 @@ export default abstract class BaseEventIndexManager {
      * not also expect to see this checkpoint again.
      *
      * @param checkpoint The checkpoint about to be crawled.
+     * @param clientRoomRank The checkpoint's room's 0-based rank in the *client's* own recency
+     *     order (`Room.getLastActiveTimestamp()`), supplied only by {@link
+     *     EventIndex.addInitialCheckpoints} for a fresh index, whose checkpoints have no crawled
+     *     history of their own yet to rank by (review-pr-c.md C-F4). `undefined` from every other
+     *     caller. A manager must not consult `MatrixClientPeg` itself to get this signal -- it is
+     *     passed in for exactly that reason.
      * @returns `true` to proceed as before; `false` to decline it.
      */
-    public async shouldCrawl(checkpoint: ICrawlerCheckpoint): Promise<boolean> {
+    public async shouldCrawl(checkpoint: ICrawlerCheckpoint, clientRoomRank?: number): Promise<boolean> {
         return true;
     }
 
