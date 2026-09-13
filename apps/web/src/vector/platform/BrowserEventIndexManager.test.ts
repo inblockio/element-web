@@ -2187,6 +2187,155 @@ describe("BrowserEventIndexManager (the labs gate)", () => {
     });
 });
 
+describe("BrowserEventIndexManager (batched writes)", () => {
+    const DEVICE = "DEVICE1";
+    let manager: BrowserEventIndexManager;
+    let userCounter = 0;
+    let userId: string;
+
+    const search = (term: string, overrides: Record<string, unknown> = {}): any =>
+        ({ search_term: term, ...SEARCH_DEFAULTS, ...overrides }) as any;
+
+    beforeEach(() => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        userId = `@batch${++userCounter}:example.org`;
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue("unit-test-pickle-key") });
+        manager = new BrowserEventIndexManager();
+    });
+
+    afterEach(async () => {
+        await manager.closeEventIndex();
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    it("a live event is searchable before its write is flushed to disk", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$unflushed", "unflushed needle"), {});
+
+        // Searchable immediately, in memory -- before commitLiveEvents, before the 5s timer,
+        // before the LIVE_WRITE_BUFFER_MAX threshold, before anything has touched disk.
+        expect((await manager.searchEventIndex(search("unflushed"))).count).toBe(1);
+        expect((await inspectRawDb()).events).toEqual([]);
+
+        // Only once explicitly flushed does the encrypted copy land.
+        await manager.commitLiveEvents();
+        expect((await inspectRawDb()).events).toHaveLength(1);
+    });
+
+    it("batches several live writes into one IndexedDB transaction instead of one per event", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction");
+
+        for (let i = 0; i < 12; i++) {
+            await manager.addEventToIndex(msg(`$batch${i}`, `batched body ${i}`), {});
+        }
+        // Twelve live writes, none flushed yet: no "events" transaction opened for any of them.
+        const eventsTxCalls = (): number =>
+            txSpy.mock.calls.filter(
+                (call) => call[0] === "events" || (Array.isArray(call[0]) && call[0].includes("events")),
+            ).length;
+        expect(eventsTxCalls()).toBe(0);
+
+        await manager.commitLiveEvents();
+        // Exactly one "events" transaction for the whole flushed batch, not twelve.
+        expect(eventsTxCalls()).toBe(1);
+        expect((await inspectRawDb()).events).toHaveLength(12);
+
+        txSpy.mockRestore();
+    });
+
+    it("a crash-style close without flush loses only the unflushed events, and nothing else is corrupted", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$durable", "durable body"), {});
+        // Establishes a flushed, durable baseline.
+        await manager.commitLiveEvents();
+
+        await manager.addEventToIndex(msg("$lost", "lost body"), {});
+        // Deliberately no commitLiveEvents() and no closeEventIndex() here: this simulates a
+        // crash before the live-write buffer's 5s timer or size threshold has had a chance to
+        // flush it. Only the durable baseline is on disk.
+        expect((await inspectRawDb()).events.map((r) => r.eventId)).toEqual(["$durable"]);
+
+        // A fresh session over the same, uncleanly-abandoned database sees exactly the durable
+        // baseline: the lost event is gone as if it never happened, and nothing else is disturbed.
+        const reloaded = new BrowserEventIndexManager();
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        try {
+            expect((await reloaded.searchEventIndex(search("durable"))).count).toBe(1);
+            expect((await reloaded.searchEventIndex(search("lost"))).count).toBe(0);
+        } finally {
+            await reloaded.closeEventIndex();
+        }
+    });
+
+    it("redacting a live event still sitting in the unflushed buffer leaves nothing on disk", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$buffered", "buffered secret"), {});
+        // Confirms it is genuinely still unflushed at the moment of redaction, not already
+        // written -- otherwise this would only exercise the ordinary delete path.
+        expect((await inspectRawDb()).events).toEqual([]);
+
+        expect(await manager.deleteEvent("$buffered")).toBe(true);
+        expect((await manager.searchEventIndex(search("buffered"))).count).toBe(0);
+
+        await manager.commitLiveEvents();
+        expect((await inspectRawDb()).events).toEqual([]);
+        expect(await manager.isEventIndexEmpty()).toBe(true);
+    });
+
+    it("redacting one buffered event does not stop a sibling in the same buffer from being flushed", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        await manager.addEventToIndex(msg("$keep", "keep this body"), {});
+        await manager.addEventToIndex(msg("$drop", "drop this body"), {});
+        expect(await manager.deleteEvent("$drop")).toBe(true);
+
+        await manager.commitLiveEvents();
+        const raw = await inspectRawDb();
+        expect(raw.events.map((r) => r.eventId)).toEqual(["$keep"]);
+        expect((await manager.searchEventIndex(search("keep"))).count).toBe(1);
+        expect((await manager.searchEventIndex(search("drop"))).count).toBe(0);
+    });
+
+    it("isEventIndexEmpty flushes the live buffer first, so a solitary unflushed event is not reported as empty", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        expect(await manager.isEventIndexEmpty()).toBe(true);
+        await manager.addEventToIndex(msg("$solo", "solo body"), {});
+        // Nothing flushed yet, and isEventIndexEmpty answers straight from IndexedDB when
+        // persistence is enabled -- so this only reports non-empty if it flushes first.
+        expect(await manager.isEventIndexEmpty()).toBe(false);
+        expect((await inspectRawDb()).events).toHaveLength(1);
+    });
+
+    it("addHistoricEvents writes a whole crawler batch as one IndexedDB transaction", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const txSpy = vi.spyOn(IDBDatabase.prototype, "transaction");
+
+        const batch = Array.from({ length: 15 }, (_unused, i) => ({
+            event: msg(`$crawl${i}`, `crawled body ${i}`),
+            profile: {},
+        }));
+        await manager.addHistoricEvents(batch, null, null);
+        await manager.commitLiveEvents();
+
+        const eventsTxCalls = txSpy.mock.calls.filter(
+            (call) => call[0] === "events" || (Array.isArray(call[0]) && call[0].includes("events")),
+        ).length;
+        expect(eventsTxCalls).toBe(1);
+        expect((await inspectRawDb()).events).toHaveLength(15);
+        txSpy.mockRestore();
+    });
+});
+
 /**
  * The corpus the scale tests below run against, built once and re-indexed per test. Every
  * assertion's expected hit set is a filter over *this array*, so nothing has to be counted by

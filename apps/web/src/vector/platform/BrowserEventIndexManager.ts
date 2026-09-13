@@ -43,6 +43,19 @@ Please see LICENSE files in the repository root for full details.
  * of the session -- which, since {@link BrowserEventIndexManager.hydrate} restores everything in the background
  * rather than all at once before `initEventIndex` returns, is initially nothing at all, growing to the whole index
  * over the following seconds as hydration proceeds.
+ *
+ * ### What a crash can lose
+ *
+ * Writes are batched, not one IndexedDB transaction per event: a crawler batch ({@link
+ * BrowserEventIndexManager.addHistoricEvents}) writes as one transaction, and live events ({@link
+ * BrowserEventIndexManager.addEventToIndex}) accumulate in {@link BrowserEventIndexManager.liveWriteBuffer} and flush
+ * as one transaction at least every 5s or every 300 events, whichever comes first (see {@link
+ * BrowserEventIndexManager.schedulePersistEvent}). A crash before a flush therefore loses, at most, one crawler batch
+ * or a few seconds of live events -- never more, and never silently corrupting what *did* commit, each transaction
+ * being all-or-nothing. This is acceptable because this index is a derived, best-effort search structure and never
+ * the source of truth for a message's existence (the room's own timeline is, unaffected by any of this), and because
+ * the crawler -- resuming from its last surviving checkpoint -- will walk back over exactly the gap a crash left and
+ * re-index it with no user-visible difference from having written it the first time.
  */
 
 import { logger } from "matrix-js-sdk/src/logger";
@@ -625,6 +638,25 @@ const HYDRATION_SLICE_DEADLINE_MS = 30;
 const HYDRATION_KEY_ORDER = "ascending" as const;
 
 /**
+ * How long a live write may sit in {@link BrowserEventIndexManager.liveWriteBuffer} before {@link
+ * BrowserEventIndexManager.flushLiveWriteBufferNow} is called automatically; see {@link
+ * BrowserEventIndexManager.schedulePersistEvent}. This is also the upper bound on how much *live*
+ * (not crawler-batch) content a crash can lose that was not already lost before this increment --
+ * see the durability note on {@link BrowserEventIndexManager.schedulePersistEvent}.
+ */
+const LIVE_WRITE_FLUSH_INTERVAL_MS = 5000;
+
+/**
+ * Live writes accumulated past this count trigger an immediate flush rather than waiting for
+ * {@link LIVE_WRITE_FLUSH_INTERVAL_MS}, so a burst of live events (a fast-scrolling backfill of the
+ * live timeline, not the crawler) cannot grow the buffer unboundedly between timer firings. Chosen
+ * from `research/browser-limits-model.md` §4.2's measured transaction-size sweet spot of 200-500
+ * records per IndexedDB transaction (fable, Chromium 149: 0.65ms/event at 1/tx, 0.43ms/event at
+ * 100/tx); 300 sits inside that band.
+ */
+const LIVE_WRITE_BUFFER_MAX = 300;
+
+/**
  * Current time in milliseconds, monotonic where available. A one-line wrapper purely so every
  * hydration timing call site reads the same way; `performance` is present in every environment this
  * file runs in (every real browser, and happy-dom in the unit tests), so there is no fallback to
@@ -791,6 +823,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * getStats} falls back to {@link estimatePlainSize}.
      */
     private readonly recordBytes = new Map<string, number>();
+    /**
+     * Record ids whose current in-memory state has not yet been written to disk, for live writes; see {@link
+     * schedulePersistEvent}. Never holds a crawler-batch id: {@link addHistoricEvents} writes its whole batch as one
+     * transaction immediately rather than buffering it, so this exists only to coalesce *live* writes -- one
+     * `addEventToIndex` call at a time -- into fewer transactions than one per call.
+     */
+    private readonly liveWriteBuffer = new Set<string>();
+    /**
+     * The pending {@link LIVE_WRITE_FLUSH_INTERVAL_MS} timer that will call {@link flushLiveWriteBufferNow}, or null
+     * when {@link liveWriteBuffer} is empty or a flush has already been triggered by size. Armed once, by the first
+     * write into an empty buffer, and not rearmed by later writes before it fires -- see {@link schedulePersistEvent}
+     * for why that is what makes "at most every 5s" bound the buffer's *oldest* entry rather than debounce forever
+     * under sustained writes.
+     */
+    private flushTimer: ReturnType<typeof setTimeout> | null = null;
 
     /**
      * The tail of the serialised persistence chain; see {@link enqueuePersist}. Awaiting it means "every write
@@ -1100,9 +1147,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * be near-empty on a database that holds hundreds of thousands of rows, and the caller above needs the honest
      * answer the moment this resolves, not the eventual one. Falls back to the in-memory check when there is nothing
      * persisted to ask, which is also the one case {@link events} cannot disagree with reality about.
+     *
+     * Flushes {@link liveWriteBuffer} first, and awaits the persist chain, because this is the one caller for which
+     * "eventually on disk" is not good enough: a live event sitting in the buffer is real and resident in {@link
+     * events}, but until it is flushed the raw `getKey()` below cannot see it, and would answer "empty" about an
+     * index that plainly is not -- exactly the wrong answer for the one caller (`EventIndex.init`) that acts on it by
+     * re-seeding checkpoints for every room. Only {@link commitLiveEvents} and this method need to reach into disk
+     * state this way; every other reader below -- {@link searchEventIndex}, {@link loadCheckpoints}, {@link
+     * materializeIfPending} -- answers from memory alone and is unaffected by anything still sitting in the buffer;
+     * see each for why.
      */
     public async isEventIndexEmpty(): Promise<boolean> {
         if (!this.persistEnabled || !this.db || !this.userId) return this.events.size === 0;
+        this.flushLiveWriteBufferNow();
+        await this.persistChain;
         const tx = this.db.transaction("events", "readonly");
         const key = await idbReq(tx.objectStore("events").index("byUser").getKey(this.userId));
         return key === undefined;
@@ -1173,8 +1231,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * transaction and events are not searchable until it runs; here they are searchable the moment {@link
      * addEventToIndex} returns, so this only waits for the encrypted writes scheduled so far to have been attempted.
      * Never rejects, so awaiting the chain reports completion, not success.
+     *
+     * Also flushes {@link liveWriteBuffer} first ({@link flushLiveWriteBufferNow}): the buffer batches live writes
+     * across up to {@link LIVE_WRITE_FLUSH_INTERVAL_MS} or {@link LIVE_WRITE_BUFFER_MAX} events, so without this a
+     * caller could await an empty chain moments after `addEventToIndex` and see "done" while the write it asked about
+     * has not even been scheduled yet.
      */
     public async commitLiveEvents(): Promise<void> {
+        this.flushLiveWriteBufferNow();
         await this.persistChain;
     }
 
@@ -1187,6 +1251,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * a positional `rank`. Unlike Seshat there is no relevance scoring, phrase or field syntax, boolean operators or
      * stemming, and query cost is bounded by the number of *terms* in the index rather than by the number of events --
      * except on the substring fallback, which is linear in total indexed text.
+     *
+     * Never needs to flush {@link liveWriteBuffer} first: every structure this reads -- {@link events}, {@link
+     * inverted}, {@link roomOrder} -- is updated synchronously by {@link upsertEvent} the moment a live event is
+     * indexed, before {@link schedulePersistEvent} ever buffers anything for disk. A live event is therefore
+     * searchable immediately, seconds before its encrypted copy exists anywhere.
      *
      * @param searchArgs - `search_term` is the raw user input; `room_id` scopes the search; `order_by_recency` sorts
      *     newest first rather than leaving the index's own iteration order; `limit` is the page size, where a missing
@@ -1297,6 +1366,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * cleared. Ending the batch there and returning `false` is safe by the contract below -- it is exactly what an
      * empty batch or a shut labs gate already does.
      *
+     * Every record this call touches is written as **one IndexedDB transaction** rather than one per event: `dirty`
+     * collects the ids that actually changed while the loop below does its (synchronous) in-memory work, and only
+     * once the whole batch has been walked does {@link enqueueBatchedWrite} encrypt and `put()` all of them together.
+     * This is queued on {@link persistChain}, not awaited here, matching every write path in this class: the crawler
+     * gets its answer as soon as the in-memory state is settled, and the encrypted copy lands in the background. A
+     * crash between this call returning and that write landing loses at most this one batch's worth of history --
+     * acceptable because the checkpoint has not advanced yet either (still queued after this write on the same
+     * chain), so the next session's crawler simply re-fetches the same batch and re-derives the identical records.
+     *
      * @returns True only if every event in the batch was already indexed *and* nothing about it changed. The crawler
      *     uses this to stop crawling backwards through a room it has covered, so a false negative costs a redundant
      *     page while a false positive would silently truncate history. An empty batch returns false, as does one
@@ -1309,6 +1387,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     ): Promise<boolean> {
         if (this.closed || !this.featureEnabled()) return false;
         let allAlready = events.length > 0;
+        const dirty = new Set<string>();
         // Three cases per event, which is why this is not just a call to upsertEvent:
         //
         // 1. An unedited record for this id and a non-edit incoming event: the ordinary "seen it already" case. Text
@@ -1333,7 +1412,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     existing.hasFile = nextFile;
                     existing.event = incoming;
                     this.indexTokens(existing.eventId, nextText);
-                    this.schedulePersistEvent(id);
+                    dirty.add(id);
                     allAlready = false;
                 }
                 continue;
@@ -1343,15 +1422,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // schedules a persist, so it must clear the flag -- a batch made only of these would otherwise report
                 // "all already added" and end the back-fill.
                 this.upsertEvent(event, profile);
-                this.schedulePersistEvent(id);
+                dirty.add(id);
                 allAlready = false;
                 continue;
             }
             if (!existing) allAlready = false;
             else if (isReplace) allAlready = false;
             this.upsertEvent(event, profile);
-            this.schedulePersistEvent(id);
+            dirty.add(id);
         }
+        this.enqueueBatchedWrite(Array.from(dirty));
         if (oldCheckpoint) await this.removeCrawlerCheckpoint(oldCheckpoint);
         if (checkpoint) await this.addCrawlerCheckpoint(checkpoint);
         return allAlready;
@@ -1403,6 +1483,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * Every outstanding crawler position; see {@link BaseEventIndexManager.loadCheckpoints}. Served from memory, the
      * records having been decrypted once during {@link initEventIndex}. The array is copied because the caller keeps it
      * as its own work queue and shifts entries off it.
+     *
+     * Never needs to flush {@link liveWriteBuffer} first, unlike {@link isEventIndexEmpty}: {@link checkpoints} is
+     * updated synchronously by {@link addCrawlerCheckpoint}/{@link removeCrawlerCheckpoint} the moment either is
+     * called, never read from disk here, so nothing sitting unflushed in the *events* write buffer can make this
+     * answer stale.
      */
     public async loadCheckpoints(): Promise<ICrawlerCheckpoint[]> {
         return this.checkpoints.slice();
@@ -1449,6 +1534,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * teardown continues, since refusing to close would leave the keys in memory. The records stay on disk -- the point
      * of the distinction from {@link deleteEventIndex} -- inert without the pickle key.
      *
+     * "Queued writes are flushed first" now includes {@link liveWriteBuffer}: {@link flushLiveWriteBufferNow} is
+     * called, synchronously, before anything is awaited, cancelling the pending timer and enqueuing the buffer's
+     * contents onto {@link persistChain} under *this* session's still-live `userId`/`dek` -- so the `await` right
+     * after genuinely waits for everything this session ever asked to be written, not just what had already reached
+     * the chain by whatever moment {@link schedulePersistEvent} happened to be called.
+     *
      * If {@link hydrate} is still running, {@link resetMemory} below moves {@link hydrationEpoch} on and clears what
      * that run has built so far; the loop notices at its next resumption point and returns without touching {@link db}
      * (already closed by then) or leaving a transaction or a pending timer behind. Not awaited here -- see {@link
@@ -1456,6 +1547,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * production code has no such need.
      */
     public async closeEventIndex(): Promise<void> {
+        this.flushLiveWriteBufferNow();
         try {
             await this.persistChain;
         } catch (e) {
@@ -1476,6 +1568,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * preferred, the database being shared by every account that has used this origin, and dropping the whole thing is
      * the fallback. Failure is survivable: leftover ciphertext is unreadable without the pickle key, which `Lifecycle`
      * destroys on the same path.
+     *
+     * Unlike {@link closeEventIndex}, {@link liveWriteBuffer} is *discarded* here ({@link discardLiveWriteBuffer}),
+     * not flushed: everything on disk is about to be deleted anyway, so writing the buffer out first would only cost
+     * an encrypt-and-commit for content the next line removes. `this.closed = true` is set first, which is also what
+     * makes discarding rather than flushing safe against the timer having already fired: {@link flushLiveWrites}
+     * re-checks {@link closed} at the moment it actually runs, so even a flush that had raced ahead of this method --
+     * queued by the timer moments before this call, its op already appended to {@link persistChain} -- writes nothing
+     * once it gets there.
      */
     public async deleteEventIndex(): Promise<void> {
         const userId = this.userId;
@@ -1484,6 +1584,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // row back in.
         this.closed = true;
         this.persistEnabled = false;
+        this.discardLiveWriteBuffer();
         try {
             await this.persistChain;
         } catch (e) {
@@ -1691,6 +1792,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * need not check for emptiness). {@link recordBytes} is the exception, describing what is on *disk*, where the row
      * survives until the delete this caller queues has committed.
      *
+     * Also drops `eventId` from {@link liveWriteBuffer}, if it is there: a redaction or removal that raced a buffered,
+     * not-yet-flushed live write must win outright, not have that write land afterwards and resurrect what this call
+     * just removed from every other structure. This is a belt-and-suspenders removal rather than the only thing making
+     * that safe -- {@link flushLiveWrites} independently re-reads {@link events} for each id at flush time and skips
+     * any that are no longer there -- but dropping it here also keeps a redacted id from counting towards {@link
+     * LIVE_WRITE_BUFFER_MAX} for no reason.
+     *
      * @param eventId - A record id, not an edit's id; resolve that through {@link editTargets} first. Unknown ids are a
      *     no-op, and nothing here touches the database.
      */
@@ -1700,6 +1808,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.unindexTokens(eventId, existing.searchText);
         this.events.delete(eventId);
         this.foldedSearchText.delete(eventId);
+        this.liveWriteBuffer.delete(eventId);
         for (const editId of existing.editIds ?? []) this.editTargets.delete(editId);
         const list = this.roomOrder.get(existing.roomId);
         if (list) {
@@ -1863,31 +1972,137 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Queue an encrypted write of one record onto the persistence chain. The record is captured by reference and
-     * serialised only when its turn comes, so a message edited twice in quick succession is written once, in its final
-     * state; `userId` and the DEK are captured by value instead, so a write scheduled just before a logout cannot be
-     * redirected at another user's rows.
+     * Buffer a live write for {@link liveWriteBuffer}, flushed later as one batched IndexedDB transaction rather than
+     * opening a transaction per event -- see {@link flushLiveWriteBufferNow} and {@link flushLiveWrites}, and the
+     * class docstring's threat model for the durability trade-off this makes.
+     *
+     * **Durability semantics.** A crash (tab kill, OS kill, browser crash) before this buffer flushes loses at most
+     * the live events buffered since the last flush -- never more than {@link LIVE_WRITE_FLUSH_INTERVAL_MS} (5s) of
+     * wall time, and never more than {@link LIVE_WRITE_BUFFER_MAX} events, whichever bound is hit first. This is
+     * acceptable for the same reason a crash losing an in-flight crawler batch already was (see {@link
+     * addHistoricEvents}): this index is a derived, best-effort search structure, never the source of truth for
+     * whether a message exists -- the room's own timeline already has it, unaffected -- and the crawler, walking
+     * backwards from its last surviving checkpoint, will eventually re-index anything a live-buffer loss dropped, the
+     * same way it recovers from any other gap. Nothing here is more fragile than the crawler-batch case; it is only a
+     * few seconds wider.
+     *
+     * Only the id is buffered here, not a snapshot of the record: {@link flushLiveWrites} re-reads {@link events} for
+     * each id at flush time, so a message edited twice before its first flush is written once, in its final state --
+     * the same outcome the old per-event scheduling achieved by capturing the object by reference, just reached by
+     * re-fetching instead of holding a reference open.
      *
      * @param eventId - The *record* id, i.e. {@link targetId} of the event that arrived, never an edit's own id.
      */
     private schedulePersistEvent(eventId: string): void {
         if (!this.persistEnabled || !this.dek || !this.db || !this.userId) return;
-        const stored = this.events.get(eventId);
-        if (!stored) return;
+        if (!this.events.has(eventId)) return;
+        this.liveWriteBuffer.add(eventId);
+        if (this.liveWriteBuffer.size >= LIVE_WRITE_BUFFER_MAX) {
+            this.flushLiveWriteBufferNow();
+        } else if (this.flushTimer === null) {
+            // Armed only by the transition from empty to non-empty, and never rearmed by a later write while it is
+            // already pending: that is what bounds the *oldest* buffered write's age by this interval, rather than
+            // resetting on every write and never firing under sustained traffic (a debounce, which this must not be).
+            this.flushTimer = setTimeout(() => this.flushLiveWriteBufferNow(), LIVE_WRITE_FLUSH_INTERVAL_MS);
+        }
+    }
+
+    /**
+     * Cancel the pending flush timer, if any, and enqueue {@link liveWriteBuffer}'s current contents as one batched
+     * write ({@link enqueueBatchedWrite}) -- a no-op if the buffer is empty. Called by the timer itself, by {@link
+     * schedulePersistEvent} when the size threshold is hit, and by every path that must observe a live write before
+     * it proceeds: {@link commitLiveEvents}, {@link closeEventIndex}, {@link isEventIndexEmpty}.
+     */
+    private flushLiveWriteBufferNow(): void {
+        if (this.flushTimer !== null) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        if (this.liveWriteBuffer.size === 0) return;
+        const ids = Array.from(this.liveWriteBuffer);
+        this.liveWriteBuffer.clear();
+        this.enqueueBatchedWrite(ids);
+    }
+
+    /**
+     * Drop {@link liveWriteBuffer} without writing it, and cancel the pending timer. Used by {@link deleteEventIndex}
+     * (everything on disk is about to be wiped, so flushing first would only cost an encrypt-and-commit for content
+     * the next step removes) and by {@link resetMemory} (a defensive reset for every path that reaches it, in case a
+     * write somehow failed to flush on its way there).
+     */
+    private discardLiveWriteBuffer(): void {
+        if (this.flushTimer !== null) {
+            clearTimeout(this.flushTimer);
+            this.flushTimer = null;
+        }
+        this.liveWriteBuffer.clear();
+    }
+
+    /**
+     * Queue one encrypted, batched write of `ids` onto the persistence chain -- shared by the crawler-batch path
+     * ({@link addHistoricEvents}, which calls this once per batch, immediately) and the live-write buffer ({@link
+     * flushLiveWriteBufferNow}, which accumulates ids across calls first). `userId` and the DEK are captured here, at
+     * the point the write is queued, not read from `this` when {@link flushLiveWrites} finally runs -- the same
+     * reason the old per-event `schedulePersistEvent` always captured them this way: a write queued just before a
+     * logout or re-initialisation must still encrypt for the session that scheduled it.
+     */
+    private enqueueBatchedWrite(ids: string[]): void {
+        if (ids.length === 0) return;
+        if (!this.persistEnabled || !this.dek || !this.db || !this.userId) return;
         const userId = this.userId;
         const dek = this.dek;
-        this.enqueuePersist(async () => {
-            const blob = await encryptJson(dek, stored, `${userId}|${eventId}`);
-            const rec: EventRecord = { userId, eventId, blob };
-            const tx = this.db!.transaction("events", "readwrite");
-            tx.objectStore("events").put(rec);
-            await txDone(tx);
-            // Only once it has committed, and replacing this record's previous contribution
-            // rather than adding to it: this is a put, so a rewrite leaves one row, not two.
-            const bytes = ciphertextByteLength(blob.ct);
-            this.ciphertextBytes += bytes - (this.recordBytes.get(eventId) ?? 0);
-            this.recordBytes.set(eventId, bytes);
-        });
+        this.enqueuePersist(() => this.flushLiveWrites(userId, dek, ids));
+    }
+
+    /**
+     * Encrypt and write `ids` as **one** IndexedDB transaction: every value is prepared -- {@link events} re-read,
+     * {@link encryptJson} awaited -- entirely before the transaction below is opened, so the only `await` inside the
+     * live transaction is {@link txDone} itself, never a decrypt or encrypt that would let IndexedDB auto-close it out
+     * from underneath a later `put()` in the same batch. This is what turns "one transaction per event" into "one
+     * transaction per batch" for both callers of {@link enqueueBatchedWrite}.
+     *
+     * Re-reads {@link events} for each id rather than trusting a snapshot taken when the id was buffered: an id can
+     * have been deleted (a redaction racing a still-buffered write; see {@link removeFromIndex}) between being queued
+     * and this running, and `this.events.get(id)` being absent is exactly how that shows up here -- skipped rather
+     * than written, which is correct because the delete this class queues elsewhere for that same id is idempotent
+     * against a row that was never written in the first place.
+     *
+     * Sequential, not `Promise.all`-parallelised: that was tried and measured
+     * (`research/measurements-pr-b.md`) to make no difference at 200k events -- Chromium's
+     * WebCrypto AES-GCM path does not pipeline meaningfully faster for concurrently-issued calls
+     * here, so the extra combinator/filter code would be complexity with no payoff. What
+     * batching *does* buy is one `put()` transaction per batch instead of one per event; the
+     * remaining drain cost at scale is genuinely the encrypt work itself, not IndexedDB.
+     *
+     * @param userId - Captured by {@link enqueueBatchedWrite} at schedule time, not read from `this.userId`.
+     * @param dek - Captured by {@link enqueueBatchedWrite} at schedule time, not read from `this.dek`.
+     */
+    private async flushLiveWrites(userId: string, dek: CryptoKey, ids: string[]): Promise<void> {
+        // this.closed is re-checked here, not only at schedule time, to close one specific race: a flush queued by
+        // the live-write timer can still be sitting on the persist chain when closeEventIndex/deleteEventIndex begin
+        // tearing the session down. Both set `closed` before doing anything else, so a flush that reaches this point
+        // afterwards -- however it got queued -- writes nothing rather than reviving a session that has moved on.
+        if (this.closed || !this.db) return;
+        const records: EventRecord[] = [];
+        const sizes: Array<[string, number]> = [];
+        for (const id of ids) {
+            const stored = this.events.get(id);
+            if (!stored) continue; // Deleted since being buffered; nothing left to write.
+            const blob = await encryptJson(dek, stored, `${userId}|${id}`);
+            records.push({ userId, eventId: id, blob });
+            sizes.push([id, ciphertextByteLength(blob.ct)]);
+        }
+        if (records.length === 0) return;
+        const tx = this.db.transaction("events", "readwrite");
+        const store = tx.objectStore("events");
+        for (const rec of records) store.put(rec);
+        await txDone(tx);
+        // Only once the whole batch has committed, and replacing each record's previous contribution rather than
+        // adding to it: these are puts, so a rewrite leaves one row per id, not two.
+        for (const [id, bytes] of sizes) {
+            this.ciphertextBytes += bytes - (this.recordBytes.get(id) ?? 0);
+            this.recordBytes.set(id, bytes);
+        }
     }
 
     /**
@@ -2218,6 +2433,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * row concurrently, in which case {@link materializeOnce}'s in-flight de-duplication map no longer has an entry
      * for it by the time this resumes, and without this second check {@link materializeRow} would run a second time
      * and duplicate the id in {@link roomOrder}, which has no "already present?" check of its own).
+     *
+     * Never needs to flush {@link liveWriteBuffer} first, despite reading disk directly: this method only ever runs
+     * for an id *not yet* in {@link events} (the first line above), and every id in {@link liveWriteBuffer} is, by
+     * construction, already in {@link events} -- {@link schedulePersistEvent} is only ever reached after {@link
+     * upsertEvent} has added the record. The two sets are therefore always disjoint, so no id this method looks up on
+     * disk can ever be the one a buffered-but-not-yet-flushed write is about to change. (Calling
+     * {@link flushLiveWriteBufferNow} here anyway, defensively, would also be actively wrong: this runs once per
+     * event inside {@link addHistoricEvents}' own loop, so forcing a synchronous flush on every call would open one
+     * transaction per event again, exactly the cost this increment's batching exists to remove.)
      */
     private async materializeIfPending(targetId: string): Promise<void> {
         if (this.events.has(targetId)) return;
@@ -2333,6 +2557,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * resumption point instead of writing into the state this method is about to hand to a new one. Every caller of
      * this method (this class's own {@link initEventIndex}, {@link closeEventIndex}, {@link deleteEventIndex}) is
      * exactly a point where the previous hydration run, if any, must be treated as no longer owning anything.
+     *
+     * Also calls {@link discardLiveWriteBuffer}: every caller of this method is a point where {@link liveWriteBuffer}
+     * either has already been explicitly flushed ({@link closeEventIndex}) or explicitly discarded ({@link
+     * deleteEventIndex}) beforehand, so this is the defensive backstop that keeps a stray timer or a leftover id from
+     * surviving into whatever this method hands to next, not the primary mechanism for either case.
      */
     private async resetMemory(): Promise<void> {
         this.clearIndexMaps();
@@ -2341,6 +2570,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.persistChain = Promise.resolve();
         this.hydrating = false;
         this.hydrationEpoch++;
+        this.discardLiveWriteBuffer();
     }
 
     /**
