@@ -30,6 +30,7 @@ import {
     replacedEventId,
     tokenize,
     effectiveEventForIndex,
+    VOCABULARY_MERGE_THRESHOLD,
 } from "./BrowserEventIndexManager";
 
 const SEARCH_DEFAULTS = {
@@ -2669,6 +2670,196 @@ describe("BrowserEventIndexManager (increment B correctness: stats, prefix, subs
 
         mergeSpy.mockRestore();
     });
+
+    it("B1b (review-pr-b.md B2-F2): prefix parity holds once a real merge has populated the binary-searched base, and again for a fresh delta on top", async () => {
+        // review-pr-b.md B2-F2: no fixture anywhere in the suite crossed VOCABULARY_MERGE_THRESHOLD,
+        // so sortedVocabulary (the base, reached via vocabularyRange/lowerBoundVocabulary and the
+        // U+FFFF sentinel) was always empty in tests and every prefix answer came from the delta's
+        // plain startsWith scan -- silently regressing a sentinel-correctness mutant from killed to
+        // surviving. This test forces VOCABULARY_MERGE_THRESHOLD to actually be crossed, so the base
+        // is the structure under test, then re-probes with a further batch left unmerged on top.
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+
+        // A random, low-cardinality vocabulary, matching the existing parity test's approach, but
+        // large enough (60 words x enough events) to push comfortably past the threshold.
+        const alphabet = "abcdefghij";
+        const randomWord = (): string => {
+            const len = 3 + Math.floor(Math.random() * 4);
+            let w = "";
+            for (let i = 0; i < len; i++) w += alphabet[Math.floor(Math.random() * alphabet.length)];
+            return w;
+        };
+        const words = Array.from({ length: 60 }, randomWord);
+        // A deterministic pair, not drawn from the a-j alphabet above: "qzbase" is a genuine
+        // prefix of "qzbasez", and the character immediately following that prefix is 'z' itself.
+        // MB20 (the sentinel regression: prefix + "z" instead of prefix + "￿" as the upper
+        // range bound) excludes exactly this shape of term -- lowerBoundVocabulary(prefix + "z")
+        // lands exactly on "qzbasez", so the exclusive upper bound wrongly cuts it from its own
+        // prefix's result. An a-j-only vocabulary can never produce that failure, since "z" then
+        // sits above every real character and behaves just like the correct sentinel would.
+        words.push("qzbase", "qzbasez");
+        const roomId = "!b1b:example.org";
+        const bodies: string[] = [];
+        const addBody = async (i: number, body: string): Promise<void> => {
+            bodies[i] = body;
+            await manager.addEventToIndex(msg(`$b1b${i}`, body, { room_id: roomId, origin_server_ts: i }), {});
+        };
+        const referenceHits = (prefix: string): string[] =>
+            bodies
+                .map((body, i) =>
+                    body !== undefined && tokenize(body).some((t) => t.startsWith(prefix)) ? `$b1b${i}` : undefined,
+                )
+                .filter((id): id is string => id !== undefined);
+        const prefixes = new Set<string>();
+        for (const w of words) for (let len = 2; len <= w.length; len++) prefixes.add(w.slice(0, len));
+        const checkAllPrefixes = async (): Promise<void> => {
+            for (const prefix of prefixes) {
+                const expected = referenceHits(prefix).sort();
+                const hit = await manager.searchEventIndex(search(prefix, { limit: bodies.length + 100 }));
+                const actual = (hit.results ?? []).map((r) => r.result.event_id).sort();
+                expect(actual).toEqual(expected);
+            }
+        };
+
+        // Deterministic placement of the crafted pair (rather than leaving their presence to the
+        // random picks below, which include them but only probabilistically): guarantees both are
+        // in the base regardless of the RNG, so this test can never flake past MB20.
+        let n = 0;
+        await addBody(n++, "qzbase filler0");
+        await addBody(n++, "qzbasez filler1");
+
+        // Enough distinct one-off filler terms (guaranteed unique, unrelated to the parity probes)
+        // to force VOCABULARY_MERGE_THRESHOLD to be crossed by real vocabulary growth, exactly the
+        // way hydration or a long crawl would cross it -- not by reflection into a private field.
+        for (; n < VOCABULARY_MERGE_THRESHOLD + 100; n++) {
+            const pick = Array.from({ length: 3 }, () => words[Math.floor(Math.random() * words.length)]);
+            await addBody(n, [...pick, `zqfiller${n}`].join(" "));
+        }
+        await checkAllPrefixes(); // the base (post-merge) is correct
+
+        // A further, deliberately small batch left sitting in the unmerged delta on top of the
+        // now-populated base -- both halves of lookupToken's prefix path live and correct at once.
+        for (let extra = 0; extra < 40; extra++, n++) {
+            const pick = Array.from({ length: 3 }, () => words[Math.floor(Math.random() * words.length)]);
+            await addBody(n, [...pick, `zqfiller${n}`].join(" "));
+        }
+        await checkAllPrefixes();
+    });
+
+    it("B2-F3 (review-pr-b.md): a remove-then-re-add cycle does not leave duplicate terms in the merged vocabulary base", async () => {
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+
+        // Five add/redact cycles of one distinctive term, exactly as review-pr-b.md's B7u does:
+        // each re-add takes indexTokens' "new term" branch again, since the previous redaction
+        // deleted it from `inverted`, pushing the term onto pendingVocabulary again -- five
+        // occurrences so far, none of them live. A ghost check alone (dropping a term with no
+        // posting set left) would already remove all of these, so it can't tell the de-dup fix
+        // apart from a no-op: the case that actually distinguishes them is a *live* duplicate.
+        for (let cycle = 0; cycle < 5; cycle++) {
+            const id = `$zqghost${cycle}`;
+            await manager.addEventToIndex(msg(id, "zqghost distinctive term"), {});
+            expect((await manager.searchEventIndex(search("zqghost", { limit: 10 }))).count).toBe(1);
+            expect(await manager.deleteEvent(id)).toBe(true);
+            expect((await manager.searchEventIndex(search("zqghost", { limit: 10 }))).count).toBe(0);
+        }
+        // A sixth, final add that is never redacted: "zqghost" is genuinely live (present in
+        // `inverted`) at merge time, so the ghost check alone lets every one of its six pushed
+        // occurrences through, and only the de-dup-by-adjacent-comparison logic can still collapse
+        // them to the one live copy.
+        const liveId = "$zqghost5";
+        await manager.addEventToIndex(msg(liveId, "zqghost distinctive term"), {});
+        expect((await manager.searchEventIndex(search("zqghost", { limit: 10 }))).count).toBe(1);
+
+        // Force a merge with enough fresh, unrelated terms, then inspect the merged base directly:
+        // "zqghost" is live, so it must appear in the merged vocabulary exactly once, never more.
+        for (let i = 0; i < VOCABULARY_MERGE_THRESHOLD + 10; i++) {
+            await manager.addEventToIndex(msg(`$zqfiller${i}`, `zqfiller${i}`), {});
+        }
+        const base = (manager as unknown as { sortedVocabulary: string[] }).sortedVocabulary;
+        const pending = (manager as unknown as { pendingVocabulary: string[] }).pendingVocabulary;
+        const occurrencesIn = (list: string[]): number => list.filter((t) => t === "zqghost").length;
+        expect(occurrencesIn(base) + occurrencesIn(pending)).toBe(1);
+        // The base stays sorted throughout -- de-duplication must not disturb binary-search validity.
+        for (let i = 1; i < base.length; i++) expect(base[i - 1] < base[i]).toBe(true);
+        expect((await manager.searchEventIndex(search("zqghost", { limit: 10 }))).count).toBe(1);
+    });
+
+    it("B2-F1 (review-pr-b.md): a vocabulary merge due mid-hydration is deferred to a safe point, not run inside a row's own task", async () => {
+        // White-box check of the mechanism indexTokens' deferMerge parameter and hydrate's own
+        // flushVocabularyMergeIfDue calls implement: seeded directly, bypassing hydration, to
+        // isolate the parameter's own behaviour from timing-dependent slice/page boundaries.
+        await manager.initEventIndex(userId, DEVICE);
+        await manager.waitForHydration();
+        const internal = manager as unknown as {
+            indexTokens: (eventId: string, text: string, deferMerge?: boolean) => void;
+            sortedVocabulary: string[];
+            pendingVocabulary: string[];
+            flushVocabularyMergeIfDue: () => void;
+        };
+
+        for (let i = 0; i < VOCABULARY_MERGE_THRESHOLD + 5; i++) {
+            internal.indexTokens(`$defer${i}`, `zqdefer${i}`, true); // deferMerge: true throughout
+        }
+        // Over threshold, but deferred: no merge has happened yet.
+        expect(internal.sortedVocabulary.length).toBe(0);
+        expect(internal.pendingVocabulary.length).toBe(VOCABULARY_MERGE_THRESHOLD + 5);
+
+        internal.flushVocabularyMergeIfDue();
+        // The safe point hydrate() calls: now it has happened, exactly once, and drained the delta.
+        expect(internal.sortedVocabulary.length).toBe(VOCABULARY_MERGE_THRESHOLD + 5);
+        expect(internal.pendingVocabulary.length).toBe(0);
+    });
+
+    it("B2-F1 (review-pr-b.md): a real, multi-slice hydration run crossing the threshold ends with a correctly merged vocabulary", async () => {
+        // Crossing VOCABULARY_MERGE_THRESHOLD (2,000) for real, rather than by reflection, needs
+        // 2,000+ hydrated rows; a generous explicit timeout keeps that comfortably clear of the
+        // default budget on a loaded CI box, on top of what slowDownDecrypt below already adds.
+        // End-to-end companion to the white-box test above: a real hydration run, slowed down so
+        // it genuinely spans several slices and page-boundary yields (the two points hydrate()
+        // flushes a deferred merge from), seeded with enough distinct terms to cross
+        // VOCABULARY_MERGE_THRESHOLD purely through materializeRow's own deferred indexTokens
+        // calls. Uses IndexedDB backing (unlike this describe's usual no-persistence setup) so
+        // there is something to hydrate from.
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue("unit-test-pickle-key") });
+        const seedManager = new BrowserEventIndexManager();
+        await seedManager.initEventIndex(userId, DEVICE);
+        await seedManager.waitForHydration();
+        const total = VOCABULARY_MERGE_THRESHOLD + 60;
+        for (let i = 0; i < total; i++) {
+            await seedManager.addEventToIndex(msg(`$hydb2f1-${i}`, `zqhydb2f1term${i}`), {});
+        }
+        await seedManager.commitLiveEvents();
+        await seedManager.closeEventIndex();
+
+        // 1ms/row is plenty: at HYDRATION_SLICE_DEADLINE_MS=30 it still forces a yield roughly
+        // every ~20-30 rows, so 2,060 rows cross dozens of slices and both page boundaries.
+        const restore = slowDownDecrypt(1);
+        try {
+            const reloaded = new BrowserEventIndexManager();
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+            try {
+                expect((await reloaded.getStats()).eventCount).toBe(total);
+                const base = (reloaded as unknown as { sortedVocabulary: string[] }).sortedVocabulary;
+                const pending = (reloaded as unknown as { pendingVocabulary: string[] }).pendingVocabulary;
+                // The merge ran (the base is populated), the delta is small (below threshold, whatever
+                // was left over after the last merge), and every term is searchable regardless of
+                // which half of lookupToken's prefix path answers it.
+                expect(base.length).toBeGreaterThan(0);
+                expect(pending.length).toBeLessThan(VOCABULARY_MERGE_THRESHOLD);
+                const hit = await reloaded.searchEventIndex(search("zqhydb2f1term", { limit: total + 10 }));
+                expect(hit.count).toBe(total);
+            } finally {
+                await reloaded.closeEventIndex();
+            }
+        } finally {
+            restore();
+            await seedManager.closeEventIndex();
+        }
+    }, 30000);
 });
 
 /**

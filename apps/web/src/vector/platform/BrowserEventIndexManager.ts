@@ -698,10 +698,20 @@ const LIVE_WRITE_BUFFER_MAX = 300;
  * choice buys is dominated by the same O(V) merge pass regardless -- a fixed threshold just makes how often that
  * pass runs a constant the reader can see directly rather than one they have to compute. At the corpus's own
  * Heaps'-law rate (~0.15 new terms/event at V=61k, n=200k, `research/browser-limits-model.md` §6.1), this merges
- * roughly once per 13,000 indexed events; each merge is one linear pass over the whole vocabulary (a few ms at
- * V=200k, `research/measurements-pr-b.md` §5), never inside a query.
+ * roughly once per 13,000 indexed events; each merge is one linear pass over the whole vocabulary --
+ * **measured at 17.28ms median at V=200,000** (`research/measurements-pr-b.md` §5.4; review-pr-b.md's B2-F1
+ * found an earlier revision of this comment cited "a few ms", which was never a real measurement and was wrong),
+ * growing to ~44ms at V=400,000 and ~65ms at V=600,000 -- long enough that {@link
+ * BrowserEventIndexManager.hydrate} never lets it run as part of a per-row task; see {@link
+ * BrowserEventIndexManager.indexTokens}'s `deferMerge` parameter. Never inside a query, regardless.
+ *
+ * @knipignore - exported so a test can seed a fixture that actually crosses this threshold rather than
+ * duplicating the number (`research/review-pr-b.md` B2-F2: no fixture in the suite used to reach 2,000 distinct
+ * terms, so {@link BrowserEventIndexManager.mergeVocabularyDelta} never ran in a test and the binary-searched
+ * *base* half of the prefix path -- as opposed to the linearly-scanned delta -- was dead code, which silently
+ * regressed a mutant from killed to surviving).
  */
-const VOCABULARY_MERGE_THRESHOLD = 2000;
+export const VOCABULARY_MERGE_THRESHOLD = 2000;
 
 /**
  * Current time in milliseconds, monotonic where available. A one-line wrapper purely so every
@@ -1920,19 +1930,44 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * Pushes a *new* term (one not already in {@link inverted}'s key set) onto {@link pendingVocabulary} rather than
      * re-sorting {@link sortedVocabulary} from scratch; merges that delta into the base, in one bounded O(V) pass,
      * once it reaches {@link VOCABULARY_MERGE_THRESHOLD} ({@link mergeVocabularyDelta}) -- on this write path, never
-     * as a side effect of a read. See `pendingVocabulary`'s own docstring for the incident this replaced.
+     * as a side effect of a read. See `pendingVocabulary`'s own docstring for the incident this replaced. The
+     * threshold check runs once per call, after the whole batch of terms in `text` has been pushed, rather than
+     * immediately at each push: that is what makes a merge fire even when a call's *own* terms are all already
+     * known (nothing new pushed this call) but an *earlier* call already left {@link pendingVocabulary} at or past
+     * the threshold -- otherwise a run of live events that happen to reuse only existing terms could leave a
+     * deferred merge (see `deferMerge` below) sitting unflushed indefinitely.
+     *
+     * @param deferMerge - When true, a merge that is due is *not* triggered here even if the delta has reached the
+     *     threshold; the caller takes on the responsibility of triggering it later, at a point it controls. The only
+     *     caller that passes `true` is {@link materializeRow}, from inside {@link hydrate}'s per-row loop
+     *     (`research/review-pr-b.md` B2-F1): a merge is a single synchronous task of up to tens of milliseconds at
+     *     realistic V (17ms measured at V=200,000, `research/measurements-pr-b.md` §5.4), and `hydrate`'s own
+     *     {@link HYDRATION_SLICE_DEADLINE_MS} accounting only checks *after* each row -- so a merge landing inside a
+     *     row's own processing would inflate that row's task by the merge's full cost, invisibly to the slice
+     *     budget, before the next check ever ran. `hydrate` instead flushes a deferred merge itself, only at a point
+     *     already outside any row's own task (see {@link flushVocabularyMergeIfDue}).
      */
-    private indexTokens(eventId: string, text: string): void {
+    private indexTokens(eventId: string, text: string, deferMerge = false): void {
         for (const token of tokenize(text)) {
             let set = this.inverted.get(token);
             if (!set) {
                 set = new Set();
                 this.inverted.set(token, set);
                 this.pendingVocabulary.push(token);
-                if (this.pendingVocabulary.length >= VOCABULARY_MERGE_THRESHOLD) this.mergeVocabularyDelta();
             }
             set.add(eventId);
         }
+        if (!deferMerge) this.flushVocabularyMergeIfDue();
+    }
+
+    /**
+     * Merge {@link pendingVocabulary} into {@link sortedVocabulary} if it has reached {@link
+     * VOCABULARY_MERGE_THRESHOLD} -- otherwise a no-op. The one gate between "the delta is due for a merge" and
+     * "the merge actually runs", so that {@link indexTokens}'s `deferMerge` path and {@link hydrate}'s own
+     * between-rows call site both go through the identical decision rather than each re-implementing it.
+     */
+    private flushVocabularyMergeIfDue(): void {
+        if (this.pendingVocabulary.length >= VOCABULARY_MERGE_THRESHOLD) this.mergeVocabularyDelta();
     }
 
     /**
@@ -2051,10 +2086,25 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * then merge two sorted sequences), replacing the O(V log V) full re-sort this class used to do on every prefix
      * query once any write had touched the vocabulary (`research/review-pr-b.md` B-F1: measured at 25ms at V=61,346,
      * 107ms at V=200,000 -- run on *every* keystroke during hydration or a crawler batch, since both dirty the
-     * vocabulary on nearly every write). Called only from {@link indexTokens}, only once {@link pendingVocabulary}
-     * reaches {@link VOCABULARY_MERGE_THRESHOLD} -- a write-path decision, never triggered by a read, so a query never
-     * pays this cost as a side effect of asking a question. A no-op if the delta is empty (defensive; the one caller
-     * never invokes this with an empty delta, but nothing here assumes that).
+     * vocabulary on nearly every write). Callers decide *when*, never a query: see {@link indexTokens}'s
+     * `deferMerge` parameter for why a call from inside {@link hydrate}'s per-row loop is not one of them, despite
+     * {@link pendingVocabulary} having reached {@link VOCABULARY_MERGE_THRESHOLD}. A no-op if the delta is empty.
+     *
+     * Two things happen while merging that neither stream needs sorted-and-deduplicated going in, only coming out:
+     *
+     * - **Duplicates are dropped** (`research/review-pr-b.md` B2-F3): a term can appear in {@link pendingVocabulary}
+     *   more than once if it is removed from {@link inverted} (its posting set empties) and later re-added before a
+     *   merge ever runs -- {@link indexTokens} re-pushes it every time, having no way to know it is already pending.
+     *   Since both `base` and the sorted `delta` are duplicate-free *within* themselves (by induction: every previous
+     *   merge already deduplicated `base`, and a term cannot be pushed onto `delta` twice without an intervening
+     *   removal, which cannot itself duplicate a sorted array), any duplicate in the merged output is necessarily
+     *   adjacent to the value that produced it, so comparing only against the immediately preceding output element
+     *   is sufficient -- no separate dedup pass or Set is needed.
+     * - **Ghosts are garbage-collected**: a term whose posting set is gone (checked against {@link inverted}, the
+     *   source of truth) is dropped rather than carried into the merged base. Nothing else ever removes a ghost --
+     *   {@link unindexTokens} deliberately does not touch either vocabulary structure -- so this is the one place
+     *   sustained add/redact churn on a term (URLs, hashes, code identifiers: exactly what `tokenize` is most
+     *   generous about keeping) does not inflate every subsequent merge's V for the rest of the session.
      */
     private mergeVocabularyDelta(): void {
         if (this.pendingVocabulary.length === 0) return;
@@ -2065,11 +2115,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         let i = 0;
         let j = 0;
         let k = 0;
+        const take = (term: string): void => {
+            if (!this.inverted.has(term)) return; // Ghost: no posting set left; do not carry it forward.
+            if (k > 0 && merged[k - 1] === term) return; // Duplicate of the value just accepted; drop it.
+            merged[k++] = term;
+        };
         while (i < base.length && j < delta.length) {
-            merged[k++] = base[i] <= delta[j] ? base[i++] : delta[j++];
+            if (base[i] <= delta[j]) take(base[i++]);
+            else take(delta[j++]);
         }
-        while (i < base.length) merged[k++] = base[i++];
-        while (j < delta.length) merged[k++] = delta[j++];
+        while (i < base.length) take(base[i++]);
+        while (j < delta.length) take(delta[j++]);
+        merged.length = k;
         this.sortedVocabulary = merged;
         this.pendingVocabulary.length = 0;
     }
@@ -2441,6 +2498,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * moment either has moved on. That is what makes teardown and re-initialisation safe against a hydration run left
      * over from a previous session: see {@link resetMemory}, which is what moves the epoch on.
      *
+     * Each row's own {@link materializeRow} indexes with {@link indexTokens}' `deferMerge` set, so a vocabulary merge
+     * that becomes due mid-row never runs as part of that row's task (`research/review-pr-b.md` B2-F1: the merge
+     * alone can cost tens of milliseconds at realistic V, and {@link HYDRATION_SLICE_DEADLINE_MS}'s own accounting
+     * only checks *after* a row completes, so it would otherwise inflate one row's task by the merge's full cost,
+     * invisibly). This loop flushes a deferred merge itself instead, at the two points already outside any row's own
+     * task: right after a slice's {@link yieldToEventLoop} and at each page boundary.
+     *
      * A row whose id is already in {@link events} is skipped rather than overwritten: a live event or a crawler batch
      * that named this id got there first and is authoritative (see {@link materializeIfPending}, which is what a write
      * path calls to pull a not-yet-hydrated row in early instead of racing this loop for it), so the disk copy this
@@ -2511,10 +2575,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                         longestSliceMs = Math.max(longestSliceMs, elapsedInSlice);
                         await yieldToEventLoop();
                         if (this.closed || epoch !== this.hydrationEpoch) return;
+                        // A safe point for the merge every row's own indexTokens() call deferred (B2-F1):
+                        // outside any row's own task, right after a real yield, so its own tens-of-milliseconds
+                        // cost is never added on top of one already in progress.
+                        this.flushVocabularyMergeIfDue();
                         sliceStart = now();
                     }
                 }
                 longestSliceMs = Math.max(longestSliceMs, now() - sliceStart);
+                // A second safe point, for a page that ends without ever crossing the slice deadline (a small
+                // last page, most commonly): otherwise a deferred merge could sit unflushed until whatever
+                // live write happens to come along next -- see flushVocabularyMergeIfDue's own caller in
+                // indexTokens, which only re-checks when *something* is indexed, not on a timer.
+                this.flushVocabularyMergeIfDue();
 
                 if (rows.length < HYDRATION_PAGE_SIZE) break;
             }
@@ -2594,7 +2667,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.events.set(stored.eventId, stored);
         this.plainTextByteEstimate += stored.searchText.length + 64;
         for (const editId of stored.editIds ?? []) this.editTargets.set(editId, stored.eventId);
-        this.indexTokens(stored.eventId, stored.searchText);
+        // deferMerge: true -- see indexTokens' docstring. hydrate()'s own loop flushes a deferred merge
+        // at its next safe point (a page boundary or a slice yield), never inside this row's own task.
+        this.indexTokens(stored.eventId, stored.searchText, true);
         this.insertRoomOrder(stored);
         const bytes = ciphertextByteLength(row.blob.ct);
         this.recordBytes.set(stored.eventId, bytes);
