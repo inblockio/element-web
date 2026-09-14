@@ -847,6 +847,11 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         await manager.closeEventIndex();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
+        // Backstop for review-pr-d.md D3-F2: a test that forgets to clear its own
+        // setChunkTargetBytesOverrideForTesting() override must not leak the chunk size into
+        // every later test in the file.
+        setChunkTargetBytesOverrideForTesting(null);
+        setEventIndexBoundsOverrideForTesting(null);
     });
 
     describe("the no-plaintext-in-IndexedDB guard (IV-1)", () => {
@@ -1619,6 +1624,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             await reloaded.closeEventIndex();
         } finally {
             materializeSpy.mockRestore();
+            setChunkTargetBytesOverrideForTesting(null); // review-pr-d.md D3-F2: this leaked past this test otherwise.
         }
     });
 
