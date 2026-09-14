@@ -5530,34 +5530,53 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         expect(survivors.has("$st1")).toBe(true); // now the newest -- must not be the one dropped
     });
 
-    it("the disk budget evicting the currently-open chunk resets it, so the next write allocates a fresh one (kills M13)", async () => {
-        setChunkTargetBytesOverrideForTesting(100_000); // stays open across every write below
+    it("the disk budget evicting the chunk it is currently appending to, within the same session, resets openChunkId so the next write allocates a fresh one (review-pr-d.md D3-F4, kills M13)", async () => {
+        // review-pr-d.md D3-F4: the previous version of this test closed and reopened the manager
+        // before tightening the budget, so `openChunkId` (never persisted -- see MetaRecord's own
+        // docstring) was `undefined` in the reloaded session and the reset branch under test was
+        // unreachable the whole time. This version never closes the manager: the eviction has to
+        // hit the chunk the live session is still appending to.
+        setChunkTargetBytesOverrideForTesting(150); // one event per chunk, roughly: seals immediately
         const m = track(new BrowserEventIndexManager());
         await m.initEventIndex(userId, DEVICE);
         await m.waitForHydration();
-        await m.addEventToIndex(msg("$oc1", "zqopenchunkbody", { origin_server_ts: 1 }), {});
+
+        // A sealed chunk with a HIGH maxTs -- must not be the one evicted below.
+        await m.addEventToIndex(msg("$ocHigh", "zqopenchunkbody high", { origin_server_ts: 9000 }), {});
         await m.commitLiveEvents();
-        const before = await m.getStats();
         expect(await dumpRawStore("chunks")).toHaveLength(1);
-        await m.closeEventIndex();
 
+        // Raise the target so the next writes stay in the fresh chunk this last seal just opened,
+        // rather than sealing it too, and give it a LOW maxTs -- lower than the sealed chunk's --
+        // so eviction-by-ascending-maxTs picks this one first even though it is the open one.
+        setChunkTargetBytesOverrideForTesting(100_000);
+        await m.addEventToIndex(msg("$ocLow", "zqopenchunkbody low", { origin_server_ts: 100 }), {});
+        await m.commitLiveEvents(); // generous default budget still in force: nothing evicted yet
+        expect(await dumpRawStore("chunks")).toHaveLength(2);
+        const before = await m.getStats();
+
+        // Tightened between commits, read live by the next flush's own enforceDiskBudget call --
+        // no close/reopen needed for a bounds override to take effect.
         setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.max(1, before.size - 1) });
-        const reloaded = track(new BrowserEventIndexManager());
-        await reloaded.initEventIndex(userId, DEVICE);
-        await reloaded.waitForHydration();
-        expect(await dumpRawStore("chunks")).toHaveLength(0); // the one and only (open) chunk was evicted
+        // This write packs into the still-open, still-under-target chunk holding $ocLow, and its own
+        // commit's flushLiveWrites -> enforceDiskBudget call is what evicts that chunk -- while it is
+        // still `this.openChunkId` -- taking $ocLow and this event down with it.
+        await m.addEventToIndex(msg("$ocLower", "zqopenchunkbody lower", { origin_server_ts: 50 }), {});
+        await m.commitLiveEvents();
+        expect(await dumpRawStore("chunks")).toHaveLength(1); // only the high-maxTs sealed chunk survives
+        const survivingIds = (await decryptAllChunkEvents(pickleKey!, DEVICE)).map((r: any) => r.eventId);
+        expect(survivingIds).toEqual(["$ocHigh"]);
 
-        // Budget raised back to generous before the next write: flushLiveWrites enforces the disk
-        // budget after every commit, and a budget still sized for $oc1's own footprint would evict
-        // $oc2's chunk the instant it lands too, confounding what this test actually checks (that
-        // the *next* write allocates a fresh chunk id rather than appending to the deleted one).
+        // Budget raised back to generous before the next write: a budget still sized for the
+        // surviving chunk's own footprint would evict the fresh chunk the instant it lands too,
+        // confounding what this test actually checks.
         setEventIndexBoundsOverrideForTesting(null);
-        await reloaded.addEventToIndex(msg("$oc2", "zqopenchunkbody two", { origin_server_ts: 2 }), {});
-        await reloaded.commitLiveEvents();
+        await m.addEventToIndex(msg("$ocNew", "zqopenchunkbody new", { origin_server_ts: 2 }), {});
+        await m.commitLiveEvents();
         const rows = await decryptAllChunkEvents(pickleKey!, DEVICE);
-        // A fresh chunk, containing only the new event -- not the old chunk id resurrected with
-        // stale accounting, and not $oc1 coming back from the dead.
-        expect(rows.map((r: any) => r.eventId)).toEqual(["$oc2"]);
+        // A fresh chunk, containing only the new event, alongside the untouched survivor -- not the
+        // deleted chunk id resurrected with stale accounting, and not the evicted events coming back.
+        expect(new Set(rows.map((r: any) => r.eventId))).toEqual(new Set(["$ocHigh", "$ocNew"]));
     });
 
     it("a chunk's AAD binds it to its own chunkId; ciphertext copied under another id fails to decrypt (kills M20)", async () => {
