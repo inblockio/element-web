@@ -2375,12 +2375,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const needsMoreThanHot = requestedOffset + limit > hotCount;
         const diskHasColdContent = this.manifest.size > this.events.size;
 
+        // The hot slice for *this page* -- computed before the cold scan, not just before building
+        // `pageItems` below, because how much cold content this call needs to look for depends on it:
+        // asking the scan for more than the page can absorb would find genuine matches this call then
+        // has nowhere to put, and -- since the resume cursor advances to wherever the scan actually
+        // stopped -- those over-fetched matches would be skipped as "already emitted" by a later page
+        // that never actually saw them. Bounding `need` to exactly this page's remaining room is what
+        // keeps the resume cursor's position exactly aligned with what was actually served.
+        const hotSlice = requestedOffset < hotHits.length ? hotHits.slice(requestedOffset, requestedOffset + limit) : [];
+
         let coldHits: Array<{ stored: StoredEvent; context: ColdContext }> = [];
         let chunkIdx = cursor.chunkIdx;
         let within = cursor.within;
         let coldExhausted = cursor.coldExhausted;
         if (needsMoreThanHot && hotCount < pageCap && diskHasColdContent && !coldExhausted && !this.closed) {
-            const need = pageCap - hotCount - alreadyHaveCold;
+            const coldNeededForPage = limit - hotSlice.length;
+            const coldRoomUnderCap = pageCap - hotCount - alreadyHaveCold;
+            const need = Math.min(coldNeededForPage, coldRoomUnderCap);
             if (need > 0) {
                 const resident = new Set(hotHits.map((h) => h.eventId));
                 const scan = await this.coldSearchScan({
@@ -2404,20 +2415,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         }
         const coldTouchedThisQuery = alreadyHaveCold > 0 || coldHits.length > 0 || coldExhausted;
 
-        // Build this page from whichever of hot/cold it needs -- possibly both, for the one page that straddles the
-        // boundary between them.
-        const pageItems: Array<{ stored: StoredEvent; coldContext?: ColdContext }> = [];
-        if (requestedOffset < hotHits.length) {
-            for (const stored of hotHits.slice(requestedOffset, requestedOffset + limit)) {
-                pageItems.push({ stored });
-            }
-        }
-        const stillNeeded = limit - pageItems.length;
-        if (stillNeeded > 0 && coldHits.length > 0) {
-            const coldSliceStart = Math.max(0, requestedOffset - hotCount - alreadyHaveCold);
-            for (const hit of coldHits.slice(coldSliceStart, coldSliceStart + stillNeeded)) {
-                pageItems.push({ stored: hit.stored, coldContext: hit.context });
-            }
+        // This page: the hot slice already computed above, plus every cold hit this call's own scan
+        // found -- `coldHits` is never larger than this page's own remaining room (`need` above), so
+        // no further slicing is needed to fit it; it is still bounded defensively rather than
+        // trusted, in case a future change to the scan's own stopping condition ever overshoots.
+        const pageItems: Array<{ stored: StoredEvent; coldContext?: ColdContext }> = hotSlice.map((stored) => ({
+            stored,
+        }));
+        for (const hit of coldHits.slice(0, limit - pageItems.length)) {
+            pageItems.push({ stored: hit.stored, coldContext: hit.context });
         }
 
         const totalKnown = hotCount + alreadyHaveCold + coldHits.length;
@@ -2427,12 +2433,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // docstring for why it is a last-search stats signal, not a per-result one.
         this.searchPartial = coldTouchedThisQuery && !coldExhausted && totalKnown >= pageCap;
 
-        let next_batch: string | undefined;
-        if (nextOffset < totalKnown || (coldTouchedThisQuery && !coldExhausted && totalKnown >= pageCap)) {
-            next_batch = coldTouchedThisQuery
-                ? this.encodeSearchCursor({ offset: nextOffset, hotCount, chunkIdx, within, coldExhausted })
-                : String(nextOffset); // legacy bare-decimal format; nothing here ever touched the cold tier.
-        }
+        // A page this call's cold tier never touched keeps the exact pre-increment-E, uncapped
+        // pagination contract (`offset + page.length < hits.length`, `hits.length` here being
+        // `hotHits.length`) -- nothing about a purely-resident query changes.
+        //
+        // Once the cold tier is involved, `next_batch` is offered *optimistically* whenever this page
+        // came back completely full (`limit` items) and the page cap has not yet been reached: this
+        // call's own `need` is bounded to what *this* page needed, so a full page does not by itself
+        // prove more exists (unlike the pre-increment-E, unbounded-count case) -- the next call's own
+        // scan is what settles that, either finding more (another full-or-partial page) or coming back
+        // short (a page under `limit`, which stops offering a token, ending the query there). This is
+        // the trade this increment makes for keeping a resumed scan's position exactly aligned with
+        // what was actually served (see `hotSlice`'s own comment above): at most one extra, possibly
+        // short, round trip at the very end of a query's content, never a wrong or skipped result.
+        const next_batch = !coldTouchedThisQuery
+            ? nextOffset < hotHits.length
+                ? String(nextOffset)
+                : undefined
+            : pageItems.length === limit && totalKnown < pageCap
+              ? this.encodeSearchCursor({ offset: nextOffset, hotCount, chunkIdx, within, coldExhausted })
+              : undefined;
 
         const results = pageItems.map((item, i) => {
             const context = item.coldContext ?? this.contextFor(item.stored, beforeLimit, afterLimit);

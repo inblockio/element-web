@@ -5668,3 +5668,346 @@ describe("BrowserEventIndexManager (increment D: chunks)", () => {
         }
     });
 });
+
+/**
+ * Increment E: the streamed cold-tier scan (`research/SYNTHESIS.md` §3.4/§7 decision #3 -- old
+ * retained messages stay findable, found slower, never lost). Every record here shares one body
+ * token so a search for it doubles as "which ids does this query find", the same convention
+ * increment C's own describe block uses.
+ */
+describe("BrowserEventIndexManager (increment E: cold tier)", () => {
+    const DEVICE = "DEVICE1";
+    const pickleKey = "unit-test-pickle-key";
+    const ROOM = "!coldtier:example.org";
+    const ROOM2 = "!coldtier2:example.org";
+    const BODY_TOKEN = "zqcoldmarker";
+
+    let userCounter = 0;
+    let userId: string;
+    let toClose: BrowserEventIndexManager[] = [];
+
+    const search = (term: string, overrides: Record<string, unknown> = {}): any =>
+        ({ search_term: term, ...SEARCH_DEFAULTS, ...overrides }) as any;
+
+    /** ids ascending == ts ascending, the newest last -- same convention as increment C's budgetCorpus. */
+    function corpus(n: number, room: string = ROOM, prefix = "$e"): any[] {
+        return Array.from({ length: n }, (_unused, i) =>
+            msg(`${prefix}${String(i).padStart(3, "0")}`, `${BODY_TOKEN} body ${i}`, {
+                room_id: room,
+                origin_server_ts: 1_000_000 + i,
+            }),
+        );
+    }
+    const idAt = (i: number, prefix = "$e"): string => `${prefix}${String(i).padStart(3, "0")}`;
+
+    function track(m: BrowserEventIndexManager): BrowserEventIndexManager {
+        toClose.push(m);
+        return m;
+    }
+
+    /** Every currently-*resident* id, read directly off the private structure -- see increment C's own residentIds. */
+    function residentIds(m: BrowserEventIndexManager): Set<string> {
+        return new Set((m as unknown as { events: Map<string, unknown> }).events.keys());
+    }
+
+    beforeEach(() => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        userId = `@coldtier${++userCounter}:example.org`;
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue(pickleKey) });
+        toClose = [];
+    });
+
+    afterEach(async () => {
+        setEventIndexBoundsOverrideForTesting(null);
+        setChunkTargetBytesOverrideForTesting(null);
+        for (const m of toClose.splice(0)) await m.closeEventIndex();
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    /** Seed `n` events with a generous budget, close, then reopen under a tight `hotWindowBytes`. */
+    async function seedAndReopen(
+        hotWindowBytes: number,
+        n: number,
+        room: string = ROOM,
+        corpusFn: (n: number, room: string) => any[] = corpus,
+    ): Promise<BrowserEventIndexManager> {
+        setEventIndexBoundsOverrideForTesting(null);
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (const ev of corpusFn(n, room)) {
+            await seed.addEventToIndex(ev, {});
+            await seed.commitLiveEvents();
+        }
+        await seed.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes });
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+        return reloaded;
+    }
+
+    it("returns cold hits newest-first after the hot hits, deduplicated against the resident set", async () => {
+        const N = 12;
+        const reloaded = await seedAndReopen(RESIDENT_BYTES_PER_EVENT_ESTIMATE * 3, N);
+        const resident = residentIds(reloaded);
+        expect(resident.size).toBeGreaterThan(0);
+        expect(resident.size).toBeLessThan(N); // genuinely a mixed hot/cold corpus
+
+        const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N }));
+        expect(hit.count).toBe(N); // every event found, hot plus cold
+        const ids = resultIds(hit);
+        expect(new Set(ids).size).toBe(ids.length); // no duplicates: dedup against the resident set held
+
+        // Every hot (resident) id precedes every cold (non-resident) one.
+        const lastResidentIdx = Math.max(...ids.map((id, i) => (resident.has(id) ? i : -1)));
+        const firstColdIdx = ids.findIndex((id) => !resident.has(id));
+        expect(firstColdIdx).toBeGreaterThan(lastResidentIdx);
+
+        // The cold segment itself is newest-first.
+        const coldTs = ids.slice(firstColdIdx).map((id) => Number(id.slice(2)));
+        for (let i = 1; i < coldTs.length; i++) {
+            expect(coldTs[i]).toBeLessThanOrEqual(coldTs[i - 1]);
+        }
+    });
+
+    it("page cap and resume cursor continue exactly: two pages cover exactly 2x limit, no overlap, no gap", async () => {
+        const N = 10;
+        const reloaded = await seedAndReopen(1, N); // ~1 resident; everything else must come from the cold scan
+        const limit = 3; // SEARCH_PAGE_CAP = 2*limit = 6 < N: the scan must stop short of the whole corpus.
+
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.results).toHaveLength(limit);
+        expect(page1.next_batch).toBeDefined();
+        // count is "known so far", not the eventual cap total: each call's own cold scan looks for
+        // only as much as *that page* needs (never more, so a resumed page can never skip content
+        // its own predecessor over-fetched and never served -- see searchEventIndex's own comment on
+        // `hotSlice`), so page 1 alone knows only its own `limit` worth of hits.
+        expect(page1.count).toBe(limit);
+
+        const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        expect(page2.results).toHaveLength(limit);
+        expect(page2.count).toBe(2 * limit); // capped at SEARCH_PAGE_CAP by the second page, not the true total (N)
+        expect(page2.next_batch).toBeUndefined(); // the cap was reached; no third page is offered
+
+        const combined = [...resultIds(page1), ...resultIds(page2)];
+        expect(new Set(combined).size).toBe(2 * limit); // no overlap between the two pages
+        // Resuming picked up exactly where page 1 left off -- the newest 2*limit ids overall, with
+        // nothing skipped and nothing repeated.
+        const expectedNewest = new Set(Array.from({ length: 2 * limit }, (_unused, i) => idAt(N - 1 - i)));
+        expect(new Set(combined)).toEqual(expectedNewest);
+    });
+
+    it("isSearchPartial is true only while the scan was actually cut at the page cap", async () => {
+        const smallCorpus = 4;
+        const bigCorpus = 10;
+
+        // A query the cold tier never needs to touch at all: never partial.
+        const allHot = track(new BrowserEventIndexManager());
+        await allHot.initEventIndex(userId, DEVICE);
+        await allHot.waitForHydration();
+        for (const ev of corpus(smallCorpus)) {
+            await allHot.addEventToIndex(ev, {});
+            await allHot.commitLiveEvents();
+        }
+        await allHot.searchEventIndex(search(BODY_TOKEN, { limit: smallCorpus }));
+        expect((await allHot.getStats()).isSearchPartial).toBe(false);
+        await allHot.closeEventIndex();
+
+        // A cold-tier query that finds everything (fewer matches than the cap): not partial.
+        userId = `@coldtier${++userCounter}:example.org`;
+        const exhausted = await seedAndReopen(1, smallCorpus);
+        await exhausted.searchEventIndex(search(BODY_TOKEN, { limit: smallCorpus }));
+        expect((await exhausted.getStats()).isSearchPartial).toBe(false);
+
+        // A cold-tier query cut at the cap: partial once enough pages have actually been fetched to
+        // reach it (each call's own scan is bounded to that page's own need -- see the page-cap test
+        // above -- so the flag only goes true after paging up to SEARCH_PAGE_CAP, not after page 1 alone).
+        userId = `@coldtier${++userCounter}:example.org`;
+        const capped = await seedAndReopen(1, bigCorpus);
+        const limit = 2; // SEARCH_PAGE_CAP = 4 < bigCorpus
+        const first = await capped.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect((await capped.getStats()).isSearchPartial).toBe(false); // not yet -- only page 1 so far
+        await capped.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: first.next_batch }));
+        expect((await capped.getStats()).isSearchPartial).toBe(true);
+
+        // And it clears again once a later query is satisfied without being cut.
+        await capped.searchEventIndex(search(BODY_TOKEN, { limit: bigCorpus }));
+        expect((await capped.getStats()).isSearchPartial).toBe(false);
+    });
+
+    it("a new search cancels an older one's still-running cold-tier scan", async () => {
+        setChunkTargetBytesOverrideForTesting(60); // one event per chunk: plenty of chunks to walk
+        const N = 20;
+        const reloaded = await seedAndReopen(1, N);
+        const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+        let calls = 0;
+        const spy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+            calls++;
+            await new Promise<void>((resolve) => setTimeout(resolve, 15));
+            return realDecrypt(...(args as Parameters<typeof realDecrypt>));
+        });
+        try {
+            const stale = reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N })); // wants ~N chunks
+            await sleep(20); // let a couple of chunk decrypts actually happen
+            expect(calls).toBeGreaterThan(0); // sanity: the stale scan genuinely started
+
+            await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: 1 })); // supersedes it
+            await stale; // let the stale call's promise settle either way; must not hang or throw
+
+            // An uncancelled scan would keep decrypting toward all N chunks; a cancelled one stops
+            // within a couple of chunks of wherever it was pre-empted.
+            expect(calls).toBeLessThan(N - 2);
+        } finally {
+            spy.mockRestore();
+        }
+    });
+
+    it("a room-scoped search finds only that room's events, even though chunks interleave rooms", async () => {
+        setChunkTargetBytesOverrideForTesting(150); // several small chunks
+        setEventIndexBoundsOverrideForTesting(null);
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        const N = 6;
+        for (let i = 0; i < N; i++) {
+            await seed.addEventToIndex(
+                msg(idAt(i, "$ra"), `${BODY_TOKEN} a ${i}`, { room_id: ROOM, origin_server_ts: 1_000_000 + i }),
+                {},
+            );
+            await seed.commitLiveEvents(); // interleaved, one flush per event, so rooms share chunks
+            await seed.addEventToIndex(
+                msg(idAt(i, "$rb"), `${BODY_TOKEN} b ${i}`, { room_id: ROOM2, origin_server_ts: 2_000_000 + i }),
+                {},
+            );
+            await seed.commitLiveEvents();
+        }
+        await seed.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes: 1 }); // force everything cold
+        const reloaded = track(new BrowserEventIndexManager());
+        await reloaded.initEventIndex(userId, DEVICE);
+        await reloaded.waitForHydration();
+
+        const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { room_id: ROOM, limit: N + 5 }));
+        const ids = resultIds(hit);
+        expect(ids).toHaveLength(N);
+        for (const id of ids) expect(id.startsWith("$ra")).toBe(true);
+    });
+
+    it("context for a cold hit comes from its own chunk's neighbouring records", async () => {
+        setChunkTargetBytesOverrideForTesting(100_000); // generous: the whole corpus in one chunk
+        const N = 5;
+        const reloaded = await seedAndReopen(1, N); // everything but the newest ends up cold
+        const hit = await reloaded.searchEventIndex(
+            search(BODY_TOKEN, { limit: N, before_limit: 1, after_limit: 1 }),
+        );
+        expect(hit.count).toBe(N);
+        const middle = hit.results!.find((r: any) => r.result.event_id === idAt(2));
+        expect(middle).toBeDefined();
+        expect(middle!.context.events_before.map((e: any) => e.event_id)).toEqual([idAt(1)]);
+        expect(middle!.context.events_after.map((e: any) => e.event_id)).toEqual([idAt(3)]);
+        expect(Object.keys(middle!.context.profile_info)).toContain("@alice:example.org");
+    });
+
+    it("scan during hydration does not double-return or miss events", async () => {
+        setChunkTargetBytesOverrideForTesting(250); // several chunks
+        const N = 12;
+        setEventIndexBoundsOverrideForTesting(null);
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (const ev of corpus(N)) {
+            await seed.addEventToIndex(ev, {});
+            await seed.commitLiveEvents();
+        }
+        await seed.closeEventIndex();
+
+        setEventIndexBoundsOverrideForTesting({ hotWindowBytes: RESIDENT_BYTES_PER_EVENT_ESTIMATE * 3 });
+        const restore = slowDownDecrypt(15);
+        try {
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            // Wait for hydration to have genuinely admitted something -- but not everything -- before
+            // searching, so the manifest is loaded (diskHasColdContent needs it) and the search below
+            // is guaranteed to land mid-hydration rather than possibly racing initEventIndex's own
+            // return. hydrate() itself is still admitting further chunks in the background while the
+            // search runs, its own decrypts interleaving with the cold scan's own (a live hydrate()
+            // admission and the cold scan both call decryptChunkOnce, which shares an in-flight
+            // decrypt for the same chunk -- see coldSearchScan's own docstring on why this must not
+            // double-return or miss events).
+            while (true) {
+                const stats = await reloaded.getStats();
+                if (stats.eventCount > 0 && stats.eventCount < N) break;
+                await sleep(4);
+            }
+            const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N }));
+            const ids = resultIds(hit);
+            expect(new Set(ids).size).toBe(ids.length); // never double-returned
+            expect(hit.count).toBeGreaterThan(0);
+            expect(hit.count).toBeLessThanOrEqual(N); // never over-counted either
+
+            await reloaded.waitForHydration();
+            const full = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N }));
+            expect(full.count).toBe(N); // and nothing was permanently missed
+            expect(new Set(resultIds(full)).size).toBe(N);
+        } finally {
+            restore();
+        }
+    });
+
+    it("a chunk deleted mid-scan (as the disk budget would) is skipped, not thrown", async () => {
+        setChunkTargetBytesOverrideForTesting(120); // several small, distinct chunks
+        const N = 8;
+        const reloaded = await seedAndReopen(1, N);
+        const rows = await dumpRawStore("chunks");
+        expect(rows.length).toBeGreaterThan(1); // sanity: genuinely more than one chunk to walk
+
+        const restore = slowDownDecrypt(20);
+        try {
+            // Raw-delete one chunk's row directly, mid-scan (the slowed decrypts above give a real
+            // window) -- simulating what the disk budget's own eviction does (deletes the whole
+            // chunk row outright); readChunkEntries cannot tell the two apart, and coldSearchScan
+            // must treat the resulting empty read as "skip this chunk", never throw.
+            const victim = rows[Math.floor(rows.length / 2)];
+            const del = withRawDb(
+                (db) =>
+                    new Promise<void>((resolve, reject) => {
+                        const req = db
+                            .transaction("chunks", "readwrite")
+                            .objectStore("chunks")
+                            .delete([victim.userId, victim.chunkId]);
+                        req.onsuccess = (): void => resolve();
+                        req.onerror = (): void => reject(req.error);
+                    }),
+            );
+            const searchPromise = reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N }));
+            await del;
+            const hit = await searchPromise; // must resolve, not throw or hang
+            const ids = resultIds(hit);
+            expect(new Set(ids).size).toBe(ids.length); // still no duplicates
+            expect(hit.count).toBeLessThan(N); // the deleted chunk's own members are genuinely gone now
+        } finally {
+            restore();
+        }
+    });
+
+    it("a live redaction does not resurrect via the cold-tier scan before its disk rewrite lands", async () => {
+        setChunkTargetBytesOverrideForTesting(100_000); // one chunk
+        const N = 4;
+        const reloaded = await seedAndReopen(1, N); // ~1 resident, the rest cold
+        const restore = slowDownDecrypt(30); // widens the window before the deletion's own rewrite lands
+        try {
+            const target = idAt(0); // the oldest, certainly cold
+            expect(await reloaded.deleteEvent(target)).toBe(true);
+            // No commitLiveEvents()/await here: enqueueDeleteRecord's own disk rewrite is still queued.
+            const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N }));
+            expect(resultIds(hit)).not.toContain(target);
+        } finally {
+            restore();
+        }
+    });
+});
