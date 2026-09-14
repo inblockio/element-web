@@ -68,6 +68,17 @@ export default class EventIndex extends EventEmitter {
 
     /**
      * A list of checkpoints which are awaiting processing by the crawler, once it has done with `currentCheckpoint`.
+     *
+     * Processed FIFO (`shift`/`push`), which is round-robin across rooms but not breadth-first *by
+     * week* the way SYNTHESIS.md §3.5 (element-meta#3252's recommendation) would prefer. That
+     * reordering was evaluated for this increment and deferred rather than implemented here: a
+     * checkpoint carries only an opaque, server-assigned pagination `token` (see {@link
+     * ICrawlerCheckpoint}) with no notion of "how many weeks back" it represents, so ordering by
+     * week would need either a schema change recording each room's crawl progress as a timestamp
+     * (increment D's chunked schema territory; the same limitation {@link
+     * BrowserEventIndexManager}'s `HYDRATION_KEY_ORDER` already documents for hydration order) or an
+     * extra request per checkpoint just to *learn* its age before deciding where to queue it,
+     * neither of which fits in a small, current-schema change. FIFO is left as is.
      */
     private crawlerCheckpoints: ICrawlerCheckpoint[] = [];
 
@@ -149,12 +160,18 @@ export default class EventIndex extends EventEmitter {
             Boolean(await client.getCrypto()?.isEncryptionEnabledInRoom(room.roomId)),
         );
 
+        // Ranked by the client's own recency (Room.getLastActiveTimestamp()) -- Element's stated
+        // policy of crawling the most recently active rooms first -- because on a fresh index none
+        // of these rooms has any crawled history of its own yet for the manager to rank by itself;
+        // see BaseEventIndexManager.shouldCrawl's `clientRoomRank` param (review-pr-c.md C-F4).
+        const rankedRooms = [...encryptedRooms].sort((a, b) => b.getLastActiveTimestamp() - a.getLastActiveTimestamp());
+
         this.logger.debug("addInitialCheckpoints: starting");
 
         // Gather the prev_batch tokens and create checkpoints for
         // our message crawler.
         await Promise.all(
-            encryptedRooms.map(async (room): Promise<void> => {
+            rankedRooms.map(async (room, rank): Promise<void> => {
                 const timeline = room.getLiveTimeline();
                 const token = timeline.getPaginationToken(Direction.Backward);
 
@@ -163,6 +180,18 @@ export default class EventIndex extends EventEmitter {
                     return;
                 }
                 this.logger.debug(`addInitialCheckpoints: Adding initial checkpoints for room ${room.roomId}`);
+
+                // Same crawl bound as crawlerFunc's own check, consulted here too so a room the
+                // manager would decline never gets a checkpoint persisted for it in the first
+                // place. Checked once per room: both directions share the same bound.
+                if (
+                    !(await indexManager.shouldCrawl(
+                        { roomId: room.roomId, token, direction: Direction.Backward },
+                        rank,
+                    ))
+                ) {
+                    return;
+                }
 
                 const backCheckpoint: ICrawlerCheckpoint = {
                     roomId: room.roomId,
@@ -475,13 +504,28 @@ export default class EventIndex extends EventEmitter {
                 this.emitNewCheckpoint();
             }
 
+            // Drain checkpoints outside the crawl bound (BaseEventIndexManager.shouldCrawl) before
+            // the sleep below, not one per loop iteration: declining is handled the same way as
+            // having caught up with this room's history (the checkpoint is removed, not retried,
+            // so it does not spin), but paying the sleep between each decline cost roughly two
+            // crawlerSleepTimes per out-of-bound room, head-of-line-blocking every in-bound
+            // checkpoint behind a possibly large declined backlog (review-pr-c.md C-F4).
+            let checkpoint = this.crawlerCheckpoints.shift();
+            while (checkpoint !== undefined && !(await indexManager.shouldCrawl(checkpoint))) {
+                this.logger.debug("Declining checkpoint outside the crawl bound", JSON.stringify(checkpoint));
+                try {
+                    await indexManager.removeCrawlerCheckpoint(checkpoint);
+                } catch (e) {
+                    this.logger.warn(`Error removing declined checkpoint ${JSON.stringify(checkpoint)}:`, e);
+                }
+                checkpoint = this.crawlerCheckpoints.shift();
+            }
+
             await sleep(sleepTime);
 
             if (cancelled) {
                 break;
             }
-
-            const checkpoint = this.crawlerCheckpoints.shift();
 
             /// There is no checkpoint available currently, one may appear if
             // a sync with limited room timelines happens, so go back to sleep.

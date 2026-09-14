@@ -60,6 +60,72 @@ export interface IIndexStats {
     size: number;
     eventCount: number;
     roomCount: number;
+    /**
+     * True while historic events are still being decrypted and loaded from disk into memory, in
+     * the background, after {@link BaseEventIndexManager.initEventIndex} has already returned;
+     * false once nothing more is pending (including immediately, if there was never anything to
+     * load). `eventCount`/`roomCount`/`size` above are always answered from what is resident right
+     * now, so they climb while this is true rather than reporting the eventual total early. Optional
+     * because a backend that restores synchronously, such as desktop's Seshat, has nothing to report
+     * here and every caller must treat "not present" the same as `false`.
+     */
+    loading?: boolean;
+    /**
+     * True once a crawl bound (a recency window or a room cap) or a byte budget (the resident hot
+     * window or the on-disk footprint) has excluded or dropped something that would otherwise be
+     * indexed. Optional and absent means "not windowed" (or "backend does not track this"), the
+     * same convention as {@link loading}. Drives {@link SearchWarning}'s "Search covers messages
+     * newer than {date}" line together with {@link oldestIndexedTs}.
+     */
+    windowed?: boolean;
+    /**
+     * The oldest event timestamp (`origin_server_ts`, epoch ms) this backend still guarantees is
+     * covered on disk, or `undefined` while nothing is known yet. Only ever moves *forward* (more
+     * recent) when something bounded is dropped, and *backward* (older) when an older event is
+     * newly discovered -- never a promise that this is the literal oldest surviving row, only that
+     * nothing older than it is guaranteed findable. See `BrowserEventIndexManager`'s docstring on
+     * its own field of the same name for why a backend bounded by disk space cannot always know the
+     * exact figure without a full scan.
+     */
+    oldestIndexedTs?: number;
+    /**
+     * A floor on the oldest event timestamp currently *resident* (hydrated into memory), or
+     * `undefined` while nothing is resident or the backend does not track this: the same
+     * guarantee-floor reading as {@link oldestIndexedTs}, not necessarily the literal minimum.
+     * Expected, but not contractually guaranteed by this interface, to read `>= oldestIndexedTs`
+     * when both are known -- everything resident is necessarily also on disk (or on its way there).
+     */
+    oldestResidentTs?: number;
+    /**
+     * The answer from a one-time `navigator.storage.persist()` request made when this backend's
+     * index was first created, or `undefined` if it was never asked (no such API, a backend that
+     * does not use it, or a session that opened an index created earlier and so never re-asked).
+     * Informational only for the settings UI; nothing reads this to change behaviour.
+     */
+    storagePersisted?: boolean;
+    /**
+     * Estimated resident bytes of this backend's own recency-tracking bookkeeping (review-pr-c.md
+     * C2-F2), if it keeps one -- `undefined` for a backend that does not, the same convention as
+     * {@link loading}. Counted *inside* {@link size}'s own budget accounting where applicable (see
+     * `BrowserEventIndexManager`'s own field of this name), not a separate allowance; surfaced here
+     * purely so the settings UI, or a future proof step, can see how much of the resident budget
+     * this bookkeeping -- as opposed to actual indexed content -- currently accounts for.
+     */
+    manifestBytes?: number;
+    /**
+     * True while the most recent {@link BaseEventIndexManager.searchEventIndex} call's streamed
+     * scan of on-disk content beyond the resident set was cut short -- by a wall-time budget, or
+     * simply by there being more content than fit on this one page -- rather than exhausting every
+     * on-disk chunk; i.e. more matches may exist than were returned, findable by asking for another
+     * page (`next_batch`). `undefined`/absent means "not tracked" (a backend
+     * with no such scan, e.g. desktop's Seshat, or a browser session before any search has run),
+     * the same convention as {@link loading}; `false` means the most recent search's scan, if any,
+     * ran to completion (or never needed to run at all). This is a *global*, last-search signal
+     * rather than a per-result one -- {@link IResultRoomEvents} (matrix-js-sdk's own type) is not
+     * this class's to extend -- which is why {@link SearchWarning} polls it the same way it already
+     * polls {@link loading}.
+     */
+    isSearchPartial?: boolean;
 }
 
 /**
@@ -220,6 +286,28 @@ export default abstract class BaseEventIndexManager {
      */
     public async addCrawlerCheckpoint(checkpoint: ICrawlerCheckpoint): Promise<void> {
         throw new Error("Unimplemented");
+    }
+
+    /**
+     * Whether the crawler should still spend a request crawling `checkpoint`, or decline it; see
+     * {@link EventIndex.crawlerFunc} (consulted before every `createMessagesRequest`) and {@link
+     * EventIndex.addInitialCheckpoints} (consulted before a fresh checkpoint is even persisted).
+     * The default is always yes: only a manager enforcing a crawl bound -- a recency window, a room
+     * cap -- needs to say no, and declining is handled by the caller exactly like having crawled to
+     * completion: the checkpoint is removed, not retried, so a manager that returns `false` must
+     * not also expect to see this checkpoint again.
+     *
+     * @param checkpoint The checkpoint about to be crawled.
+     * @param clientRoomRank The checkpoint's room's 0-based rank in the *client's* own recency
+     *     order (`Room.getLastActiveTimestamp()`), supplied only by {@link
+     *     EventIndex.addInitialCheckpoints} for a fresh index, whose checkpoints have no crawled
+     *     history of their own yet to rank by (review-pr-c.md C-F4). `undefined` from every other
+     *     caller. A manager must not consult `MatrixClientPeg` itself to get this signal -- it is
+     *     passed in for exactly that reason.
+     * @returns `true` to proceed as before; `false` to decline it.
+     */
+    public async shouldCrawl(checkpoint: ICrawlerCheckpoint, clientRoomRank?: number): Promise<boolean> {
+        return true;
     }
 
     /**
