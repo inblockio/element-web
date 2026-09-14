@@ -41,6 +41,7 @@ import {
 import {
     DAY_MS,
     setChunkTargetBytesOverrideForTesting,
+    setColdScanBudgetMsOverrideForTesting,
     setEventIndexBoundsOverrideForTesting,
 } from "./eventIndexBounds";
 
@@ -5721,6 +5722,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
     afterEach(async () => {
         setEventIndexBoundsOverrideForTesting(null);
         setChunkTargetBytesOverrideForTesting(null);
+        setColdScanBudgetMsOverrideForTesting(null);
         for (const m of toClose.splice(0)) await m.closeEventIndex();
         vi.unstubAllGlobals();
         vi.restoreAllMocks();
@@ -5866,6 +5868,178 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         // And it clears again once a later query is satisfied without being cut.
         await capped.searchEventIndex(search(BODY_TOKEN, { limit: bigCorpus }));
         expect((await capped.getStats()).isSearchPartial).toBe(false);
+    });
+
+    it("E-F3: continues through the remaining hot hits and into the cold tier -- 2*limit+5 resident, 5 on disk, all reachable", async () => {
+        // The old gate (`hotCount < pageCap`) declined the cold tier forever once >=2*limit hits
+        // were resident, on every page, including the page where hot hits actually ran out and the
+        // remaining room could only be filled from disk. Element's own SEARCH_LIMIT=10 made this any
+        // query with >=20 resident matches -- reproduced here with exactly that shape.
+        setChunkTargetBytesOverrideForTesting(100_000); // a handful of chunks: not what this test targets
+        const limit = 10;
+        const residentCount = 2 * limit + 5; // 25
+        const coldCount = 5;
+        const N = residentCount + coldCount; // 30
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (const ev of corpus(N)) {
+            await seed.addEventToIndex(ev, {});
+            await seed.commitLiveEvents(); // persist every one, so all 30 are genuinely on disk
+        }
+        // Demote the oldest `coldCount` ids out of residency directly: everything above was already
+        // persisted, so this reproduces "25 resident, 5 on-disk-only" without depending on the
+        // hot-window byte estimate to land on an exact count.
+        const asAny = seed as unknown as { events: Map<string, unknown> };
+        for (let i = 0; i < coldCount; i++) asAny.events.delete(idAt(i));
+        expect(residentIds(seed).size).toBe(residentCount);
+
+        const walked: string[] = [];
+        let nextBatch: string | undefined;
+        let guard = 0;
+        do {
+            const page = await seed.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+            walked.push(...resultIds(page));
+            nextBatch = page.next_batch;
+        } while (nextBatch !== undefined && ++guard < 10);
+
+        expect(new Set(walked).size).toBe(N); // every one of the 30 reachable, no duplicates
+        expect(new Set(walked)).toEqual(new Set(Array.from({ length: N }, (_unused, i) => idAt(i))));
+        // Newest-first throughout: hot precedes cold structurally, and each tier is itself
+        // newest-first, so the whole walk is the corpus's own newest-first order end to end.
+        const expectedOrder = Array.from({ length: N }, (_unused, i) => idAt(N - 1 - i));
+        expect(walked).toEqual(expectedOrder);
+    });
+
+    it("E-F1: a live message sealing a new chunk between pages does not repeat page 1 on page 2", async () => {
+        // review-pr-e.md's R1/R1b: openChunkId is undefined after every reopen, so a fresh session's
+        // very first live message always allocates a new chunk, which the old chunkIdx-based cursor
+        // saw as a shift of every later position by one. The new cursor resumes by chunk id and
+        // event id, both unaffected by another chunk existing.
+        setChunkTargetBytesOverrideForTesting(400);
+        const N = 12;
+        const reloaded = await seedAndReopen(1, N);
+        const limit = 2;
+
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.next_batch).toBeDefined();
+        const page1Ids = resultIds(page1);
+
+        // A live, non-matching message arrives: openChunkId is undefined after reopen, so this
+        // seals a brand-new chunk at the newest position of the walk.
+        await reloaded.addEventToIndex(
+            msg("$live1", "unrelated live content", { room_id: ROOM, origin_server_ts: 5_000_000 }),
+            {},
+        );
+        await reloaded.commitLiveEvents();
+
+        const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        const page2Ids = resultIds(page2);
+
+        expect(page2Ids).not.toEqual(page1Ids); // page 2 must not just repeat page 1 verbatim
+        const combined = [...page1Ids, ...page2Ids];
+        expect(new Set(combined).size).toBe(combined.length); // and nothing served twice either
+    });
+
+    it("E-F1: the chunk a resume cursor points at being disk-budget-deleted between pages falls back cleanly", async () => {
+        // The chunk named by the cursor's chunkId hint can itself be gone by the time a later page
+        // resumes (the disk budget evicted it) -- the walk must fall back to the first chunk whose
+        // own maxTs is <= the boundary, never throw, and never duplicate or silently skip everything
+        // after it.
+        setChunkTargetBytesOverrideForTesting(150); // several small, distinct chunks
+        const N = 14;
+        const reloaded = await seedAndReopen(1, N);
+        const limit = 2;
+
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.next_batch).toBeDefined();
+        const page1Ids = resultIds(page1);
+
+        // Raw-delete every chunk row: the resume chunk is certainly among them, simulating the disk
+        // budget dropping it (and others) between pages. readChunkEntries treats a missing row as an
+        // empty chunk regardless of cause; coldSearchScan must fall back to a fresh walk position by
+        // value rather than throw or hang on a now-nonexistent chunkId hint.
+        const rows = await dumpRawStore("chunks");
+        expect(rows.length).toBeGreaterThan(1);
+        await withRawDb(
+            (db) =>
+                new Promise<void>((resolve, reject) => {
+                    const tx = db.transaction("chunks", "readwrite");
+                    for (const row of rows) tx.objectStore("chunks").delete([row.userId, row.chunkId]);
+                    tx.oncomplete = (): void => resolve();
+                    tx.onerror = (): void => reject(tx.error);
+                }),
+        );
+
+        const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        const page2Ids = resultIds(page2); // must resolve, not throw or hang
+
+        const combined = [...page1Ids, ...page2Ids];
+        expect(new Set(combined).size).toBe(combined.length); // no duplicates even with every chunk gone
+    });
+
+    it("E-F1: an event already served as a hot hit being evicted from residency before a later page does not resurrect it", async () => {
+        // A resident event this query already served on page 1 (via the hot tier) can be evicted
+        // (demoted out of `events`) by the time a later page's cold scan runs. The cold-tier walk
+        // only ever proceeds forward from its own resume position, never re-visiting a chunk newer
+        // than where it stopped, so an item already served and now merely evicted must not resurface.
+        setChunkTargetBytesOverrideForTesting(400);
+        const N = 10;
+        const reloaded = await seedAndReopen(RESIDENT_BYTES_PER_EVENT_ESTIMATE, N); // ~1 resident
+        const limit = 2; // > resident count, so page 1's hot slice does not fill the page and cold is touched
+        const residentBefore = residentIds(reloaded);
+        expect(residentBefore.size).toBeGreaterThan(0);
+
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.next_batch).toBeDefined();
+        const page1Ids = resultIds(page1);
+        const servedHotId = page1Ids.find((id) => residentBefore.has(id));
+        expect(servedHotId).toBeDefined(); // sanity: page 1 genuinely included a hot hit
+
+        // Evict it directly, the same way the resident (hot-window) budget would.
+        const asAny = reloaded as unknown as { events: Map<string, unknown> };
+        asAny.events.delete(servedHotId!);
+
+        const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        const combined = [...page1Ids, ...resultIds(page2)];
+        expect(new Set(combined).size).toBe(combined.length); // the evicted id is not served a second time
+    });
+
+    it("COLD_SCAN_BUDGET_MS: a miss query exhausting the budget returns a resume position instead of scanning everything", async () => {
+        // A query matching nothing cannot stop early on `need` (its only other stopping condition is
+        // "chunk walk exhausted"), so without a bound it decrypts every remaining chunk in one call.
+        setChunkTargetBytesOverrideForTesting(60); // one event per chunk: several chunks to walk
+        setColdScanBudgetMsOverrideForTesting(5); // tiny budget: must stop within a couple of chunks
+        try {
+            const N = 20;
+            const reloaded = await seedAndReopen(1, N);
+
+            let fakeMs = 0;
+            const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => {
+                fakeMs += 3; // each call advances the fake clock, so the budget check trips deterministically
+                return fakeMs;
+            });
+            let missNextBatch: string | undefined;
+            try {
+                const miss = await reloaded.searchEventIndex(search("zqnomatch", { limit: 10 }));
+                expect(miss.results).toEqual([]);
+                expect(miss.count).toBe(0);
+                // Budget-cut, not exhausted: a resume token must still be offered, so a later page can
+                // continue rather than the query silently ending with disk content left unscanned.
+                expect(miss.next_batch).toBeDefined();
+                missNextBatch = miss.next_batch;
+            } finally {
+                nowSpy.mockRestore();
+            }
+
+            // The next page resumes and, with the fake clock restored to real time, finishes the walk.
+            const page2 = await reloaded.searchEventIndex(
+                search("zqnomatch", { limit: 10, next_batch: missNextBatch }),
+            );
+            expect(page2.results).toEqual([]);
+        } finally {
+            setColdScanBudgetMsOverrideForTesting(null);
+        }
     });
 
     it("a new search cancels an older one's still-running cold-tier scan", async () => {

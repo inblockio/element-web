@@ -2797,13 +2797,25 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         let curBoundaryTs = opts.boundaryTs;
         for (let ci = startCi; ci < walk.length; ci++) {
             if (this.closed || this.searchEpoch !== opts.epoch) {
-                return { hits, chunkId: walk[ci]?.chunkId, boundaryId: curBoundaryId, boundaryTs: curBoundaryTs, exhausted: false };
+                return {
+                    hits,
+                    chunkId: walk[ci]?.chunkId,
+                    boundaryId: curBoundaryId,
+                    boundaryTs: curBoundaryTs,
+                    exhausted: false,
+                };
             }
             if (now() - budgetStart >= budgetMs) {
                 // The miss-cost bound (review recommendation): return what we have, positioned exactly at this
                 // chunk, rather than decrypting every remaining chunk in one call -- the next page's own call
                 // resumes here. Not `exhausted`: there is genuinely more left to look at.
-                return { hits, chunkId: walk[ci].chunkId, boundaryId: curBoundaryId, boundaryTs: curBoundaryTs, exhausted: false };
+                return {
+                    hits,
+                    chunkId: walk[ci].chunkId,
+                    boundaryId: curBoundaryId,
+                    boundaryTs: curBoundaryTs,
+                    exhausted: false,
+                };
             }
 
             const chunkId = walk[ci].chunkId;
@@ -2838,7 +2850,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 if (anchorIdx >= 0) {
                     skipUntilIdx = anchorIdx + 1;
                 } else if (opts.boundaryTs !== undefined) {
-                    skipUntilIdx = orderedIds.findIndex((id) => (entries.get(id)?.originServerTs ?? 0) < opts.boundaryTs!);
+                    skipUntilIdx = orderedIds.findIndex(
+                        (id) => (entries.get(id)?.originServerTs ?? 0) < opts.boundaryTs!,
+                    );
                     if (skipUntilIdx === -1) skipUntilIdx = orderedIds.length;
                 }
             }
@@ -2883,11 +2897,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 if (now() - sliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
                     await yieldToEventLoop();
                     if (this.closed || this.searchEpoch !== opts.epoch) {
-                        return { hits, chunkId, boundaryId: curBoundaryId, boundaryTs: curBoundaryTs, exhausted: false };
+                        return {
+                            hits,
+                            chunkId,
+                            boundaryId: curBoundaryId,
+                            boundaryTs: curBoundaryTs,
+                            exhausted: false,
+                        };
                     }
                     sliceStart = now();
                     if (now() - budgetStart >= budgetMs) {
-                        return { hits, chunkId, boundaryId: curBoundaryId, boundaryTs: curBoundaryTs, exhausted: false };
+                        return {
+                            hits,
+                            chunkId,
+                            boundaryId: curBoundaryId,
+                            boundaryTs: curBoundaryTs,
+                            exhausted: false,
+                        };
                     }
                 }
             }

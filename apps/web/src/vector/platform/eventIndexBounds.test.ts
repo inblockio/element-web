@@ -87,7 +87,8 @@ describe("deviceMemoryTier", () => {
                 deviceMemory: undefined,
                 userAgentData: undefined,
                 maxTouchPoints: 5,
-                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                userAgent:
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             });
             expect(deviceMemoryTier()).toBe("small");
         });
@@ -98,7 +99,8 @@ describe("deviceMemoryTier", () => {
                 deviceMemory: undefined,
                 userAgentData: undefined,
                 maxTouchPoints: 0,
-                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+                userAgent:
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
             });
             expect(deviceMemoryTier()).toBe("desktop");
         });
