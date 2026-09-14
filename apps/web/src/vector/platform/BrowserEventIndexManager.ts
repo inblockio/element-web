@@ -1130,6 +1130,51 @@ interface ManifestEntry {
 }
 
 /**
+ * The resume position for {@link BrowserEventIndexManager.searchEventIndex}'s streamed cold-tier
+ * scan (increment E, `research/SYNTHESIS.md` §3.4/§7 decision #3: old retained messages stay
+ * findable, found slower, never lost), encoded into `next_batch` as JSON once a query's scan has
+ * touched disk at all -- a query whose page(s) come entirely from the resident (hot) set keeps the
+ * legacy bare-decimal `next_batch` format {@link parseSearchCursor}/{@link encodeSearchCursor}
+ * already produced before this increment, unchanged, so every existing hot-only caller sees no
+ * difference.
+ *
+ * `offset`/`hotCount` are a deliberate simplification, not full session state: once a query's cold
+ * scan starts, the hot-hit count it saw that first time is *pinned* here rather than recomputed on
+ * every subsequent page (a live write landing mid-pagination could in principle change it) -- the
+ * same "recomputed from memory, so a shift across a page boundary is possible" best-effort
+ * pagination contract {@link searchEventIndex}'s own docstring already states for `next_batch`,
+ * just extended to cover the cold tier too, rather than a new one. `chunkIdx`/`within` are what
+ * make resumption cheap: they name the newest-first chunk-walk position ({@link
+ * newestFirstChunkWalk}) the previous call's scan stopped at, and how many of *that* chunk's own
+ * matches (not raw entries) were already emitted, so a resumed scan re-decrypts at most the one
+ * chunk it stopped inside and then only genuinely new chunks after it -- never the ones a previous
+ * page already fully consumed.
+ */
+interface ColdSearchCursor {
+    /** Combined hot+cold position of the next item to serve; the plain pagination offset. */
+    offset: number;
+    /**
+     * The hot-hit count as of the call that started this query's cold scan, or `undefined` on the
+     * legacy bare-decimal format (meaning: recompute fresh from this call's own hot hits, exactly
+     * as every pre-increment-E call already did).
+     */
+    hotCount?: number;
+    /** Index into {@link newestFirstChunkWalk}'s result where the next cold read should resume. */
+    chunkIdx: number;
+    /** Matches of chunk `chunkIdx` already emitted by an earlier call; skip this many on resume. */
+    within: number;
+    /** True once a previous call's scan reached the end of the chunk walk with nothing left. */
+    coldExhausted: boolean;
+}
+
+/** The shape both {@link BrowserEventIndexManager.contextFor} and {@link BrowserEventIndexManager.coldContextFor} return. */
+type ColdContext = {
+    events_before: IMatrixEvent[];
+    events_after: IMatrixEvent[];
+    profile_info: Record<string, IMatrixProfile>;
+};
+
+/**
  * Push `entry` onto a plain binary min-heap ordered by `ts`, array-backed, no external library:
  * both {@link BrowserEventIndexManager.residentHeap} (oldest-resident-event-first, for the
  * hot-window budget) and {@link BrowserEventIndexManager.diskChunkHeap} (oldest-chunk-first, by the
@@ -1434,7 +1479,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * in-memory session (reset only by {@link clearIndexMaps}): once true, {@link
      * materializeIfPending} must keep consulting disk for ids it cannot find resident even after
      * {@link hydrating} itself goes false, because "hydration finished" no longer implies "every row
-     * was visited" the way it did before this increment. Feeds {@link getStats}' `windowed`.
+     * was visited" the way it did before this increment.
+     *
+     * **No longer feeds {@link getStats}' `windowed` (increment E).** Content beyond the resident
+     * budget is still on disk and still findable -- {@link searchEventIndex}'s streamed cold-tier
+     * scan reaches it, just more slowly than a resident hit -- so it is not the same kind of "gone"
+     * {@link diskBudgetDropped}/{@link crawlBoundDeclined} are. This field still gates
+     * `materializeIfPending`'s on-demand disk consultation above, which is unrelated to `windowed`.
      */
     private residentBudgetExceeded = false;
     /**
@@ -1450,6 +1501,25 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * ({@link IIndexStats.oldestIndexedTs}) are two separate conditions rather than one.
      */
     private crawlBoundDeclined = false;
+    /**
+     * Bumped at the top of every {@link searchEventIndex} call, before any cold-tier scan work
+     * starts. A scan's every `await` (a chunk decrypt, a slice yield) re-checks this against the
+     * value it captured at its own start, so a *newer* search superseding an older, still-running
+     * one makes the older one stop at its next checkpoint rather than keep decrypting chunks or
+     * holding the event loop for a result nothing will use -- the same "epoch" discipline {@link
+     * hydrationEpoch} already uses for hydration, applied to search instead. Never reset except by
+     * this counter's own increment; there is no "search closed" state to restore it to.
+     */
+    private searchEpoch = 0;
+    /**
+     * True once the most recent {@link searchEventIndex} call's cold-tier scan stopped at the page
+     * cap (`SEARCH_PAGE_CAP`, `research/SYNTHESIS.md` §3.7) with more on-disk content left
+     * unscanned, rather than exhausting every chunk on record for that query. Surfaced on {@link
+     * getStats} as `isSearchPartial`; see that field's own docstring for why this is a last-search,
+     * not per-result, signal. Recomputed on every search call (including one that never touches the
+     * cold tier at all, which clears it back to false), never left stale from an earlier query.
+     */
+    private searchPartial = false;
     /**
      * The answer from the one-time {@link navigator.storage.persist} request made when this user's
      * index is first created (never on a later re-open of an existing one; see {@link
@@ -1685,6 +1755,24 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * row's own `editIds` is checked against this set while it streams in from disk.
      */
     private readonly pendingRedactions = new Set<string>();
+
+    /**
+     * ids removed from the resident set ({@link removeFromIndex}) by a genuine deletion -- {@link
+     * deleteEvent}'s ordinary path, or {@link materializeRow}'s "redacted before it was even
+     * hydrated" path -- whose disk chunk has been queued for rewrite ({@link enqueueDeleteRecord})
+     * but has not committed yet. Added synchronously the same moment the record leaves {@link
+     * events}/`manifest` bookkeeping begins; removed once that queued rewrite settles (success or
+     * failure, in a `finally`). Unlike {@link residentHeap}'s "durable by construction" candidates,
+     * a **deleted** id's old disk row can still be sitting there, unchanged, for as long as the
+     * removal sits on {@link persistChain} -- which is exactly the window {@link coldSearchScan}
+     * (increment E) would otherwise be able to read: it walks {@link chunkMembers}/decrypts a
+     * chunk directly, neither of which reflects the deletion until the queued rewrite lands, and
+     * its own "already resident?" check (`this.events.has`) reads false for a just-deleted id
+     * (deletion removed it from `events` too), so nothing else stops a stale hit here without this
+     * set. {@link materializeIfPending} checks it for the same reason, on the same window, for an
+     * on-demand pull racing the same queued rewrite.
+     */
+    private readonly pendingDiskDeletes = new Set<string>();
 
     /**
      * chunkId -> the in-flight {@link readChunkEntries} attempt for it, if any; see {@link
@@ -2073,12 +2161,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * neither of which scan anything either.
      *
      * `windowed`, `oldestIndexedTs` and `oldestResidentTs` are every one of them plain scalar field
-     * reads too -- see {@link residentBudgetExceeded}, {@link diskBudgetDropped}, {@link
-     * crawlBoundDeclined}, {@link oldestIndexedTs} and {@link oldestResidentTs} for how each is
-     * maintained -- so none of the three costs this method anything it did not already cost.
+     * reads too -- see {@link diskBudgetDropped}, {@link crawlBoundDeclined}, {@link oldestIndexedTs}
+     * and {@link oldestResidentTs} for how each is maintained -- so none of the three costs this
+     * method anything it did not already cost.
+     *
+     * **`windowed` no longer includes {@link residentBudgetExceeded} (increment E).** Before the
+     * streamed cold-tier scan existed, everything beyond the resident (hot-window) budget was
+     * genuinely unfindable, so a resident-budget breach belonged in the same "something is excluded"
+     * signal as a real crawl-bound decline or disk-budget drop. Now it is merely *slower* to find
+     * (`research/SYNTHESIS.md` §7 decision #3), which is a wholly different thing to tell a user than
+     * "not covered at all" -- conflating the two would make `windowed` fire, and `SearchWarning` show
+     * the "Search covers messages newer than {date}" line with a date that understates real coverage,
+     * on every large, ordinarily-healthy index. `windowed` now reflects only the crawl bound
+     * ({@link crawlBoundDeclined}) and the disk budget ({@link diskBudgetDropped}) -- the two ways
+     * content can be genuinely absent from disk, as opposed to merely absent from memory.
      *
      * `manifestBytes` is {@link manifest}'s own share of {@link residentByteEstimate} (review-pr-c.md
      * C2-F2) -- `manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE`, another O(1) `Map.size` read.
+     *
+     * `isSearchPartial` (increment E) is {@link searchPartial}, a plain scalar set by the most recent
+     * {@link searchEventIndex} call; see that field's own docstring.
      */
     public async getStats(): Promise<IIndexStats> {
         return {
@@ -2086,11 +2188,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             eventCount: this.events.size,
             roomCount: this.roomOrder.size,
             loading: this.hydrating,
-            windowed: this.residentBudgetExceeded || this.diskBudgetDropped || this.crawlBoundDeclined,
+            windowed: this.diskBudgetDropped || this.crawlBoundDeclined,
             oldestIndexedTs: this.oldestIndexedTs,
             oldestResidentTs: this.oldestResidentTs,
             storagePersisted: this.storagePersisted,
             manifestBytes: this.manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
+            isSearchPartial: this.searchPartial,
         };
     }
 
@@ -2136,32 +2239,62 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Run a query against the in-memory index; see {@link BaseEventIndexManager.searchEventIndex}. The pipeline:
-     * tokenise the query exactly as indexed text was and intersect the per-term match sets, so a result must contain
-     * *every* term (terms of two characters or more also match by prefix, so results narrow while the user is still
-     * typing); fall back to a substring scan ({@link substringHits}) if that found nothing; filter by room; sort by
-     * recency if asked; paginate by offset; then decorate each hit with its surrounding events ({@link contextFor}) and
-     * a positional `rank`. Unlike Seshat there is no relevance scoring, phrase or field syntax, boolean operators or
-     * stemming, and query cost is bounded by the number of *terms* in the index rather than by the number of events --
-     * except on the substring fallback, which is linear in total indexed text.
+     * Run a query against the in-memory index, then -- if that alone did not already reach the page cap -- a streamed
+     * scan of on-disk content the resident set does not cover; see {@link BaseEventIndexManager.searchEventIndex}.
+     * The hot-path pipeline (unchanged from before increment E): tokenise the query exactly as indexed text was and
+     * intersect the per-term match sets, so a result must contain *every* term (terms of two characters or more also
+     * match by prefix, so results narrow while the user is still typing); fall back to a substring scan ({@link
+     * substringHits}) if that found nothing; filter by room; sort by recency if asked.
+     *
+     * **The cold tier (increment E, `research/SYNTHESIS.md` §3.4/§7 decision #3).** Old retained messages stay
+     * findable, just found slower: if the hot hits alone are fewer than `SEARCH_PAGE_CAP` (`2 * limit`) and this
+     * user's manifest knows of on-disk events this session does not hold resident, {@link coldSearchScan} streams a
+     * newest-first read of the chunks the hot path could not see, applying the *same* matching semantics
+     * (token AND + prefix, or the folded substring fallback -- whichever the hot path itself used for this query) to
+     * each decrypted record, appended newest-first **after** the hot hits, deduplicated by eventId against both the
+     * resident set and anything already found. This is why `hits`/pagination below speak of "hot" and "cold"
+     * separately rather than one flat array: the cold half is only ever discovered as far as a page actually needs,
+     * never materialised in full up front.
+     *
+     * **Context for a cold hit comes from the same chunk's own decrypted neighbours** ({@link coldContextFor}),
+     * bounded to that one chunk's population (tens of records) -- not a second disk read of manifest neighbours.
+     * Chosen because the chunk is already decrypted and resident in memory at the moment a match is found in it, so
+     * this needs no extra I/O and keeps "at most one decrypted chunk in memory at a time" exactly true; the
+     * trade-off is that a hit whose true neighbours in the room's timeline landed in an *adjacent* chunk (the crawl
+     * interleaves rooms, so this is possible) will show a shorter context than {@link contextFor}'s disk-independent,
+     * whole-room-order view gives a hot hit -- an accepted, bounded degradation, not a silent gap: nothing pretends
+     * these are more complete than they are.
+     *
+     * **Cancellation.** A new call bumps {@link searchEpoch}; a scan already in flight for an older call notices at
+     * its next `await` (a chunk decrypt or a slice yield) and returns whatever it has rather than continuing to
+     * decrypt chunks or hold the event loop for a result nothing will use. No transaction is ever held across an
+     * await here to begin with ({@link BrowserEventIndexManager.readChunkEntries} closes its own before decrypting),
+     * so cancellation only ever stops *further* reads, never interrupts one already open.
      *
      * Never needs to flush {@link liveWriteBuffer} first: every structure this reads -- {@link events}, {@link
      * inverted}, {@link roomOrder} -- is updated synchronously by {@link upsertEvent} the moment a live event is
      * indexed, before {@link schedulePersistEvent} ever buffers anything for disk. A live event is therefore
      * searchable immediately, seconds before its encrypted copy exists anywhere.
      *
-     * @param searchArgs - `search_term` is the raw user input; `room_id` scopes the search; `order_by_recency` sorts
-     *     newest first rather than leaving the index's own iteration order; `limit` is the page size, where a missing
-     *     or zero value means 10 and a negative one clamps to 1; `before_limit`/`after_limit` ask for context events
-     *     either side of each hit; `next_batch` is an opaque token from a previous call.
-     * @returns The page. `count` is the total number of matches rather than the page size, `highlights` the query's
-     *     terms (returned even for an empty result, so the UI can mark them), and `next_batch` the token for the
-     *     following page.
+     * @param searchArgs - `search_term` is the raw user input; `room_id` scopes the search (and, once the cold tier
+     *     is reached, restricts the chunk walk itself to chunks holding at least one of that room's events -- see
+     *     {@link newestFirstChunkWalk}); `order_by_recency` sorts newest first rather than leaving the index's own
+     *     iteration order (the hot half only -- cold hits are always appended newest-first regardless); `limit` is
+     *     the page size, where a missing or zero value means 10 and a negative one clamps to 1; `before_limit`/
+     *     `after_limit` ask for context events either side of each hit; `next_batch` is an opaque token from a
+     *     previous call -- see {@link parseSearchCursor}/{@link ColdSearchCursor} for its two possible shapes.
+     * @returns The page. `count` is the total number of matches *known so far* (hot plus every cold hit discovered
+     *     across this query's pages), which can be less than the true total while {@link searchPartial}/{@link
+     *     IIndexStats.isSearchPartial} is true; `highlights` the query's terms (returned even for an empty result,
+     *     so the UI can mark them); `next_batch` the token for the following page.
      */
     public async searchEventIndex(searchArgs: ISearchArgs): Promise<IResultRoomEvents> {
         const tokens = tokenize(searchArgs.search_term);
         const empty: IResultRoomEvents = { count: 0, results: [], highlights: tokens, next_batch: undefined };
         if (this.closed) return empty;
+
+        // Cancels any older call's still-running cold scan; see this method's own docstring.
+        const epoch = ++this.searchEpoch;
 
         // Intersect the per-term match sets, so a result must contain every term (AND, not OR). `ids === null` is the
         // sentinel for "no term processed yet", which is what lets the first term *seed* the set instead of being
@@ -2187,58 +2320,398 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         }
 
         // The term path found nothing: retry the raw query as a literal substring. See substringHits for what this
-        // reaches that whole-word terms cannot.
-        if (!ids || ids.size === 0) {
+        // reaches that whole-word terms cannot. Captured before `ids` is replaced: the cold-tier scan below must
+        // apply the *same* decision (token-AND vs substring), not re-derive its own independently of what the hot
+        // path just did.
+        const useSubstring = !ids || ids.size === 0;
+        if (useSubstring) {
             ids = this.substringHits(searchArgs.search_term, searchArgs.room_id);
         }
-        if (ids.size === 0) return empty;
 
         // Resolve ids to records, dropping any that have gone: a redaction between matching and reading must not become
         // an undefined result. Room scoping is applied here rather than inside the index, there being no per-room
         // posting lists.
-        let hits = Array.from(ids, (eventId) => this.events.get(eventId)).filter((e): e is StoredEvent => Boolean(e));
+        let hotHits = Array.from(ids ?? [], (eventId) => this.events.get(eventId)).filter(
+            (e): e is StoredEvent => Boolean(e),
+        );
         if (searchArgs.room_id) {
-            hits = hits.filter((e) => e.roomId === searchArgs.room_id);
+            hotHits = hotHits.filter((e) => e.roomId === searchArgs.room_id);
         }
 
         // Newest first when the caller asks. Otherwise the order is whatever fell out of the Set iteration above:
         // deterministic for a given index state, but derived from insertion order rather than from any notion of
-        // relevance, which nothing here computes.
+        // relevance, which nothing here computes. Cold hits (below) are always appended newest-first regardless of
+        // this flag -- they come from a disk scan that only ever walks newest-first, there being no cheap way to
+        // walk it any other way.
         if (searchArgs.order_by_recency) {
-            hits.sort((a, b) => b.originServerTs - a.originServerTs);
+            hotHits.sort((a, b) => b.originServerTs - a.originServerTs);
         }
+        // Deliberately no "hot found nothing, return empty" short-circuit here (unlike the
+        // pre-increment-E code): a query the resident index cannot answer at all is exactly the
+        // case the cold-tier scan below exists for (hits lying entirely beyond the hot window).
 
-        // Pagination is a plain offset, and `next_batch` that offset back as a decimal string. An offset rather than a
-        // cursor because the whole result set is recomputed from memory on every call, so events indexed between two
-        // pages can shift rows across the boundary. A malformed token resolves to offset 0 rather than throwing at the
-        // user.
-        const offset = searchArgs.next_batch ? Number.parseInt(searchArgs.next_batch, 10) || 0 : 0;
         const limit = Math.max(1, searchArgs.limit || 10);
-        const page = hits.slice(offset, offset + limit);
-        const next_batch = offset + page.length < hits.length ? String(offset + page.length) : undefined;
-
+        // SEARCH_PAGE_CAP (research/SYNTHESIS.md §3.7): the ceiling on hot+cold hits this query will ever
+        // accumulate across every page, hot and cold alike -- Proton's own `hybridSearch` cap, "two pages" at the
+        // default page size. Once reached, {@link searchPartial}/`isSearchPartial` goes true and the scan stops
+        // rather than walking the rest of this user's disk for one query.
+        const pageCap = 2 * limit;
         const beforeLimit = Math.max(0, searchArgs.before_limit || 0);
         const afterLimit = Math.max(0, searchArgs.after_limit || 0);
 
-        const results = page.map((hit, i) => {
-            const context = this.contextFor(hit, beforeLimit, afterLimit);
+        // Pagination is a plain offset either way. Backward compatible: a token this query's own cold scan never
+        // touches (the overwhelming majority -- everything the pre-increment-E suite already exercises) keeps the
+        // exact bare-decimal `next_batch` format and parsing that predates this increment; only a query whose scan
+        // actually reaches disk switches to the richer {@link ColdSearchCursor} JSON shape. See {@link
+        // parseSearchCursor}.
+        const cursor = this.parseSearchCursor(searchArgs.next_batch);
+        const requestedOffset = cursor.offset;
+        // Pinned at the call that first touched the cold tier for this query, not recomputed on every later page --
+        // see {@link ColdSearchCursor}'s own docstring for why (the same "recomputed from memory, so a write
+        // between pages can shift things" best-effort contract the plain offset above already has, just extended).
+        const hotCount = cursor.hotCount ?? hotHits.length;
+        const alreadyHaveCold = Math.max(0, requestedOffset - hotCount);
+
+        const needsMoreThanHot = requestedOffset + limit > hotCount;
+        const diskHasColdContent = this.manifest.size > this.events.size;
+
+        let coldHits: Array<{ stored: StoredEvent; context: ColdContext }> = [];
+        let chunkIdx = cursor.chunkIdx;
+        let within = cursor.within;
+        let coldExhausted = cursor.coldExhausted;
+        if (needsMoreThanHot && hotCount < pageCap && diskHasColdContent && !coldExhausted && !this.closed) {
+            const need = pageCap - hotCount - alreadyHaveCold;
+            if (need > 0) {
+                const resident = new Set(hotHits.map((h) => h.eventId));
+                const scan = await this.coldSearchScan({
+                    tokens,
+                    useSubstring,
+                    rawQuery: searchArgs.search_term,
+                    roomId: searchArgs.room_id,
+                    startChunkIdx: cursor.chunkIdx,
+                    startWithin: cursor.within,
+                    need,
+                    epoch,
+                    excludeIds: resident,
+                    beforeLimit,
+                    afterLimit,
+                });
+                coldHits = scan.hits;
+                chunkIdx = scan.chunkIdx;
+                within = scan.within;
+                coldExhausted = scan.exhausted;
+            }
+        }
+        const coldTouchedThisQuery = alreadyHaveCold > 0 || coldHits.length > 0 || coldExhausted;
+
+        // Build this page from whichever of hot/cold it needs -- possibly both, for the one page that straddles the
+        // boundary between them.
+        const pageItems: Array<{ stored: StoredEvent; coldContext?: ColdContext }> = [];
+        if (requestedOffset < hotHits.length) {
+            for (const stored of hotHits.slice(requestedOffset, requestedOffset + limit)) {
+                pageItems.push({ stored });
+            }
+        }
+        const stillNeeded = limit - pageItems.length;
+        if (stillNeeded > 0 && coldHits.length > 0) {
+            const coldSliceStart = Math.max(0, requestedOffset - hotCount - alreadyHaveCold);
+            for (const hit of coldHits.slice(coldSliceStart, coldSliceStart + stillNeeded)) {
+                pageItems.push({ stored: hit.stored, coldContext: hit.context });
+            }
+        }
+
+        const totalKnown = hotCount + alreadyHaveCold + coldHits.length;
+        const nextOffset = requestedOffset + pageItems.length;
+        // "Partial" in the SEARCH_PAGE_CAP sense: the scan stopped with (as far as this session knows) more on-disk
+        // content left to look at. Independent of whether *this page* has a next_batch -- see this field's own
+        // docstring for why it is a last-search stats signal, not a per-result one.
+        this.searchPartial = coldTouchedThisQuery && !coldExhausted && totalKnown >= pageCap;
+
+        let next_batch: string | undefined;
+        if (nextOffset < totalKnown || (coldTouchedThisQuery && !coldExhausted && totalKnown >= pageCap)) {
+            next_batch = coldTouchedThisQuery
+                ? this.encodeSearchCursor({ offset: nextOffset, hotCount, chunkIdx, within, coldExhausted })
+                : String(nextOffset); // legacy bare-decimal format; nothing here ever touched the cold tier.
+        }
+
+        const results = pageItems.map((item, i) => {
+            const context = item.coldContext ?? this.contextFor(item.stored, beforeLimit, afterLimit);
             return {
                 // `rank` is positional, not a relevance score, and nothing should read a meaning into its magnitude. It
                 // is 1/n over the hit's position in the *whole* result set rather than in the page, so any consumer
                 // that sorts by rank reproduces the order chosen above. Seshat puts a real BM25 score here; the
                 // substitution is safe only because nothing in Element reads it.
-                rank: 1 / (offset + i + 1),
-                result: this.resultEvent(hit.event),
+                rank: 1 / (requestedOffset + i + 1),
+                result: this.resultEvent(item.stored.event),
                 context,
             };
         });
 
         return {
-            count: hits.length,
+            count: totalKnown,
             results,
             highlights: tokens,
             next_batch,
         };
+    }
+
+    /**
+     * Parse a `next_batch` token into {@link ColdSearchCursor}, accepting both shapes this class has ever produced:
+     * a bare decimal offset (the format used before increment E, and still used by any query whose cold tier this
+     * query's scan never touches) or the JSON {@link ColdSearchCursor} shape a cold-touching query now produces.
+     * `undefined`/empty, and anything that parses as neither, all resolve to offset 0 with no cold-scan state --
+     * "a malformed token resolves to offset 0 rather than throwing at the user", the same contract this had before
+     * increment E, now extended to a second token shape.
+     */
+    private parseSearchCursor(token: string | undefined): ColdSearchCursor {
+        const none: ColdSearchCursor = { offset: 0, chunkIdx: 0, within: 0, coldExhausted: false };
+        if (!token) return none;
+        if (/^\d+$/.test(token)) {
+            return { ...none, offset: Number.parseInt(token, 10) || 0 };
+        }
+        try {
+            const parsed: unknown = JSON.parse(token);
+            if (
+                parsed &&
+                typeof parsed === "object" &&
+                typeof (parsed as ColdSearchCursor).offset === "number" &&
+                typeof (parsed as ColdSearchCursor).chunkIdx === "number" &&
+                typeof (parsed as ColdSearchCursor).within === "number"
+            ) {
+                const p = parsed as ColdSearchCursor;
+                return {
+                    offset: p.offset,
+                    hotCount: typeof p.hotCount === "number" ? p.hotCount : undefined,
+                    chunkIdx: p.chunkIdx,
+                    within: p.within,
+                    coldExhausted: Boolean(p.coldExhausted),
+                };
+            }
+        } catch {
+            // Malformed JSON: fall through to `none`, same as any other unrecognised token.
+        }
+        return none;
+    }
+
+    /** The inverse of {@link parseSearchCursor}, for a query whose scan has touched the cold tier. */
+    private encodeSearchCursor(cursor: ColdSearchCursor): string {
+        return JSON.stringify(cursor);
+    }
+
+    /**
+     * The newest-first walk order {@link coldSearchScan} reads chunks in: every chunk id this session knows about
+     * (from {@link chunkMembers}, no I/O), ranked by that chunk's own newest member `originServerTs` -- exactly
+     * {@link hydrate}'s own chunk-ordering computation (see its docstring for why *chunk* `maxTs`, not a per-event
+     * sort, is both cheap and the right newest-first notion once storage is chunked), reused here rather than
+     * duplicated with different rounding. Room-scoped when `roomId` is given: {@link manifestRoomIds} names every id
+     * in that room, and {@link manifest} each one's chunk, so the walk can skip a chunk with nothing from this room
+     * without ever decrypting it -- "use the manifest's roomId" rather than filtering post-decrypt.
+     *
+     * Sliced across {@link HYDRATION_SLICE_DEADLINE_MS} the same way {@link hydrate}'s own seeding pass is (a chunk
+     * count in the thousands, not the hundreds of thousands, but each one still costs a pass over its own
+     * membership); `null` if `epoch` was superseded or the index closed mid-walk, which {@link coldSearchScan}
+     * treats as "found nothing more this call" rather than throwing.
+     */
+    private async newestFirstChunkWalk(roomId: string | undefined, epoch: number): Promise<number[] | null> {
+        const relevantChunkIds = roomId
+            ? new Set(
+                  Array.from(this.manifestRoomIds.get(roomId) ?? [], (id) => this.manifest.get(id)?.chunkId).filter(
+                      (id): id is number => id !== undefined,
+                  ),
+              )
+            : null;
+        const chunkMaxTs = new Map<number, number>();
+        let sliceStart = now();
+        for (const [chunkId, members] of this.chunkMembers) {
+            if (relevantChunkIds && !relevantChunkIds.has(chunkId)) continue;
+            if (this.closed || this.searchEpoch !== epoch) return null;
+            let max = -Infinity;
+            for (const id of members) {
+                const ts = this.manifest.get(id)?.ts;
+                if (ts !== undefined && ts > max) max = ts;
+            }
+            if (max > -Infinity) chunkMaxTs.set(chunkId, max);
+            if (now() - sliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
+                await yieldToEventLoop();
+                if (this.closed || this.searchEpoch !== epoch) return null;
+                sliceStart = now();
+            }
+        }
+        return Array.from(chunkMaxTs.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map((pair) => pair[0]);
+    }
+
+    /**
+     * Whether `stored` matches every one of `tokens`, the cold-tier analogue of {@link searchEventIndex}'s
+     * resident-index term-AND-with-prefix path: `stored` has no posting-list entry (it is not indexed -- that is
+     * the whole reason it is being checked here rather than found via {@link lookupToken}), so this tokenises its
+     * own {@link StoredEvent.searchText} on the spot and checks each query token against that small, per-record set
+     * directly -- an exact match, or (mirroring {@link lookupToken}'s own `token.length >= 2` guard) a prefix match
+     * against any of the record's own tokens. Cheap: a record's own token count is tens, not the whole vocabulary.
+     */
+    private coldRecordMatchesTokens(stored: StoredEvent, tokens: string[]): boolean {
+        if (tokens.length === 0) return false;
+        const recordTokens = tokenize(stored.searchText);
+        for (const token of tokens) {
+            if (recordTokens.includes(token)) continue;
+            if (token.length >= 2 && recordTokens.some((t) => t.startsWith(token))) continue;
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Context for a cold hit, sourced from the *same already-decrypted chunk*'s own other members -- see {@link
+     * searchEventIndex}'s own docstring for why this, rather than a further disk read by manifest neighbours, is
+     * what this increment implements: no extra I/O, and "at most one decrypted chunk in memory at a time" stays
+     * exactly true. Bounded to that chunk's own population (tens of records, {@link CHUNK_TARGET_BYTES}'s own
+     * sizing) -- a genuine neighbour that happens to live in an *adjacent* chunk (rooms interleave across chunks by
+     * write order, not by room) is not reached, which can make a cold hit's context shorter than a hot hit's own
+     * whole-room-order {@link contextFor} would give the same position. Mirrors {@link contextFor}'s own shape
+     * (timeline-ordered before/after plus `profile_info`) so the two are interchangeable to a caller.
+     */
+    private coldContextFor(chunkEntries: Map<string, StoredEvent>, hit: StoredEvent, beforeLimit: number, afterLimit: number): ColdContext {
+        const roomList = Array.from(chunkEntries.values())
+            .filter((e) => e.roomId === hit.roomId)
+            .sort((a, b) => a.originServerTs - b.originServerTs);
+        const idx = roomList.findIndex((e) => e.eventId === hit.eventId);
+        const beforeEvents = idx >= 0 ? roomList.slice(Math.max(0, idx - beforeLimit), idx) : [];
+        const afterEvents = idx >= 0 ? roomList.slice(idx + 1, idx + 1 + afterLimit) : [];
+        const events_before = beforeEvents.map((ev) => this.resultEvent(ev.event));
+        const events_after = afterEvents.map((ev) => this.resultEvent(ev.event));
+        const profile_info: Record<string, IMatrixProfile> = {};
+        for (const ev of [hit, ...beforeEvents, ...afterEvents]) {
+            if (ev.event.sender) profile_info[ev.event.sender] = ev.profile;
+        }
+        return { events_before, events_after, profile_info };
+    }
+
+    /**
+     * The streamed newest-first disk scan {@link searchEventIndex} runs once the resident index alone has not
+     * reached `SEARCH_PAGE_CAP`: walk {@link newestFirstChunkWalk}'s order starting at `startChunkIdx`/`startWithin`
+     * (a fresh query starts both at 0), reading and decrypting **one chunk at a time** -- {@link decryptChunkOnce},
+     * shared with any concurrent {@link hydrate}/{@link materializeIfPending} call decrypting the same chunk, so a
+     * scan racing hydration's own admission neither double-decrypts nor double-returns an event hydration just made
+     * resident (checked live via `this.events.has(id)`, not a snapshot taken before the scan started) -- evaluating
+     * `useSubstring ? folded-substring : token-AND-with-prefix` ({@link coldRecordMatchesTokens}) against every
+     * member not already resident or in `excludeIds` (the hot hits), newest-member-first within the chunk to match
+     * {@link hydrate}'s own admission order.
+     *
+     * On `startChunkIdx` only, the first `startWithin` *matches* (not raw entries) are skipped without being
+     * re-emitted -- they are what an earlier call already returned; see {@link ColdSearchCursor}'s own docstring.
+     * A chunk whose disk row is gone by the time it is read (the disk budget dropped it between the walk being
+     * computed and this reaching it) decrypts to an empty map ({@link readChunkEntries}'s own contract) and is
+     * simply skipped, never thrown; a chunk that fails to decrypt for any other reason is logged and skipped the
+     * same way, rather than aborting the whole query over one bad chunk.
+     *
+     * Stops, and returns a resume position, as soon as: `need` new hits have been found; the chunk walk is
+     * exhausted (`exhausted: true`, nothing left on disk for this query); or `epoch` is superseded ({@link
+     * searchEpoch}) or the index closes, in which case cancellation must not leave a slice or a transaction
+     * running -- checked after every `await` (a decrypt, a slice yield), the same discipline {@link hydrate} uses.
+     * Sliced in {@link HYDRATION_SLICE_DEADLINE_MS} deadlines with the existing {@link yieldToEventLoop} helper.
+     */
+    private async coldSearchScan(opts: {
+        tokens: string[];
+        useSubstring: boolean;
+        rawQuery: string;
+        roomId: string | undefined;
+        startChunkIdx: number;
+        startWithin: number;
+        need: number;
+        epoch: number;
+        excludeIds: Set<string>;
+        beforeLimit: number;
+        afterLimit: number;
+    }): Promise<{ hits: Array<{ stored: StoredEvent; context: ColdContext }>; chunkIdx: number; within: number; exhausted: boolean }> {
+        const hits: Array<{ stored: StoredEvent; context: ColdContext }> = [];
+        const notFound = { hits, chunkIdx: opts.startChunkIdx, within: opts.startWithin, exhausted: false };
+        if (opts.need <= 0 || !this.dek || !this.db || !this.userId || this.closed) return notFound;
+        const userId = this.userId;
+        const dek = this.dek;
+        const foldedQuery = flattenCopy(foldText(opts.rawQuery)).replace(/\s+/g, " ").trim();
+        if (opts.useSubstring && foldedQuery.length < 3) return { ...notFound, exhausted: true };
+
+        const walk = await this.newestFirstChunkWalk(opts.roomId, opts.epoch);
+        if (walk === null) return notFound; // Cancelled or closed mid-walk-computation.
+
+        let sliceStart = now();
+        for (let ci = opts.startChunkIdx; ci < walk.length; ci++) {
+            if (this.closed || this.searchEpoch !== opts.epoch) return { ...notFound, chunkIdx: ci, within: 0 };
+
+            const chunkId = walk[ci];
+            const members = this.chunkMembers.get(chunkId);
+            // Cheap, no-I/O skip: every member of this chunk is already resident, so the hot path already found
+            // (or ruled out) everything in it -- nothing cold to decrypt for.
+            if (!members || Array.from(members).every((id) => this.events.has(id))) continue;
+
+            let entries: Map<string, StoredEvent>;
+            try {
+                entries = await this.decryptChunkOnce(userId, dek, chunkId);
+            } catch (e) {
+                log.debug("EventIndex: cold scan could not read a chunk; skipping it", e);
+                continue;
+            }
+            if (this.closed || this.searchEpoch !== opts.epoch) return { ...notFound, chunkIdx: ci, within: 0 };
+            if (entries.size === 0) continue; // Deleted by the disk budget between the walk and this read.
+
+            const orderedIds = Array.from(entries.keys()).sort(
+                (a, b) => (entries.get(b)?.originServerTs ?? 0) - (entries.get(a)?.originServerTs ?? 0),
+            );
+
+            let matchIndex = 0;
+            for (const id of orderedIds) {
+                // this.events: already resident, the hot path already covers it. excludeIds: already
+                // returned this call. pendingDiskDeletes: removed from the resident set by a genuine
+                // deletion whose disk rewrite has not committed yet -- see that field's own docstring
+                // for why a plain `events.has` check alone cannot see this window.
+                // this.events: already resident, the hot path already covers it. excludeIds: already
+                // returned this call. pendingDiskDeletes: removed from the resident set by a genuine
+                // deletion whose disk rewrite has not committed yet (the window *before*
+                // manifestRemove runs). !manifest.has(id): the authoritative "is this id still on
+                // disk at all, right now" check, live against the current manifest rather than the
+                // snapshot `entries` was decrypted from -- closes the *other* window, where this
+                // chunk's own ciphertext was read (started) before a concurrent deletion's
+                // manifestRemove + disk commit landed, but this loop only inspects the result after
+                // both had already finished: `entries` is then a stale pre-deletion snapshot even
+                // though pendingDiskDeletes has *also* already been cleared (the deletion's own
+                // `finally` runs after both manifestRemove and the disk write) -- a real race hit
+                // empirically (R9's flake) that pendingDiskDeletes alone does not close, because the
+                // two checks guard non-overlapping windows of the same deletion's lifetime.
+                if (
+                    this.events.has(id) ||
+                    opts.excludeIds.has(id) ||
+                    this.pendingDiskDeletes.has(id) ||
+                    !this.manifest.has(id)
+                ) {
+                    continue;
+                }
+                const stored = entries.get(id)!;
+                if (opts.roomId && stored.roomId !== opts.roomId) continue;
+                const isMatch = opts.useSubstring
+                    ? flattenCopy(foldText(stored.searchText)).includes(foldedQuery)
+                    : this.coldRecordMatchesTokens(stored, opts.tokens);
+                if (!isMatch) continue;
+
+                if (ci === opts.startChunkIdx && matchIndex < opts.startWithin) {
+                    matchIndex++;
+                    continue; // Already emitted by an earlier call.
+                }
+                matchIndex++;
+
+                hits.push({ stored, context: this.coldContextFor(entries, stored, opts.beforeLimit, opts.afterLimit) });
+                if (hits.length >= opts.need) return { hits, chunkIdx: ci, within: matchIndex, exhausted: false };
+
+                if (now() - sliceStart >= HYDRATION_SLICE_DEADLINE_MS) {
+                    await yieldToEventLoop();
+                    if (this.closed || this.searchEpoch !== opts.epoch) {
+                        return { hits, chunkIdx: ci, within: matchIndex, exhausted: false };
+                    }
+                    sliceStart = now();
+                }
+            }
+        }
+        return { hits, chunkIdx: walk.length, within: 0, exhausted: true };
     }
 
     /**
@@ -3154,11 +3627,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      *     when that sender's event was indexed, so results render with the display name and avatar of the time. A hit
      *     absent from its own room list yields two empty lists rather than throwing.
      */
-    private contextFor(
-        hit: StoredEvent,
-        beforeLimit: number,
-        afterLimit: number,
-    ): { events_before: IMatrixEvent[]; events_after: IMatrixEvent[]; profile_info: Record<string, IMatrixProfile> } {
+    private contextFor(hit: StoredEvent, beforeLimit: number, afterLimit: number): ColdContext {
         const list = this.roomOrder.get(hit.roomId) ?? [];
         const idx = this.positionInRoomOrder(list, hit);
         const beforeIds = idx >= 0 ? list.slice(Math.max(0, idx - beforeLimit), idx) : [];
@@ -3209,7 +3678,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * docstring), so there is always exactly one chunk to rewrite.
      */
     private enqueueDeleteRecord(userId: string, targetId: string): void {
+        // Synchronous, same moment the record leaves the resident set -- see pendingDiskDeletes's
+        // own docstring for the window this closes.
+        this.pendingDiskDeletes.add(targetId);
         this.enqueuePersist(async () => {
+          try {
             const dek = this.dek;
             const entry = this.manifest.get(targetId);
             if (!entry) return; // Never reached disk at all -- still buffered only.
@@ -3269,6 +3742,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     this.openChunkPlainBytes = 0;
                 }
             }
+          } finally {
+            // However this settled -- deleted the whole chunk, rewrote it, found nothing to do, or
+            // threw -- the window pendingDiskDeletes exists for is over: either the disk row now
+            // reflects the deletion, or nothing here ever depended on it doing so.
+            this.pendingDiskDeletes.delete(targetId);
+          }
         });
     }
 
@@ -4418,13 +4897,26 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // resurrect a record into an index that has moved on, or duplicate one already materialized in the meantime.
         if (this.closed || epoch !== this.hydrationEpoch) return;
         if (this.events.has(targetId)) return;
+        // A deletion racing this same read (see pendingDiskDeletes's own docstring): `targetId` left
+        // the resident set and is queued for a disk rewrite that has not landed yet, so `entries`
+        // (read just above) can still carry its now-stale ciphertext. Must not resurrect it.
+        if (this.pendingDiskDeletes.has(targetId)) return;
+        // The *other* window (found empirically via coldSearchScan's own R9 flake, same fix
+        // applies here): this read could have started before a concurrent deletion's
+        // manifestRemove + disk commit, both of which can finish before this line runs, clearing
+        // pendingDiskDeletes too -- `entries` is then a stale pre-deletion snapshot. The manifest is
+        // the authoritative live answer to "is this id still on disk at all", checked fresh here
+        // rather than trusted from before the decrypt.
+        if (!this.manifest.has(targetId)) return;
         const targetStored = entries.get(targetId);
         if (!targetStored) return; // Redacted since the manifest was consulted; nothing left to pull in.
 
         this.materializeRow(userId, targetStored);
         const bounds = getEventIndexBounds();
         for (const [id, stored] of entries) {
-            if (id === targetId || this.events.has(id)) continue;
+            if (id === targetId || this.events.has(id) || this.pendingDiskDeletes.has(id) || !this.manifest.has(id)) {
+                continue;
+            }
             if (this.residentByteEstimate() >= bounds.hotWindowBytes) break;
             this.materializeRow(userId, stored);
         }
@@ -4790,10 +5282,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.openChunkPlainBytes = 0;
         this.nextChunkId = 0;
         this.pendingRedactions.clear();
+        this.pendingDiskDeletes.clear();
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;
         this.sortedVocabulary.length = 0;
         this.pendingVocabulary.length = 0;
+        this.searchPartial = false;
     }
 
     /**

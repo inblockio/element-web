@@ -112,6 +112,19 @@ export interface IIndexStats {
      * this bookkeeping -- as opposed to actual indexed content -- currently accounts for.
      */
     manifestBytes?: number;
+    /**
+     * True while the most recent {@link BaseEventIndexManager.searchEventIndex} call's streamed
+     * scan of on-disk content beyond the resident set was cut short at the page cap rather than
+     * exhausting every on-disk chunk -- i.e. more matches may exist than were returned, findable by
+     * asking for another page (`next_batch`). `undefined`/absent means "not tracked" (a backend
+     * with no such scan, e.g. desktop's Seshat, or a browser session before any search has run),
+     * the same convention as {@link loading}; `false` means the most recent search's scan, if any,
+     * ran to completion (or never needed to run at all). This is a *global*, last-search signal
+     * rather than a per-result one -- {@link IResultRoomEvents} (matrix-js-sdk's own type) is not
+     * this class's to extend -- which is why {@link SearchWarning} polls it the same way it already
+     * polls {@link loading}.
+     */
+    isSearchPartial?: boolean;
 }
 
 /**
