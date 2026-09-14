@@ -5834,7 +5834,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         expect(page2.next_batch).toBeDefined(); // more left: the cold tier, not yet reached by either page
 
         const page3 = await seed.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page2.next_batch }));
-        expect(page3.results.length).toBeGreaterThan(0); // page 3 genuinely reaches disk
+        expect(page3.results!.length).toBeGreaterThan(0); // page 3 genuinely reaches disk
         for (const r of resultIds(page3)) expect(residentIds(seed).has(r)).toBe(false); // real cold hits
 
         const combined = [...resultIds(page1), ...resultIds(page2), ...resultIds(page3)];
