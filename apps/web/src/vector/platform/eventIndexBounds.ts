@@ -237,17 +237,57 @@ const SMALL_BOUNDS: EventIndexBounds = {
 };
 
 /**
- * Which tier this browser falls into: `navigator.deviceMemory` (Chromium-only; Firefox and Safari
- * do not expose it, per the Device Memory API spec, and its absence is deliberately not treated as
- * "must be a beefy desktop" -- a browser that hides the signal gets the *more conservative* bound)
- * of 4 GiB or less, or the property being absent altogether, is the small tier; anything reporting
- * more than 4 is the desktop tier. `deviceMemory` is a rounded, coarse figure (a power of two) by
- * design, so no finer-grained tiering is attempted.
+ * Best-effort "is this a phone/tablet, not a desktop" signal, consulted only when {@link
+ * deviceMemoryTier} has no `navigator.deviceMemory` to go on at all (`measurements-cross-engine.md`
+ * §3.3/§3.4 of the increment-E handover: that is every non-Chromium browser, unconditionally --
+ * Firefox and Safari desktop users included). Two sources, in order:
+ *
+ * 1. `navigator.userAgentData?.mobile === true` -- the Client Hints replacement for UA sniffing,
+ *    itself Chromium-only today, but cheap to check first when present since it is a structured
+ *    boolean rather than a string to pattern-match.
+ * 2. A conservative UA regex (`Android|iPhone|iPad|Mobile`) -- covers Firefox for Android and iOS
+ *    Safari/Firefox/Chrome (all WebKit-based on iOS, per Apple's WebKit-only policy, and all still
+ *    report `Mobile` in their own UA string), consulted whenever the first check is not `true`
+ *    (`userAgentData` absent, or itself reporting non-mobile) so that a browser exposing neither
+ *    signal cleanly still gets a real answer instead of defaulting to "must be desktop".
+ *
+ * Never consulted when `deviceMemory` *is* present (Chromium desktop and Chromium Android both
+ * report it directly, more precisely than any UA guess could) -- see {@link deviceMemoryTier}.
+ */
+function isLikelyMobileUserAgent(): boolean {
+    const nav = globalThis.navigator as
+        | (Navigator & { userAgentData?: { mobile?: boolean }; userAgent?: string })
+        | undefined;
+    if (nav?.userAgentData?.mobile === true) return true;
+    const ua = typeof nav?.userAgent === "string" ? nav.userAgent : "";
+    return /Android|iPhone|iPad|Mobile/.test(ua);
+}
+
+/**
+ * Which tier this browser falls into. `navigator.deviceMemory` (Chromium-only; Firefox and Safari
+ * do not expose it, per the Device Memory API spec) of 4 GiB or less is the small tier; more than 4
+ * is the desktop tier -- the API is a rounded, coarse figure (a power of two) by design, so no
+ * finer-grained tiering is attempted from it.
+ *
+ * **When `deviceMemory` is absent**, this used to default straight to the small tier on the theory
+ * that "a browser that hides the signal gets the more conservative bound" -- measured
+ * (`measurements-cross-engine.md` §3.3/§3.4) to silently cap *every* Firefox and Safari desktop
+ * user at the small tier's 48 MiB hot window / 20-room crawl cap regardless of actual device RAM,
+ * a much larger and more consequential effect than anything else that document measured: a Firefox
+ * user on a 64 GiB workstation got the identical budget as a Chromium user on a genuinely
+ * memory-constrained 2 GiB phone. The signal the code needs is "is this device likely
+ * memory-constrained", and `deviceMemory`'s absence answers a different question ("is this
+ * browser Chromium") -- conflating the two was the bug. Absent `deviceMemory` now falls back to
+ * {@link isLikelyMobileUserAgent}: a plausibly-mobile device still gets the conservative small
+ * tier (the same reasoning as before, just gated on a better signal), while a plausibly-desktop
+ * browser with no `deviceMemory` (Firefox/Safari desktop) gets the desktop tier instead of being
+ * silently downgraded.
  */
 export function deviceMemoryTier(): EventIndexTier {
     const nav = globalThis.navigator as (Navigator & { deviceMemory?: number }) | undefined;
     const mem = nav?.deviceMemory;
-    return typeof mem === "number" && mem > 4 ? "desktop" : "small";
+    if (typeof mem === "number") return mem <= 4 ? "small" : "desktop";
+    return isLikelyMobileUserAgent() ? "small" : "desktop";
 }
 
 /**

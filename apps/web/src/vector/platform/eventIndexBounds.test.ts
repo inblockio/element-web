@@ -30,9 +30,51 @@ describe("deviceMemoryTier", () => {
         expect(deviceMemoryTier()).toBe("small");
     });
 
-    it("is small when deviceMemory is absent (Firefox, Safari)", () => {
-        vi.stubGlobal("navigator", { ...globalThis.navigator, deviceMemory: undefined });
-        expect(deviceMemoryTier()).toBe("small");
+    // The four cases increment E's tier-heuristic fix cares about: deviceMemory present always
+    // wins (covered above); deviceMemory absent falls back to a mobile check, which can now say
+    // either "small" (mobile) or "desktop" (not mobile) -- unlike the old code, which answered
+    // "small" unconditionally the moment deviceMemory was missing, silently downgrading every
+    // Firefox/Safari desktop user (measurements-cross-engine.md §3.3/§3.4).
+    describe("deviceMemory absent (Firefox, Safari): falls back to a mobile check", () => {
+        it("is small when userAgentData.mobile is true", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: { mobile: true },
+                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) DesktopUAButOverridden",
+            });
+            expect(deviceMemoryTier()).toBe("small");
+        });
+
+        it("is small when userAgentData is absent but the UA string looks mobile (iPhone)", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: undefined,
+                userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15",
+            });
+            expect(deviceMemoryTier()).toBe("small");
+        });
+
+        it("is desktop when neither userAgentData nor the UA string indicate mobile (Firefox desktop)", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: undefined,
+                userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:151.0) Gecko/20100101 Firefox/151.0",
+            });
+            expect(deviceMemoryTier()).toBe("desktop");
+        });
+
+        it("is desktop when userAgentData reports non-mobile and the UA string does not look mobile either", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: { mobile: false },
+                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Safari/605.1.15",
+            });
+            expect(deviceMemoryTier()).toBe("desktop");
+        });
     });
 });
 
@@ -51,7 +93,13 @@ describe("getEventIndexBounds", () => {
     });
 
     it("small tier: 48 MiB hot window, 128 MiB disk budget, 90 days, 20 rooms", () => {
-        vi.stubGlobal("navigator", { ...globalThis.navigator, deviceMemory: undefined });
+        // deviceMemory absent alone is no longer sufficient for the small tier (see
+        // deviceMemoryTier's own describe block above) -- this must also look mobile.
+        vi.stubGlobal("navigator", {
+            ...globalThis.navigator,
+            deviceMemory: undefined,
+            userAgentData: { mobile: true },
+        });
         const bounds = getEventIndexBounds();
         expect(bounds).toEqual({
             tier: "small",
