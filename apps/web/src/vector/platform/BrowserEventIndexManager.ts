@@ -1191,6 +1191,15 @@ interface ColdScanSession {
      * E2-F2.
      */
     readonly hotHits: StoredEvent[];
+    /**
+     * The `eventId`s in {@link hotHits}, fixed at the same instant. The cold scan dedups against this snapshot
+     * rather than against live `this.events` residency: an event that was cold when the session was created and
+     * becomes resident before the walk reaches its chunk must still be delivered by the cold side, because it was
+     * never part of {@link hotHits} and so will never be delivered by the hot side either. Residency only grows
+     * between session creation and a given chunk's turn on the walk (hydration slices, `materializeIfPending`), so
+     * asking `this.events` there silently drops the hit from every page instead of skipping a true duplicate.
+     */
+    readonly hotIds: Set<string>;
     /** How far into {@link hotHits} this session has delivered so far. */
     hotPos: number;
     /** The newest-first chunk-id walk, snapshotted once at session creation. See the interface docstring. */
@@ -2479,6 +2488,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             afterLimit,
             limit,
             hotHits,
+            hotIds: new Set(hotHits.map((stored) => stored.eventId)),
             hotPos: 0,
             walk,
             walkPos: 0,
@@ -2524,12 +2534,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // the cold tier on the very page hot hits run out (E2-F2). `returned` also catches a hit that a
         // concurrent cold step already delivered for this same session (only possible across overlapping calls
         // on the same token, which nothing in Element's own UI does, but the check is free either way).
+        // `hotHits` holds the StoredEvent object itself, snapshotted at session creation, so nothing removes an
+        // entry from it when the event is later redacted. Liveness is therefore re-checked here, at delivery,
+        // with the same predicate the cold loop already uses to tell a genuine deletion from a mere hot-window
+        // eviction: a redaction (this.events lost it AND the manifest lost it, or it is queued for disk
+        // deletion) is dropped; an id that is merely no longer resident but still on disk is still delivered
+        // from the snapshot (E3-F2).
         while (session.hotPos < session.hotHits.length && pageItems.length < session.limit) {
             const stored = session.hotHits[session.hotPos++];
-            if (!session.returned.has(stored.eventId)) {
-                session.returned.add(stored.eventId);
-                pageItems.push({ stored });
+            if (session.returned.has(stored.eventId)) continue;
+            if (
+                this.pendingDiskDeletes.has(stored.eventId) ||
+                (!this.events.has(stored.eventId) && !this.manifest.has(stored.eventId))
+            ) {
+                continue; // Redacted since the snapshot; a merely RAM-evicted hit stays deliverable.
             }
+            session.returned.add(stored.eventId);
+            pageItems.push({ stored });
         }
 
         if (pageItems.length < session.limit && !session.exhausted) {
@@ -2744,9 +2765,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
             const chunkId = session.walk[session.walkPos].chunkId;
             const members = this.chunkMembers.get(chunkId);
-            // Cheap, no-I/O skip: every member of this chunk is already resident or already delivered by this
-            // session, so there is nothing cold left to decrypt for.
-            if (!members || Array.from(members).every((id) => this.events.has(id) || session.returned.has(id))) {
+            // Cheap, no-I/O skip: every member of this chunk was already resident at session creation (so hot
+            // already owns delivering it) or already delivered by this session. Dedup against session.hotIds,
+            // not live this.events residency -- see ColdScanSession.hotIds' own docstring for why a member that
+            // became resident after the snapshot must still be treated as cold here (E3-F1).
+            if (!members || Array.from(members).every((id) => session.hotIds.has(id) || session.returned.has(id))) {
                 session.walkPos++;
                 continue;
             }
@@ -2775,17 +2798,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             let chunkFullyConsumed = true;
             for (const id of orderedIds) {
                 // session.returned: the sole dedup mechanism -- see this method's own docstring for why a Set,
-                // not a position, is what makes resuming a partially-consumed chunk exact. this.events: already
-                // resident, the hot path already covers it. pendingDiskDeletes: removed from the resident set by
-                // a genuine deletion whose disk rewrite has not committed yet (the window *before*
-                // manifestRemove runs). !manifest.has(id): the authoritative "is this id still on disk at all,
-                // right now" check, live against the current manifest rather than the snapshot `entries` was
-                // decrypted from -- closes the *other* window, where this chunk's own ciphertext was read
+                // not a position, is what makes resuming a partially-consumed chunk exact. session.hotIds: this
+                // id was part of the hot snapshot, so the hot path already owns delivering it -- checked against
+                // the fixed snapshot, not live this.events residency, so an id that became resident after the
+                // snapshot is still delivered here rather than dropped (E3-F1). pendingDiskDeletes: removed from
+                // the resident set by a genuine deletion whose disk rewrite has not committed yet (the window
+                // *before* manifestRemove runs). !manifest.has(id): the authoritative "is this id still on disk
+                // at all, right now" check, live against the current manifest rather than the snapshot `entries`
+                // was decrypted from -- closes the *other* window, where this chunk's own ciphertext was read
                 // (started) before a concurrent deletion's manifestRemove + disk commit landed, but this loop
                 // only inspects the result after both had already finished.
                 if (
                     session.returned.has(id) ||
-                    this.events.has(id) ||
+                    session.hotIds.has(id) ||
                     this.pendingDiskDeletes.has(id) ||
                     !this.manifest.has(id)
                 ) {

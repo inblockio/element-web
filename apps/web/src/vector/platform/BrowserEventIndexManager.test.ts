@@ -6407,4 +6407,237 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             asAny.pendingDiskDeletes.delete(target);
         }
     });
+
+    // review-pr-e.md E3-F1: a cold hit that becomes resident mid-session (hydration admitting it, or an
+    // on-demand materializeIfPending pull) is delivered by neither tier, because the cold scan used to
+    // dedup against live `this.events` residency rather than the session's own fixed `hotHits` snapshot.
+    // `materializeIfPending` only does real work once `residentBudgetExceeded` is true (see its own
+    // docstring), which `seedAndReopen`'s tight `hotWindowBytes` reopen sets genuinely, the same way
+    // hydration itself would leave it after stopping early.
+    describe("E3-F1: a cold hit racing into residency mid-session", () => {
+        async function materialize(m: BrowserEventIndexManager, id: string): Promise<void> {
+            await (m as unknown as { materializeIfPending(id: string): Promise<void> }).materializeIfPending(id);
+        }
+
+        it("P1: a single cold hit materialized before the walk reaches its chunk is still served, not dropped", async () => {
+            setChunkTargetBytesOverrideForTesting(400);
+            const N = 10;
+            const limit = 2;
+            const reloaded = await seedAndReopen(1, N);
+
+            const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+            expect(page1.next_batch).toBeDefined();
+
+            // Lift the resident budget before materializing, so pulling this one id in does not itself
+            // evict another resident id via enforceResidentBudget -- residentBudgetExceeded (which gates
+            // materializeIfPending) is already true from the tight-budget reopen above and stays true
+            // regardless of this override.
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: Number.MAX_SAFE_INTEGER });
+            await materialize(reloaded, idAt(0)); // oldest: certainly cold, certainly last on the walk
+            expect(residentIds(reloaded).has(idAt(0))).toBe(true);
+
+            const all = [...resultIds(page1)];
+            let nextBatch = page1.next_batch;
+            let guard = 0;
+            do {
+                const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+                all.push(...resultIds(page));
+                nextBatch = page.next_batch;
+            } while (nextBatch !== undefined && ++guard < 20);
+
+            expect(new Set(all).size).toBe(N); // every id served exactly once, including the raced-in one
+            expect(all).toContain(idAt(0));
+        });
+
+        it("F1b: the same through a realistic reopen with more than one hit already resident", async () => {
+            setChunkTargetBytesOverrideForTesting(400);
+            const N = 12;
+            const limit = 2;
+            const reloaded = await seedAndReopen(RESIDENT_BYTES_PER_EVENT_ESTIMATE * 2, N);
+            const resident = residentIds(reloaded);
+            expect(resident.size).toBeGreaterThan(0);
+            expect(resident.size).toBeLessThan(N);
+
+            const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+            expect(page1.next_batch).toBeDefined();
+
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: Number.MAX_SAFE_INTEGER });
+            await materialize(reloaded, idAt(0));
+            expect(residentIds(reloaded).has(idAt(0))).toBe(true);
+
+            const all = [...resultIds(page1)];
+            let nextBatch = page1.next_batch;
+            let guard = 0;
+            do {
+                const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+                all.push(...resultIds(page));
+                nextBatch = page.next_batch;
+            } while (nextBatch !== undefined && ++guard < 20);
+
+            expect(new Set(all).size).toBe(N);
+            expect(all).toContain(idAt(0));
+        });
+
+        it("F1c: the fast-skip half independently -- a whole chunk becoming resident is not skipped away undecrypted", async () => {
+            setChunkTargetBytesOverrideForTesting(150); // small, multi-member chunks
+            const N = 10;
+            const limit = 2;
+            const reloaded = await seedAndReopen(1, N);
+
+            const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+            expect(page1.next_batch).toBeDefined();
+
+            // The chunk holding the oldest id is the one the newest-first walk reaches last. Materialize
+            // every one of its members before paging further: this is what makes the cheap, no-I/O
+            // fast-skip at the top of coldScanSessionStep's loop fire (rather than the deeper per-record
+            // filter, which P1/F1b exercise instead).
+            const chunkMembers = (reloaded as unknown as { chunkMembers: Map<number, Set<string>> }).chunkMembers;
+            let target: Set<string> | undefined;
+            for (const members of chunkMembers.values()) {
+                if (members.has(idAt(0))) {
+                    target = members;
+                    break;
+                }
+            }
+            expect(target).toBeDefined();
+
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: Number.MAX_SAFE_INTEGER });
+            for (const id of target!) await materialize(reloaded, id);
+            for (const id of target!) expect(residentIds(reloaded).has(id)).toBe(true);
+
+            const all = [...resultIds(page1)];
+            let nextBatch = page1.next_batch;
+            let guard = 0;
+            do {
+                const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+                all.push(...resultIds(page));
+                nextBatch = page.next_batch;
+            } while (nextBatch !== undefined && ++guard < 20);
+
+            expect(new Set(all).size).toBe(N); // the whole now-resident chunk still served, not fast-skipped away
+            for (const id of target!) expect(all).toContain(id);
+        });
+    });
+
+    // review-pr-e.md E3-F2: an event redacted between pages was still served on a later page with its
+    // cleartext body, because the hot delivery loop only checked `session.returned` against the fixed
+    // `hotHits` snapshot and never re-checked liveness at delivery time.
+    describe("E3-F2: liveness re-checked at hot delivery", () => {
+        async function seedFullyResident(n: number): Promise<BrowserEventIndexManager> {
+            setChunkTargetBytesOverrideForTesting(100_000); // one chunk: irrelevant to this test's concern
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            for (const ev of corpus(n)) {
+                await seed.addEventToIndex(ev, {});
+                await seed.commitLiveEvents();
+            }
+            return seed;
+        }
+
+        it("F2a: a redaction landing between pages is not served with its cleartext body on a later page", async () => {
+            const N = 8;
+            const limit = 3;
+            const seed = await seedFullyResident(N);
+            expect(residentIds(seed).size).toBe(N); // all resident: this is about the *hot* snapshot, not cold
+
+            const page1 = await seed.searchEventIndex(search(BODY_TOKEN, { limit }));
+            expect(page1.next_batch).toBeDefined();
+            const page1Ids = resultIds(page1);
+
+            const target = idAt(2); // not among page 1's newest 3 (idAt(7), idAt(6), idAt(5))
+            expect(page1Ids).not.toContain(target);
+            expect(await seed.deleteEvent(target)).toBe(true);
+            await seed.commitLiveEvents(); // the disk rewrite genuinely lands before we page further
+
+            const all = [...page1Ids];
+            let nextBatch = page1.next_batch;
+            let guard = 0;
+            do {
+                const page = await seed.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+                all.push(...resultIds(page));
+                nextBatch = page.next_batch;
+            } while (nextBatch !== undefined && ++guard < 20);
+
+            expect(all).not.toContain(target); // redacted since the snapshot: must not be served, cleartext or not
+            expect(new Set(all).size).toBe(N - 1); // every other hit still served exactly once
+        });
+
+        it("F2b (control): a hit merely evicted from residency, not redacted, is still served from the snapshot", async () => {
+            const N = 8;
+            const limit = 3;
+            const seed = await seedFullyResident(N);
+
+            const page1 = await seed.searchEventIndex(search(BODY_TOKEN, { limit }));
+            expect(page1.next_batch).toBeDefined();
+            const page1Ids = resultIds(page1);
+
+            const target = idAt(2);
+            expect(page1Ids).not.toContain(target);
+            // Evict from residency directly -- the same thing the resident (hot-window) budget does --
+            // leaving the manifest and disk row completely intact, unlike a real redaction.
+            const asAny = seed as unknown as { events: Map<string, unknown>; pendingDiskDeletes: Set<string> };
+            expect(asAny.events.has(target)).toBe(true);
+            asAny.events.delete(target);
+            expect(asAny.pendingDiskDeletes.has(target)).toBe(false);
+
+            const all = [...page1Ids];
+            let nextBatch = page1.next_batch;
+            let guard = 0;
+            do {
+                const page = await seed.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+                all.push(...resultIds(page));
+                nextBatch = page.next_batch;
+            } while (nextBatch !== undefined && ++guard < 20);
+
+            expect(all).toContain(target); // merely RAM-evicted, still deliverable from the snapshot
+            expect(new Set(all).size).toBe(N);
+        });
+    });
+
+    // Mutation-campaign gaps from review-pr-e.md's "Survived, real coverage gaps" table: M26 (the chunk
+    // walk itself is newest-first, not just each chunk's own record order) and M21/I8 (a page mixing hot
+    // and cold hits can exceed `limit`).
+    it("M26 (mutation campaign): the chunk walk itself is newest-first, not just each chunk's own record order", async () => {
+        setChunkTargetBytesOverrideForTesting(150); // several small, distinct chunks
+        const N = 12;
+        const limit = 4;
+        const reloaded = await seedAndReopen(1, N);
+        const rows = await dumpRawStore("chunks");
+        expect(rows.length).toBeGreaterThan(2); // genuinely several chunks to cross
+
+        const walked: string[] = [];
+        let nextBatch: string | undefined;
+        let guard = 0;
+        do {
+            const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+            walked.push(...resultIds(page));
+            nextBatch = page.next_batch;
+        } while (nextBatch !== undefined && ++guard < 20);
+
+        expect(new Set(walked).size).toBe(N);
+        // Global newest-first order end to end -- only true if the *chunk* walk visits newest-maxTs
+        // chunks first, not merely each chunk's own records in order (round 1's own M26, previously
+        // unpinned by this suite: the existing E-F3 test's chunkTargetBytes is generous enough to stay
+        // one chunk, so it never exercised the cross-chunk order at all).
+        const expectedOrder = Array.from({ length: N }, (_unused, i) => idAt(N - 1 - i));
+        expect(walked).toEqual(expectedOrder);
+    });
+
+    it("M21/I8 (mutation campaign): a page mixing hot and cold hits never exceeds the requested limit", async () => {
+        setChunkTargetBytesOverrideForTesting(150); // several small chunks, so one cold step finds several
+        const N = 10;
+        const limit = 6;
+        const reloaded = await seedAndReopen(RESIDENT_BYTES_PER_EVENT_ESTIMATE * 2, N);
+        const resident = residentIds(reloaded);
+        expect(resident.size).toBeGreaterThan(0);
+        expect(resident.size).toBeLessThan(limit); // genuinely still room left for cold on this page
+
+        const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        const ids = resultIds(page);
+        expect(ids.length).toBeLessThanOrEqual(limit);
+        // Genuinely mixed hot+cold on this one page, so a bound violation on either side would show.
+        expect(ids.some((id) => resident.has(id))).toBe(true);
+        expect(ids.some((id) => !resident.has(id))).toBe(true);
+    });
 });
