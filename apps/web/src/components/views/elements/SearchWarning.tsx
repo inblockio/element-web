@@ -102,7 +102,8 @@ const LOADING_POLL_MS = 1000;
  *     always meant to promise: the date before which a message is genuinely not covered at all
  *     (excluded by the crawl window or the disk budget), which is also exactly what still makes
  *     `windowed` true. `searchPartial`: true while the most recent search's own cold-tier scan
- *     was cut short at the page cap rather than exhausting everything on disk for that query
+ *     was cut short -- by a wall-time budget, or simply by there being more on-disk content than
+ *     fit on this one page -- rather than exhausting everything on disk for that query
  *     ({@link IIndexStats.isSearchPartial}), surfaced through the same "results may be
  *     incomplete" line as `incomplete` (both mean the same thing to a user: what is on screen may
  *     not be everything) via a one-line disjunct in {@link SearchWarning} below, not a new
@@ -282,9 +283,10 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
     if (eventIndex) {
         // The index is still missing history for this search, so it may silently return partial
         // results (#32253) -- or (increment E) the most recent search's own cold-tier scan was cut
-        // short at the page cap, so more on-disk matches may exist than were shown. Both read the
-        // same to a user (what's on screen may not be everything), so one line covers both rather
-        // than a second warning.
+        // short -- by a wall-time budget, or simply by there being more on-disk content than fit on
+        // this one page -- so more on-disk matches may exist than were shown. Both read the same to
+        // a user (what's on screen may not be everything), so one line covers both rather than a
+        // second warning.
         if ((indexIncomplete || searchPartial) && kind === WarningKind.Search) {
             // This warning appears dynamically while a search panel is already open (the crawler
             // finishes draining mid-session), so mark it as a polite live region for screen readers.

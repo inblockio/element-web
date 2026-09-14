@@ -6625,7 +6625,12 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
     });
 
     it("M21/I8 (mutation campaign): a page mixing hot and cold hits never exceeds the requested limit", async () => {
-        setChunkTargetBytesOverrideForTesting(150); // several small chunks, so one cold step finds several
+        // One generous chunk, so it alone holds more matches than `limit` (and more than the residual
+        // `need` after the hot hits) -- with review-pr-e.md's original `150`, chunks are so small that
+        // only the outer, chunk-boundary "enough hits, stop walking chunks" check ever fires, and the
+        // inner, per-record "enough hits, stop this chunk" break that M21 loosens (`need` -> `need * 2`)
+        // never gets exercised, making the mutant a no-op.
+        setChunkTargetBytesOverrideForTesting(100000);
         const N = 10;
         const limit = 6;
         const reloaded = await seedAndReopen(RESIDENT_BYTES_PER_EVENT_ESTIMATE * 2, N);
@@ -6635,7 +6640,9 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
 
         const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
         const ids = resultIds(page);
-        expect(ids.length).toBeLessThanOrEqual(limit);
+        // N (10) exceeds `limit` (6), so a correctly-bounded page is exactly `limit` long -- not merely
+        // under it, which is what makes this assertion sensitive to the inner per-record break.
+        expect(ids.length).toBe(limit);
         // Genuinely mixed hot+cold on this one page, so a bound violation on either side would show.
         expect(ids.some((id) => resident.has(id))).toBe(true);
         expect(ids.some((id) => !resident.has(id))).toBe(true);
