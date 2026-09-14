@@ -5774,6 +5774,29 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         }
     });
 
+    it("dedupe holds even when a cold hit becomes resident between pages", async () => {
+        const N = 10;
+        const reloaded = await seedAndReopen(1, N);
+        const limit = 3;
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        const page1Ids = resultIds(page1);
+        expect(page1.next_batch).toBeDefined();
+
+        // Simulate hydration (or an on-demand pull) racing ahead and materializing one of page 1's
+        // own cold hits into residency before page 2 runs: `excludeIds` (a snapshot of the resident
+        // matches taken at the *start* of each call) cannot see this, which is exactly why
+        // coldSearchScan also checks `this.events.has(id)` live, not only `excludeIds`.
+        const raced = page1Ids[page1Ids.length - 1];
+        await (reloaded as unknown as { materializeIfPending(id: string): Promise<void> }).materializeIfPending(
+            raced,
+        );
+        expect(residentIds(reloaded).has(raced)).toBe(true); // sanity: the race actually landed
+
+        const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        const combined = [...page1Ids, ...resultIds(page2)];
+        expect(new Set(combined).size).toBe(combined.length); // no id served twice
+    });
+
     it("page cap and resume cursor continue exactly: two pages cover exactly 2x limit, no overlap, no gap", async () => {
         const N = 10;
         const reloaded = await seedAndReopen(1, N); // ~1 resident; everything else must come from the cold scan
@@ -5867,7 +5890,11 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
     });
 
     it("a room-scoped search finds only that room's events, even though chunks interleave rooms", async () => {
-        setChunkTargetBytesOverrideForTesting(150); // several small chunks
+        // Large enough that several of both rooms' events share one chunk (not one event per
+        // chunk): this test wants a chunk that genuinely mixes rooms, so the per-record room filter
+        // inside coldSearchScan is what has to do the work, not just newestFirstChunkWalk's own
+        // "skip a chunk with nothing from this room at all" walk-level filter.
+        setChunkTargetBytesOverrideForTesting(600);
         setEventIndexBoundsOverrideForTesting(null);
         const seed = track(new BrowserEventIndexManager());
         await seed.initEventIndex(userId, DEVICE);
@@ -5885,6 +5912,8 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             );
             await seed.commitLiveEvents();
         }
+        // Sanity: chunks are genuinely shared across rooms, not one event per chunk.
+        expect((await dumpRawStore("chunks")).length).toBeLessThan(2 * N);
         await seed.closeEventIndex();
 
         setEventIndexBoundsOverrideForTesting({ hotWindowBytes: 1 }); // force everything cold
@@ -6008,6 +6037,31 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(resultIds(hit)).not.toContain(target);
         } finally {
             restore();
+        }
+    });
+
+    it("the pendingDiskDeletes tombstone alone (deterministic, no timing) hides a cold hit from the scan", async () => {
+        // The natural-timing version above exercises the whole deletion race end to end, but is
+        // still a race: whether *this specific guard* (as opposed to the live manifest re-check
+        // that also covers part of the same window -- see pendingDiskDeletes's own docstring) is
+        // what caught it is not something a timing-based test alone can isolate reliably. This one
+        // sets the tombstone directly, with the manifest deliberately left untouched (as it
+        // genuinely is during the window between a deletion's synchronous removeFromIndex and its
+        // queued closure's own manifestRemove), so only pendingDiskDeletes can be doing the work.
+        setChunkTargetBytesOverrideForTesting(100_000); // one chunk
+        const N = 4;
+        const reloaded = await seedAndReopen(1, N);
+        const target = idAt(0); // certainly cold
+        expect(residentIds(reloaded).has(target)).toBe(false);
+
+        const asAny = reloaded as unknown as { pendingDiskDeletes: Set<string> };
+        asAny.pendingDiskDeletes.add(target);
+        try {
+            const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N }));
+            expect(resultIds(hit)).not.toContain(target);
+            expect(hit.count).toBe(N - 1); // exactly the one tombstoned id is hidden, nothing else
+        } finally {
+            asAny.pendingDiskDeletes.delete(target);
         }
     });
 });
