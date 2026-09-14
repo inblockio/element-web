@@ -112,6 +112,17 @@ function useIsIndexIncomplete(
     index: EventIndex | null,
     scope?: SearchScope,
     roomId?: string,
+    // E-F2 fix: `searchPartial` is written by the manager *after* a search runs, which is after this
+    // hook has already mounted in production (`SearchWarning` renders as soon as the search panel
+    // opens; results, and any cold-tier partiality they carry, arrive later). The poll below was
+    // armed only while `loading` was true, so a settled session -- the overwhelmingly common case,
+    // and the only state in which the cold tier is what search relies on -- never re-read
+    // `isSearchPartial` at all once mounted. `pollAlways` (true for `WarningKind.Search`, the only
+    // caller this signal applies to) arms the same poll unconditionally instead, so a search that
+    // completes after mount is still noticed within `LOADING_POLL_MS`. See this file's own
+    // "poll effect" below for the one-line change; `getStats()` is an in-memory read on this
+    // backend, so the file already accepted a 1s poll as its own convention before this fix.
+    pollAlways: boolean = false,
 ): { incomplete: boolean; loading: boolean; windowed: boolean; oldestSearchableTs?: number; searchPartial: boolean } {
     const readCheckpoints = useCallback((): { relevant: boolean; anyOutstanding: boolean } => {
         if (!index) return { relevant: false, anyOutstanding: false };
@@ -242,10 +253,10 @@ function useIsIndexIncomplete(
     // interval instead, armed only while `loading` is true, so a session that finished hydrating
     // before this ever mounts (the overwhelmingly common case) never starts a timer at all.
     useEffect(() => {
-        if (!index || !loading) return;
+        if (!index || !(loading || pollAlways)) return;
         const poll = setInterval(() => void update(), LOADING_POLL_MS);
         return () => clearInterval(poll);
-    }, [index, loading, update]);
+    }, [index, loading, pollAlways, update]);
 
     return { incomplete, loading, windowed, oldestSearchableTs, searchPartial };
 }
@@ -258,7 +269,7 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
         windowed: indexWindowed,
         oldestSearchableTs,
         searchPartial,
-    } = useIsIndexIncomplete(eventIndex, scope, roomId);
+    } = useIsIndexIncomplete(eventIndex, scope, roomId, kind === WarningKind.Search);
 
     // An all-rooms search merges hits from every locally-indexed encrypted room, regardless of
     // whether the room this panel happens to be docked in (isRoomEncrypted, a property of *that one*

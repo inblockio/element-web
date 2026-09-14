@@ -661,9 +661,14 @@ describe("<SearchWarning />", () => {
         });
 
         describe("searchPartial (increment E: a cold-tier scan was cut at the page cap)", () => {
-            it("shows the same 'results may be incomplete' line as incomplete when searchPartial is true", async () => {
+            // E-F2 regression: in production, SearchWarning mounts when the search panel opens, and
+            // isSearchPartial can only become true *after* a search actually runs -- strictly after
+            // mount. Setting the flag before render() (the pre-fix version of these three tests) only
+            // ever exercises the mount-time read, which is the one ordering that cannot happen for
+            // real. Every test below flips the flag after mount and advances the poll instead.
+
+            it("shows the same 'results may be incomplete' line as incomplete once a search sets searchPartial, after mount", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
-                index.isSearchPartial = true;
                 setIndex(index);
 
                 const { queryByText, queryByRole } = render(
@@ -675,14 +680,22 @@ describe("<SearchWarning />", () => {
                     />,
                 );
                 await settle();
+                expect(queryByText(PARTIAL_WARNING)).not.toBeInTheDocument(); // nothing yet: no search has run
+
+                // The search this panel is for completes, and the manager's own cold-tier scan was
+                // cut at the page cap -- nothing emits an event for this (see SearchWarning.tsx's own
+                // docstring), so only the poll below can notice it.
+                index.isSearchPartial = true;
+                await act(async () => {
+                    await jest.advanceTimersByTimeAsync(1000);
+                });
 
                 expect(queryByText(PARTIAL_WARNING)).toBeInTheDocument();
                 expect(queryByRole("status")).toBeInTheDocument();
             });
 
-            it("shows nothing when searchPartial is false and nothing else applies", async () => {
+            it("shows nothing when searchPartial stays false and nothing else applies", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
-                index.isSearchPartial = false;
                 setIndex(index);
 
                 const { queryByText, container } = render(
@@ -695,15 +708,22 @@ describe("<SearchWarning />", () => {
                 );
                 await settle();
 
+                // A search runs and finds nothing partial; the poll still fires (armed for every
+                // Search-kind mount now), but has nothing new to report.
+                await act(async () => {
+                    await jest.advanceTimersByTimeAsync(1000);
+                });
+
                 expect(queryByText(PARTIAL_WARNING)).not.toBeInTheDocument();
                 expect(container).toBeEmptyDOMElement();
             });
 
             it("never shows the partial-results line for WarningKind.Files from searchPartial alone", async () => {
                 // searchPartial is a Search-only signal (a cold-tier scan is a search concept); the
-                // Files kind has its own loading-only disjunct and must not react to it.
+                // Files kind has its own loading-only disjunct and must not react to it -- and, per
+                // the E-F2 fix, must not have its poll armed unconditionally either, since Files has
+                // no `searchPartial` line to ever wait for.
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
-                index.isSearchPartial = true;
                 setIndex(index);
 
                 const { queryByText, container } = render(
@@ -711,9 +731,42 @@ describe("<SearchWarning />", () => {
                 );
                 await settle();
 
+                index.isSearchPartial = true;
+                await act(async () => {
+                    await jest.advanceTimersByTimeAsync(1000);
+                });
+
                 expect(queryByText(PARTIAL_WARNING)).not.toBeInTheDocument();
                 expect(queryByText(PARTIAL_FILES_WARNING)).not.toBeInTheDocument();
                 expect(container).toBeEmptyDOMElement();
+            });
+
+            it("REGRESSION (fails without the E-F2 fix): a settled session's poll still notices searchPartial turning true after mount", async () => {
+                // This is the direct repro from review-pr-e.md E-F2: mount already-settled (never
+                // loading), flip isSearchPartial true, advance 10s of fake timers. Before the fix the
+                // poll was never armed at all in this state (SearchWarning.tsx's own comment said so
+                // deliberately), so this assertion fails without it.
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.loading = false;
+                setIndex(index);
+
+                const { queryByText } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+                expect(queryByText(PARTIAL_WARNING)).not.toBeInTheDocument();
+
+                index.isSearchPartial = true;
+                await act(async () => {
+                    await jest.advanceTimersByTimeAsync(10000);
+                });
+
+                expect(queryByText(PARTIAL_WARNING)).toBeInTheDocument();
             });
         });
     });
