@@ -2993,6 +2993,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      *     to backwards; `fromEvent` is an event id from a previous page, and results start immediately after it. One
      *     that is no longer indexed ends the listing rather than erroring, since restarting from the first page would
      *     turn a panel that pages until it gets an empty answer into an endless loop.
+     *
+     * **Out of scope for increment E's cold tier, deliberately.** Unlike {@link searchEventIndex},
+     * this only ever reads {@link roomOrder}/{@link events} -- the resident set -- so a file older
+     * than the hot window is not listed here even though it is still findable by a text search that
+     * happens to match it. Left as a named follow-up rather than extended in this increment: the
+     * Files panel has no page-cap/streamed-scan precedent to extend from the way search's own
+     * pagination does, and giving it one is a separate, larger design question (a bounded scan
+     * keyed on `hasFile` rather than on search terms) than this increment's brief covers.
      */
     public async loadFileEvents(args: ILoadArgs): Promise<IEventAndProfile[]> {
         const ids = this.roomOrder.get(args.roomId) ?? [];

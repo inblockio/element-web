@@ -41,9 +41,13 @@ class FakeEventIndex {
 
     /** Settable after construction; see the "windowed" describe block below. */
     public windowed = false;
-    // oldestResidentTs, not oldestIndexedTs: SearchWarning's date line now sources from the
-    // resident (searchable) floor, not the disk one -- see useIsIndexIncomplete's own docstring.
-    public oldestResidentTs: number | undefined = undefined;
+    // oldestIndexedTs, not oldestResidentTs (increment E): SearchWarning's date line sources from
+    // the on-disk floor, not the resident one -- the cold-tier scan makes resident-only coverage
+    // the wrong promise to make -- see useIsIndexIncomplete's own docstring.
+    public oldestIndexedTs: number | undefined = undefined;
+
+    /** Settable after construction; see the "searchPartial" describe block below. */
+    public isSearchPartial = false;
 
     /** getStats() rejects once, then answers normally; see "treats a getStats() failure as not loading". */
     public getStatsFailsOnce = false;
@@ -72,7 +76,8 @@ class FakeEventIndex {
         roomCount: number;
         loading: boolean;
         windowed: boolean;
-        oldestResidentTs: number | undefined;
+        oldestIndexedTs: number | undefined;
+        isSearchPartial: boolean;
     }> {
         if (this.getStatsFailsOnce) {
             this.getStatsFailsOnce = false;
@@ -84,7 +89,8 @@ class FakeEventIndex {
             roomCount: 0,
             loading: this.loading,
             windowed: this.windowed,
-            oldestResidentTs: this.oldestResidentTs,
+            oldestIndexedTs: this.oldestIndexedTs,
+            isSearchPartial: this.isSearchPartial,
         };
     }
 
@@ -562,7 +568,7 @@ describe("<SearchWarning />", () => {
             it('shows "Search covers messages newer than {date}" when windowed and a date is known', async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = true;
-                index.oldestResidentTs = WINDOWED_TS;
+                index.oldestIndexedTs = WINDOWED_TS;
                 setIndex(index);
 
                 const { queryByText } = render(
@@ -581,7 +587,7 @@ describe("<SearchWarning />", () => {
             it("does not show the windowed line when nothing has been excluded", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = false;
-                index.oldestResidentTs = WINDOWED_TS; // a date being known is not sufficient on its own
+                index.oldestIndexedTs = WINDOWED_TS; // a date being known is not sufficient on its own
                 setIndex(index);
 
                 const { queryByText, container } = render(
@@ -601,7 +607,7 @@ describe("<SearchWarning />", () => {
             it("does not show the windowed line when windowed but no date is known yet", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = true;
-                index.oldestResidentTs = undefined; // windowed without a date is not enough either
+                index.oldestIndexedTs = undefined; // windowed without a date is not enough either
                 setIndex(index);
 
                 const { queryByText, container } = render(
@@ -621,7 +627,7 @@ describe("<SearchWarning />", () => {
             it("never shows the windowed line for WarningKind.Files", async () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.windowed = true;
-                index.oldestResidentTs = WINDOWED_TS;
+                index.oldestIndexedTs = WINDOWED_TS;
                 setIndex(index);
 
                 const { queryByText } = render(<SearchWarning isRoomEncrypted={true} kind={WarningKind.Files} />);
@@ -634,7 +640,7 @@ describe("<SearchWarning />", () => {
                 const index = new FakeEventIndex([], [SEARCHED_ROOM]);
                 index.loading = true;
                 index.windowed = true;
-                index.oldestResidentTs = WINDOWED_TS;
+                index.oldestIndexedTs = WINDOWED_TS;
                 setIndex(index);
 
                 const { queryByText } = render(
@@ -651,6 +657,63 @@ describe("<SearchWarning />", () => {
                 // already makes `incomplete` true for this scope/room regardless of windowed.
                 expect(queryByText(PARTIAL_WARNING)).toBeInTheDocument();
                 expect(queryByText(/Search covers messages newer than/)).not.toBeInTheDocument();
+            });
+        });
+
+        describe("searchPartial (increment E: a cold-tier scan was cut at the page cap)", () => {
+            it("shows the same 'results may be incomplete' line as incomplete when searchPartial is true", async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.isSearchPartial = true;
+                setIndex(index);
+
+                const { queryByText, queryByRole } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+
+                expect(queryByText(PARTIAL_WARNING)).toBeInTheDocument();
+                expect(queryByRole("status")).toBeInTheDocument();
+            });
+
+            it("shows nothing when searchPartial is false and nothing else applies", async () => {
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.isSearchPartial = false;
+                setIndex(index);
+
+                const { queryByText, container } = render(
+                    <SearchWarning
+                        isRoomEncrypted={true}
+                        kind={WarningKind.Search}
+                        scope={SearchScope.Room}
+                        roomId={SEARCHED_ROOM}
+                    />,
+                );
+                await settle();
+
+                expect(queryByText(PARTIAL_WARNING)).not.toBeInTheDocument();
+                expect(container).toBeEmptyDOMElement();
+            });
+
+            it("never shows the partial-results line for WarningKind.Files from searchPartial alone", async () => {
+                // searchPartial is a Search-only signal (a cold-tier scan is a search concept); the
+                // Files kind has its own loading-only disjunct and must not react to it.
+                const index = new FakeEventIndex([], [SEARCHED_ROOM]);
+                index.isSearchPartial = true;
+                setIndex(index);
+
+                const { queryByText, container } = render(
+                    <SearchWarning isRoomEncrypted={true} kind={WarningKind.Files} />,
+                );
+                await settle();
+
+                expect(queryByText(PARTIAL_WARNING)).not.toBeInTheDocument();
+                expect(queryByText(PARTIAL_FILES_WARNING)).not.toBeInTheDocument();
+                expect(container).toBeEmptyDOMElement();
             });
         });
     });

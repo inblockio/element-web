@@ -93,17 +93,26 @@ const LOADING_POLL_MS = 1000;
  *     the date before which a result is not guaranteed *findable by a query right now*, when known,
  *     for the "Search covers messages newer than {date}" line — `undefined` on a backend that does
  *     not report it, or before this session has learned one. Sourced from {@link
- *     IIndexStats.oldestResidentTs}, not {@link IIndexStats.oldestIndexedTs}: until increment E
- *     adds the streamed cold scan, a row outside the resident (hot-window) set is on disk but not
- *     searchable, so `oldestIndexedTs` (a disk guarantee) would overstate what a query can actually
- *     see today. Revisit this choice when E lands — the cold scan is what would make
- *     `oldestIndexedTs` the correct source again.
+ *     IIndexStats.oldestIndexedTs} (increment E), not {@link IIndexStats.oldestResidentTs}: now
+ *     that `BrowserEventIndexManager.searchEventIndex` streams a cold-tier scan over on-disk
+ *     content beyond the resident (hot-window) set, a row outside that set is still genuinely
+ *     findable, just slower (the disk scan rather than the in-memory index), so
+ *     `oldestResidentTs` (a memory guarantee) would understate real coverage and show a date
+ *     newer than the truth. `oldestIndexedTs` (the on-disk guarantee) is what this line has
+ *     always meant to promise: the date before which a message is genuinely not covered at all
+ *     (excluded by the crawl window or the disk budget), which is also exactly what still makes
+ *     `windowed` true. `searchPartial`: true while the most recent search's own cold-tier scan
+ *     was cut short at the page cap rather than exhausting everything on disk for that query
+ *     ({@link IIndexStats.isSearchPartial}), surfaced through the same "results may be
+ *     incomplete" line as `incomplete` (both mean the same thing to a user: what is on screen may
+ *     not be everything) via a one-line disjunct in {@link SearchWarning} below, not a new
+ *     warning of its own.
  */
 function useIsIndexIncomplete(
     index: EventIndex | null,
     scope?: SearchScope,
     roomId?: string,
-): { incomplete: boolean; loading: boolean; windowed: boolean; oldestSearchableTs?: number } {
+): { incomplete: boolean; loading: boolean; windowed: boolean; oldestSearchableTs?: number; searchPartial: boolean } {
     const readCheckpoints = useCallback((): { relevant: boolean; anyOutstanding: boolean } => {
         if (!index) return { relevant: false, anyOutstanding: false };
         const { crawlingRooms } = index.crawlingRooms();
@@ -126,9 +135,10 @@ function useIsIndexIncomplete(
     // existing convention for every signal here) rather than adding a second timer for a pair of
     // properties that, once true, are expected to stay true or only become more true.
     const [windowed, setWindowed] = useState<boolean>(false);
-    // oldestResidentTs, not oldestIndexedTs: see this hook's own docstring for why (until
-    // increment E's cold scan, only the resident set is actually searchable).
+    // oldestIndexedTs, not oldestResidentTs (increment E): see this hook's own docstring for why.
     const [oldestSearchableTs, setOldestSearchableTs] = useState<number | undefined>(undefined);
+    // Same refresh convention as windowed/oldestSearchableTs above: opportunistic, not polled.
+    const [searchPartial, setSearchPartial] = useState<boolean>(false);
 
     // Shared between the subscription effect below and the poll effect further down, so a tick
     // from either agrees with the other about which answer is current; a ref rather than a
@@ -161,7 +171,8 @@ function useIsIndexIncomplete(
             if (current !== generationRef.current) return;
             isLoading = Boolean(stats?.loading);
             setWindowed(Boolean(stats?.windowed));
-            setOldestSearchableTs(stats?.oldestResidentTs);
+            setOldestSearchableTs(stats?.oldestIndexedTs);
+            setSearchPartial(Boolean(stats?.isSearchPartial));
         } catch (e) {
             // A backend whose getStats() rejects is not evidence either way; log and treat it as
             // not loading rather than let the rejection go unhandled (this function is always
@@ -202,6 +213,7 @@ function useIsIndexIncomplete(
             setLoading(false);
             setWindowed(false);
             setOldestSearchableTs(undefined);
+            setSearchPartial(false);
             return;
         }
 
@@ -235,7 +247,7 @@ function useIsIndexIncomplete(
         return () => clearInterval(poll);
     }, [index, loading, update]);
 
-    return { incomplete, loading, windowed, oldestSearchableTs };
+    return { incomplete, loading, windowed, oldestSearchableTs, searchPartial };
 }
 
 export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, scope, roomId }: IProps): JSX.Element {
@@ -245,6 +257,7 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
         loading: indexLoading,
         windowed: indexWindowed,
         oldestSearchableTs,
+        searchPartial,
     } = useIsIndexIncomplete(eventIndex, scope, roomId);
 
     // An all-rooms search merges hits from every locally-indexed encrypted room, regardless of
@@ -257,8 +270,11 @@ export default function SearchWarning({ isRoomEncrypted, kind, showLogo = true, 
 
     if (eventIndex) {
         // The index is still missing history for this search, so it may silently return partial
-        // results (#32253). Warn the user.
-        if (indexIncomplete && kind === WarningKind.Search) {
+        // results (#32253) -- or (increment E) the most recent search's own cold-tier scan was cut
+        // short at the page cap, so more on-disk matches may exist than were shown. Both read the
+        // same to a user (what's on screen may not be everything), so one line covers both rather
+        // than a second warning.
+        if ((indexIncomplete || searchPartial) && kind === WarningKind.Search) {
             // This warning appears dynamically while a search panel is already open (the crawler
             // finishes draining mid-session), so mark it as a polite live region for screen readers.
             return (
