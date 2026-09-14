@@ -5787,9 +5787,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         // matches taken at the *start* of each call) cannot see this, which is exactly why
         // coldSearchScan also checks `this.events.has(id)` live, not only `excludeIds`.
         const raced = page1Ids[page1Ids.length - 1];
-        await (reloaded as unknown as { materializeIfPending(id: string): Promise<void> }).materializeIfPending(
-            raced,
-        );
+        await (reloaded as unknown as { materializeIfPending(id: string): Promise<void> }).materializeIfPending(raced);
         expect(residentIds(reloaded).has(raced)).toBe(true); // sanity: the race actually landed
 
         const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
@@ -5931,9 +5929,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         setChunkTargetBytesOverrideForTesting(100_000); // generous: the whole corpus in one chunk
         const N = 5;
         const reloaded = await seedAndReopen(1, N); // everything but the newest ends up cold
-        const hit = await reloaded.searchEventIndex(
-            search(BODY_TOKEN, { limit: N, before_limit: 1, after_limit: 1 }),
-        );
+        const hit = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: N, before_limit: 1, after_limit: 1 }));
         expect(hit.count).toBe(N);
         const middle = hit.results!.find((r: any) => r.result.event_id === idAt(2));
         expect(middle).toBeDefined();

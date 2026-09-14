@@ -2331,8 +2331,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // Resolve ids to records, dropping any that have gone: a redaction between matching and reading must not become
         // an undefined result. Room scoping is applied here rather than inside the index, there being no per-room
         // posting lists.
-        let hotHits = Array.from(ids ?? [], (eventId) => this.events.get(eventId)).filter(
-            (e): e is StoredEvent => Boolean(e),
+        let hotHits = Array.from(ids ?? [], (eventId) => this.events.get(eventId)).filter((e): e is StoredEvent =>
+            Boolean(e),
         );
         if (searchArgs.room_id) {
             hotHits = hotHits.filter((e) => e.roomId === searchArgs.room_id);
@@ -2382,7 +2382,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // stopped -- those over-fetched matches would be skipped as "already emitted" by a later page
         // that never actually saw them. Bounding `need` to exactly this page's remaining room is what
         // keeps the resume cursor's position exactly aligned with what was actually served.
-        const hotSlice = requestedOffset < hotHits.length ? hotHits.slice(requestedOffset, requestedOffset + limit) : [];
+        const hotSlice =
+            requestedOffset < hotHits.length ? hotHits.slice(requestedOffset, requestedOffset + limit) : [];
 
         let coldHits: Array<{ stored: StoredEvent; context: ColdContext }> = [];
         let chunkIdx = cursor.chunkIdx;
@@ -2591,7 +2592,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * whole-room-order {@link contextFor} would give the same position. Mirrors {@link contextFor}'s own shape
      * (timeline-ordered before/after plus `profile_info`) so the two are interchangeable to a caller.
      */
-    private coldContextFor(chunkEntries: Map<string, StoredEvent>, hit: StoredEvent, beforeLimit: number, afterLimit: number): ColdContext {
+    private coldContextFor(
+        chunkEntries: Map<string, StoredEvent>,
+        hit: StoredEvent,
+        beforeLimit: number,
+        afterLimit: number,
+    ): ColdContext {
         const roomList = Array.from(chunkEntries.values())
             .filter((e) => e.roomId === hit.roomId)
             .sort((a, b) => a.originServerTs - b.originServerTs);
@@ -2643,7 +2649,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         excludeIds: Set<string>;
         beforeLimit: number;
         afterLimit: number;
-    }): Promise<{ hits: Array<{ stored: StoredEvent; context: ColdContext }>; chunkIdx: number; within: number; exhausted: boolean }> {
+    }): Promise<{
+        hits: Array<{ stored: StoredEvent; context: ColdContext }>;
+        chunkIdx: number;
+        within: number;
+        exhausted: boolean;
+    }> {
         const hits: Array<{ stored: StoredEvent; context: ColdContext }> = [];
         const notFound = { hits, chunkIdx: opts.startChunkIdx, within: opts.startWithin, exhausted: false };
         if (opts.need <= 0 || !this.dek || !this.db || !this.userId || this.closed) return notFound;
@@ -3710,72 +3721,72 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // own docstring for the window this closes.
         this.pendingDiskDeletes.add(targetId);
         this.enqueuePersist(async () => {
-          try {
-            const dek = this.dek;
-            const entry = this.manifest.get(targetId);
-            if (!entry) return; // Never reached disk at all -- still buffered only.
-            if (!dek || !this.db) {
-                this.manifestRemove(targetId);
-                return;
-            }
-            const chunkId = entry.chunkId;
-            const wasOpen = chunkId === this.openChunkId;
-            // The open chunk's own live buffer is mutated directly (it is the authoritative
-            // in-memory copy, never re-read from disk while open); a sealed chunk is read fresh.
-            const entries = wasOpen ? this.openChunkEntries : await this.readChunkEntries(userId, dek, chunkId);
-            entries.delete(targetId);
-            if (wasOpen) this.openChunkPlainBytes = entries.size > 0 ? chunkPlainBytesFor(entries) : 0;
-            // oldestIndexedTs is deliberately NOT touched here: it is a *cutoff* from a deliberate,
-            // contiguous, oldest-first drop (enforceDiskBudget), not a promise about any arbitrary
-            // single record's age, and an ordinary redaction is neither of those things -- see
-            // oldestIndexedTs's own docstring, and deleteRecordsForDiskBudget's for the case that
-            // *does* update it.
-            this.manifestRemove(targetId);
-
-            let newTotal = this.ciphertextBytes - (this.chunkInfo.get(chunkId)?.bytes ?? 0);
-            let chunkRecord: ChunkRecord | null = null;
-            let newInfo: { bytes: number; minTs: number; maxTs: number } | null = null;
-            if (entries.size > 0) {
-                const blob = await encryptBinary(dek, Array.from(entries), chunkAad(userId, chunkId));
-                chunkRecord = { userId, chunkId, blob };
-                newInfo = { bytes: blob.ct.length + blob.iv.length, ...tsRangeOf(entries) };
-                newTotal += newInfo.bytes;
-            }
-
-            const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
-            const meta = await this.loadMeta(userId);
-            const tx = this.db.transaction(["chunks", "meta"], "readwrite");
-            if (chunkRecord) tx.objectStore("chunks").put(chunkRecord);
-            else tx.objectStore("chunks").delete([userId, chunkId]);
-            for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
-            if (meta) {
-                tx.objectStore("meta").put({
-                    ...meta,
-                    diskBytes: newTotal,
-                    manifestPageCount: this.manifestPages.length,
-                    nextChunkId: this.nextChunkId,
-                });
-            }
-            await txDone(tx);
-
-            this.ciphertextBytes = newTotal;
-            if (newInfo) {
-                this.chunkInfo.set(chunkId, newInfo);
-                heapPushTs(this.diskChunkHeap, { ts: newInfo.maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
-            } else {
-                this.chunkInfo.delete(chunkId);
-                if (wasOpen) {
-                    this.openChunkId = undefined;
-                    this.openChunkEntries.clear();
-                    this.openChunkPlainBytes = 0;
+            try {
+                const dek = this.dek;
+                const entry = this.manifest.get(targetId);
+                if (!entry) return; // Never reached disk at all -- still buffered only.
+                if (!dek || !this.db) {
+                    this.manifestRemove(targetId);
+                    return;
                 }
+                const chunkId = entry.chunkId;
+                const wasOpen = chunkId === this.openChunkId;
+                // The open chunk's own live buffer is mutated directly (it is the authoritative
+                // in-memory copy, never re-read from disk while open); a sealed chunk is read fresh.
+                const entries = wasOpen ? this.openChunkEntries : await this.readChunkEntries(userId, dek, chunkId);
+                entries.delete(targetId);
+                if (wasOpen) this.openChunkPlainBytes = entries.size > 0 ? chunkPlainBytesFor(entries) : 0;
+                // oldestIndexedTs is deliberately NOT touched here: it is a *cutoff* from a deliberate,
+                // contiguous, oldest-first drop (enforceDiskBudget), not a promise about any arbitrary
+                // single record's age, and an ordinary redaction is neither of those things -- see
+                // oldestIndexedTs's own docstring, and deleteRecordsForDiskBudget's for the case that
+                // *does* update it.
+                this.manifestRemove(targetId);
+
+                let newTotal = this.ciphertextBytes - (this.chunkInfo.get(chunkId)?.bytes ?? 0);
+                let chunkRecord: ChunkRecord | null = null;
+                let newInfo: { bytes: number; minTs: number; maxTs: number } | null = null;
+                if (entries.size > 0) {
+                    const blob = await encryptBinary(dek, Array.from(entries), chunkAad(userId, chunkId));
+                    chunkRecord = { userId, chunkId, blob };
+                    newInfo = { bytes: blob.ct.length + blob.iv.length, ...tsRangeOf(entries) };
+                    newTotal += newInfo.bytes;
+                }
+
+                const manifestRecords = await this.prepareManifestPageWrites(userId, dek);
+                const meta = await this.loadMeta(userId);
+                const tx = this.db.transaction(["chunks", "meta"], "readwrite");
+                if (chunkRecord) tx.objectStore("chunks").put(chunkRecord);
+                else tx.objectStore("chunks").delete([userId, chunkId]);
+                for (const rec of manifestRecords) tx.objectStore("meta").put(rec);
+                if (meta) {
+                    tx.objectStore("meta").put({
+                        ...meta,
+                        diskBytes: newTotal,
+                        manifestPageCount: this.manifestPages.length,
+                        nextChunkId: this.nextChunkId,
+                    });
+                }
+                await txDone(tx);
+
+                this.ciphertextBytes = newTotal;
+                if (newInfo) {
+                    this.chunkInfo.set(chunkId, newInfo);
+                    heapPushTs(this.diskChunkHeap, { ts: newInfo.maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
+                } else {
+                    this.chunkInfo.delete(chunkId);
+                    if (wasOpen) {
+                        this.openChunkId = undefined;
+                        this.openChunkEntries.clear();
+                        this.openChunkPlainBytes = 0;
+                    }
+                }
+            } finally {
+                // However this settled -- deleted the whole chunk, rewrote it, found nothing to do, or
+                // threw -- the window pendingDiskDeletes exists for is over: either the disk row now
+                // reflects the deletion, or nothing here ever depended on it doing so.
+                this.pendingDiskDeletes.delete(targetId);
             }
-          } finally {
-            // However this settled -- deleted the whole chunk, rewrote it, found nothing to do, or
-            // threw -- the window pendingDiskDeletes exists for is over: either the disk row now
-            // reflects the deletion, or nothing here ever depended on it doing so.
-            this.pendingDiskDeletes.delete(targetId);
-          }
         });
     }
 
