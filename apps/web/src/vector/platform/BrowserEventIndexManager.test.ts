@@ -5841,6 +5841,33 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         expect(new Set(combined).size).toBe(combined.length); // no repeat across the hot/cold seam
     });
 
+    it("a same-chunk resume after a mid-chunk cut relies on `returned`, not a position, to avoid a duplicate", async () => {
+        // A single large chunk holding several cold matches, with `limit` small enough that finding
+        // `need` mid-chunk stops before the chunk is fully consumed: walkPos stays on that same
+        // chunk for the next call, which re-decrypts it from scratch and must skip what this
+        // session already delivered from it via the `returned` Set alone -- there is no saved
+        // in-chunk position to trust (unlike the previous boundary-cursor shape's `within` count).
+        setChunkTargetBytesOverrideForTesting(100_000); // one chunk holds the whole corpus
+        const N = 6;
+        const reloaded = await seedAndReopen(RESIDENT_BYTES_PER_EVENT_ESTIMATE, N); // ~1 resident, rest cold
+        const residentCount = residentIds(reloaded).size;
+        expect(residentCount).toBeGreaterThan(0);
+        expect(residentCount).toBeLessThan(N); // sanity: genuinely a mixed hot/cold, single-chunk corpus
+        const limit = 2;
+
+        const walked: string[] = [];
+        let nextBatch: string | undefined;
+        let guard = 0;
+        do {
+            const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+            walked.push(...resultIds(page));
+            nextBatch = page.next_batch;
+        } while (nextBatch !== undefined && ++guard < 10);
+
+        expect(new Set(walked).size).toBe(walked.length); // no id served twice across the resumed chunk
+        expect(new Set(walked)).toEqual(new Set(Array.from({ length: N }, (_unused, i) => idAt(i))));
+    });
+
     it("a budget cut resumes across at least three chunks with no repeat and no drop", async () => {
         setChunkTargetBytesOverrideForTesting(60); // one event per chunk: several chunks to walk
         setColdScanBudgetMsOverrideForTesting(5); // tiny budget: cuts well before a whole chunk's neighbours
