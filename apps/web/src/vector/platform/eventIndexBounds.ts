@@ -216,6 +216,46 @@ export function setChunkTargetBytesOverrideForTesting(override: number | null): 
     chunkTargetBytesOverrideForTesting = override;
 }
 
+/**
+ * Wall-clock ceiling, in milliseconds, on one {@link BrowserEventIndexManager.coldSearchScan} call: a query that
+ * matches nothing on disk cannot stop early on `need` (its only other stopping condition is "chunk walk
+ * exhausted"), so without a bound it decrypts and scans *every* remaining cold chunk in a single call. Measured
+ * (increment-E review, `research/review-pr-e.md` "The miss cost"): a miss query costs **2,716.9 ms at 200k**
+ * events (49,152 resident, ~151,000 cold-swept) and **7,759.2 ms at 500k** (131,072 resident, ~369,000
+ * cold-swept), real Chromium, ~18-21 µs/cold-event -- both sliced to zero long tasks (the app stays responsive),
+ * but with no partial results and, pre-this-fix, no "results may be incomplete" line either (E-F2), so the user
+ * simply watches a multi-second spinner. 1,000 ms sits comfortably under even the 200k figure while leaving
+ * headroom below the 7.8 s worst case measured so far; a scan that hits this ceiling returns whatever it has with
+ * `exhausted: false` (never `true` -- there is genuinely more left), so the next page's own call resumes exactly
+ * at the boundary this one reached rather than losing anything. Checked at the same points {@link
+ * HYDRATION_SLICE_DEADLINE_MS} already is (once per chunk, and once per slice-yield inside a chunk), so it costs
+ * no new timer or await.
+ *
+ * @knipignore - exported for tests
+ */
+export const COLD_SCAN_BUDGET_MS = 1000;
+
+/**
+ * Test-only override for {@link getColdScanBudgetMs}, the same shape as {@link
+ * setChunkTargetBytesOverrideForTesting}: `null` (the default) means "use {@link COLD_SCAN_BUDGET_MS}". Production
+ * code never calls the setter.
+ */
+let coldScanBudgetMsOverrideForTesting: number | null = null;
+
+/** The cold-scan wall-clock budget in effect right now; see {@link COLD_SCAN_BUDGET_MS}. */
+export function getColdScanBudgetMs(): number {
+    return coldScanBudgetMsOverrideForTesting ?? COLD_SCAN_BUDGET_MS;
+}
+
+/**
+ * Test-only hook: force {@link getColdScanBudgetMs} to a specific value, or pass `null` to clear the override.
+ * Never called from production code.
+ * @knipignore - exported for tests
+ */
+export function setColdScanBudgetMsOverrideForTesting(override: number | null): void {
+    coldScanBudgetMsOverrideForTesting = override;
+}
+
 const DESKTOP_BOUNDS: EventIndexBounds = {
     tier: "desktop",
     hotWindowBytes: 128 * 1024 * 1024,
@@ -250,17 +290,30 @@ const SMALL_BOUNDS: EventIndexBounds = {
  *    report `Mobile` in their own UA string), consulted whenever the first check is not `true`
  *    (`userAgentData` absent, or itself reporting non-mobile) so that a browser exposing neither
  *    signal cleanly still gets a real answer instead of defaulting to "must be desktop".
+ * 3. **iPadOS's default desktop-mode UA (E-F4 fix).** Since iPadOS 13, Safari's "Request Desktop
+ *    Website" is on by default, so an iPad's own UA carries neither `iPad` nor `Mobile` and reads
+ *    as plain desktop Safari (`Macintosh; Intel Mac OS X ...`) -- the regex above cannot see it,
+ *    `deviceMemory` and `userAgentData` are both WebKit-absent, so before this check an iPad landed
+ *    on the *desktop* tier: a 128 MiB hot window and a 512 MiB disk budget, on the engine
+ *    `measurements-cross-engine.md` measured as the most memory-opaque of the three, on the device
+ *    class with the tightest per-tab limits of any browser Element Web runs in -- a regression this
+ *    increment's own E0 fix introduced (before it, no `deviceMemory` meant the small tier
+ *    unconditionally, so an iPad got the conservative bound by accident). The standard detection:
+ *    `navigator.maxTouchPoints > 1` (a real iPad in desktop-UA mode reports 5; a real Mac reports 0)
+ *    together with a `Macintosh` UA token, so a genuine Mac laptop/desktop is unaffected.
  *
  * Never consulted when `deviceMemory` *is* present (Chromium desktop and Chromium Android both
  * report it directly, more precisely than any UA guess could) -- see {@link deviceMemoryTier}.
  */
 function isLikelyMobileUserAgent(): boolean {
     const nav = globalThis.navigator as
-        | (Navigator & { userAgentData?: { mobile?: boolean }; userAgent?: string })
+        | (Navigator & { userAgentData?: { mobile?: boolean }; userAgent?: string; maxTouchPoints?: number })
         | undefined;
     if (nav?.userAgentData?.mobile === true) return true;
     const ua = typeof nav?.userAgent === "string" ? nav.userAgent : "";
-    return /Android|iPhone|iPad|Mobile/.test(ua);
+    if (/Android|iPhone|iPad|Mobile/.test(ua)) return true;
+    if (typeof nav?.maxTouchPoints === "number" && nav.maxTouchPoints > 1 && /Macintosh/.test(ua)) return true;
+    return false;
 }
 
 /**
