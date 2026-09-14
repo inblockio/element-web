@@ -2680,6 +2680,76 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             expect(new Set(order).size).toBe(order.length);
             await reloaded.closeEventIndex();
         });
+
+        it("D3-F1 (review-pr-d.md): a redaction landing during hydration's chunk-decrypt await never leaves a phantom id in roomOrder", async () => {
+            // Small chunks, so the corpus spans several chunks and hydrate()'s walk crosses chunk
+            // boundaries -- the shape review-pr-d.md's D3-F1 repro (R1/R1b) used to catch a since-
+            // removed per-room pending merge (hydrationPendingByRoom/flushRoomOrderPending) leaving
+            // an id resident in roomOrder that a same-session redaction had already dropped from
+            // events. materializeRow() now splices straight into roomOrder for every admitted row
+            // (no batching, no pending window), so this proves the invariant holds without that
+            // structure rather than merely no longer reproducing a bug in code that is gone.
+            setChunkTargetBytesOverrideForTesting(700);
+            try {
+                const total = 24;
+                await manager.initEventIndex(userId, DEVICE);
+                await manager.waitForHydration();
+                for (let i = 0; i < total; i++) {
+                    await manager.addEventToIndex(
+                        msg(`$rd${String(i).padStart(3, "0")}`, `zqredact wording ${i}`, {
+                            room_id: room,
+                            origin_server_ts: 10_000 + i,
+                        }),
+                        {},
+                    );
+                }
+                await manager.commitLiveEvents();
+                await manager.closeEventIndex();
+
+                const reloaded = new BrowserEventIndexManager();
+                const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+                let victim: string | undefined;
+                const decryptSpy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args: any[]) => {
+                    const out = await (realDecrypt as any)(...args);
+                    // Fires once, right after an earlier chunk's members are already resident in
+                    // `events` -- exactly the window the original repro landed the redaction in,
+                    // just keyed off actual residency instead of a pending list that no longer exists.
+                    if (!victim) {
+                        const events: Map<string, unknown> = (reloaded as any).events;
+                        if (events.size > 0) {
+                            victim = events.keys().next().value!;
+                            void reloaded.deleteEvent(victim);
+                        }
+                    }
+                    return out;
+                });
+                try {
+                    await reloaded.initEventIndex(userId, DEVICE);
+                    await reloaded.waitForHydration();
+
+                    expect(victim).toBeDefined();
+                    const roomOrder: Map<string, string[]> = (reloaded as any).roomOrder;
+                    const events: Map<string, unknown> = (reloaded as any).events;
+                    const list = roomOrder.get(room) ?? [];
+                    const phantoms = list.filter((id) => !events.has(id));
+                    expect(phantoms).toEqual([]);
+                    expect(list).not.toContain(victim);
+                    expect((await reloaded.getStats()).eventCount).toBe(total - 1);
+
+                    // Production's own search arguments (Searching.ts): before_limit: 1 must not
+                    // throw for any hit, including one adjacent to where the victim used to sit.
+                    await expect(
+                        reloaded.searchEventIndex(search("zqredact", { before_limit: 1, after_limit: 1 })),
+                    ).resolves.toMatchObject({ count: expect.any(Number) });
+
+                    await reloaded.closeEventIndex();
+                } finally {
+                    decryptSpy.mockRestore();
+                }
+            } finally {
+                setChunkTargetBytesOverrideForTesting(null);
+            }
+        });
     });
 });
 
