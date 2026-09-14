@@ -5803,71 +5803,209 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         expect(new Set(combined).size).toBe(combined.length); // no id served twice
     });
 
-    it("page cap and resume cursor continue exactly: two pages cover exactly 2x limit, no overlap, no gap", async () => {
-        setChunkTargetBytesOverrideForTesting(400); // several chunks -- see the previous test's own comment
-        const N = 10;
-        const reloaded = await seedAndReopen(1, N); // ~1 resident; everything else must come from the cold scan
-        const limit = 3; // SEARCH_PAGE_CAP = 2*limit = 6 < N: the scan must stop short of the whole corpus.
+    it("hot hits exactly limit, then exactly 2x limit, then the cold tier is reached on the next page (E2-F2)", async () => {
+        // A session's hot list is fixed at creation and hotPos simply keeps advancing across pages,
+        // so a resident hit count that is an exact multiple of `limit` (the E2-F2 shape: the review's
+        // own gate, `hotSlice.length < limit`, never re-entered the cold tier once a page filled
+        // exactly from hot alone) cannot strand the cold tier: there is no per-page recomputation
+        // left that could special-case this boundary.
+        setChunkTargetBytesOverrideForTesting(400);
+        const limit = 3;
+        const hotCount = 2 * limit; // 6: exactly two full pages of hot hits, no partial page in between
+        const coldCount = 4;
+        const N = hotCount + coldCount; // 10
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        for (const ev of corpus(N)) {
+            await seed.addEventToIndex(ev, {});
+            await seed.commitLiveEvents(); // persist every one, so the cold ids are genuinely on disk
+        }
+        const asAny = seed as unknown as { events: Map<string, unknown> };
+        for (let i = 0; i < coldCount; i++) asAny.events.delete(idAt(i));
+        expect(residentIds(seed).size).toBe(hotCount);
 
-        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
-        expect(page1.results).toHaveLength(limit);
+        const page1 = await seed.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.results).toHaveLength(limit); // page 1: entirely hot
         expect(page1.next_batch).toBeDefined();
-        // count is "known so far", not the eventual cap total: each call's own cold scan looks for
-        // only as much as *that page* needs (never more, so a resumed page can never skip content
-        // its own predecessor over-fetched and never served -- see searchEventIndex's own comment on
-        // `hotSlice`), so page 1 alone knows only its own `limit` worth of hits.
-        expect(page1.count).toBe(limit);
 
-        const page2 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
-        expect(page2.results).toHaveLength(limit);
-        expect(page2.count).toBe(2 * limit); // capped at SEARCH_PAGE_CAP by the second page, not the true total (N)
-        expect(page2.next_batch).toBeUndefined(); // the cap was reached; no third page is offered
+        const page2 = await seed.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        expect(page2.results).toHaveLength(limit); // page 2: entirely hot too -- hot exhausts exactly here
+        expect(page2.next_batch).toBeDefined(); // more left: the cold tier, not yet reached by either page
 
-        const combined = [...resultIds(page1), ...resultIds(page2)];
-        expect(new Set(combined).size).toBe(2 * limit); // no overlap between the two pages
-        // Resuming picked up exactly where page 1 left off -- the newest 2*limit ids overall, with
-        // nothing skipped and nothing repeated.
-        const expectedNewest = new Set(Array.from({ length: 2 * limit }, (_unused, i) => idAt(N - 1 - i)));
-        expect(new Set(combined)).toEqual(expectedNewest);
+        const page3 = await seed.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page2.next_batch }));
+        expect(page3.results.length).toBeGreaterThan(0); // page 3 genuinely reaches disk
+        for (const r of resultIds(page3)) expect(residentIds(seed).has(r)).toBe(false); // real cold hits
+
+        const combined = [...resultIds(page1), ...resultIds(page2), ...resultIds(page3)];
+        expect(new Set(combined).size).toBe(combined.length); // no repeat across the hot/cold seam
     });
 
-    it("isSearchPartial is true only while the scan was actually cut at the page cap", async () => {
-        setChunkTargetBytesOverrideForTesting(400); // several chunks -- see the dedupe test's own comment
-        const smallCorpus = 4;
-        const bigCorpus = 10;
-
-        // A query the cold tier never needs to touch at all: never partial.
-        const allHot = track(new BrowserEventIndexManager());
-        await allHot.initEventIndex(userId, DEVICE);
-        await allHot.waitForHydration();
-        for (const ev of corpus(smallCorpus)) {
-            await allHot.addEventToIndex(ev, {});
-            await allHot.commitLiveEvents();
+    it("a budget cut resumes across at least three chunks with no repeat and no drop", async () => {
+        setChunkTargetBytesOverrideForTesting(60); // one event per chunk: several chunks to walk
+        setColdScanBudgetMsOverrideForTesting(5); // tiny budget: cuts well before a whole chunk's neighbours
+        try {
+            const N = 15;
+            const reloaded = await seedAndReopen(1, N);
+            let fakeMs = 0;
+            const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => {
+                fakeMs += 3; // each call advances the fake clock, tripping the budget deterministically
+                return fakeMs;
+            });
+            const walked: string[] = [];
+            let nextBatch: string | undefined;
+            let guard = 0;
+            try {
+                do {
+                    const page = await reloaded.searchEventIndex(
+                        search(BODY_TOKEN, { limit: 2, next_batch: nextBatch }),
+                    );
+                    walked.push(...resultIds(page));
+                    nextBatch = page.next_batch;
+                } while (nextBatch !== undefined && ++guard < 40);
+            } finally {
+                nowSpy.mockRestore();
+            }
+            expect(nextBatch).toBeUndefined(); // eventually exhausts even though every call's own budget is tiny
+            expect(guard).toBeGreaterThanOrEqual(3); // genuinely spanned several budget-cut pages/chunks
+            expect(new Set(walked).size).toBe(walked.length); // no id served twice across the whole walk
+            expect(new Set(walked)).toEqual(new Set(Array.from({ length: N }, (_unused, i) => idAt(i)))); // and none missing
+        } finally {
+            setColdScanBudgetMsOverrideForTesting(null);
         }
-        await allHot.searchEventIndex(search(BODY_TOKEN, { limit: smallCorpus }));
-        expect((await allHot.getStats()).isSearchPartial).toBe(false);
-        await allHot.closeEventIndex();
+    });
 
-        // A cold-tier query that finds everything (fewer matches than the cap): not partial.
-        userId = `@coldtier${++userCounter}:example.org`;
-        const exhausted = await seedAndReopen(1, smallCorpus);
-        await exhausted.searchEventIndex(search(BODY_TOKEN, { limit: smallCorpus }));
-        expect((await exhausted.getStats()).isSearchPartial).toBe(false);
+    it("searchPartial is true on every budget-cut page and false only on the page that exhausts the session", async () => {
+        setChunkTargetBytesOverrideForTesting(60); // one event per chunk: several chunks to walk
+        setColdScanBudgetMsOverrideForTesting(5); // tiny budget: forces a cut on (almost) every call
+        try {
+            const N = 12;
+            const reloaded = await seedAndReopen(1, N);
+            let fakeMs = 0;
+            const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => {
+                fakeMs += 3;
+                return fakeMs;
+            });
+            let nextBatch: string | undefined;
+            try {
+                for (let i = 0; i < 3; i++) {
+                    const page = await reloaded.searchEventIndex(
+                        search(BODY_TOKEN, { limit: 5, next_batch: nextBatch }),
+                    );
+                    expect(page.next_batch).toBeDefined(); // the tiny budget must cut this page
+                    expect((await reloaded.getStats()).isSearchPartial).toBe(true);
+                    nextBatch = page.next_batch;
+                }
+            } finally {
+                nowSpy.mockRestore();
+            }
 
-        // A cold-tier query cut at the cap: partial once enough pages have actually been fetched to
-        // reach it (each call's own scan is bounded to that page's own need -- see the page-cap test
-        // above -- so the flag only goes true after paging up to SEARCH_PAGE_CAP, not after page 1 alone).
-        userId = `@coldtier${++userCounter}:example.org`;
-        const capped = await seedAndReopen(1, bigCorpus);
-        const limit = 2; // SEARCH_PAGE_CAP = 4 < bigCorpus
-        const first = await capped.searchEventIndex(search(BODY_TOKEN, { limit }));
-        expect((await capped.getStats()).isSearchPartial).toBe(false); // not yet -- only page 1 so far
-        await capped.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: first.next_batch }));
-        expect((await capped.getStats()).isSearchPartial).toBe(true);
+            // Real clock from here: page through to the end. The very last page (no next_batch) must
+            // clear the flag -- searchPartial is never true once nothing is left to look at.
+            let guard = 0;
+            let last: Awaited<ReturnType<typeof reloaded.searchEventIndex>> | undefined;
+            do {
+                last = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: 5, next_batch: nextBatch }));
+                nextBatch = last.next_batch;
+            } while (nextBatch !== undefined && ++guard < 20);
+            expect(nextBatch).toBeUndefined();
+            expect((await reloaded.getStats()).isSearchPartial).toBe(false);
+        } finally {
+            setColdScanBudgetMsOverrideForTesting(null);
+        }
+    });
 
-        // And it clears again once a later query is satisfied without being cut.
-        await capped.searchEventIndex(search(BODY_TOKEN, { limit: bigCorpus }));
-        expect((await capped.getStats()).isSearchPartial).toBe(false);
+    it("a chunk sealed after the session's own snapshot is never visited by that session's cold scan", async () => {
+        setChunkTargetBytesOverrideForTesting(400);
+        const N = 10;
+        const reloaded = await seedAndReopen(1, N);
+        const limit = 2;
+
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.next_batch).toBeDefined();
+
+        // A live, matching message arrives after this session's own walk was snapshotted: it must
+        // never surface via this session, however many further pages are fetched -- it is newer than
+        // the query's own start and belongs to a chunk the snapshot never included in the first place.
+        await reloaded.addEventToIndex(
+            msg("$afterSnapshot", `${BODY_TOKEN} arrived after the snapshot`, {
+                room_id: ROOM,
+                origin_server_ts: 9_000_000,
+            }),
+            {},
+        );
+        await reloaded.commitLiveEvents();
+
+        const walked = [...resultIds(page1)];
+        let nextBatch = page1.next_batch;
+        let guard = 0;
+        do {
+            const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: nextBatch }));
+            walked.push(...resultIds(page));
+            nextBatch = page.next_batch;
+        } while (nextBatch !== undefined && ++guard < 20);
+
+        expect(walked).not.toContain("$afterSnapshot");
+    });
+
+    it("an unknown or evicted next_batch token resolves to an empty page, never a throw", async () => {
+        setChunkTargetBytesOverrideForTesting(400);
+        const N = 10;
+        const reloaded = await seedAndReopen(1, N);
+        const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit: 2, next_batch: "not-a-real-token" }));
+        expect(page.results).toEqual([]);
+        expect(page.count).toBe(0);
+        expect(page.next_batch).toBeUndefined();
+    });
+
+    it("a fifth concurrent session evicts the oldest of the four already alive", async () => {
+        setChunkTargetBytesOverrideForTesting(400);
+        const N = 10;
+        const reloaded = await seedAndReopen(1, N);
+        const limit = 2;
+        const tokens: string[] = [];
+        for (let i = 0; i < 4; i++) {
+            const page = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+            expect(page.next_batch).toBeDefined();
+            tokens.push(page.next_batch!);
+        }
+        const asAny = reloaded as unknown as { coldScanSessions: Map<string, unknown> };
+        expect(asAny.coldScanSessions.size).toBe(4); // MAX_COLD_SCAN_SESSIONS
+
+        // A fifth fresh session must evict the first (oldest) of the four above, not any other.
+        const fifth = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(fifth.next_batch).toBeDefined();
+        expect(asAny.coldScanSessions.size).toBe(4); // still bounded, not 5
+
+        const evicted = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: tokens[0] }));
+        expect(evicted.results).toEqual([]); // the oldest session's token no longer resolves
+        expect(evicted.next_batch).toBeUndefined();
+
+        // The three more recent of the original four are still alive and resolve without throwing.
+        for (const token of tokens.slice(1)) {
+            await expect(
+                reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: token })),
+            ).resolves.toBeDefined();
+        }
+    });
+
+    it("closeEventIndex drops every live cold-scan session", async () => {
+        setChunkTargetBytesOverrideForTesting(400);
+        const N = 10;
+        const reloaded = await seedAndReopen(1, N);
+        const limit = 2;
+        const page1 = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit }));
+        expect(page1.next_batch).toBeDefined();
+        const asAny = reloaded as unknown as { coldScanSessions: Map<string, unknown> };
+        expect(asAny.coldScanSessions.size).toBeGreaterThan(0);
+
+        await reloaded.closeEventIndex();
+        expect(asAny.coldScanSessions.size).toBe(0);
+
+        // The old token must not resolve after teardown -- same "unknown token" contract, not a throw.
+        const resumed = await reloaded.searchEventIndex(search(BODY_TOKEN, { limit, next_batch: page1.next_batch }));
+        expect(resumed.results).toEqual([]);
+        expect(resumed.next_batch).toBeUndefined();
     });
 
     it("E-F3: continues through the remaining hot hits and into the cold tier -- 2*limit+5 resident, 5 on disk, all reachable", async () => {
