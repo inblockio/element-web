@@ -212,6 +212,89 @@ async function seedLegacyV2Fixture(
     return { salt };
 }
 
+/**
+ * Seed the field-standard v2 shape (review-pr-d.md D3-F3): a real `events` object store, PLUS
+ * increment C's own bookkeeping sharing the `meta` store under composite `${userId}|...` keys --
+ * a manifest page, an encrypted `oldestIndexedTs` row -- PLUS `manifestPageCount`/`diskBytes` on the
+ * `MetaRecord` itself and a checkpoint row. C added all of this without bumping
+ * `EVENTINDEX_DB_VERSION`, so this, not the bare pre-manifest shape {@link seedLegacyV2Fixture}
+ * seeds, is the only v2 shape every account that ever ran increment C actually has on disk.
+ */
+async function seedLegacyV2WithCManifestFixture(
+    pickleKey: string,
+    userId: string,
+    deviceId: string,
+    rawEvents: any[],
+): Promise<void> {
+    const salt = crypto.getRandomValues(new Uint8Array(32));
+    const dek = await deriveDek(pickleKey, salt, userId, deviceId);
+    const evRecords: Array<{ userId: string; eventId: string; blob: { iv: string; ct: string } }> = [];
+    const manifestEntries: Array<[string, number, string]> = [];
+    let diskBytes = 0;
+    for (const ev of rawEvents) {
+        const stored = {
+            event: ev,
+            profile: {},
+            roomId: ev.room_id,
+            eventId: ev.event_id,
+            originServerTs: ev.origin_server_ts ?? 0,
+            searchText: extractSearchText(ev),
+            hasFile: eventHasFile(ev),
+            edited: false,
+        };
+        const blob = await encryptJson(dek, stored, `${userId}|${ev.event_id}`);
+        diskBytes += blob.ct.length;
+        evRecords.push({ userId, eventId: ev.event_id, blob });
+        manifestEntries.push([ev.event_id, ev.origin_server_ts ?? 0, ev.room_id]);
+    }
+    const pageKey = `${userId}|manifest:0`;
+    const pageBlob = await encryptJson(dek, manifestEntries, pageKey);
+    const oldestKey = `${userId}|oldestIndexedTs`;
+    const oldestBlob = await encryptJson(dek, { ts: rawEvents[0].origin_server_ts }, oldestKey);
+    const cpId = "someopaquehmacid=";
+    const cpBlob = await encryptJson(
+        dek,
+        { roomId: "!crawl:example.org", token: "tok", direction: Direction.Backward },
+        `${userId}|cp|${cpId}`,
+    );
+
+    await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.open(EVENTINDEX_DB_NAME, 2);
+        req.onupgradeneeded = (): void => {
+            const db = req.result;
+            db.createObjectStore("meta", { keyPath: "userId" });
+            const events = db.createObjectStore("events", { keyPath: ["userId", "eventId"] });
+            events.createIndex("byUser", "userId", { unique: false });
+            const cps = db.createObjectStore("checkpoints", { keyPath: "id" });
+            cps.createIndex("byUser", "userId", { unique: false });
+        };
+        req.onerror = (): void => reject(req.error);
+        req.onsuccess = (): void => {
+            const db = req.result;
+            const tx = db.transaction(["meta", "events", "checkpoints"], "readwrite");
+            tx.objectStore("meta").put({
+                userId,
+                salt: encodeBase64(salt),
+                userVersion: 7,
+                diskBytes,
+                manifestPageCount: 1,
+            });
+            tx.objectStore("meta").put({ userId: pageKey, blob: pageBlob });
+            tx.objectStore("meta").put({ userId: oldestKey, blob: oldestBlob });
+            for (const rec of evRecords) tx.objectStore("events").put(rec);
+            tx.objectStore("checkpoints").put({ id: cpId, userId, blob: cpBlob });
+            tx.oncomplete = (): void => {
+                db.close();
+                resolve();
+            };
+            tx.onerror = (): void => {
+                db.close();
+                reject(tx.error);
+            };
+        };
+    });
+}
+
 async function inspectRawDb(pickleKey: string, deviceId: string): Promise<RawSnapshot> {
     const events = await decryptAllChunkEvents(pickleKey, deviceId);
     return withRawDb(async (db) => {
@@ -225,6 +308,11 @@ async function inspectRawDb(pickleKey: string, deviceId: string): Promise<RawSna
 /** Every record of one store, exactly as it sits on disk. */
 async function dumpRawStore(name: string): Promise<any[]> {
     return withRawDb((db) => idbPromise(db.transaction(name, "readonly").objectStore(name).getAll()));
+}
+
+/** Every key of one store, exactly as it sits on disk -- cheaper than {@link dumpRawStore} when only the key set matters. */
+async function dumpRawKeys(name: string): Promise<any[]> {
+    return withRawDb((db) => idbPromise(db.transaction(name, "readonly").objectStore(name).getAllKeys()) as any);
 }
 
 /**
@@ -4597,6 +4685,61 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(hit.count).toBe(1);
             expect((await reloaded.searchEventIndex(search("zqlegacy-only-content-0"))).count).toBe(0); // still gone
             expect((await reloaded.getStats()).eventCount).toBe(1);
+        });
+
+        it("resets a v2 database that already carries increment C's manifest, oldestIndexedTs row and disk accounting (review-pr-d.md D3-F3)", async () => {
+            // The field-standard shape, not the bare pre-manifest one the test above seeds: every
+            // account that ever ran increment C has a `${userId}|manifest:<n>` page and an encrypted
+            // `${userId}|oldestIndexedTs` row sharing the `meta` store, plus `manifestPageCount`/
+            // `diskBytes` on the MetaRecord itself. Mutants D3 (stop deleting `|`-keyed meta rows) and
+            // D4 (carry manifestPageCount/nextChunkId over instead of zeroing) both survived the
+            // suite without a test seeding this shape; this is that test.
+            const corpus = Array.from({ length: 12 }, (_unused, i) =>
+                msg(`$c${i}`, `zqcmanifest-legacy-${i}`, { origin_server_ts: 5000 + i }),
+            );
+            await seedLegacyV2WithCManifestFixture(pickleKey!, userId, DEVICE, corpus);
+            expect(await dumpRawStore("events")).toHaveLength(12);
+            expect((await dumpRawKeys("meta")).length).toBe(3); // MetaRecord + manifest page + oldestIndexedTs
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForManifest();
+            await reloaded.waitForHydration();
+
+            await withRawDb(async (db) => {
+                expect(db.version).toBe(3);
+                expect(db.objectStoreNames.contains("events")).toBe(false);
+            });
+            // Every composite `|`-keyed meta row -- C's manifest page and its oldestIndexedTs row --
+            // is gone, not merely orphaned as stale ciphertext (D3).
+            expect(await dumpRawKeys("meta")).toEqual([userId]);
+            const metaRow = (await dumpRawStore("meta"))[0];
+            expect(Object.keys(metaRow).sort()).toEqual([
+                "manifestPageCount",
+                "nextChunkId",
+                "salt",
+                "userId",
+                "userVersion",
+            ]);
+            expect(metaRow.manifestPageCount).toBe(0); // zeroed, not carried over from C (D4)
+            expect(metaRow.userVersion).toBe(7); // caller-owned, kept
+            expect(await dumpRawStore("chunks")).toEqual([]);
+            expect(await dumpRawStore("checkpoints")).toEqual([]);
+            expect(await reloaded.isEventIndexEmpty()).toBe(true);
+            expect(await reloaded.loadCheckpoints()).toEqual([]);
+            expect((await reloaded.searchEventIndex(search("zqcmanifest-legacy-0"))).count).toBe(0);
+            const stats = await reloaded.getStats();
+            expect(stats.eventCount).toBe(0);
+            expect(stats.size).toBe(0);
+
+            // Re-crawl works from empty, exactly as the bare-v2 case does.
+            await reloaded.addHistoricEvents(
+                [{ event: msg("$cnew1", "zqcmanifest-fresh content", { room_id: ROOM }), profile: {} }],
+                null,
+                null,
+            );
+            await reloaded.commitLiveEvents();
+            expect((await reloaded.searchEventIndex(search("zqcmanifest-fresh"))).count).toBe(1);
         });
     });
 
