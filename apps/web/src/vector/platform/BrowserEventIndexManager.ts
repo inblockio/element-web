@@ -1293,14 +1293,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * loadFileEvents} depend on it.
      */
     private readonly roomOrder = new Map<string, string[]>();
-    /**
-     * Room id -> event ids admitted by {@link hydrate}'s own bulk loop (via {@link materializeRow}'s
-     * `bulkHydration` path) since the last {@link flushRoomOrderPending} call, not yet merged into
-     * {@link roomOrder}. See {@link flushRoomOrderPending}'s own docstring for why this exists
-     * (review-pr-d.md D-R6) and when it drains. Always empty outside a hydration run in progress;
-     * {@link clearIndexMaps} clears it defensively on every reset regardless.
-     */
-    private readonly hydrationPendingByRoom = new Map<string, string[]>();
     /** Outstanding crawler positions, cleartext in memory and mirrored encrypted to disk. */
     private checkpoints: ICrawlerCheckpoint[] = [];
     /** Schema version owned by `EventIndex`, round-tripped through the `meta` record. */
@@ -2812,14 +2804,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * `set`) that keeps a bug reaching this function from becoming a silent duplicate rather than a caller's own
      * mistake to fix.
      *
-     * **Not what {@link hydrate}'s own bulk loop uses any more (review-pr-d.md D-R6).** This is an
-     * O(room size) splice per call -- fine for one live event at a time, but called once per
-     * *admitted* row during a restore it becomes O(N^2/rooms) over the whole hydration (measured
-     * 100.5 µs/event at 131k admitted vs 37.7 µs/event at 49k on the same corpus, a ratio matching
-     * N^2, not N). {@link materializeRow}'s `bulkHydration` path appends to {@link
-     * hydrationPendingByRoom} instead ({@link flushRoomOrderPending} merges it in later); only the
-     * interactive, one-row-at-a-time paths ({@link materializeIfPending}, live writes via {@link
-     * upsertEvent}) still call this directly.
+     * review-pr-d.md D-R6 proposed deferring this during {@link hydrate}'s bulk loop into a per-room
+     * pending list, merged in later in one linear pass, to avoid the O(N^2/rooms) splice cost over a
+     * whole restore. review-pr-d.md D3-F1 found that deferral let a redaction or eviction landing
+     * mid-hydration leave a phantom id in {@link roomOrder} that is not in {@link events}, wedging
+     * {@link contextFor} for that room for the rest of the session; D3-F5 found no measured
+     * restore-time benefit from the deferral on the corpora it was tried against. It was removed:
+     * {@link hydrate} calls this method directly for every admitted row, same as every other caller.
      */
     private insertRoomOrder(stored: StoredEvent): void {
         let list = this.roomOrder.get(stored.roomId);
@@ -2835,58 +2826,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             else hi = mid;
         }
         list.splice(lo, 0, stored.eventId);
-    }
-
-    /**
-     * Drain {@link hydrationPendingByRoom} into {@link roomOrder}, one merge per affected room
-     * rather than one splice per admitted event -- the fix for review-pr-d.md D-R6's O(N^2/rooms)
-     * hydration cost. Each room's pending ids (appended in whatever order {@link hydrate}'s chunk
-     * walk admitted them, not necessarily sorted -- newest-member-first *within* one chunk visit,
-     * but a room's events are typically spread across many chunks, visited in `maxTs` order across
-     * chunks, not within one room) are sorted by `origin_server_ts` once, then merged with the
-     * room's existing sorted {@link roomOrder} list in one linear pass -- O(existing + pending) for
-     * that room, not O(existing) per *event* in pending. Called at every point {@link hydrate}
-     * already treats as a safe flush point for the vocabulary merge ({@link
-     * flushVocabularyMergeIfDue}): after a slice yield, at each chunk-batch boundary, and on every
-     * exit from the loop (the resident-budget stop included) -- so {@link roomOrder} is never left
-     * missing an id that is already resident in {@link events} for longer than one slice.
-     *
-     * Ties (equal `origin_server_ts` between an existing and a pending id) resolve existing-first,
-     * the same "stable, arrival-order-ish" bias {@link insertRoomOrder}'s own upper-bound binary
-     * search gives a live insert -- not a promise either path makes about *which* tied id ends up
-     * first, only that the result stays a valid ascending-by-ts ordering, which is all {@link
-     * contextFor}/{@link loadFileEvents} depend on.
-     */
-    private flushRoomOrderPending(epoch: number): void {
-        if (this.hydrationPendingByRoom.size === 0) return;
-        if (this.closed || epoch !== this.hydrationEpoch) {
-            this.hydrationPendingByRoom.clear();
-            return;
-        }
-        for (const [roomId, pendingIds] of this.hydrationPendingByRoom) {
-            pendingIds.sort(
-                (a, b) => (this.events.get(a)?.originServerTs ?? 0) - (this.events.get(b)?.originServerTs ?? 0),
-            );
-            const existing = this.roomOrder.get(roomId);
-            if (!existing || existing.length === 0) {
-                this.roomOrder.set(roomId, pendingIds);
-                continue;
-            }
-            const merged: string[] = new Array(existing.length + pendingIds.length);
-            let i = 0;
-            let j = 0;
-            let k = 0;
-            while (i < existing.length && j < pendingIds.length) {
-                const tsExisting = this.events.get(existing[i])?.originServerTs ?? 0;
-                const tsPending = this.events.get(pendingIds[j])?.originServerTs ?? 0;
-                if (tsExisting <= tsPending) merged[k++] = existing[i++];
-                else merged[k++] = pendingIds[j++];
-            }
-            while (i < existing.length) merged[k++] = existing[i++];
-            while (j < pendingIds.length) merged[k++] = pendingIds[j++];
-            this.roomOrder.set(roomId, merged);
-        }
-        this.hydrationPendingByRoom.clear();
     }
 
     /**
@@ -3224,15 +3163,22 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const idx = this.positionInRoomOrder(list, hit);
         const beforeIds = idx >= 0 ? list.slice(Math.max(0, idx - beforeLimit), idx) : [];
         const afterIds = idx >= 0 ? list.slice(idx + 1, idx + 1 + afterLimit) : [];
-        const events_before = beforeIds.map((id) => this.resultEvent(this.events.get(id)!.event));
-        const events_after = afterIds.map((id) => this.resultEvent(this.events.get(id)!.event));
+        // Resolved and filtered, not asserted non-null: `roomOrder` entries are meant to always be
+        // resident in `events`, but a future regression of that invariant (review-pr-d.md D3-F1 was
+        // one such shape) should drop the stale id from this one result rather than throw and fail
+        // the whole search for the room.
+        const beforeEvents = beforeIds.flatMap((id) => {
+            const ev = this.events.get(id);
+            return ev ? [ev] : [];
+        });
+        const afterEvents = afterIds.flatMap((id) => {
+            const ev = this.events.get(id);
+            return ev ? [ev] : [];
+        });
+        const events_before = beforeEvents.map((ev) => this.resultEvent(ev.event));
+        const events_after = afterEvents.map((ev) => this.resultEvent(ev.event));
         const profile_info: Record<string, IMatrixProfile> = {};
-        const consider = [
-            hit,
-            ...beforeIds.map((id) => this.events.get(id)!),
-            ...afterIds.map((id) => this.events.get(id)!),
-        ];
-        for (const ev of consider) {
+        for (const ev of [hit, ...beforeEvents, ...afterEvents]) {
             if (ev.event.sender) profile_info[ev.event.sender] = ev.profile;
         }
         return { events_before, events_after, profile_info };
@@ -4161,7 +4107,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 if (this.residentByteEstimate() >= bounds.hotWindowBytes) {
                     this.residentBudgetExceeded = true;
                     log.info(`EventIndex: hydration stopped at the resident budget after ${hydratedCount} events`);
-                    this.flushRoomOrderPending(epoch);
                     return;
                 }
                 const group = sortedChunkIds.slice(i, i + HYDRATION_CHUNK_BATCH);
@@ -4272,10 +4217,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                             log.info(
                                 `EventIndex: hydration stopped at the resident budget after ${hydratedCount} events`,
                             );
-                            this.flushRoomOrderPending(epoch);
                             return;
                         }
-                        this.materializeRow(userId, stored, true);
+                        this.materializeRow(userId, stored);
                         hydratedCount++;
                     }
 
@@ -4286,11 +4230,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                         if (this.closed || epoch !== this.hydrationEpoch) return;
                         // A safe point for the merge every row's own indexTokens() call deferred (B2-F1):
                         // outside any row's own task, right after a real yield, so its own tens-of-milliseconds
-                        // cost is never added on top of one already in progress. flushRoomOrderPending is the
-                        // same idea for D-R6's deferred room-order merge: outside any row's own task, so its
-                        // own O(existing+pending) cost per room is never added on top of one already in progress.
+                        // cost is never added on top of one already in progress.
                         this.flushVocabularyMergeIfDue();
-                        this.flushRoomOrderPending(epoch);
                         sliceStart = now();
                     }
                 }
@@ -4299,9 +4240,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // (a small last batch, most commonly): otherwise a deferred merge could sit unflushed
                 // until whatever live write happens to come along next -- see
                 // flushVocabularyMergeIfDue's own caller in indexTokens, which only re-checks when
-                // *something* is indexed, not on a timer. Same reasoning for flushRoomOrderPending.
+                // *something* is indexed, not on a timer.
                 this.flushVocabularyMergeIfDue();
-                this.flushRoomOrderPending(epoch);
 
                 // Once per batch, not once per row: cheap in the common case (one scalar comparison),
                 // and disk usage only ever grows from writes, never from hydration itself decrypting
@@ -4323,7 +4263,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             // policy every other failure path in this class already follows.
             this.hydrationFailure = e;
             log.warn("EventIndex: hydration failed; leaving the index partially hydrated", e);
-            this.flushRoomOrderPending(epoch); // Do not lose room order for whatever did admit before the failure.
         } finally {
             if (epoch === this.hydrationEpoch) {
                 this.hydrating = false;
@@ -4367,17 +4306,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * ({@link hydrate}'s loop, {@link materializeIfPending}'s own re-checks), but this guard is what
      * makes a future caller that forgets one fail safe rather than silently duplicate the id in
      * {@link roomOrder}, which has no "already present?" check of its own.
-     *
-     * @param bulkHydration - When true (only {@link hydrate}'s own loop passes this), the room-order
-     *     insertion is deferred: the id is appended to {@link hydrationPendingByRoom} in O(1) rather
-     *     than binary-search-spliced into {@link roomOrder} in O(room size) -- see {@link
-     *     flushRoomOrderPending}'s own docstring for why (review-pr-d.md D-R6: `insertRoomOrder`'s
-     *     per-event memmove made hydration O(N^2/rooms)) and for who flushes the deferred entries and
-     *     when. `false` (every other caller -- {@link materializeIfPending}, an interactive,
-     *     single-row path) inserts immediately, exactly as before: there is no asymptotic gain to
-     *     batching one row, and the caller acts on the result synchronously afterwards.
      */
-    private materializeRow(userId: string, stored: StoredEvent, bulkHydration = false): void {
+    private materializeRow(userId: string, stored: StoredEvent): void {
         if (this.events.has(stored.eventId)) return;
 
         const redactedByPendingEdit = (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id));
@@ -4393,16 +4323,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // deferMerge: true -- see indexTokens' docstring. hydrate()'s own loop flushes a deferred merge
         // at its next safe point (a page boundary or a slice yield), never inside this row's own task.
         this.indexTokens(stored.eventId, stored.searchText, true);
-        if (bulkHydration) {
-            let pending = this.hydrationPendingByRoom.get(stored.roomId);
-            if (!pending) {
-                pending = [];
-                this.hydrationPendingByRoom.set(stored.roomId, pending);
-            }
-            pending.push(stored.eventId);
-        } else {
-            this.insertRoomOrder(stored);
-        }
+        this.insertRoomOrder(stored);
 
         // Unlike schema v2, nothing here touches ciphertextBytes/chunkInfo: that accounting is
         // entirely per-chunk now, owned by whichever path decrypted the chunk this event came from
@@ -4846,7 +4767,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.foldedSearchText.clear();
         this.inverted.clear();
         this.roomOrder.clear();
-        this.hydrationPendingByRoom.clear();
         this.ciphertextBytes = 0;
         this.chunkInfo.clear();
         this.chunkMembers.clear();
