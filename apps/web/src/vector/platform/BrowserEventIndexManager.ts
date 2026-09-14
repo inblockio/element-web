@@ -2517,6 +2517,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * True if `eventId`, a member of some {@link ColdScanSession.hotHits} snapshot, is still something a page
+     * could actually serve: not queued for a disk-delete rewrite, and still known either resident or on disk.
+     * `false` means redacted/removed since the snapshot was taken. `hotHits` holds the `StoredEvent` object
+     * itself, snapshotted at session creation, so nothing removes an entry from it when the event is later
+     * redacted -- liveness has to be re-checked here, live, against the same two structures the cold loop
+     * already checks (a genuine deletion clears both `this.events` and `this.manifest`, or queues the id in
+     * `pendingDiskDeletes` ahead of the disk rewrite that will); an id that is merely no longer resident but
+     * still on disk is still servable (E3-F2). Shared by the hot delivery loop below and by `count`'s
+     * pre-cold-tier tally, so a page can never claim (or count) more than it could actually serve.
+     */
+    private isSnapshotHitLive(eventId: string): boolean {
+        return !this.pendingDiskDeletes.has(eventId) && (this.events.has(eventId) || this.manifest.has(eventId));
+    }
+
+    /**
      * Deliver one page of `session`: every remaining hot hit up to `limit`, then -- if there is still room on this
      * page -- as many cold hits as {@link coldScanSessionStep} can find within {@link COLD_SCAN_BUDGET_MS}. Ends and
      * removes the session from {@link coldScanSessions} the moment both {@link ColdScanSession.hotHits} and {@link
@@ -2543,10 +2558,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         while (session.hotPos < session.hotHits.length && pageItems.length < session.limit) {
             const stored = session.hotHits[session.hotPos++];
             if (session.returned.has(stored.eventId)) continue;
-            if (
-                this.pendingDiskDeletes.has(stored.eventId) ||
-                (!this.events.has(stored.eventId) && !this.manifest.has(stored.eventId))
-            ) {
+            if (!this.isSnapshotHitLive(stored.eventId)) {
                 continue; // Redacted since the snapshot; a merely RAM-evicted hit stays deliverable.
             }
             session.returned.add(stored.eventId);
@@ -2589,8 +2601,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             // meaning: the size of the whole (fixed, session-lifetime) resident result set, not a
             // running per-page tally -- see ColdScanSession.coldTouched's own docstring for why
             // switching to "known so far" only once the cold tier is actually touched never
-            // under-reports.
-            count: session.coldTouched ? session.returned.size : session.hotHits.length,
+            // under-reports. `hotHits` is a fixed snapshot never pruned on redaction, so a raw
+            // `.length` here would over-report once anything in it is redacted/removed; count only
+            // the members `isSnapshotHitLive` -- the same predicate the delivery loop above uses to
+            // decide what to serve -- still considers servable.
+            count: session.coldTouched
+                ? session.returned.size
+                : session.hotHits.reduce((n, h) => n + (this.isSnapshotHitLive(h.eventId) ? 1 : 0), 0),
             results,
             highlights: session.tokens,
             next_batch: session.exhausted ? undefined : session.token,
