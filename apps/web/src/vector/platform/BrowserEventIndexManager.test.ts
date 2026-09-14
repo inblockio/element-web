@@ -5775,6 +5775,12 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
     });
 
     it("dedupe holds even when a cold hit becomes resident between pages", async () => {
+        // A small chunk target so this corpus spans several chunks: cross-page resumption is only a
+        // meaningful test of the chunk-walk's own resume logic when a page boundary can fall inside
+        // (or between) more than one chunk -- at the default 48 KiB target this whole corpus is one
+        // chunk, in which the old chunkIdx-based cursor could never shift (review-pr-e.md's own
+        // "why the suite cannot see either" section; this is what killed mutants M5/M26).
+        setChunkTargetBytesOverrideForTesting(400);
         const N = 10;
         const reloaded = await seedAndReopen(1, N);
         const limit = 3;
@@ -5796,6 +5802,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
     });
 
     it("page cap and resume cursor continue exactly: two pages cover exactly 2x limit, no overlap, no gap", async () => {
+        setChunkTargetBytesOverrideForTesting(400); // several chunks -- see the previous test's own comment
         const N = 10;
         const reloaded = await seedAndReopen(1, N); // ~1 resident; everything else must come from the cold scan
         const limit = 3; // SEARCH_PAGE_CAP = 2*limit = 6 < N: the scan must stop short of the whole corpus.
@@ -5823,6 +5830,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
     });
 
     it("isSearchPartial is true only while the scan was actually cut at the page cap", async () => {
+        setChunkTargetBytesOverrideForTesting(400); // several chunks -- see the dedupe test's own comment
         const smallCorpus = 4;
         const bigCorpus = 10;
 

@@ -2420,15 +2420,28 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // same as before.
         const needCold = hotSlice.length < limit;
         const hotExhaustedNow = cursor.hotExhausted || needCold;
+        // E-F5 fix: whether disk has *any* content at all -- no longer `this.manifest.size >
+        // this.events.size`, which compared the sizes of two unrelated sets (on-disk-not-resident vs.
+        // resident-but-not-yet-flushed) and could read false, skipping the scan entirely, whenever unflushed
+        // live writes outnumbered genuinely cold events, exactly when the cold set first appears. A plain
+        // `manifest.size > 0` still avoids attempting a scan when there is genuinely nothing on disk (a
+        // pickle-key-less, persistence-disabled session, or a fresh index before its first flush) without ever
+        // producing that false negative; the per-chunk "every member resident" skip inside coldSearchScan
+        // already makes an all-resident index's own walk free once there is something to walk at all.
+        const diskMightHaveColdContent = this.manifest.size > 0;
+        const attemptCold = needCold && diskMightHaveColdContent;
 
-        // How many items this query has already served across earlier pages. `cursor.emitted` is exact once the
-        // query has actually touched the cold tier (it is written by this method's own `encodeSearchCursor` call
-        // below), but a legacy bare-decimal cursor -- still possible on the very call that first transitions into
-        // cold, since a page can be hot-only for several calls before its hot slice finally runs dry -- always
-        // parses `emitted` as 0. `requestedOffset` is that legacy format's own already-served count (the same
-        // best-effort "offset accounts for everything served so far" contract hot-only pagination always had), so
-        // it, not the unset `emitted`, is the correct source while `cursor.hotExhausted` is still false.
-        const priorEmitted = cursor.hotExhausted ? cursor.emitted : requestedOffset;
+        // SEARCH_PAGE_CAP's own budget, counted from the point this query first touches the cold tier -- not from
+        // the start of the query. A hot-heavy query can serve any number of purely-resident pages first (the
+        // legacy, uncapped `!coldTouchedThisQuery` branch below; unchanged, still exercised by the "pages through
+        // the whole result set" at-scale test), and `requestedOffset` on the transition page can already exceed
+        // `pageCap` on its own (E-F3's own scenario: 2*limit+5 resident matches alone is already past a 2*limit
+        // cap) -- counting that pre-transition total against the cap would zero out `capRoom` on the very page
+        // that is supposed to start reaching disk, recreating E-F3's bug in a new shape. So the budget restarts at
+        // 0 the moment `hotExhausted` first becomes true (this page's own leftover hot slice counts against the
+        // fresh budget, everything before it does not), and `cursor.emitted` carries that reset total forward on
+        // every later page once it is genuinely tracking it.
+        const priorEmitted = cursor.hotExhausted ? cursor.emitted : 0;
 
         let coldHits: Array<{ stored: StoredEvent; context: ColdContext }> = [];
         let chunkId = cursor.chunkId;
@@ -2437,17 +2450,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         let coldExhausted = cursor.coldExhausted;
         // Once this query has touched (or is about to touch) the cold tier, SEARCH_PAGE_CAP caps the running
         // total across every page, hot and cold alike -- see `pageCap`'s own docstring above.
-        const coldTouchedThisQuery = cursor.hotExhausted || needCold;
-        if (needCold && !coldExhausted && !this.closed) {
+        const coldTouchedThisQuery = cursor.hotExhausted || attemptCold;
+        if (attemptCold && !coldExhausted && !this.closed) {
             const capRoom = Math.max(0, pageCap - priorEmitted - hotSlice.length);
             const need = Math.min(limit - hotSlice.length, capRoom);
             if (need > 0) {
-                // E-F5: no longer gated on `this.manifest.size > this.events.size` -- that compared the size of
-                // two unrelated sets (on-disk-not-resident vs. resident-but-not-yet-flushed), which could read
-                // false (skipping the scan entirely) whenever unflushed live writes outnumbered genuinely cold
-                // events, exactly when the cold set first appears. The walk itself is O(chunks + members) with no
-                // I/O, and an all-resident chunk is already skipped for free below, so there is nothing this
-                // guard saved that is worth the false negative.
                 const resident = new Set(hotHits.map((h) => h.eventId));
                 const scan = await this.coldSearchScan({
                     tokens,
@@ -2533,7 +2540,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // is 1/n over the hit's position in the *whole* result set rather than in the page, so any consumer
                 // that sorts by rank reproduces the order chosen above. Seshat puts a real BM25 score here; the
                 // substitution is safe only because nothing in Element reads it.
-                rank: 1 / (priorEmitted + i + 1),
+                // Legacy (never-cold-touched) path: the true offset, exactly as before increment E. Once the cold
+                // tier is involved, `priorEmitted` is itself reset at the tier transition (see its own comment
+                // above) rather than the true lifetime total, so rank is positional within the cold-tier portion
+                // of the query from that point on, not the whole query -- the same "known so far" relaxation
+                // `count` makes for the same reason.
+                rank: 1 / ((coldTouchedThisQuery ? priorEmitted : requestedOffset) + i + 1),
                 result: this.resultEvent(item.stored.event),
                 context,
             };

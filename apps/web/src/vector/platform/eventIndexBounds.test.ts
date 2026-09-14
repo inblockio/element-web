@@ -75,6 +75,44 @@ describe("deviceMemoryTier", () => {
             });
             expect(deviceMemoryTier()).toBe("desktop");
         });
+
+        // E-F4: iPadOS's default "Request Desktop Website" mode (on by default since iPadOS 13)
+        // sends a plain desktop-Safari UA with no `iPad`/`Mobile` token, and WebKit exposes neither
+        // `deviceMemory` nor `userAgentData` -- so before this fix an iPad landed on the desktop
+        // tier (128 MiB hot window, 512 MiB disk budget) on the engine with the tightest per-tab
+        // memory limits of the three, a regression E0's own fix introduced.
+        it("is small for iPadOS's default desktop-mode UA (maxTouchPoints > 1 with a Macintosh UA)", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: undefined,
+                maxTouchPoints: 5,
+                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            });
+            expect(deviceMemoryTier()).toBe("small");
+        });
+
+        it("stays desktop for a genuine Mac (Macintosh UA, maxTouchPoints 0)", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: undefined,
+                maxTouchPoints: 0,
+                userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            });
+            expect(deviceMemoryTier()).toBe("desktop");
+        });
+
+        it("stays desktop for maxTouchPoints > 1 on a non-Macintosh UA (a touch laptop is not an iPad)", () => {
+            vi.stubGlobal("navigator", {
+                ...globalThis.navigator,
+                deviceMemory: undefined,
+                userAgentData: undefined,
+                maxTouchPoints: 10,
+                userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+            });
+            expect(deviceMemoryTier()).toBe("desktop");
+        });
     });
 });
 
