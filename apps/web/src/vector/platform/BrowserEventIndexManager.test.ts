@@ -6647,4 +6647,47 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         expect(ids.some((id) => resident.has(id))).toBe(true);
         expect(ids.some((id) => !resident.has(id))).toBe(true);
     });
+
+    // siwx-oidc e2e UX3 (e2e/element/ew-encrypted-search.spec.mjs): after an m.replace, the pre-edit body was
+    // still found. The edit updates the resident record at once, but its encrypted rewrite waits in the live
+    // write buffer (up to LIVE_WRITE_FLUSH_INTERVAL_MS) -- and since E3-F1 the cold scan skips only the hot
+    // *matches* (session.hotIds), so the resident record the hot tier had correctly rejected was re-evaluated
+    // against its stale disk copy, and the old body matched there. The resident record is the authoritative
+    // copy of anything it holds; the disk copy is only authoritative for what is not resident.
+    describe("UX3: an edit's pre-edit body is not served from the not-yet-rewritten disk copy", () => {
+        async function editedBeforeFlush(): Promise<BrowserEventIndexManager> {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            await m.addEventToIndex(msg("$orig", "ewsearch-123-alpha", { room_id: ROOM }), {});
+            await m.addEventToIndex(msg("$other", "alpha other", { room_id: ROOM, origin_server_ts: 500 }), {});
+            await m.commitLiveEvents(); // both on disk, so every search below reaches the cold tier
+            await m.addEventToIndex({ ...edit("$edit", "$orig", "ewsearch-123-beta"), room_id: ROOM }, {});
+            // Deliberately no commitLiveEvents(): the rewrite of $orig's chunk is still buffered.
+            return m;
+        }
+
+        it("substring path: the old body is gone at once, the new body is found under the original id", async () => {
+            const m = await editedBeforeFlush();
+            const oldHit = await m.searchEventIndex(search("ewsearch-123-alpha"));
+            expect(resultIds(oldHit)).toEqual([]);
+            expect(oldHit.count).toBe(0);
+
+            const newHit = await m.searchEventIndex(search("ewsearch-123-beta"));
+            expect(resultIds(newHit)).toEqual(["$orig"]);
+            expect(newHit.results![0].result.content.body).toBe("ewsearch-123-beta");
+
+            await m.commitLiveEvents();
+            expect(resultIds(await m.searchEventIndex(search("ewsearch-123-alpha")))).toEqual([]);
+        });
+
+        it("term path: a token only the pre-edit body held matches only the record that still holds it", async () => {
+            const m = await editedBeforeFlush();
+            // `alpha` still has a resident match ($other), so this query takes the token path, not the substring
+            // fallback; $orig must not ride along on its stale disk copy.
+            const hit = await m.searchEventIndex(search("alpha"));
+            expect(resultIds(hit)).toEqual(["$other"]);
+            expect(hit.count).toBe(1);
+        });
+    });
 });
