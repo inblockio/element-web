@@ -2366,7 +2366,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * Never needs to flush {@link liveWriteBuffer} first: every structure this reads -- {@link events}, {@link
      * inverted}, {@link roomOrder} -- is updated synchronously by {@link upsertEvent} the moment a live event is
      * indexed, before {@link schedulePersistEvent} ever buffers anything for disk. A live event is therefore
-     * searchable immediately, seconds before its encrypted copy exists anywhere.
+     * searchable immediately, seconds before its encrypted copy exists anywhere. The cold tier does read disk, which
+     * lags such a buffered write, so it prefers the resident record for any id that has one ({@link
+     * coldScanSessionStep}); that, not a flush, is what keeps an edit's pre-edit body out of the results.
      *
      * @param searchArgs - `search_term` is the raw user input; `room_id` scopes the search (and, once a session
      *     reaches the cold tier, restricts the chunk walk itself to chunks holding at least one of that room's
@@ -2708,8 +2710,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * with any concurrent {@link hydrate}/{@link materializeIfPending} call decrypting the same chunk, so a scan
      * racing hydration's own admission neither double-decrypts nor double-returns an event hydration just made
      * resident -- evaluating `useSubstring ? folded-substring : token-AND-with-prefix` ({@link
-     * coldRecordMatchesTokens}) against every member not already resident, already tombstoned, or already returned
-     * by this session, newest-member-first within the chunk to match {@link hydrate}'s own admission order.
+     * coldRecordMatchesTokens}) against every member not in the session's hot snapshot, already tombstoned, or already
+     * returned by this session, newest-member-first within the chunk to match {@link hydrate}'s own admission order.
+     * A member that is resident is evaluated (and served) from its resident record, never from the decrypted chunk,
+     * whose copy can lag a buffered rewrite such as an edit's.
      *
      * **Resuming needs no cursor at all, only `session.returned` (re-scoped from the previous `(originServerTs,
      * eventId)` boundary shape, which review-pr-e.md's second round -- E2-F1, E2-F4 -- found still unstable).**
@@ -2816,7 +2820,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 ) {
                     continue;
                 }
-                const stored = entries.get(id)!;
+                // The resident record, when there is one, is the authoritative copy: every write reaches it
+                // synchronously, while the decrypted `entries` copy lags any rewrite still waiting in {@link
+                // liveWriteBuffer}. Matching that disk copy instead served an edited message under its pre-edit
+                // body (siwx-oidc e2e UX3): the hot tier had correctly rejected the resident record, and
+                // session.hotIds names only hot *matches*, so the stale copy got a second, wrong evaluation here.
+                // A member that is not resident (the cold case proper, or one that became resident after the
+                // snapshot, E3-F1) is evaluated exactly as before, from whichever copy is current.
+                const stored = this.events.get(id) ?? entries.get(id)!;
                 if (session.roomId && stored.roomId !== session.roomId) continue;
                 const isMatch = session.useSubstring
                     ? flattenCopy(foldText(stored.searchText)).includes(foldedQuery)
