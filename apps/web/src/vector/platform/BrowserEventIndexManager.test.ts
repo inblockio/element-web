@@ -6689,5 +6689,58 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(resultIds(hit)).toEqual(["$other"]);
             expect(hit.count).toBe(1);
         });
+
+        it("room scope: the stale copy is not served to its own room, and the resident copy does not leak into another", async () => {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            // The same old body in two rooms, written together so both land in one chunk: the walk for either
+            // room's search then decrypts a chunk that holds the other room's record too.
+            await m.addEventToIndex(msg("$orig", "ewsearch-123-alpha", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            await m.addEventToIndex(msg("$twin", "ewsearch-123-alpha", { room_id: ROOM2, origin_server_ts: 900 }), {});
+            await m.commitLiveEvents();
+            await m.addEventToIndex({ ...edit("$edit", "$orig", "ewsearch-123-beta"), room_id: ROOM }, {});
+            // Deliberately no commitLiveEvents(): the chunk still holds $orig's pre-edit body.
+
+            // The room the edit happened in: neither the substring query nor the term query may find the old body.
+            for (const term of ["ewsearch-123-alpha", "alpha"]) {
+                const stale = await m.searchEventIndex(search(term, { room_id: ROOM }));
+                expect(resultIds(stale)).toEqual([]);
+                expect(stale.count).toBe(0);
+            }
+            // The other room still finds its own untouched record by that body (the cold tier is not muted) ...
+            const twin = await m.searchEventIndex(search("ewsearch-123-alpha", { room_id: ROOM2 }));
+            expect(resultIds(twin)).toEqual(["$twin"]);
+            // ... and the edited record, which now matches the NEW body, does not cross into it.
+            const leak = await m.searchEventIndex(search("ewsearch-123-beta", { room_id: ROOM2 }));
+            expect(resultIds(leak)).toEqual([]);
+            const own = await m.searchEventIndex(search("ewsearch-123-beta", { room_id: ROOM }));
+            expect(resultIds(own)).toEqual(["$orig"]);
+        });
+
+        it("the cold tier serves the resident copy of a record the hot snapshot rejected, not the chunk copy", async () => {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            await m.addEventToIndex(msg("$x1", "ewsearchbeta one", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            await m.addEventToIndex(msg("$x2", "ewsearchbeta two", { room_id: ROOM, origin_server_ts: 1001 }), {});
+            await m.addEventToIndex(msg("$y", "unrelated text", { room_id: ROOM, origin_server_ts: 1002 }), {});
+            await m.commitLiveEvents();
+
+            // Page one snapshots the hot matches ($x2, $x1) and opens a session; $y is resident but not a hit.
+            const first = await m.searchEventIndex(search("ewsearchbeta", { limit: 2 }));
+            expect(resultIds(first)).toEqual(["$x2", "$x1"]);
+            expect(first.next_batch).toBeDefined();
+
+            // $y is edited into a match while the session is open. Its chunk copy still says "unrelated text".
+            await m.addEventToIndex({ ...edit("$edit", "$y", "ewsearchbeta three"), room_id: ROOM }, {});
+
+            // Page two reaches $y only through the cold step. It must evaluate AND serve the resident copy.
+            const second = await m.searchEventIndex(search("ewsearchbeta", { limit: 2, next_batch: first.next_batch }));
+            expect(resultIds(second)).toEqual(["$y"]);
+            expect(second.results![0].result.content.body).toBe("ewsearchbeta three");
+            expect(second.count).toBe(3);
+            expect(second.next_batch).toBeUndefined();
+        });
     });
 });
