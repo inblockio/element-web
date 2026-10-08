@@ -6743,4 +6743,209 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(second.next_batch).toBeUndefined();
         });
     });
+
+    // Fifth carry, S3. enforceResidentBudget used to evict the oldest resident record even when that record had been
+    // edited and its rewrite had not committed yet (waiting in the live write buffer, or in a batch queued on the
+    // persist chain). flushLiveWrites skips an id it can no longer find in `events`, so the edit never reached disk:
+    // the pre-edit body stayed findable from the cold tier, after every reload. Eviction now defers such a record
+    // until its write has committed.
+    describe("S3: eviction defers a record whose write has not committed", () => {
+        type Priv = {
+            events: Map<string, unknown>;
+            persistChain: Promise<void>;
+            pendingWriteIds: Map<string, number>;
+            liveWriteBuffer: Set<string>;
+        };
+        const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
+        const crawl = (...events: any[]): Array<{ event: any; profile: object }> =>
+            events.map((event) => ({ event, profile: {} }));
+        const editOld = (): any => ({ ...edit("$e", "$old", "zznewword", 9000), room_id: ROOM });
+        const historic = (id: string, ts: number): any =>
+            msg(id, `zzhistoric ${id}`, { room_id: ROOM, origin_server_ts: ts });
+        const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
+
+        async function open(): Promise<BrowserEventIndexManager> {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            return m;
+        }
+
+        /** `$old` (the oldest record) in its own sealed chunk, plus `fillers` newer ones; all committed. */
+        async function seedOld(m: BrowserEventIndexManager, fillers = 5): Promise<void> {
+            await m.addEventToIndex(msg("$old", "zzoldword", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            for (let i = 0; i < fillers; i++) {
+                await m.addEventToIndex(
+                    msg(`$n${i}`, `zzfiller ${i}`, { room_id: ROOM, origin_server_ts: 2000 + i }),
+                    {},
+                );
+            }
+            await m.commitLiveEvents();
+        }
+
+        /** What is on disk for `$old` right now, decrypted straight off a second connection. */
+        async function oldOnDisk(): Promise<any> {
+            return (await decryptAllChunkEvents(pickleKey, DEVICE)).find((r) => r.eventId === "$old");
+        }
+
+        async function expectEditedEverywhere(m: BrowserEventIndexManager): Promise<void> {
+            const fresh = await m.searchEventIndex(search("zznewword"));
+            expect(resultIds(fresh)).toEqual(["$old"]);
+            expect(fresh.results![0].result.content.body).toBe("zznewword");
+            expect(resultIds(await m.searchEventIndex(search("zzoldword")))).toEqual([]);
+        }
+
+        /** Reopen with the default bounds, as the next browser session would: only what reached disk survives. */
+        async function reopen(m: BrowserEventIndexManager): Promise<BrowserEventIndexManager> {
+            await m.closeEventIndex();
+            setEventIndexBoundsOverrideForTesting(null);
+            return open();
+        }
+
+        beforeEach(() => {
+            setChunkTargetBytesOverrideForTesting(150); // one record per chunk: $old's rewrite is a sealed-chunk rewrite
+        });
+
+        it("CONTROL: with no eviction the edit reaches disk and only the new body is found", async () => {
+            const m = await open();
+            await seedOld(m);
+            await m.addEventToIndex(editOld(), {});
+            await m.addHistoricEvents(crawl(historic("$h", 3000)), null, null);
+            await priv(m).persistChain;
+            await m.commitLiveEvents();
+
+            await expectEditedEverywhere(m);
+            expect((await oldOnDisk()).searchText).toBe("zznewword");
+        });
+
+        it("a crawler commit inside the flush window does not evict the edited record; the edit lands, then it is evicted", async () => {
+            const m = await open();
+            await seedOld(m);
+            await m.addEventToIndex(editOld(), {}); // buffered, not flushed
+            expect(priv(m).liveWriteBuffer.has("$old")).toBe(true);
+
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(3) });
+            // The crawler batch commits on its own and runs the resident budget, whose oldest candidate is $old.
+            await m.addHistoricEvents(crawl(historic("$h", 3000)), null, null);
+            await priv(m).persistChain;
+            expect(priv(m).events.has("$old")).toBe(true); // deferred (before the fix: evicted here, edit dropped)
+            expect(priv(m).events.size).toBe(3); // the pass still brought the set to budget, evicting newer records
+
+            // What the 5 s timer would do, with a budget that now needs $old gone as well.
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(2) });
+            await m.commitLiveEvents();
+            expect(priv(m).events.has("$old")).toBe(false); // deferral is not retention: evicted once durable
+            expect(priv(m).events.size).toBe(2);
+            expect(priv(m).pendingWriteIds.size).toBe(0);
+
+            expect((await oldOnDisk()).searchText).toBe("zznewword");
+            await expectEditedEverywhere(m); // $old is only on disk now: served by the cold tier
+        });
+
+        it("the edit is permanent: it is still there after closing and reopening", async () => {
+            const m = await open();
+            await seedOld(m);
+            await m.addEventToIndex(editOld(), {});
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(3) });
+            await m.addHistoricEvents(crawl(historic("$h", 3000)), null, null);
+            await priv(m).persistChain;
+            await m.commitLiveEvents();
+
+            const next = await reopen(m);
+            expect(priv(next).events.has("$old")).toBe(true); // resident again, from its disk row
+            await expectEditedEverywhere(next);
+        });
+
+        it("MATERIALIZE: an edit of an old message pulled in from disk for it survives a crawler commit", async () => {
+            const seed = await open();
+            await seed.addEventToIndex(msg("$old", "zzoldword", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            for (let i = 0; i < 9; i++) {
+                await seed.addEventToIndex(
+                    msg(`$n${i}`, `zzfiller ${i}`, { room_id: ROOM, origin_server_ts: 2000 + i }),
+                    {},
+                );
+            }
+            await seed.commitLiveEvents();
+            await seed.closeEventIndex();
+
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(4) });
+            const m = await open(); // hydration stops at the budget: the oldest record stays on disk
+            expect(priv(m).events.has("$old")).toBe(false);
+
+            await m.addEventToIndex(editOld(), {}); // materializes $old (the heap minimum) and edits it in place
+            expect(priv(m).events.has("$old")).toBe(true);
+            await m.addHistoricEvents(crawl(historic("$h", 3000)), null, null);
+            await priv(m).persistChain;
+            expect(priv(m).events.has("$old")).toBe(true); // before the fix: evicted by the crawler commit
+
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(3) });
+            await m.commitLiveEvents();
+            expect(priv(m).events.has("$old")).toBe(false);
+            await expectEditedEverywhere(m);
+
+            const next = await reopen(m);
+            await expectEditedEverywhere(next);
+        });
+
+        it("a record edited by a batch still queued behind another batch's commit is not evicted by it", async () => {
+            const m = await open();
+            await seedOld(m);
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(3) });
+
+            // Hold the persist chain so both batches are queued, uncommitted, at the same time.
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            priv(m).persistChain = priv(m).persistChain.then(() => gate);
+            await m.addHistoricEvents(crawl(historic("$h1", 3000)), null, null); // batch A: its commit runs the budget
+            await m.addHistoricEvents(crawl(editOld()), null, null); // batch B: the crawler's copy of the edit
+            expect(priv(m).liveWriteBuffer.has("$old")).toBe(false); // queued, not buffered
+            expect(priv(m).pendingWriteIds.get("$old")).toBe(1);
+            release();
+            await priv(m).persistChain;
+
+            expect(priv(m).pendingWriteIds.size).toBe(0);
+            expect((await oldOnDisk()).searchText).toBe("zznewword"); // before the fix: still "zzoldword"
+            await expectEditedEverywhere(m);
+        });
+
+        it("a record the crawler already edited in a batch it is still assembling is not evicted by a commit mid-batch", async () => {
+            const seed = await open();
+            await seed.addEventToIndex(msg("$z", "zzzbody", { room_id: ROOM, origin_server_ts: 500 }), {});
+            await seedOld(seed);
+            await seed.closeEventIndex();
+
+            // Six records fit: $n4..$n0 and $old. $z, the oldest, stays on disk.
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(6) });
+            const m = await open();
+            expect(priv(m).events.has("$old")).toBe(true);
+            expect(priv(m).events.has("$z")).toBe(false);
+
+            // The crawler batch edits $old, then has to read $z's chunk from disk; hold that read open.
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const realDecrypt = (m as any).decryptChunkOnce.bind(m);
+            const decrypt = vi.spyOn(m as any, "decryptChunkOnce").mockImplementation(async (...args: any[]) => {
+                await gate;
+                return realDecrypt(...args);
+            });
+            const batch = m.addHistoricEvents(
+                crawl(editOld(), msg("$z", "zzzbody refreshed", { room_id: ROOM, origin_server_ts: 500 })),
+                null,
+                null,
+            );
+            await vi.waitFor(() => expect(decrypt).toHaveBeenCalled());
+            expect(priv(m).pendingWriteIds.get("$old")).toBe(1); // held from the mutation, not from the enqueue
+
+            // Meanwhile a live write commits, and its flush runs the resident budget.
+            await m.addEventToIndex(msg("$live", "zzlive", { room_id: ROOM, origin_server_ts: 3000 }), {});
+            await m.commitLiveEvents();
+            expect(priv(m).events.has("$old")).toBe(true); // before the fix: evicted here, its edit never written
+
+            release();
+            await batch;
+            await priv(m).persistChain;
+            expect(priv(m).pendingWriteIds.size).toBe(0);
+            expect((await oldOnDisk()).searchText).toBe("zznewword");
+        });
+    });
 });

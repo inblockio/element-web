@@ -1479,8 +1479,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * eviction pops first. The result was effectively quadratic in event count, and a 200k-event
      * ingest did not finish inside a 15-minute harness timeout. Granting candidacy only at the
      * write-commit site removes the "not yet durable" case from {@link enforceResidentBudget}
-     * entirely -- every entry popped from this heap either evicts or is stale, never deferred for
-     * durability -- at the cost of eviction lagging insertion by up to one flush's worth (a live
+     * entirely -- every entry popped from this heap either evicts or is stale, never deferred because its
+     * FIRST write is not durable yet (a record whose later REWRITE is pending is deferred, see {@link
+     * enforceResidentBudget}) -- at the cost of eviction lagging insertion by up to one flush's worth (a live
      * buffer: {@link LIVE_WRITE_BUFFER_MAX} events or {@link LIVE_WRITE_FLUSH_INTERVAL_MS}; a crawler
      * batch: ~100 events), never unboundedly.
      */
@@ -1769,6 +1770,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * `addEventToIndex` call at a time -- into fewer transactions than one per call.
      */
     private readonly liveWriteBuffer = new Set<string>();
+    /**
+     * Record id -> how many writes that name it have been promised to disk but have not committed yet and are no
+     * longer (or not yet) in {@link liveWriteBuffer}: a batch queued on {@link persistChain} ({@link
+     * enqueueBatchedWrite}) whose {@link flushLiveWrites} has not finished, or a crawler batch still being assembled
+     * by {@link addHistoricEvents}. Together with {@link liveWriteBuffer} this is "the record in memory is ahead of
+     * its disk copy", which {@link enforceResidentBudget} must not evict: eviction deletes the in-memory record, and
+     * {@link flushLiveWrites} skips an id it cannot find in {@link events}, so evicting here silently turned an edit
+     * into a write that never happens and left the pre-edit body findable from disk for good. See {@link
+     * hasPendingWrite}, {@link holdPendingWrites}.
+     *
+     * Never cleared by {@link clearIndexMaps}: every hold is paired with exactly one release (a `finally` around the
+     * queued operation), so the counts stay exact across a reset, and clearing it would let an old session's release
+     * decrement a new session's hold for the same id.
+     */
+    private readonly pendingWriteIds = new Map<string, number>();
     /**
      * The pending {@link LIVE_WRITE_FLUSH_INTERVAL_MS} timer that will call {@link flushLiveWriteBufferNow}, or null
      * when {@link liveWriteBuffer} is empty or a flush has already been triggered by size. Armed once, by the first
@@ -2918,51 +2934,65 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (this.closed || !this.featureEnabled()) return false;
         let allAlready = events.length > 0;
         const dirty = new Set<string>();
-        // Three cases per event, which is why this is not just a call to upsertEvent:
-        //
-        // 1. An unedited record for this id and a non-edit incoming event: the ordinary "seen it already" case. Text
-        //    and file flag are recomputed rather than trusted, because the crawler can hand back a better copy than the
-        //    live timeline gave us. Only a real difference re-indexes or clears the "nothing new here" flag.
-        // 2. A record already edited, and this is the original arriving late: the edit's content must survive, only the
-        //    envelope is taken.
-        // 3. Anything else -- a new event, or an edit for a record we hold -- is a plain upsert.
-        for (const { event, profile } of events) {
-            const id = this.targetId(event);
-            await this.materializeIfPending(id);
-            if (this.closed) return false;
-            const existing = this.events.get(id);
-            const isReplace = replacedEventId(event) !== null;
-            if (existing && !isReplace && existing.edited === false) {
-                const incoming = effectiveEventForIndex(event);
-                const nextText = extractSearchText(incoming);
-                const nextFile = eventHasFile(incoming);
-                if (nextText !== existing.searchText || nextFile !== existing.hasFile) {
-                    this.unindexTokens(existing.eventId, existing.searchText);
-                    this.plainTextByteEstimate += nextText.length - existing.searchText.length;
-                    existing.searchText = nextText;
-                    existing.hasFile = nextFile;
-                    existing.event = incoming;
-                    this.indexTokens(existing.eventId, nextText);
-                    dirty.add(id);
-                    allAlready = false;
-                }
-                continue;
-            }
-            if (existing && !isReplace && existing.edited) {
-                // Original arriving after an edit: keep the new body, take the envelope. That rewrites the record and
-                // schedules a persist, so it must clear the flag -- a batch made only of these would otherwise report
-                // "all already added" and end the back-fill.
-                this.upsertEvent(event, profile);
-                dirty.add(id);
-                allAlready = false;
-                continue;
-            }
-            if (!existing) allAlready = false;
-            else if (isReplace) allAlready = false;
-            this.upsertEvent(event, profile);
+        // A record changed in place stays un-evictable until its write has committed (see pendingWriteIds), and that
+        // has to start at the mutation, not at enqueueBatchedWrite: this loop awaits (materializeIfPending reads a
+        // chunk from disk) between one event and the next, and an earlier batch committing in that window runs the
+        // eviction pass. enqueueBatchedWrite takes over with a hold of its own before these are given back.
+        const markDirty = (id: string): void => {
+            if (dirty.has(id)) return;
             dirty.add(id);
+            this.holdPendingWrite(id);
+        };
+        try {
+            // Three cases per event, which is why this is not just a call to upsertEvent:
+            //
+            // 1. An unedited record for this id and a non-edit incoming event: the ordinary "seen it already" case.
+            //    Text and file flag are recomputed rather than trusted, because the crawler can hand back a better
+            //    copy than the live timeline gave us. Only a real difference re-indexes or clears the "nothing new
+            //    here" flag.
+            // 2. A record already edited, and this is the original arriving late: the edit's content must survive,
+            //    only the envelope is taken.
+            // 3. Anything else -- a new event, or an edit for a record we hold -- is a plain upsert.
+            for (const { event, profile } of events) {
+                const id = this.targetId(event);
+                await this.materializeIfPending(id);
+                if (this.closed) return false;
+                const existing = this.events.get(id);
+                const isReplace = replacedEventId(event) !== null;
+                if (existing && !isReplace && existing.edited === false) {
+                    const incoming = effectiveEventForIndex(event);
+                    const nextText = extractSearchText(incoming);
+                    const nextFile = eventHasFile(incoming);
+                    if (nextText !== existing.searchText || nextFile !== existing.hasFile) {
+                        this.unindexTokens(existing.eventId, existing.searchText);
+                        this.plainTextByteEstimate += nextText.length - existing.searchText.length;
+                        existing.searchText = nextText;
+                        existing.hasFile = nextFile;
+                        existing.event = incoming;
+                        this.indexTokens(existing.eventId, nextText);
+                        markDirty(id);
+                        allAlready = false;
+                    }
+                    continue;
+                }
+                if (existing && !isReplace && existing.edited) {
+                    // Original arriving after an edit: keep the new body, take the envelope. That rewrites the record
+                    // and schedules a persist, so it must clear the flag -- a batch made only of these would
+                    // otherwise report "all already added" and end the back-fill.
+                    this.upsertEvent(event, profile);
+                    markDirty(id);
+                    allAlready = false;
+                    continue;
+                }
+                if (!existing) allAlready = false;
+                else if (isReplace) allAlready = false;
+                this.upsertEvent(event, profile);
+                markDirty(id);
+            }
+            this.enqueueBatchedWrite(Array.from(dirty));
+        } finally {
+            for (const id of dirty) this.releasePendingWrite(id);
         }
-        this.enqueueBatchedWrite(Array.from(dirty));
         if (oldCheckpoint) await this.removeCrawlerCheckpoint(oldCheckpoint);
         if (checkpoint) await this.addCrawlerCheckpoint(checkpoint);
         return allAlready;
@@ -3501,6 +3531,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * any that are no longer there -- but dropping it here also keeps a redacted id from counting towards {@link
      * LIVE_WRITE_BUFFER_MAX} for no reason.
      *
+     * That is the contract for a **deletion** (a redaction, or a disk-budget drop that removes the row too). It is
+     * exactly why this must never be the eviction path for a record whose write is still pending: {@link
+     * enforceResidentBudget} checks {@link hasPendingWrite} first, because evicting through here would discard an
+     * edit instead of persisting it.
+     *
      * @param eventId - A record id, not an edit's id; resolve that through {@link editTargets} first. Unknown ids are a
      *     no-op, and nothing here touches the database.
      */
@@ -3924,6 +3959,43 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * True while `eventId`'s in-memory record may be ahead of its disk copy: it is waiting in {@link
+     * liveWriteBuffer}, or in a queued/in-flight batch or one still being assembled ({@link pendingWriteIds}).
+     * {@link enforceResidentBudget} defers such a record instead of evicting it.
+     */
+    private hasPendingWrite(eventId: string): boolean {
+        return this.liveWriteBuffer.has(eventId) || this.pendingWriteIds.has(eventId);
+    }
+
+    /** Add one hold on `eventId` in {@link pendingWriteIds}; undone by exactly one {@link releasePendingWrite}. */
+    private holdPendingWrite(eventId: string): void {
+        this.pendingWriteIds.set(eventId, (this.pendingWriteIds.get(eventId) ?? 0) + 1);
+    }
+
+    /** Undo one {@link holdPendingWrite}; the entry goes away with its last hold. */
+    private releasePendingWrite(eventId: string): void {
+        const n = this.pendingWriteIds.get(eventId);
+        if (n === undefined) return;
+        if (n <= 1) this.pendingWriteIds.delete(eventId);
+        else this.pendingWriteIds.set(eventId, n - 1);
+    }
+
+    /**
+     * Hold every id in `ids` (see {@link hasPendingWrite}) and return the function that gives the holds back. The
+     * returned function is idempotent, so the commit path can call it as early as the write is durable (before the
+     * eviction pass that follows it) and a `finally` can call it again on every other way out.
+     */
+    private holdPendingWrites(ids: readonly string[]): () => void {
+        for (const id of ids) this.holdPendingWrite(id);
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            for (const id of ids) this.releasePendingWrite(id);
+        };
+    }
+
+    /**
      * Buffer a live write for {@link liveWriteBuffer}, flushed later as one batched IndexedDB transaction rather than
      * opening a transaction per event -- see {@link flushLiveWriteBufferNow} and {@link flushLiveWrites}, and the
      * class docstring's threat model for the durability trade-off this makes.
@@ -4232,7 +4304,17 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (!this.persistEnabled || !this.dek || !this.db || !this.userId) return;
         const userId = this.userId;
         const dek = this.dek;
-        this.enqueuePersist(() => this.flushLiveWrites(userId, dek, ids));
+        // The records in `ids` stay un-evictable from here until their write has committed (or failed): see
+        // pendingWriteIds. Taken synchronously, before the op is queued, so there is no gap between the caller's
+        // own hold (liveWriteBuffer, or addHistoricEvents' assembly hold) ending and this one starting.
+        const release = this.holdPendingWrites(ids);
+        this.enqueuePersist(async () => {
+            try {
+                await this.flushLiveWrites(userId, dek, ids, release);
+            } finally {
+                release();
+            }
+        });
     }
 
     /**
@@ -4264,7 +4346,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * @param userId - Captured by {@link enqueueBatchedWrite} at schedule time, not read from `this.userId`.
      * @param dek - Captured by {@link enqueueBatchedWrite} at schedule time, not read from `this.dek`.
      */
-    private async flushLiveWrites(userId: string, dek: CryptoKey, ids: string[]): Promise<void> {
+    private async flushLiveWrites(
+        userId: string,
+        dek: CryptoKey,
+        ids: string[],
+        releasePendingWrites: () => void,
+    ): Promise<void> {
         // this.closed is re-checked here, not only at schedule time, to close one specific race: a flush queued by
         // the live-write timer can still be sitting on the persist chain when closeEventIndex/deleteEventIndex begin
         // tearing the session down. Both set `closed` before doing anything else, so a flush that reaches this point
@@ -4371,6 +4458,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             this.chunkInfo.set(u.chunkId, { bytes: u.bytes, minTs: u.minTs, maxTs: u.maxTs });
             heapPushTs(this.diskChunkHeap, { ts: u.maxTs, id: String(u.chunkId) }); // D4: order by maxTs, not minTs.
         }
+        // This batch is durable: its records stop being protected from eviction *before* the pass below, so the
+        // oldest of them (an old record whose edit this batch just wrote) can leave memory in this very commit
+        // rather than lingering until the next one. A record that was edited again meanwhile is still protected
+        // by liveWriteBuffer / a later batch's own hold.
+        releasePendingWrites();
         for (const { id, stored } of live) {
             // Only now, once the write has actually committed, does this id become an eviction
             // candidate -- see residentHeap's own docstring for why granting candidacy any earlier
@@ -5107,13 +5199,28 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * the record's disk row, which is the whole point (rows beyond the resident budget stay
      * findable later, via the streamed cold scan increment E adds).
      *
-     * Every candidate this pops from {@link residentHeap} is durable by construction -- see that
+     * Every candidate this pops from {@link residentHeap} was durable when it was pushed -- see that
      * field's own docstring for why entries are pushed only from {@link flushLiveWrites} and {@link
-     * materializeRow}, never at the moment a record becomes resident -- so, unlike an earlier
-     * version of this method, there is no "not yet durable, defer it" case to handle here at all;
-     * the only thing skipped (and re-pushed, so a later call can reconsider it) is a **stale**
-     * entry, whose id is no longer resident or has been re-timed since (see {@link heapPushTs}'s
-     * docstring), and `protectedId` (see below).
+     * materializeRow}, never at the moment a record becomes resident -- but "was durable" is not "is
+     * durable": a record that was committed long ago and has since been **edited or refreshed** in place
+     * is ahead of its disk copy until its new write commits. Such a record is deferred, never evicted
+     * ({@link hasPendingWrite}: in {@link liveWriteBuffer}, in a queued or in-flight batch, or in a crawler
+     * batch still being assembled), and is pushed back so the pass after its write commits evicts it. The
+     * other things skipped (and re-pushed, so a later call can reconsider them) are a **stale** entry,
+     * whose id is no longer resident or has been re-timed since (see {@link heapPushTs}'s docstring), and
+     * `protectedId` (see below). Only a redaction ({@link deleteEvent}) may drop a pending write.
+     *
+     * **Deferral cannot make the resident set unbounded.** The deferred set is exactly the records with an
+     * uncommitted write, which is the same population that is already outside the budget by design: a
+     * record becomes an eviction candidate only when its first write commits, so everything still waiting
+     * on {@link persistChain} (a whole crawler backlog, for a fast ingest) is resident and un-evictable
+     * regardless of this check. Deferral adds only previously-committed records that are re-written while
+     * resident, each held by one uncommitted write: at most {@link LIVE_WRITE_BUFFER_MAX} in the buffer plus
+     * whatever the chain has not yet committed, and every commit releases its own batch and then runs this
+     * method again. The holds cannot leak either: they are released in a `finally` around the queued write
+     * (success, failure, closed session), so the worst case is a stalled chain, in which nothing new is
+     * evicted by this method anyway. A write that *fails* is not retried (see {@link enqueuePersist}); its
+     * record becomes evictable again once the hold is released.
      *
      * @param protectedId - An id to never evict during *this* call, however old, because the caller
      *     just on-demand-materialized it ({@link materializeIfPending}) and is about to act on it
@@ -5138,7 +5245,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             const top = heapPopMinTs(this.residentHeap)!;
             const stored = this.events.get(top.id);
             if (!stored || stored.originServerTs !== top.ts) continue; // Stale: gone, or re-timed.
-            if (top.id === protectedId) {
+            // protectedId: the caller is about to act on this record. hasPendingWrite: the record in memory is ahead
+            // of its disk copy (an edit, a refreshed body), and evicting it would drop the only copy of that change:
+            // flushLiveWrites skips an id it can no longer find in `events`. Deferred, not evicted, and pushed back
+            // below, so the pass that follows the write's own commit sees it again and evicts it then.
+            if (top.id === protectedId || this.hasPendingWrite(top.id)) {
                 deferred.push(top);
                 continue;
             }
