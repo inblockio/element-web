@@ -5062,7 +5062,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                         (a, b) => (this.manifest.get(b)?.ts ?? 0) - (this.manifest.get(a)?.ts ?? 0),
                     );
                     for (const id of members) {
-                        if (this.events.has(id)) continue;
+                        // pendingDiskDeletes: redacted while this walk was on its way here (pulled in on demand and
+                        // removed, its chunk rewrite still queued), so the copy in `chunkEntries` is stale.
+                        if (this.events.has(id) || this.pendingDiskDeletes.has(id)) continue;
                         const stored = chunkEntries.get(id);
                         if (!stored) continue; // Redacted since the manifest was built; nothing left to read.
 

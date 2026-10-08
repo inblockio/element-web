@@ -7637,6 +7637,57 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         });
     });
 
+    // Re-review R2 (in prod since D-core): a record redacted before hydration reached it must not be hydrated again.
+    describe("R2: hydration does not bring back a record whose redaction is still being written", () => {
+        it("a message redacted while hydration is on its way to its chunk stays out of the index", async () => {
+            const body = (i: number): string => `zqh${i}word body`;
+            const idOf = (i: number): string => `$h${String(i).padStart(3, "0")}`;
+            setChunkTargetBytesOverrideForTesting(700); // a few events per chunk: many chunks
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            for (let i = 0; i < 24; i++) {
+                await seed.addEventToIndex(msg(idOf(i), body(i), { room_id: ROOM, origin_server_ts: 10_000 + i }), {});
+            }
+            await seed.commitLiveEvents();
+            await seed.closeEventIndex();
+
+            setEventIndexBoundsOverrideForTesting(null); // everything fits: hydration reads every chunk
+            const restoreDecrypt = slowDownDecrypt(25); // slow enough that the redaction lands before the walk ends
+            const m = track(new BrowserEventIndexManager());
+            const internals = m as unknown as {
+                chunkMembers: Map<number, Set<string>>;
+                events: Map<string, unknown>;
+                manifest: Map<string, unknown>;
+                persistChain: Promise<void>;
+            };
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const victim = idOf(0); // the oldest: newest-first hydration reaches its chunk last
+            try {
+                await m.initEventIndex(userId, DEVICE);
+                await m.waitForManifest();
+                expect(internals.chunkMembers.size).toBeGreaterThan(2);
+                expect(internals.events.has(victim)).toBe(false); // control: not hydrated yet
+                // Hold the chain, so the chunk rewrite that removes the victim stays queued while the walk goes on.
+                internals.persistChain = internals.persistChain.then(() => gate);
+                expect(await m.deleteEvent(victim)).toBe(true); // pulled in on demand, removed, rewrite queued
+                await m.waitForHydration(); // the walk reaches the victim's chunk with its stale copy
+                expect(internals.events.has(victim)).toBe(false);
+                expect(resultIds(await m.searchEventIndex(search("zqh0word")))).toEqual([]);
+            } finally {
+                release();
+                restoreDecrypt();
+            }
+            await internals.persistChain; // the rewrite commits
+            expect(internals.events.has(victim)).toBe(false);
+            expect(internals.manifest.has(victim)).toBe(false);
+            expect(resultIds(await m.searchEventIndex(search("zqh0word")))).toEqual([]);
+            // The other records are untouched.
+            expect(resultIds(await m.searchEventIndex(search("zqh1word")))).toEqual([idOf(1)]);
+        });
+    });
+
     // Fifth carry, S4: the two review gaps that the UX3 tests above only half cover.
     describe("S4: the UX3 cold-scan fix, paged one hit at a time and scoped to a room", () => {
         it("a resident record edited into a match between pages is served exactly once, with its new body", async () => {
