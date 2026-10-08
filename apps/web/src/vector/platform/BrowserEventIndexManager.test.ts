@@ -7441,6 +7441,54 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             }
         });
 
+        it("a row write from a session that was re-initialised during its encrypt cannot replace the new session's row", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+
+            // Hold the old session's row write inside its encrypt: it has passed its epoch check but not opened its
+            // transaction yet.
+            let entered!: () => void;
+            const inEncrypt = new Promise<void>((resolve) => (entered = resolve));
+            let releaseEncrypt!: () => void;
+            const gate = new Promise<void>((resolve) => (releaseEncrypt = resolve));
+            const realEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+            let calls = 0;
+            const encryptSpy = vi.spyOn(crypto.subtle, "encrypt").mockImplementation(async (...args) => {
+                if (++calls === 1) {
+                    entered();
+                    await gate;
+                }
+                return realEncrypt(...(args as Parameters<typeof realEncrypt>));
+            });
+            try {
+                expect(await m.deleteEvent("$a-redaction-of-the-old-session")).toBe(false);
+                await inEncrypt;
+                const oldChain = priv(m).persistChain;
+
+                // The settings panel re-initialises without closing first; the new session parks the redaction we care
+                // about and its row write commits.
+                await m.initEventIndex(userId, DEVICE);
+                await m.waitForHydration();
+                expect(await m.deleteEvent(EDIT)).toBe(false);
+                await priv(m).persistChain;
+                expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+
+                // The old session's write now resumes. It must write nothing: the connection it would use is the new
+                // session's, and its set is the old session's.
+                releaseEncrypt();
+                await oldChain;
+                expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+            } finally {
+                releaseEncrypt();
+                encryptSpy.mockRestore();
+            }
+            await m.closeEventIndex();
+
+            const next = await reopenSmall();
+            expect(priv(next).pendingRedactions.has(EDIT)).toBe(true);
+            expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+        });
+
         it("a parked-redaction row that cannot be read is left alone for the rest of the session", async () => {
             await seedEdited();
             const first = await reopenSmall();

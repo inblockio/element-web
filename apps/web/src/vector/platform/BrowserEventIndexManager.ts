@@ -5245,10 +5245,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private async writePendingRedactions(userId: string, dek: CryptoKey): Promise<void> {
         if (!this.db || this.pendingRedactionsRowUnreadable) return;
+        const epoch = this.hydrationEpoch;
         const key = pendingRedactionsKey(userId);
         const ids = Array.from(this.pendingRedactions);
         // Encrypted before the transaction opens, like every other write in this file.
         const blob = ids.length > 0 ? await encryptJson(dek, ids, key) : null;
+        // The session that asked for this write may be gone by now (a re-initialisation without a close lands during
+        // the encrypt): its set must not replace the row the next session has written, through the next session's
+        // connection.
+        if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
         const tx = this.db.transaction("meta", "readwrite");
         if (blob) tx.objectStore("meta").put({ userId: key, blob } satisfies ManifestPageRecord);
         else tx.objectStore("meta").delete(key);
