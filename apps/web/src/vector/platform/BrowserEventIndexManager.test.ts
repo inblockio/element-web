@@ -7183,6 +7183,37 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
         });
 
+        it("a failed chunk rewrite keeps the id parked: the record is still hidden after a reload", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            expect(await m.deleteEvent(EDIT)).toBe(false);
+            await priv(m).persistChain; // the parking write
+
+            // Queue the apply behind a gate, so the failure can be installed after the cold scan has read its chunk.
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            priv(m).persistChain = priv(m).persistChain.then(() => gate);
+            expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+            const readSpy = vi
+                .spyOn(priv(m), "readChunkEntries")
+                .mockRejectedValue(new Error("simulated rewrite failure"));
+            release();
+            await priv(m).persistChain;
+            readSpy.mockRestore();
+
+            // The rewrite did not happen, so the record is still on disk and the id that hides it must be too.
+            expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
+            expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+            await m.closeEventIndex();
+
+            const next = await reopenSmall();
+            expect(priv(next).pendingRedactions.has(EDIT)).toBe(true);
+            expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+            // This time the rewrite goes through, and only then does the id leave the row.
+            await priv(next).persistChain;
+            expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+        });
+
         it("survives a reload before anything read the record: still hidden, and removed once met", async () => {
             await seedEdited();
             const m = await reopenSmall();

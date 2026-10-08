@@ -3944,12 +3944,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * **A no-op only if `targetId` never reached disk at all** (no manifest entry -- still
      * buffered): every id that has one always names a real chunk (see {@link ManifestEntry}'s own
      * docstring), so there is always exactly one chunk to rewrite.
+     *
+     * @param parkedIds - Parked redactions ({@link pendingRedactions}) that this removal answers. They are forgotten,
+     *     and the parked row rewritten, by this same operation, but only once the rewrite's transaction has completed
+     *     ({@link forgetParkedRedactions}): a rewrite that fails leaves the record on disk, and the ids that hide it
+     *     must outlive that.
      */
-    private enqueueDeleteRecord(userId: string, targetId: string): void {
+    private enqueueDeleteRecord(userId: string, targetId: string, parkedIds: readonly string[] = []): void {
         // Synchronous, same moment the record leaves the resident set -- see pendingDiskDeletes's
         // own docstring for the window this closes.
         this.pendingDiskDeletes.add(targetId);
+        const epoch = this.hydrationEpoch;
         this.enqueuePersist(async () => {
+            let committed = false;
             try {
                 const dek = this.dek;
                 const entry = this.manifest.get(targetId);
@@ -3997,6 +4004,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     });
                 }
                 await txDone(tx);
+                committed = true;
 
                 this.ciphertextBytes = newTotal;
                 if (newInfo) {
@@ -4016,6 +4024,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // reflects the deletion, or nothing here ever depended on it doing so.
                 this.pendingDiskDeletes.delete(targetId);
             }
+            if (committed) await this.forgetParkedRedactions(userId, epoch, parkedIds);
         });
     }
 
@@ -5133,13 +5142,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     /**
      * Apply a parked redaction to the record it turned out to name: the record leaves memory and is queued for removal
      * from its chunk on disk -- the same whole-record removal {@link deleteEvent} does, the pre-edit body having been
-     * overwritten in place -- so the redaction no longer depends on the parked set. For the paths that meet the record
-     * on disk without materializing it ({@link coldScanSessionStep}); {@link materializeRow} does the same inline.
+     * overwritten in place -- so the redaction no longer depends on the parked set. The parked ids are forgotten when
+     * that rewrite has committed, not before ({@link enqueueDeleteRecord}). Shared by the paths that meet the record
+     * on disk: {@link coldScanSessionStep}, and {@link materializeRow} for one that is about to become resident.
      */
     private applyParkedRedaction(userId: string, onDisk: StoredEvent, resident: StoredEvent | undefined): void {
         if (resident) this.removeFromIndex(onDisk.eventId);
-        if (this.persistEnabled && this.db) this.enqueueDeleteRecord(userId, onDisk.eventId);
-        this.unparkWhenDeleted([...(onDisk.editIds ?? []), ...(resident?.editIds ?? [])]);
+        const parkedIds = [...(onDisk.editIds ?? []), ...(resident?.editIds ?? [])];
+        if (this.persistEnabled && this.db) this.enqueueDeleteRecord(userId, onDisk.eventId, parkedIds);
+        else this.unparkRedactions(parkedIds); // nothing on disk to rewrite
     }
 
     /**
@@ -5177,26 +5188,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Forget parked redactions once the chunk rewrite that removes their record has committed: queued on {@link
-     * persistChain} right behind {@link enqueueDeleteRecord}, and writing the row itself in the same operation.
-     * Forgetting them any earlier would let a crash between the two writes leave the record on disk with nothing left
-     * to hide it.
+     * Forget parked redactions once the chunk rewrite that removes their record has committed, and rewrite the row
+     * without them. Runs inside {@link enqueueDeleteRecord}'s own operation, after its transaction has completed and
+     * not otherwise: forgetting them any earlier would let a crash between the two writes leave the record on disk
+     * with nothing left to hide it, and a rewrite that fails never gets here, so its ids stay parked, in memory and
+     * in the row, for the next session to apply. The epoch check keeps an operation left over from a previous
+     * session from touching the next session's set.
      */
-    private unparkWhenDeleted(ids: readonly string[]): void {
-        if (ids.length === 0) return;
-        if (!this.persistEnabled || !this.dek || !this.db || !this.userId) {
-            this.unparkRedactions(ids);
-            return;
-        }
-        const userId = this.userId;
+    private async forgetParkedRedactions(userId: string, epoch: number, ids: readonly string[]): Promise<void> {
         const dek = this.dek;
-        const epoch = this.hydrationEpoch;
-        this.enqueuePersist(async () => {
-            if (this.closed || epoch !== this.hydrationEpoch) return;
-            let changed = false;
-            for (const id of ids) changed = this.pendingRedactions.delete(id) || changed;
-            if (changed) await this.writePendingRedactions(userId, dek);
-        });
+        if (ids.length === 0 || !dek || this.closed || epoch !== this.hydrationEpoch) return;
+        let changed = false;
+        for (const id of ids) changed = this.pendingRedactions.delete(id) || changed;
+        if (changed) await this.writePendingRedactions(userId, dek);
     }
 
     /**
@@ -5257,8 +5261,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (this.events.has(stored.eventId)) return;
 
         if (this.carriesParkedRedaction(stored)) {
-            this.enqueueDeleteRecord(userId, stored.eventId);
-            this.unparkWhenDeleted(stored.editIds ?? []);
+            this.applyParkedRedaction(userId, stored, undefined);
             return;
         }
 
