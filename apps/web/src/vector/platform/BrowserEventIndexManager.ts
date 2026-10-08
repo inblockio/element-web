@@ -2721,8 +2721,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         beforeLimit: number,
         afterLimit: number,
     ): ColdContext {
-        const roomList = Array.from(chunkEntries.values())
-            .filter((e) => e.roomId === hit.roomId)
+        // `chunkEntries` is a decrypted snapshot that can be behind the index: a neighbour the user has redacted since
+        // (its disk rewrite pending, or already committed after this chunk was read) must not appear, and one edited
+        // since is shown as it is now, from its resident record, not as the chunk remembers it. A neighbour that is
+        // merely not resident any more is still shown from the chunk.
+        const roomList = Array.from(chunkEntries.values(), (e) => this.events.get(e.eventId) ?? e)
+            .filter(
+                (e) =>
+                    e.roomId === hit.roomId && !this.pendingDiskDeletes.has(e.eventId) && this.manifest.has(e.eventId),
+            )
             .sort((a, b) => a.originServerTs - b.originServerTs);
         const idx = roomList.findIndex((e) => e.eventId === hit.eventId);
         const beforeEvents = idx >= 0 ? roomList.slice(Math.max(0, idx - beforeLimit), idx) : [];

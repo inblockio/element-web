@@ -6948,4 +6948,95 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect((await oldOnDisk()).searchText).toBe("zznewword");
         });
     });
+
+    // Fifth carry, S2. A cold hit's context lines come from the decrypted chunk, a snapshot that can be behind the
+    // index. A neighbour redacted since (its disk rewrite still pending) used to appear in them with its body.
+    describe("S2: the context of a cold hit follows the index, not the chunk snapshot", () => {
+        type Priv = {
+            events: Map<string, any>;
+            manifest: Map<string, { chunkId: number }>;
+            persistChain: Promise<void>;
+            dek: CryptoKey;
+            userId: string;
+            decryptChunkOnce(userId: string, dek: CryptoKey, chunkId: number): Promise<Map<string, any>>;
+            coldContextFor(chunk: Map<string, any>, hit: any, before: number, after: number): any;
+        };
+        const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
+        const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
+        const withContext = (term: string): any => search(term, { before_limit: 3, after_limit: 3 });
+        const contextBodies = (r: any): string[] =>
+            [...(r.results[0].context?.events_before ?? []), ...(r.results[0].context?.events_after ?? [])].map(
+                (e: any) => e.content?.body,
+            );
+
+        /** `$hit` and `$near` (adjacent in the room, one chunk), both on disk only; the newest four are resident. */
+        async function reopenedWithNeighbour(): Promise<BrowserEventIndexManager> {
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            await seed.addEventToIndex(msg("$hit", "zzhitword", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            await seed.addEventToIndex(msg("$near", "zzneighbourbody", { room_id: ROOM, origin_server_ts: 1001 }), {});
+            for (let i = 0; i < 6; i++) {
+                await seed.addEventToIndex(
+                    msg(`$n${i}`, `zzfiller ${i}`, { room_id: ROOM, origin_server_ts: 2000 + i }),
+                    {},
+                );
+            }
+            await seed.commitLiveEvents();
+            await seed.closeEventIndex();
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(4) });
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            expect(residentIds(m).has("$hit")).toBe(false);
+            expect(residentIds(m).has("$near")).toBe(false);
+            return m;
+        }
+
+        it("a redacted neighbour whose disk delete is still pending is not shown", async () => {
+            const m = await reopenedWithNeighbour();
+            // Control: before the redaction the neighbour IS part of the hit's context.
+            expect(contextBodies(await m.searchEventIndex(withContext("zzhitword")))).toContain("zzneighbourbody");
+
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            priv(m).persistChain = priv(m).persistChain.then(() => gate); // the chunk rewrite cannot start
+            expect(await m.deleteEvent("$near")).toBe(true);
+
+            const hit = await m.searchEventIndex(withContext("zzhitword"));
+            expect(resultIds(hit)).toEqual(["$hit"]);
+            expect(contextBodies(hit)).not.toContain("zzneighbourbody");
+            expect(JSON.stringify(hit)).not.toContain("zzneighbourbody");
+            release();
+            await priv(m).persistChain;
+        });
+
+        it("a neighbour whose delete committed after the chunk was read is not shown either", async () => {
+            const m = await reopenedWithNeighbour();
+            const hitChunk = priv(m).manifest.get("$hit")!.chunkId;
+            // The snapshot a scan would be holding: decrypted before the redaction.
+            const snapshot = await priv(m).decryptChunkOnce(priv(m).userId, priv(m).dek, hitChunk);
+            const bodiesAround = (): string[] => {
+                const context = priv(m).coldContextFor(snapshot, snapshot.get("$hit"), 3, 3);
+                return [...context.events_before, ...context.events_after].map((e: any) => e.content?.body);
+            };
+            expect(bodiesAround()).toContain("zzneighbourbody"); // control: the snapshot does hold the neighbour
+
+            expect(await m.deleteEvent("$near")).toBe(true);
+            await priv(m).persistChain; // committed: pendingDiskDeletes is empty again, the manifest has lost it
+            expect(bodiesAround()).not.toContain("zzneighbourbody");
+            expect(bodiesAround()).toContain("zzfiller 0"); // the rest of the context is intact
+        });
+
+        it("an edited neighbour is shown as it is now, not as the chunk remembers it", async () => {
+            const m = await reopenedWithNeighbour();
+            // $near is pulled in by its edit and rewritten in memory only; the chunk still says "zzneighbourbody".
+            await m.addEventToIndex({ ...edit("$edit", "$near", "zzneighbournew"), room_id: ROOM }, {});
+
+            const hit = await m.searchEventIndex(withContext("zzhitword"));
+            expect(resultIds(hit)).toEqual(["$hit"]);
+            expect(contextBodies(hit)).toContain("zzneighbournew");
+            expect(contextBodies(hit)).not.toContain("zzneighbourbody");
+        });
+    });
 });
