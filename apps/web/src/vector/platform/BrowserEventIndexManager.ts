@@ -62,7 +62,8 @@ Please see LICENSE files in the repository root for full details.
  *   this same store, keyed by a string that embeds `userId` and a page/purpose tag, never a room or event id. The
  *   salt is not secret by construction. The parked-redactions row's ids are inside its ciphertext; what it adds to
  *   the disclosure is that such a row exists and, from its length, roughly how many (at most {@link
- *   PENDING_REDACTIONS_MAX}) -- the same equality-and-count residue the checkpoints have.
+ *   PENDING_REDACTIONS_MAX}) -- the same equality-and-count residue the checkpoints have. On a large account the row
+ *   is always there and near that cap, for the reason given at {@link PENDING_REDACTIONS_MAX}.
  * - Shape: the number of chunk records approximates (events / events-per-chunk), not the event count directly, and
  *   each ciphertext length the size of the events it packs -- coarser than schema v2's one-length-per-event shape.
  *
@@ -99,6 +100,18 @@ Please see LICENSE files in the repository root for full details.
  * timeline is, unaffected by any of this), and because the crawler -- resuming from its last surviving checkpoint --
  * will walk back over exactly the gap a crash left and re-index it with no user-visible difference from having
  * written it the first time.
+ *
+ * **That repair does not cover redactions.** A redaction arrives once, live, and the crawler walks only history it has
+ * not covered yet, so it never brings one back. A redaction that was applied in memory but whose write had not
+ * committed when the crash hit is lost for good: after the reload the message it removed is searchable again, with its
+ * text as it was last written, until something redacts it again. Two writes can be in that state. The chunk rewrite
+ * that removes a redacted record ({@link BrowserEventIndexManager.enqueueDeleteRecord}) is queued on the persist chain
+ * like every other write. And a redaction of an edit whose original is not resident, so that there is nothing to remove
+ * yet, is parked ({@link BrowserEventIndexManager.pendingRedactions}), and the write of the parked-redactions row is
+ * queued the same way. Neither waits for the 5s timer; each waits behind whatever the chain already holds, so the
+ * window is however long that queue is, not a fixed few seconds. Once a parked redaction's row write has committed it
+ * survives a crash: the record is removed from its chunk first and the id leaves the row only after that rewrite has
+ * committed, so a crash between the two still finds the record hidden, and a rewrite that fails leaves the id parked.
  */
 
 import { logger } from "matrix-js-sdk/src/logger";
@@ -1121,6 +1134,17 @@ function pendingRedactionsKey(userId: string): string {
  * decrypting the chunk that would hold it, so the set is bounded instead: past this many, the OLDEST is forgotten
  * (named degradation: a redacted edit whose original is still unread on disk, and which was parked this long ago and
  * this many redactions back, is no longer hidden from the cold tier). About 4096 x 50 B = 200 KiB on disk.
+ *
+ * **Known limitation: on a large account the set lives at this cap.** A redaction is parked only while hydration runs
+ * or once the resident budget has been exceeded and rows were left on disk ({@link
+ * BrowserEventIndexManager.deleteEvent}), which for an index larger than the hot window is always. And the crawler
+ * calls `deleteEvent` for every historic redaction it meets (redacted reactions and events this index never held
+ * included) before it adds the events of the same batch, so the first crawl fills the set with ids that name nothing
+ * the index holds. Past the cap the oldest id goes first, so a parked redaction of an edit lasts about this many later
+ * redactions that name nothing the index can resolve; after that the redacted edit's text is searchable again. The
+ * remedy, planned for the next increment, is a background sweep: when the set passes half the cap, walk the chunks
+ * once, apply the ids that name a record and drop the rest (one complete walk proves that an id names nothing, the way
+ * a complete hydration does).
  * @knipignore - exported for tests.
  */
 export const PENDING_REDACTIONS_MAX = 4096;
@@ -1888,7 +1912,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * {@link coldScanSessionStep}, which drops the record from disk too ({@link applyParkedRedaction}) and never
      * serves it, nor shows it as context ({@link coldContextFor}). It is emptied only when that is certain to be
      * safe: when a hydration run that never hit the resident budget has visited every row ({@link hydrate}); or by
-     * the {@link PENDING_REDACTIONS_MAX} cap, which forgets the oldest.
+     * the {@link PENDING_REDACTIONS_MAX} cap, which forgets the oldest (on a large account the set sits at that cap;
+     * see there for what it costs and the planned remedy).
      */
     private readonly pendingRedactions = new Set<string>();
     /** True while a {@link schedulePendingRedactionsPersist} write is queued and has not started; see there. */
@@ -5435,7 +5460,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * batch still being assembled), and is pushed back so the pass after its write commits evicts it. The
      * other things skipped (and re-pushed, so a later call can reconsider them) are a **stale** entry,
      * whose id is no longer resident or has been re-timed since (see {@link heapPushTs}'s docstring), and
-     * `protectedId` (see below). Only a redaction ({@link deleteEvent}) may drop a pending write.
+     * `protectedId` (see below). Only a deletion may drop a pending write: a redaction ({@link deleteEvent}), a parked
+     * redaction applied to its resident record ({@link applyParkedRedaction}), or a disk-budget drop ({@link
+     * deleteRecordsForDiskBudget}). Each goes through {@link removeFromIndex}, which also drops the record from {@link
+     * liveWriteBuffer}.
      *
      * **Deferral cannot make the resident set unbounded.** The deferred set is exactly the records with an
      * uncommitted write, which is the same population that is already outside the budget by design: a
