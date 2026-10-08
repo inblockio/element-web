@@ -7052,6 +7052,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             manifest: Map<string, unknown>;
             persistChain: Promise<void>;
             pendingRedactions: Set<string>;
+            readChunkEntries: (...args: unknown[]) => Promise<unknown>;
         };
         const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
         const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
@@ -7086,6 +7087,29 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
 
         const diskHas = async (id: string): Promise<boolean> =>
             (await decryptAllChunkEvents(pickleKey, DEVICE)).some((r) => r.eventId === id);
+
+        /**
+         * What a crash at this very moment would leave on disk: whether `id` is still in a chunk, and the ids the
+         * parked-redactions row holds (null when there is no row).
+         */
+        async function diskState(id: string): Promise<{ recordOnDisk: boolean; parked: string[] | null }> {
+            const recordOnDisk = await diskHas(id);
+            return withRawDb(async (db) => {
+                const meta = (await idbPromise(db.transaction("meta", "readonly").objectStore("meta").get(userId))) as {
+                    salt: string;
+                };
+                const dek = await deriveDek(
+                    pickleKey,
+                    decodeBase64(meta.salt) as Uint8Array<ArrayBuffer>,
+                    userId,
+                    DEVICE,
+                );
+                const row = (await idbPromise(
+                    db.transaction("meta", "readonly").objectStore("meta").get(parkedKey()),
+                )) as { blob: { iv: string; ct: string } } | undefined;
+                return { recordOnDisk, parked: row ? await decryptJson<string[]>(dek, row.blob, parkedKey()) : null };
+            });
+        }
 
         it("the cold tier stops serving the redacted edit's body, and the record is removed from disk when first met", async () => {
             await seedEdited();
@@ -7125,6 +7149,38 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(await dumpRawKeys("meta")).not.toContain(parkedKey()); // an empty set leaves no row
             // The unrelated records are untouched.
             expect(resultIds(await m.searchEventIndex(search("zzfiller", { limit: 20 }))).length).toBe(6);
+        });
+
+        it("a parking write still queued when the record is met cannot drop the id before the record has left its chunk", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            expect(priv(m).events.has("$old")).toBe(false);
+
+            // Hold the persist chain, so the parking write is queued but has not started when the cold scan meets
+            // the record. The order the writes then run in is the whole property: parking write, chunk rewrite,
+            // row write.
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            priv(m).persistChain = priv(m).persistChain.then(() => gate);
+            expect(await m.deleteEvent(EDIT)).toBe(false); // parked; its row write is queued behind the gate
+            expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]); // applied: rewrite queued
+
+            // The disk as a crash would find it once the parking write has committed and the chunk rewrite has not
+            // started: captured when the rewrite first reads its chunk.
+            let atCrashPoint: { recordOnDisk: boolean; parked: string[] | null } | undefined;
+            const realRead = priv(m).readChunkEntries.bind(m);
+            const readSpy = vi.spyOn(priv(m), "readChunkEntries").mockImplementation(async (...args: unknown[]) => {
+                atCrashPoint ??= await diskState("$old");
+                return realRead(...args);
+            });
+            release();
+            await priv(m).persistChain;
+            readSpy.mockRestore();
+
+            // Record still on disk, so the id that hides it must still be on disk too.
+            expect(atCrashPoint).toEqual({ recordOnDisk: true, parked: [EDIT] });
+            // Once the rewrite has committed, the id and its row go.
+            expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
         });
 
         it("survives a reload before anything read the record: still hidden, and removed once met", async () => {
