@@ -1875,7 +1875,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * all to look up -- only the original's row carries it, in that row's own `editIds` -- and {@link
      * editTargets} for that original cannot exist until the row that would populate it has been
      * decrypted. Parked here by {@link deleteEvent}, and drained by {@link materializeRow} as each
-     * row's own `editIds` is checked against this set while it streams in from disk.
+     * row's own `editIds` is checked against this set while it streams in from disk. A redaction of
+     * the message itself is parked too when its row could not be pulled in (the chunk read failed),
+     * and is matched against the row's own id.
      *
      * **Durable, bounded, and checked by every reader of disk rows.** Hydration is bounded by the resident budget, so
      * "hydration ended" does not mean "every row was visited"; a redaction parked here used to be dropped at that
@@ -5133,10 +5135,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (changed) this.schedulePendingRedactionsPersist();
     }
 
-    /** Whether a redaction is parked against an edit that was folded into `stored`; such a record is redacted. */
+    /**
+     * Whether a redaction is parked against `stored` itself (its row could not be pulled in when the redaction
+     * arrived, see {@link deleteEvent}) or against an edit that was folded into it; such a record is redacted.
+     */
     private carriesParkedRedaction(stored: StoredEvent): boolean {
         if (this.pendingRedactions.size === 0) return false;
-        return (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id));
+        return (
+            this.pendingRedactions.has(stored.eventId) ||
+            (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id))
+        );
     }
 
     /**
@@ -5148,7 +5156,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private applyParkedRedaction(userId: string, onDisk: StoredEvent, resident: StoredEvent | undefined): void {
         if (resident) this.removeFromIndex(onDisk.eventId);
-        const parkedIds = [...(onDisk.editIds ?? []), ...(resident?.editIds ?? [])];
+        const parkedIds = [onDisk.eventId, ...(onDisk.editIds ?? []), ...(resident?.editIds ?? [])];
         if (this.persistEnabled && this.db) this.enqueueDeleteRecord(userId, onDisk.eventId, parkedIds);
         else this.unparkRedactions(parkedIds); // nothing on disk to rewrite
     }

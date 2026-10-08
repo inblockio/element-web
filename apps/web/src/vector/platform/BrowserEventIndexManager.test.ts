@@ -7053,6 +7053,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             persistChain: Promise<void>;
             pendingRedactions: Set<string>;
             readChunkEntries: (...args: unknown[]) => Promise<unknown>;
+            decryptChunkOnce: (...args: unknown[]) => Promise<unknown>;
         };
         const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
         const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
@@ -7210,6 +7211,48 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(priv(next).pendingRedactions.has(EDIT)).toBe(true);
             expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
             // This time the rewrite goes through, and only then does the id leave the row.
+            await priv(next).persistChain;
+            expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+        });
+
+        /**
+         * The redaction names the message itself, but its row cannot be pulled in (the chunk read fails once), so
+         * nothing resolves the id and it is parked under the record's OWN id rather than an edit's.
+         */
+        async function parkRedactionOfOriginal(m: BrowserEventIndexManager): Promise<void> {
+            const decryptSpy = vi.spyOn(priv(m), "decryptChunkOnce").mockRejectedValueOnce(new Error("handle closed"));
+            expect(await m.deleteEvent("$old")).toBe(false);
+            decryptSpy.mockRestore();
+            expect(priv(m).pendingRedactions.has("$old")).toBe(true);
+        }
+
+        it("a redaction parked under the record's own id is applied by the cold scan", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            expect(priv(m).events.has("$old")).toBe(false);
+            await parkRedactionOfOriginal(m);
+
+            expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+            await priv(m).persistChain;
+            expect(priv(m).pendingRedactions.size).toBe(0); // applied to the record: no longer depends on the set
+            expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+            expect(resultIds(await m.searchEventIndex(search("zzfiller", { limit: 20 }))).length).toBe(6);
+        });
+
+        it("a redaction parked under the record's own id is applied by a hydration that reads its row later", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            await parkRedactionOfOriginal(m);
+            await priv(m).persistChain;
+            expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: ["$old"] });
+            await m.closeEventIndex();
+
+            setEventIndexBoundsOverrideForTesting(null); // everything fits: hydration reads every row
+            const next = track(new BrowserEventIndexManager());
+            await next.initEventIndex(userId, DEVICE);
+            await next.waitForHydration();
+            expect(priv(next).events.has("$old")).toBe(false); // dropped on arrival, never resident
+            expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
             await priv(next).persistChain;
             expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
         });
