@@ -7283,4 +7283,62 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(JSON.stringify(hit)).not.toContain("zzneighbouredit");
         });
     });
+
+    // Fifth carry, S4: the two review gaps that the UX3 tests above only half cover.
+    describe("S4: the UX3 cold-scan fix, paged one hit at a time and scoped to a room", () => {
+        it("a resident record edited into a match between pages is served exactly once, with its new body", async () => {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            await m.addEventToIndex(msg("$x1", "ewsearchbeta one", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            await m.addEventToIndex(msg("$x2", "ewsearchbeta two", { room_id: ROOM, origin_server_ts: 1001 }), {});
+            await m.addEventToIndex(msg("$y", "unrelated text", { room_id: ROOM, origin_server_ts: 1002 }), {});
+            await m.commitLiveEvents();
+
+            const first = await m.searchEventIndex(search("ewsearchbeta", { limit: 1 }));
+            expect(resultIds(first)).toEqual(["$x2"]);
+            await m.addEventToIndex({ ...edit("$edit", "$y", "ewsearchbeta three"), room_id: ROOM }, {});
+            const second = await m.searchEventIndex(search("ewsearchbeta", { limit: 1, next_batch: first.next_batch }));
+            expect(resultIds(second)).toEqual(["$x1"]);
+            const third = await m.searchEventIndex(search("ewsearchbeta", { limit: 1, next_batch: second.next_batch }));
+            expect(resultIds(third)).toEqual(["$y"]);
+            expect(third.results![0].result.content.body).toBe("ewsearchbeta three");
+            // The page that filled its limit leaves the walk where it stood; the next one finds the session empty.
+            const fourth = await m.searchEventIndex(search("ewsearchbeta", { limit: 1, next_batch: third.next_batch }));
+            expect(resultIds(fourth)).toEqual([]);
+            expect(fourth.next_batch).toBeUndefined();
+            // Exactly once over the whole session, and nothing left to serve it a second time.
+            expect([...resultIds(first), ...resultIds(second), ...resultIds(third), ...resultIds(fourth)]).toEqual([
+                "$x2",
+                "$x1",
+                "$y",
+            ]);
+            expect(fourth.count).toBe(3);
+            const stale = await m.searchEventIndex(search("ewsearchbeta", { limit: 1, next_batch: first.next_batch }));
+            expect(resultIds(stale)).toEqual([]); // the exhausted session's token resolves to an empty page
+        });
+
+        it("room scope, term path: the stale chunk copy is not served to its own room while a same-room record matches", async () => {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            await m.addEventToIndex(msg("$orig", "ewsearch-123-alpha", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            await m.addEventToIndex(msg("$other", "alpha other", { room_id: ROOM, origin_server_ts: 500 }), {});
+            await m.addEventToIndex(msg("$twin", "alpha twin", { room_id: ROOM2, origin_server_ts: 900 }), {});
+            await m.commitLiveEvents();
+            await m.addEventToIndex({ ...edit("$edit", "$orig", "ewsearch-123-beta"), room_id: ROOM }, {});
+            // No commitLiveEvents(): the chunk still holds $orig's pre-edit body.
+
+            // `alpha` still has resident matches in both rooms, so every query below takes the TERM path (not the
+            // substring fallback) and reaches the cold step with a non-empty hot snapshot.
+            const own = await m.searchEventIndex(search("alpha", { room_id: ROOM }));
+            expect(resultIds(own)).toEqual(["$other"]);
+            expect(own.count).toBe(1);
+            const twin = await m.searchEventIndex(search("alpha", { room_id: ROOM2 }));
+            expect(resultIds(twin)).toEqual(["$twin"]);
+            expect(twin.count).toBe(1);
+            expect(resultIds(await m.searchEventIndex(search("beta", { room_id: ROOM })))).toEqual(["$orig"]);
+            expect(resultIds(await m.searchEventIndex(search("beta", { room_id: ROOM2 })))).toEqual([]);
+        });
+    });
 });
