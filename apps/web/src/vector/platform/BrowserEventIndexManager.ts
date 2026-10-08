@@ -2152,6 +2152,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // unlike hydrate()'s own failure path, which has to undo however much of a restore
                 // it had already completed.
                 this.clearIndexMaps();
+                // A parked-row write queued under the epoch bumped next is skipped when it runs ({@link
+                // schedulePendingRedactionsPersist}), so it must not leave this session believing one is still on its
+                // way, as {@link resetMemory} does for the same reason.
+                this.pendingRedactionsWriteQueued = false;
                 this.hydrationEpoch++; // Invalidates the manifest/hydrate work just started above.
                 await this.deleteUserRecords(userId);
                 await this.saveMeta({

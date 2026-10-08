@@ -7077,7 +7077,8 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             readChunkEntries: (...args: unknown[]) => Promise<unknown>;
             decryptChunkOnce: (...args: unknown[]) => Promise<unknown>;
             pendingRedactionsWriteQueued: boolean;
-            pendingDiskDeletes: Set<string>;
+            loadCrawlerCheckpoints: (...args: unknown[]) => Promise<boolean>;
+            residentBudgetExceeded: boolean;
         };
         const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
         const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
@@ -7487,6 +7488,43 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             const next = await reopenSmall();
             expect(priv(next).pendingRedactions.has(EDIT)).toBe(true);
             expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+        });
+
+        it("a checkpoint that fails to decrypt on re-initialisation does not leave the parked row unwritten for the session", async () => {
+            await seedEdited();
+            const m = await reopenSmall(); // a first session, still open when it is initialised again below
+
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let queuedBeforeWipe: boolean | undefined;
+            const realLoad = priv(m).loadCrawlerCheckpoints.bind(m);
+            const loadSpy = vi
+                .spyOn(priv(m), "loadCrawlerCheckpoints")
+                .mockImplementationOnce(async (...args: unknown[]) => {
+                    await realLoad(...args);
+                    // A redaction parked while the index is still loading: its row write is queued behind a gate.
+                    priv(m).persistChain = priv(m).persistChain.then(() => gate);
+                    await m.deleteEvent("$junk-during-init");
+                    queuedBeforeWipe = priv(m).pendingRedactionsWriteQueued;
+                    return false; // as if a stored checkpoint could not be decrypted: the wipe path
+                });
+            try {
+                await m.initEventIndex(userId, DEVICE);
+            } finally {
+                loadSpy.mockRestore();
+            }
+            expect(queuedBeforeWipe).toBe(true); // control: the write really was queued before the wipe
+            // The wipe discarded that session's set and moved the epoch on, so the queued write will be skipped.
+            expect(priv(m).pendingRedactions.size).toBe(0);
+            release();
+            await priv(m).persistChain;
+
+            // The index is re-crawled after a wipe and runs over its budget again: a redaction parked now must reach
+            // the row, which it cannot if the skipped write left its "queued" mark behind.
+            priv(m).residentBudgetExceeded = true;
+            expect(await m.deleteEvent(EDIT)).toBe(false);
+            await priv(m).persistChain;
+            expect((await diskState("$old")).parked).toEqual([EDIT]);
         });
 
         it("a parked-redaction row that cannot be read is left alone for the rest of the session", async () => {
