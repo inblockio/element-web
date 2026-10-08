@@ -7054,6 +7054,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             pendingRedactions: Set<string>;
             readChunkEntries: (...args: unknown[]) => Promise<unknown>;
             decryptChunkOnce: (...args: unknown[]) => Promise<unknown>;
+            pendingRedactionsWriteQueued: boolean;
         };
         const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
         const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
@@ -7255,6 +7256,47 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
             await priv(next).persistChain;
             expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+        });
+
+        it("a re-initialisation without a close does not lose the new session's parked row write", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            const hold = (): { gate: Promise<void>; release: () => void } => {
+                let release!: () => void;
+                return { gate: new Promise<void>((resolve) => (release = resolve)), release };
+            };
+            const oldSession = hold();
+            const newSession = hold();
+            try {
+                // The old session parks an id; its row write is queued behind a gate, so it has not started.
+                priv(m).persistChain = priv(m).persistChain.then(() => oldSession.gate);
+                const oldChain = priv(m).persistChain;
+                await m.deleteEvent("$junk-a");
+                expect(priv(m).pendingRedactionsWriteQueued).toBe(true);
+
+                // The settings panel re-initialises without closing first. The new session parks the redaction we
+                // care about, behind a gate of its own.
+                await m.initEventIndex(userId, DEVICE);
+                await m.waitForHydration();
+                priv(m).persistChain = priv(m).persistChain.then(() => newSession.gate);
+                expect(await m.deleteEvent(EDIT)).toBe(false);
+                expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
+                expect(priv(m).pendingRedactionsWriteQueued).toBe(true); // this session's write, queued
+
+                // The old session's write finally runs, finds itself stale and writes nothing. It must not take the
+                // new session's "write queued" mark with it.
+                oldSession.release();
+                await oldChain;
+                expect(priv(m).pendingRedactionsWriteQueued).toBe(true);
+
+                newSession.release();
+                await priv(m).persistChain;
+                expect(priv(m).pendingRedactionsWriteQueued).toBe(false);
+                expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+            } finally {
+                oldSession.release(); // a failed assertion must not leave the chain gated for the teardown
+                newSession.release();
+            }
         });
 
         it("survives a reload before anything read the record: still hidden, and removed once met", async () => {

@@ -5176,8 +5176,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const dek = this.dek;
         const epoch = this.hydrationEpoch;
         this.enqueuePersist(async () => {
-            this.pendingRedactionsWriteQueued = false;
+            // A write left over from a previous session writes nothing and leaves the flag alone: it now belongs to
+            // the session that reset it ({@link resetMemory}), whose own write may be queued.
             if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+            this.pendingRedactionsWriteQueued = false;
             await this.writePendingRedactions(userId, dek);
         });
     }
@@ -5811,6 +5813,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     private async resetMemory(): Promise<void> {
         this.clearIndexMaps();
+        // A parked-row write queued by the session being discarded is skipped when it runs (epoch check), so it
+        // must not leave the next session believing one is still on its way.
+        this.pendingRedactionsWriteQueued = false;
         this.checkpoints = [];
         this.userVersion = 0;
         this.persistChain = Promise.resolve();
