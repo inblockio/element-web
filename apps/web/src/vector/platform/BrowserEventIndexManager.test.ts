@@ -32,6 +32,7 @@ import {
     isWebEventIndexSupported,
     MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
     MANIFEST_PAGE_SIZE,
+    PENDING_REDACTIONS_MAX,
     replacedEventId,
     RESIDENT_BYTES_PER_EVENT_ESTIMATE,
     tokenize,
@@ -2455,7 +2456,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
             }
         });
 
-        it("R8: pendingRedactions is drained once hydration ends", async () => {
+        it("R8: pendingRedactions is drained once a complete hydration ends", async () => {
             await seed(4);
             const restore = slowDownDecrypt(15);
             try {
@@ -7037,6 +7038,249 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(resultIds(hit)).toEqual(["$hit"]);
             expect(contextBodies(hit)).toContain("zzneighbournew");
             expect(contextBodies(hit)).not.toContain("zzneighbourbody");
+        });
+    });
+
+    // Fifth carry, N2. A redaction naming an EDIT's event id is resolved through the edited message's record
+    // (editTargets); when that record is not resident it was parked in memory and dropped at the end of hydration,
+    // while the cold tier went on serving the redacted edit's body, and a reload brought it back everywhere. The
+    // parked redaction is now durable (one encrypted meta row), honoured by the cold scan, which also removes the
+    // record from disk the first time it meets it, and bounded.
+    describe("N2: a parked redaction of an edit stays in force until its record is met", () => {
+        type Priv = {
+            events: Map<string, unknown>;
+            manifest: Map<string, unknown>;
+            persistChain: Promise<void>;
+            pendingRedactions: Set<string>;
+        };
+        const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
+        const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
+        const EDIT = "$redacted-edit-id";
+        const parkedKey = (): string => `${userId}|pendingRedactions`;
+
+        /** `$old` (oldest) edited by `EDIT`, then six newer records; all committed, then closed. */
+        async function seedEdited(): Promise<void> {
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            await seed.addEventToIndex(msg("$old", "zzoriginalbody", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            await seed.addEventToIndex({ ...edit(EDIT, "$old", "zzeditedsecret", 1500), room_id: ROOM }, {});
+            for (let i = 0; i < 6; i++) {
+                await seed.addEventToIndex(
+                    msg(`$n${i}`, `zzfiller ${i}`, { room_id: ROOM, origin_server_ts: 2000 + i }),
+                    {},
+                );
+            }
+            await seed.commitLiveEvents();
+            await seed.closeEventIndex();
+        }
+
+        /** Reopen under a four-record resident budget: `$old` stays on disk. */
+        async function reopenSmall(): Promise<BrowserEventIndexManager> {
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(4) });
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            return m;
+        }
+
+        const diskHas = async (id: string): Promise<boolean> =>
+            (await decryptAllChunkEvents(pickleKey, DEVICE)).some((r) => r.eventId === id);
+
+        it("the cold tier stops serving the redacted edit's body, and the record is removed from disk when first met", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            expect(priv(m).events.has("$old")).toBe(false);
+            // Control: the edited body is findable through the cold tier before the redaction.
+            expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual(["$old"]);
+
+            expect(await m.deleteEvent(EDIT)).toBe(false); // parked: $old is not resident, nothing resolves the id
+            expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
+
+            await priv(m).persistChain; // the parking itself is written; what follows is the application of it
+            const writes: string[] = [];
+            const realTransaction = IDBDatabase.prototype.transaction;
+            vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                this: IDBDatabase,
+                names,
+                mode,
+                ...rest
+            ) {
+                if (mode === "readwrite") writes.push(typeof names === "string" ? names : Array.from(names).join("+"));
+                return realTransaction.call(this, names, mode, ...rest);
+            });
+
+            const after = await m.searchEventIndex(search("zzeditedsecret"));
+            expect(resultIds(after)).toEqual([]);
+            expect(after.count).toBe(0);
+            expect(resultIds(await m.searchEventIndex(search("zzoriginalbody")))).toEqual([]); // dropped, not reverted
+
+            await priv(m).persistChain;
+            // The record leaves its chunk BEFORE the parked id leaves the row: a crash in between must not leave the
+            // record on disk with nothing left to hide it.
+            expect(writes).toEqual(["chunks+meta", "meta"]);
+            expect(priv(m).pendingRedactions.size).toBe(0); // applied to the record: no longer depends on the set
+            expect(priv(m).manifest.has("$old")).toBe(false);
+            expect(await diskHas("$old")).toBe(false);
+            expect(await dumpRawKeys("meta")).not.toContain(parkedKey()); // an empty set leaves no row
+            // The unrelated records are untouched.
+            expect(resultIds(await m.searchEventIndex(search("zzfiller", { limit: 20 }))).length).toBe(6);
+        });
+
+        it("survives a reload before anything read the record: still hidden, and removed once met", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            await m.deleteEvent(EDIT);
+            await priv(m).persistChain;
+            expect(await dumpRawKeys("meta")).toContain(parkedKey());
+            await m.closeEventIndex();
+
+            // Nothing has read $old's record since: the redaction lives only in the persisted row.
+            const next = await reopenSmall();
+            expect(priv(next).pendingRedactions.has(EDIT)).toBe(true);
+            expect(priv(next).events.has("$old")).toBe(false);
+            expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+            await priv(next).persistChain;
+            expect(await diskHas("$old")).toBe(false);
+            expect(await dumpRawKeys("meta")).not.toContain(parkedKey());
+        });
+
+        it("survives a reload into full hydration: the record is dropped on arrival, and ids nothing holds are forgotten", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            await m.deleteEvent(EDIT);
+            await m.deleteEvent("$never-indexed-reaction");
+            await priv(m).persistChain;
+            await m.closeEventIndex();
+
+            setEventIndexBoundsOverrideForTesting(null); // everything fits: hydration reads every row
+            const next = track(new BrowserEventIndexManager());
+            await next.initEventIndex(userId, DEVICE);
+            await next.waitForHydration();
+            expect(priv(next).events.has("$old")).toBe(false);
+            expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+            // A complete walk that never had to evict anything has met every row: what is still parked names nothing.
+            expect(priv(next).pendingRedactions.size).toBe(0);
+            await priv(next).persistChain;
+            expect(await diskHas("$old")).toBe(false);
+            expect(await dumpRawKeys("meta")).not.toContain(parkedKey());
+        });
+
+        it("a redaction parked while hydration runs is still parked when a budget-limited hydration ends", async () => {
+            await seedEdited();
+            const restore = slowDownDecrypt(15);
+            try {
+                setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(4) });
+                const m = track(new BrowserEventIndexManager());
+                await m.initEventIndex(userId, DEVICE);
+                expect(await m.deleteEvent(EDIT)).toBe(false); // parked mid-hydration
+                await m.waitForHydration();
+                // Hydration stopped at the budget, so it has NOT met every row: the redaction must outlive it.
+                expect(priv(m).events.has("$old")).toBe(false);
+                expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
+                expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+            } finally {
+                restore();
+            }
+        });
+
+        it("the persisted row holds no cleartext", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            await m.deleteEvent(EDIT);
+            await m.deleteEvent("$some-other-redacted-event");
+            await priv(m).persistChain;
+            expect(await dumpRawKeys("meta")).toContain(parkedKey());
+            const whole = await dumpWholeDb();
+            expect(whole).not.toContain(EDIT);
+            expect(whole).not.toContain("$some-other-redacted-event");
+            expect(whole).not.toContain("zzeditedsecret");
+            expect(whole).not.toContain("zzoriginalbody");
+            expect(whole).not.toContain(ROOM);
+        });
+
+        it("an unreadable parked-redaction row is treated like any unreadable row: this user's index is wiped", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            await m.deleteEvent(EDIT);
+            await priv(m).persistChain;
+            await m.closeEventIndex();
+            await withRawDb(async (db) => {
+                const tx = db.transaction("meta", "readwrite");
+                tx.objectStore("meta").put({ userId: parkedKey(), blob: { iv: "AAAAAAAAAAAAAAAA", ct: "AAAA" } });
+                await new Promise<void>((resolve, reject) => {
+                    tx.oncomplete = (): void => resolve();
+                    tx.onerror = (): void => reject(tx.error);
+                });
+            });
+
+            const next = await reopenSmall();
+            expect((await next.getStats()).eventCount).toBe(0);
+            expect(resultIds(await next.searchEventIndex(search("zzfiller")))).toEqual([]);
+            expect(await dumpRawKeys("meta")).toEqual([userId]);
+            expect(await diskHas("$old")).toBe(false);
+        });
+
+        it("deleting the index leaves no parked-redaction row behind", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            await m.deleteEvent(EDIT);
+            await priv(m).persistChain;
+            expect(await dumpRawKeys("meta")).toContain(parkedKey());
+            await m.deleteEventIndex();
+            expect(await dumpRawKeys("meta")).not.toContain(parkedKey());
+        });
+
+        it("is bounded: past the cap the oldest parked redaction is forgotten, in memory and on disk", async () => {
+            await seedEdited();
+            const m = await reopenSmall();
+            for (let i = 0; i < PENDING_REDACTIONS_MAX + 10; i++) await m.deleteEvent(`$junk${i}`);
+            expect(priv(m).pendingRedactions.size).toBe(PENDING_REDACTIONS_MAX);
+            expect(priv(m).pendingRedactions.has("$junk0")).toBe(false);
+            expect(priv(m).pendingRedactions.has("$junk9")).toBe(false);
+            expect(priv(m).pendingRedactions.has("$junk10")).toBe(true);
+            expect(priv(m).pendingRedactions.has(`$junk${PENDING_REDACTIONS_MAX + 9}`)).toBe(true);
+            // Ids nothing holds change nothing for anyone else: the unredacted edit is still found.
+            expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual(["$old"]);
+
+            await priv(m).persistChain;
+            await m.closeEventIndex();
+            const next = await reopenSmall();
+            expect(priv(next).pendingRedactions.size).toBe(PENDING_REDACTIONS_MAX);
+            expect(priv(next).pendingRedactions.has("$junk0")).toBe(false);
+        });
+
+        it("a neighbour carrying a parked redaction is not shown in a hit's context", async () => {
+            const seed = track(new BrowserEventIndexManager());
+            await seed.initEventIndex(userId, DEVICE);
+            await seed.waitForHydration();
+            // $near is OLDER than $hit, so the cold walk (newest first) meets $hit before $near.
+            await seed.addEventToIndex(msg("$near", "zzneighbourbody", { room_id: ROOM, origin_server_ts: 999 }), {});
+            await seed.addEventToIndex({ ...edit(EDIT, "$near", "zzneighbouredit", 1001), room_id: ROOM }, {});
+            await seed.addEventToIndex(msg("$hit", "zzhitword", { room_id: ROOM, origin_server_ts: 1000 }), {});
+            for (let i = 0; i < 6; i++) {
+                await seed.addEventToIndex(
+                    msg(`$n${i}`, `zzfiller ${i}`, { room_id: ROOM, origin_server_ts: 2000 + i }),
+                    {},
+                );
+            }
+            await seed.commitLiveEvents();
+            await seed.closeEventIndex();
+
+            const m = await reopenSmall();
+            const context = (r: any): string[] =>
+                [...(r.results[0].context?.events_before ?? []), ...(r.results[0].context?.events_after ?? [])].map(
+                    (e: any) => e.content?.body,
+                );
+            const ask = (): Promise<any> =>
+                m.searchEventIndex(search("zzhitword", { before_limit: 3, after_limit: 3 }));
+            expect(context(await ask())).toContain("zzneighbouredit"); // control: shown before the redaction
+
+            await m.deleteEvent(EDIT);
+            const hit = await ask();
+            expect(resultIds(hit)).toEqual(["$hit"]);
+            expect(context(hit)).not.toContain("zzneighbouredit");
+            expect(JSON.stringify(hit)).not.toContain("zzneighbouredit");
         });
     });
 });

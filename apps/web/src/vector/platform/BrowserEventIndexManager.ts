@@ -57,21 +57,25 @@ Please see LICENSE files in the repository root for full details.
  *   confirmed offline by hashing it. What it does disclose is **equality and count**.
  * - `meta`: `userId`, the HKDF `salt`, `userVersion` and the small scalar bookkeeping fields on {@link MetaRecord}
  *   (chunk/page counts, the currently-open chunk id) -- all counts or ids, nothing content-shaped. Manifest pages
- *   ({@link ManifestPageRecord}) and the persisted {@link BrowserEventIndexManager.oldestIndexedTs} row live in this
- *   same store, keyed by a string that embeds `userId` and a page/purpose tag, never a room or event id. The salt is
- *   not secret by construction.
+ *   ({@link ManifestPageRecord}), the persisted {@link BrowserEventIndexManager.oldestIndexedTs} row and, only while
+ *   some redaction is still waiting for its record, the parked-redactions row ({@link pendingRedactionsKey}) live in
+ *   this same store, keyed by a string that embeds `userId` and a page/purpose tag, never a room or event id. The
+ *   salt is not secret by construction. The parked-redactions row's ids are inside its ciphertext; what it adds to
+ *   the disclosure is that such a row exists and, from its length, roughly how many (at most {@link
+ *   PENDING_REDACTIONS_MAX}) -- the same equality-and-count residue the checkpoints have.
  * - Shape: the number of chunk records approximates (events / events-per-chunk), not the event count directly, and
  *   each ciphertext length the size of the events it packs -- coarser than schema v2's one-length-per-event shape.
  *
- * **The complete cleartext key set, across every store, is: `userId`, `chunkId`, the manifest page keys and the HKDF
- * salt** -- `eventId` has left it entirely, on every database this class opens. A v2 (or v1) database is never
- * converted in place: {@link openDb}'s `onupgradeneeded` resets it, dropping the legacy `events` store outright
- * (schema v2's cleartext `[userId, eventId]` primary key and its `byUser` index go with it) rather than reading it
- * to repack its rows into chunks -- see {@link openDb}'s own docstring, "Migration v2 -> v3: reset, not convert"
- * (`research/SYNTHESIS.md` §3.2, decision #5). There is therefore no window, of any length, in which this class
- * holds an open connection to a database with a live `events` store: the reset happens inside the same
- * `versionchange` transaction that bumps {@link EVENTINDEX_DB_VERSION}, before any application code -- this class's
- * own included -- ever gets to read from it. See the exact-key-set test in the test file, which pins this.
+ * **The complete cleartext key set, across every store, is: `userId`, `chunkId`, the purpose-tagged `meta` keys listed
+ * above (manifest pages, `oldestIndexedTs`, parked redactions) and the HKDF salt** -- `eventId` has left it entirely,
+ * on every database this class opens. A v2 (or v1) database is never converted in place: {@link openDb}'s
+ * `onupgradeneeded` resets it, dropping the legacy `events` store outright (schema v2's cleartext `[userId, eventId]`
+ * primary key and its `byUser` index go with it) rather than reading it to repack its rows into chunks -- see {@link
+ * openDb}'s own docstring, "Migration v2 -> v3: reset, not convert" (`research/SYNTHESIS.md` §3.2, decision #5). There
+ * is therefore no window, of any length, in which this class holds an open connection to a database with a live
+ * `events` store: the reset happens inside the same `versionchange` transaction that bumps {@link
+ * EVENTINDEX_DB_VERSION}, before any application code -- this class's own included -- ever gets to read from it. See
+ * the exact-key-set test in the test file, which pins this.
  *
  * Every record is additionally bound by AAD to its own key, so an attacker with write access cannot re-file a record
  * under another user or chunk id and have it decrypt -- though that is no defence against deleting records or rolling
@@ -1101,6 +1105,27 @@ function oldestIndexedTsKey(userId: string): string {
 }
 
 /**
+ * The primary key -- and AAD -- of the one encrypted row holding {@link
+ * BrowserEventIndexManager.pendingRedactions}: ids a redaction named that no record could be found for yet. Same
+ * `{userId, blob}` shape and same "purpose tag, never a room or event id" key discipline as {@link
+ * oldestIndexedTsKey}; the row exists only while the set is non-empty. The ids themselves are inside the ciphertext.
+ */
+function pendingRedactionsKey(userId: string): string {
+    return `${userId}|pendingRedactions`;
+}
+
+/**
+ * The most redactions {@link BrowserEventIndexManager.pendingRedactions} keeps waiting for their record (memory and
+ * the encrypted row alike). Most of what lands there is not an edit at all -- a redacted reaction, an event this index
+ * never held, a redaction delivered twice -- and nothing can tell those apart from a real edit's id without
+ * decrypting the chunk that would hold it, so the set is bounded instead: past this many, the OLDEST is forgotten
+ * (named degradation: a redacted edit whose original is still unread on disk, and which was parked this long ago and
+ * this many redactions back, is no longer hidden from the cold tier). About 4096 x 50 B = 200 KiB on disk.
+ * @knipignore - exported for tests.
+ */
+export const PENDING_REDACTIONS_MAX = 4096;
+
+/**
  * One candidate for eviction/deletion by age: an id (an event id for {@link
  * BrowserEventIndexManager.residentHeap}, or `String(chunkId)` for {@link
  * BrowserEventIndexManager.diskChunkHeap}) and the `originServerTs` it was pushed onto a heap with.
@@ -1851,8 +1876,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * editTargets} for that original cannot exist until the row that would populate it has been
      * decrypted. Parked here by {@link deleteEvent}, and drained by {@link materializeRow} as each
      * row's own `editIds` is checked against this set while it streams in from disk.
+     *
+     * **Durable, bounded, and checked by every reader of disk rows.** Hydration is bounded by the resident budget, so
+     * "hydration ended" does not mean "every row was visited"; a redaction parked here used to be dropped at that
+     * point, and in any case lived in memory only, so the redacted edit's body came back from the cold tier (and,
+     * after a reload, from everywhere). Now the set is mirrored to one encrypted `meta` row ({@link
+     * pendingRedactionsKey}, {@link schedulePendingRedactionsPersist}), reloaded by {@link loadManifest}, and
+     * applied by whichever path decrypts the record first: {@link materializeRow} (hydration, an on-demand pull) or
+     * {@link coldScanSessionStep}, which drops the record from disk too ({@link applyParkedRedaction}) and never
+     * serves it, nor shows it as context ({@link coldContextFor}). It is emptied only when that is certain to be
+     * safe: when a hydration run that never hit the resident budget has visited every row ({@link hydrate}); or by
+     * the {@link PENDING_REDACTIONS_MAX} cap, which forgets the oldest.
      */
     private readonly pendingRedactions = new Set<string>();
+    /** True while a {@link schedulePendingRedactionsPersist} write is queued and has not started; see there. */
+    private pendingRedactionsWriteQueued = false;
 
     /**
      * ids removed from the resident set ({@link removeFromIndex}) by a genuine deletion -- {@link
@@ -2152,8 +2190,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * materializeIfPending}, which pulls it in if there is one) so there is something here to remove rather than
      * treating "not decrypted yet" as "does not exist". And one that resolves to neither -- which, in either of
      * those states, can mean "this is an edit's id, and its original is a disk row not hydrated yet, so {@link
-     * editTargets} cannot know about it" -- is parked in {@link pendingRedactions} for {@link materializeRow} to
-     * drain as rows stream in, rather than being dropped as a no-op.
+     * editTargets} cannot know about it" -- is parked in {@link pendingRedactions} for {@link materializeRow} (or the
+     * cold scan) to apply as soon as it meets the record, rather than being dropped as a no-op. Parked redactions are
+     * persisted, so they survive a reload; see {@link pendingRedactions}.
      *
      * `!this.hydrating` alone used to be reason enough to skip {@link materializeIfPending} outright (as an
      * optimisation -- that method's own guard makes the skip correct either way): once hydration is bounded, that
@@ -2174,7 +2213,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
         }
         if (targetId === undefined) {
-            if (this.hydrating || this.residentBudgetExceeded) this.pendingRedactions.add(eventId);
+            if (this.hydrating || this.residentBudgetExceeded) this.parkRedaction(eventId);
             return false;
         }
         const existed = this.events.has(targetId);
@@ -2728,7 +2767,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const roomList = Array.from(chunkEntries.values(), (e) => this.events.get(e.eventId) ?? e)
             .filter(
                 (e) =>
-                    e.roomId === hit.roomId && !this.pendingDiskDeletes.has(e.eventId) && this.manifest.has(e.eventId),
+                    e.roomId === hit.roomId &&
+                    !this.pendingDiskDeletes.has(e.eventId) &&
+                    this.manifest.has(e.eventId) &&
+                    !this.carriesParkedRedaction(e),
             )
             .sort((a, b) => a.originServerTs - b.originServerTs);
         const idx = roomList.findIndex((e) => e.eventId === hit.eventId);
@@ -2753,7 +2795,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * coldRecordMatchesTokens}) against every member not in the session's hot snapshot, already tombstoned, or already
      * returned by this session, newest-member-first within the chunk to match {@link hydrate}'s own admission order.
      * A member that is resident is evaluated (and served) from its resident record, never from the decrypted chunk,
-     * whose copy can lag a buffered rewrite such as an edit's.
+     * whose copy can lag a buffered rewrite such as an edit's. A member whose folded-in edit a parked redaction names
+     * ({@link pendingRedactions}) is redacted: it is never served, and is removed from disk on the spot ({@link
+     * applyParkedRedaction}).
      *
      * **Resuming needs no cursor at all, only `session.returned` (re-scoped from the previous `(originServerTs,
      * eventId)` boundary shape, which review-pr-e.md's second round -- E2-F1, E2-F4 -- found still unstable).**
@@ -2867,7 +2911,17 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // session.hotIds names only hot *matches*, so the stale copy got a second, wrong evaluation here.
                 // A member that is not resident (the cold case proper, or one that became resident after the
                 // snapshot, E3-F1) is evaluated exactly as before, from whichever copy is current.
-                const stored = this.events.get(id) ?? entries.get(id)!;
+                const onDisk = entries.get(id)!;
+                const resident = this.events.get(id);
+                const stored = resident ?? onDisk;
+                // A redaction named an edit folded into this record before the record could be found (see
+                // pendingRedactions): the record is redacted. Checked for every member of every chunk this walk
+                // decrypts, not only for matches, so the first read of the chunk also removes the record from disk
+                // and the redaction stops depending on the parked set.
+                if (this.carriesParkedRedaction(onDisk) || (resident && this.carriesParkedRedaction(resident))) {
+                    this.applyParkedRedaction(userId, onDisk, resident);
+                    continue;
+                }
                 if (session.roomId && stored.roomId !== session.roomId) continue;
                 const isMatch = session.useSubstring
                     ? flattenCopy(foldText(stored.searchText)).includes(foldedQuery)
@@ -4689,9 +4743,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // on a brand-new index -- not an error; see loadOldestIndexedTs's own docstring.
         try {
             this.oldestIndexedTs = await this.loadOldestIndexedTs(userId, dek);
+            // Redactions that were still waiting for their record when the last session ended; see
+            // pendingRedactions. Loaded before hydrate() reads its first chunk (it awaits this method).
+            await this.loadPendingRedactions(userId, dek, epoch);
         } catch {
             log.warn(
-                "EventIndex: the persisted oldestIndexedTs row could not be decrypted; wiping leftover for this user",
+                "EventIndex: a persisted oldestIndexedTs or parked-redaction row could not be decrypted; wiping leftover",
             );
             this.clearIndexMaps();
             await this.deleteUserRecords(userId);
@@ -4811,6 +4868,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const bounds = getEventIndexBounds();
 
         this.hydrating = true;
+        // True only when the walk below ran to its end: every chunk read and every row of it admitted or
+        // skipped for a stated reason, never cut short by the resident budget, a teardown or an error.
+        let walkComplete = false;
 
         try {
             await this.manifestReadyPromise;
@@ -5002,6 +5062,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 if (this.persistEnabled) await this.enforceDiskBudget(userId);
                 if (this.closed || epoch !== this.hydrationEpoch) return;
             }
+            walkComplete = true;
         } catch (e) {
             // Anything not already handled inside the loop above -- most realistically db.transaction()/idbReq()/
             // txDone() throwing because another tab's onversionchange closed this connection out from underneath an
@@ -5016,13 +5077,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         } finally {
             if (epoch === this.hydrationEpoch) {
                 this.hydrating = false;
-                // Any redaction still parked here named an edit whose original this run never reached (the row
-                // does not exist, or decrypting it failed independently of this run's own error path above).
-                // clearIndexMaps() would silently absorb these on the next reset regardless, but logging first
-                // makes a redaction that this run could not act on visible rather than incidental.
-                if (this.pendingRedactions.size > 0) {
+                // Any redaction still parked here named an edit whose record this run never met -- but only a run
+                // that read EVERY row, and never had to evict one to stay in budget, can conclude from that that
+                // there is no such record (an id nothing holds: a redacted reaction, a redaction delivered twice).
+                // A run cut short at the resident budget has not: the record may be one of the rows it left on
+                // disk, so the redaction stays parked, and durable, for whatever reads that row next (the cold
+                // scan, an on-demand pull, the next session's hydration). See pendingRedactions.
+                if (this.pendingRedactions.size > 0 && walkComplete && !this.residentBudgetExceeded) {
                     log.debug(`EventIndex: ${this.pendingRedactions.size} redaction(s) never found their original`);
                     this.pendingRedactions.clear();
+                    this.schedulePendingRedactionsPersist();
                 }
             }
         }
@@ -5032,6 +5096,138 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 `EventIndex: hydration finished in ${(now() - started).toFixed(1)}ms, ${hydratedCount} events, ` +
                     `longest slice ${longestSliceMs.toFixed(1)}ms, order manifest-ts-desc`,
             );
+        }
+    }
+
+    /**
+     * Park a redaction that named an id nothing could resolve yet; see {@link pendingRedactions}. Forgets the oldest
+     * parked id(s) beyond {@link PENDING_REDACTIONS_MAX}.
+     */
+    private parkRedaction(eventId: string): void {
+        if (this.pendingRedactions.has(eventId)) return;
+        this.pendingRedactions.add(eventId);
+        let dropped = 0;
+        while (this.pendingRedactions.size > PENDING_REDACTIONS_MAX) {
+            const oldest = this.pendingRedactions.values().next().value;
+            if (oldest === undefined) break;
+            this.pendingRedactions.delete(oldest);
+            dropped++;
+        }
+        if (dropped > 0) log.debug(`EventIndex: ${dropped} oldest parked redaction(s) forgotten at the cap`);
+        this.schedulePendingRedactionsPersist();
+    }
+
+    /** Forget parked redactions that have just been applied to their record. */
+    private unparkRedactions(ids: readonly string[]): void {
+        let changed = false;
+        for (const id of ids) changed = this.pendingRedactions.delete(id) || changed;
+        if (changed) this.schedulePendingRedactionsPersist();
+    }
+
+    /** Whether a redaction is parked against an edit that was folded into `stored`; such a record is redacted. */
+    private carriesParkedRedaction(stored: StoredEvent): boolean {
+        if (this.pendingRedactions.size === 0) return false;
+        return (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id));
+    }
+
+    /**
+     * Apply a parked redaction to the record it turned out to name: the record leaves memory and is queued for removal
+     * from its chunk on disk -- the same whole-record removal {@link deleteEvent} does, the pre-edit body having been
+     * overwritten in place -- so the redaction no longer depends on the parked set. For the paths that meet the record
+     * on disk without materializing it ({@link coldScanSessionStep}); {@link materializeRow} does the same inline.
+     */
+    private applyParkedRedaction(userId: string, onDisk: StoredEvent, resident: StoredEvent | undefined): void {
+        if (resident) this.removeFromIndex(onDisk.eventId);
+        if (this.persistEnabled && this.db) this.enqueueDeleteRecord(userId, onDisk.eventId);
+        this.unparkWhenDeleted([...(onDisk.editIds ?? []), ...(resident?.editIds ?? [])]);
+    }
+
+    /**
+     * Mirror {@link pendingRedactions} to its encrypted `meta` row, coalesced: any number of changes before the queued
+     * write starts cost one write, which reads the set as it is THEN (an empty set deletes the row, so an index with
+     * nothing parked has no such row at all). Queued on {@link persistChain} like every write, so it commits in order
+     * with the chunk rewrites a parked redaction produces. The epoch check keeps a write left over from a previous
+     * session from encrypting the next session's set under the previous one's key.
+     */
+    private schedulePendingRedactionsPersist(): void {
+        if (this.pendingRedactionsWriteQueued) return;
+        if (!this.persistEnabled || !this.dek || !this.db || !this.userId) return;
+        this.pendingRedactionsWriteQueued = true;
+        const userId = this.userId;
+        const dek = this.dek;
+        const epoch = this.hydrationEpoch;
+        this.enqueuePersist(async () => {
+            this.pendingRedactionsWriteQueued = false;
+            if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+            await this.writePendingRedactions(userId, dek);
+        });
+    }
+
+    /** Write {@link pendingRedactions} as it is now to its row, or delete the row when it is empty. */
+    private async writePendingRedactions(userId: string, dek: CryptoKey): Promise<void> {
+        if (!this.db) return;
+        const key = pendingRedactionsKey(userId);
+        const ids = Array.from(this.pendingRedactions);
+        // Encrypted before the transaction opens, like every other write in this file.
+        const blob = ids.length > 0 ? await encryptJson(dek, ids, key) : null;
+        const tx = this.db.transaction("meta", "readwrite");
+        if (blob) tx.objectStore("meta").put({ userId: key, blob } satisfies ManifestPageRecord);
+        else tx.objectStore("meta").delete(key);
+        await txDone(tx);
+    }
+
+    /**
+     * Forget parked redactions once the chunk rewrite that removes their record has committed: queued on {@link
+     * persistChain} right behind {@link enqueueDeleteRecord}, and writing the row itself in the same operation.
+     * Forgetting them any earlier would let a crash between the two writes leave the record on disk with nothing left
+     * to hide it.
+     */
+    private unparkWhenDeleted(ids: readonly string[]): void {
+        if (ids.length === 0) return;
+        if (!this.persistEnabled || !this.dek || !this.db || !this.userId) {
+            this.unparkRedactions(ids);
+            return;
+        }
+        const userId = this.userId;
+        const dek = this.dek;
+        const epoch = this.hydrationEpoch;
+        this.enqueuePersist(async () => {
+            if (this.closed || epoch !== this.hydrationEpoch) return;
+            let changed = false;
+            for (const id of ids) changed = this.pendingRedactions.delete(id) || changed;
+            if (changed) await this.writePendingRedactions(userId, dek);
+        });
+    }
+
+    /**
+     * Read and decrypt the persisted {@link pendingRedactions} row, if any, into the set (a union: a redaction can be
+     * parked before this runs). An absent row is the normal case. A row that fails to **decrypt** throws, and {@link
+     * loadManifest} answers it like any other unreadable row: wipe this user's index.
+     */
+    private async loadPendingRedactions(userId: string, dek: CryptoKey, epoch: number): Promise<void> {
+        if (!this.db) return;
+        const key = pendingRedactionsKey(userId);
+        let row: ManifestPageRecord | undefined;
+        try {
+            const tx = this.db.transaction("meta", "readonly");
+            row = (await idbReq(tx.objectStore("meta").get(key))) as ManifestPageRecord | undefined;
+            await txDone(tx);
+        } catch (e) {
+            log.warn("EventIndex: could not read the parked-redaction row; treating it as absent", e);
+            return;
+        }
+        if (!row) return;
+        const ids = await decryptJson<string[]>(dek, row.blob, key);
+        if (this.closed || epoch !== this.hydrationEpoch) return;
+        // Parked before this ran (a redaction can land while initEventIndex is still deriving keys): the row on disk
+        // does not know about it yet.
+        const parkedBefore = this.pendingRedactions.size > 0;
+        for (const id of ids) this.pendingRedactions.add(id);
+        if (parkedBefore) this.schedulePendingRedactionsPersist();
+        while (this.pendingRedactions.size > PENDING_REDACTIONS_MAX) {
+            const oldest = this.pendingRedactions.values().next().value;
+            if (oldest === undefined) break;
+            this.pendingRedactions.delete(oldest);
         }
     }
 
@@ -5060,10 +5256,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private materializeRow(userId: string, stored: StoredEvent): void {
         if (this.events.has(stored.eventId)) return;
 
-        const redactedByPendingEdit = (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id));
-        if (redactedByPendingEdit) {
-            for (const id of stored.editIds ?? []) this.pendingRedactions.delete(id);
+        if (this.carriesParkedRedaction(stored)) {
             this.enqueueDeleteRecord(userId, stored.eventId);
+            this.unparkWhenDeleted(stored.editIds ?? []);
             return;
         }
 
@@ -5462,6 +5657,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         );
         for (const key of manifestKeys) metaStore.delete(key);
         metaStore.delete(oldestIndexedTsKey(userId)); // review-pr-c.md C2-F4's own encrypted row
+        metaStore.delete(pendingRedactionsKey(userId)); // the parked redactions, see pendingRedactions
         await txDone(metaTx);
     }
 
