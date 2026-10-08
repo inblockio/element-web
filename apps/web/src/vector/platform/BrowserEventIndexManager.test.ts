@@ -7299,6 +7299,43 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             }
         });
 
+        it("a parked-redaction row that cannot be read is left alone for the rest of the session", async () => {
+            await seedEdited();
+            const first = await reopenSmall();
+            await first.deleteEvent(EDIT);
+            await first.closeEventIndex();
+            expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+
+            // This session cannot READ the row (a read error, not a failure to decrypt, which wipes the index).
+            const realGet = IDBObjectStore.prototype.get;
+            const getSpy = vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (
+                this: IDBObjectStore,
+                query: IDBValidKey | IDBKeyRange,
+            ) {
+                if (query === parkedKey()) throw new Error("simulated read failure");
+                return realGet.call(this, query);
+            });
+            let m: BrowserEventIndexManager;
+            try {
+                m = await reopenSmall();
+            } finally {
+                getSpy.mockRestore();
+            }
+            expect(priv(m).pendingRedactions.size).toBe(0); // nothing was read
+
+            // A redaction parked now must not overwrite the ids this session never saw.
+            await m.deleteEvent("$another-redacted-id");
+            expect(priv(m).pendingRedactions.has("$another-redacted-id")).toBe(true);
+            await priv(m).persistChain;
+            expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+            await m.closeEventIndex();
+
+            // The next session can read the row again: the redaction is still in force.
+            const next = await reopenSmall();
+            expect(priv(next).pendingRedactions.has(EDIT)).toBe(true);
+            expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+        });
+
         it("survives a reload before anything read the record: still hidden, and removed once met", async () => {
             await seedEdited();
             const m = await reopenSmall();

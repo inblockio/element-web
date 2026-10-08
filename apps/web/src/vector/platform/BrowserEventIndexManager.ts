@@ -1893,6 +1893,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private readonly pendingRedactions = new Set<string>();
     /** True while a {@link schedulePendingRedactionsPersist} write is queued and has not started; see there. */
     private pendingRedactionsWriteQueued = false;
+    /**
+     * True when {@link loadPendingRedactions} could not READ the persisted row this session (a read error, not a
+     * failure to decrypt). The set in memory then knows nothing of what the row holds, so {@link
+     * writePendingRedactions} leaves the row alone for the rest of the session instead of replacing it with a set
+     * that is missing those ids; the next session reads it again.
+     */
+    private pendingRedactionsRowUnreadable = false;
 
     /**
      * ids removed from the resident set ({@link removeFromIndex}) by a genuine deletion -- {@link
@@ -5184,9 +5191,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         });
     }
 
-    /** Write {@link pendingRedactions} as it is now to its row, or delete the row when it is empty. */
+    /**
+     * Write {@link pendingRedactions} as it is now to its row, or delete the row when it is empty. Does nothing when
+     * the row could not be read this session ({@link pendingRedactionsRowUnreadable}).
+     */
     private async writePendingRedactions(userId: string, dek: CryptoKey): Promise<void> {
-        if (!this.db) return;
+        if (!this.db || this.pendingRedactionsRowUnreadable) return;
         const key = pendingRedactionsKey(userId);
         const ids = Array.from(this.pendingRedactions);
         // Encrypted before the transaction opens, like every other write in this file.
@@ -5216,7 +5226,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     /**
      * Read and decrypt the persisted {@link pendingRedactions} row, if any, into the set (a union: a redaction can be
      * parked before this runs). An absent row is the normal case. A row that fails to **decrypt** throws, and {@link
-     * loadManifest} answers it like any other unreadable row: wipe this user's index.
+     * loadManifest} answers it like any other unreadable row: wipe this user's index. A row that cannot be **read**
+     * is not treated as absent: it is left alone for the rest of the session ({@link pendingRedactionsRowUnreadable}).
      */
     private async loadPendingRedactions(userId: string, dek: CryptoKey, epoch: number): Promise<void> {
         if (!this.db) return;
@@ -5227,7 +5238,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             row = (await idbReq(tx.objectStore("meta").get(key))) as ManifestPageRecord | undefined;
             await txDone(tx);
         } catch (e) {
-            log.warn("EventIndex: could not read the parked-redaction row; treating it as absent", e);
+            log.warn("EventIndex: could not read the parked-redaction row; leaving it alone for this session", e);
+            if (!this.closed && epoch === this.hydrationEpoch) this.pendingRedactionsRowUnreadable = true;
             return;
         }
         if (!row) return;
@@ -5781,6 +5793,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.openChunkPlainBytes = 0;
         this.nextChunkId = 0;
         this.pendingRedactions.clear();
+        this.pendingRedactionsRowUnreadable = false; // every row of this user is wiped or discarded with the set
         this.pendingDiskDeletes.clear();
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;
