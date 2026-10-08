@@ -4766,7 +4766,10 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             await manager.commitLiveEvents();
 
             expect(reencrypted.length).toBeGreaterThan(0); // control: the flush was seen
-            expect(reencrypted.length).toBeLessThan(internals.manifestPages.length); // not every page there is
+            // At most the page the new entry lands in and the page holding the entries of the chunk the flush rewrites
+            // (seen as [1000, 1]): not every page there is, and not all but one of them either.
+            expect(reencrypted.length).toBeLessThanOrEqual(2);
+            expect(reencrypted.length).toBeLessThan(internals.manifestPages.length);
             for (const entries of reencrypted) expect(entries).toBeLessThanOrEqual(MANIFEST_PAGE_SIZE);
         });
     });
