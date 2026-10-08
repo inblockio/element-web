@@ -7077,6 +7077,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             readChunkEntries: (...args: unknown[]) => Promise<unknown>;
             decryptChunkOnce: (...args: unknown[]) => Promise<unknown>;
             pendingRedactionsWriteQueued: boolean;
+            pendingDiskDeletes: Set<string>;
         };
         const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
         const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
@@ -7133,6 +7134,38 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 )) as { blob: { iv: string; ct: string } } | undefined;
                 return { recordOnDisk, parked: row ? await decryptJson<string[]>(dek, row.blob, parkedKey()) : null };
             });
+        }
+
+        /** Reopen with everything fitting the resident budget, so that hydration reads every row. */
+        async function reopenFull(): Promise<BrowserEventIndexManager> {
+            setEventIndexBoundsOverrideForTesting(null);
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            return m;
+        }
+
+        /**
+         * Make the next readwrite transaction over `chunks` and `meta` really ABORT, rather than throw: `abort()` runs
+         * in a microtask, after the caller has queued its requests and while it awaits the transaction's completion.
+         */
+        function abortNextChunkTransaction(): { restore: () => void; aborted: () => number } {
+            const realTransaction = IDBDatabase.prototype.transaction;
+            let aborted = 0;
+            const spy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                this: IDBDatabase,
+                names,
+                mode,
+                ...rest
+            ) {
+                const tx = realTransaction.call(this, names, mode, ...rest);
+                if (aborted === 0 && mode === "readwrite" && Array.isArray(names) && names.includes("chunks")) {
+                    aborted++;
+                    queueMicrotask(() => tx.abort());
+                }
+                return tx;
+            });
+            return { restore: () => spy.mockRestore(), aborted: () => aborted };
         }
 
         it("the cold tier stops serving the redacted edit's body, and the record is removed from disk when first met", async () => {
@@ -7236,6 +7269,93 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             // This time the rewrite goes through, and only then does the id leave the row.
             await priv(next).persistChain;
             expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+        });
+
+        // R1: a complete hydration forgets the parked ids nothing met a record for, but not the ones its own walk has
+        // just handed to a rewrite that has not committed yet.
+        for (const failure of ["abort", "read"] as const) {
+            it(`a chunk rewrite that ${failure === "abort" ? "aborts" : "cannot read its chunk"} during a complete hydration keeps the id parked`, async () => {
+                await seedEdited();
+                setEventIndexBoundsOverrideForTesting(null);
+                const restoreDecrypt = slowDownDecrypt(30); // the redaction below lands while hydration is running
+                const m = track(new BrowserEventIndexManager());
+                let aborter: ReturnType<typeof abortNextChunkTransaction> | undefined;
+                let readSpy: { mockRestore: () => void } | undefined;
+                try {
+                    await m.initEventIndex(userId, DEVICE);
+                    expect(await m.deleteEvent(EDIT)).toBe(false); // parked: $old has not been hydrated yet
+                    expect(priv(m).events.has("$old")).toBe(false);
+                    await priv(m).persistChain; // the parking write: the row holds EDIT
+
+                    // From here on the rewrite of $old's chunk, which the walk queues when it meets the record, fails.
+                    if (failure === "abort") aborter = abortNextChunkTransaction();
+                    else {
+                        readSpy = vi
+                            .spyOn(priv(m), "readChunkEntries")
+                            .mockRejectedValue(new Error("simulated read failure"));
+                    }
+                    await m.waitForHydration();
+                    await priv(m).persistChain;
+                    if (aborter) expect(aborter.aborted()).toBe(1); // control: the transaction was really aborted
+                } finally {
+                    aborter?.restore();
+                    readSpy?.mockRestore();
+                    restoreDecrypt();
+                }
+
+                // The record is still in its chunk, so the id that hides it must still be parked: in memory and on disk.
+                expect(priv(m).events.has("$old")).toBe(false);
+                expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
+                expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+                expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+                await m.closeEventIndex();
+
+                // The next session still hides it, and this time the rewrite goes through.
+                const next = await reopenFull();
+                expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+                expect(priv(next).events.has("$old")).toBe(false);
+                await priv(next).persistChain;
+                expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+            });
+        }
+
+        it("a parking write still queued when a hydration meets the record cannot drop the id before the rewrite has run", async () => {
+            await seedEdited();
+            setEventIndexBoundsOverrideForTesting(null);
+            const restoreDecrypt = slowDownDecrypt(30);
+            const m = track(new BrowserEventIndexManager());
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            let atCrashPoint: { recordOnDisk: boolean; parked: string[] | null } | undefined;
+            try {
+                await m.initEventIndex(userId, DEVICE);
+                expect(await m.deleteEvent(EDIT)).toBe(false);
+                await priv(m).persistChain; // EDIT's row write has committed
+
+                // Another park's row write is queued behind a gate when the walk meets $old and queues its rewrite
+                // after it. The drain at the end of the walk must not fold into that earlier write: it would delete
+                // EDIT from the row before the rewrite has run.
+                priv(m).persistChain = priv(m).persistChain.then(() => gate);
+                expect(await m.deleteEvent("$never-indexed-reaction")).toBe(false);
+                await m.waitForHydration();
+                expect(priv(m).pendingRedactions.has("$never-indexed-reaction")).toBe(false); // forgotten: names nothing
+                restoreDecrypt();
+
+                // The disk as a crash would find it at the rewrite's first read of its chunk.
+                const realRead = priv(m).readChunkEntries.bind(m);
+                vi.spyOn(priv(m), "readChunkEntries").mockImplementation(async (...args: unknown[]) => {
+                    atCrashPoint ??= await diskState("$old");
+                    return realRead(...args);
+                });
+                release();
+                await priv(m).persistChain;
+            } finally {
+                release();
+                restoreDecrypt();
+            }
+            expect(atCrashPoint).toEqual({ recordOnDisk: true, parked: [EDIT] });
+            expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+            expect(priv(m).pendingRedactions.size).toBe(0);
         });
 
         /**
@@ -7391,8 +7511,10 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(priv(next).events.has("$old")).toBe(false);
             expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
             // A complete walk that never had to evict anything has met every row: what is still parked names nothing.
-            expect(priv(next).pendingRedactions.size).toBe(0);
+            expect(priv(next).pendingRedactions.has("$never-indexed-reaction")).toBe(false);
+            // The ids that did name a record go when its rewrite has committed, so the rest is checked after the chain.
             await priv(next).persistChain;
+            expect(priv(next).pendingRedactions.size).toBe(0);
             expect(await diskHas("$old")).toBe(false);
             expect(await dumpRawKeys("meta")).not.toContain(parkedKey());
         });

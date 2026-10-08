@@ -1916,6 +1916,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * see there for what it costs and the planned remedy).
      */
     private readonly pendingRedactions = new Set<string>();
+    /**
+     * The members of {@link pendingRedactions} that {@link applyParkedRedaction} has answered with a chunk rewrite
+     * ({@link enqueueDeleteRecord}) that has not committed yet. A complete hydration forgets the parked ids nothing
+     * claimed ({@link hydrate}) but never these: until the rewrite has committed they are what hides the record, and
+     * a rewrite that fails never commits. Released by {@link forgetParkedRedactions}, with the ids themselves.
+     */
+    private readonly claimedParkedIds = new Set<string>();
     /** True while a {@link schedulePendingRedactionsPersist} write is queued and has not started; see there. */
     private pendingRedactionsWriteQueued = false;
     /**
@@ -5126,10 +5133,20 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // A run cut short at the resident budget has not: the record may be one of the rows it left on
                 // disk, so the redaction stays parked, and durable, for whatever reads that row next (the cold
                 // scan, an on-demand pull, the next session's hydration). See pendingRedactions.
+                // Except the ids this very walk met a record for ({@link claimedParkedIds}): the rewrite that
+                // removes that record may still be on the persist chain, or fail, and until it has committed the
+                // id is what hides the record.
                 if (this.pendingRedactions.size > 0 && walkComplete && !this.residentBudgetExceeded) {
-                    log.debug(`EventIndex: ${this.pendingRedactions.size} redaction(s) never found their original`);
-                    this.pendingRedactions.clear();
-                    this.schedulePendingRedactionsPersist();
+                    let forgotten = 0;
+                    for (const id of Array.from(this.pendingRedactions)) {
+                        if (this.claimedParkedIds.has(id)) continue;
+                        this.pendingRedactions.delete(id);
+                        forgotten++;
+                    }
+                    if (forgotten > 0) {
+                        log.debug(`EventIndex: ${forgotten} redaction(s) never found their original`);
+                        this.schedulePendingRedactionsPersist();
+                    }
                 }
             }
         }
@@ -5189,8 +5206,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private applyParkedRedaction(userId: string, onDisk: StoredEvent, resident: StoredEvent | undefined): void {
         if (resident) this.removeFromIndex(onDisk.eventId);
         const parkedIds = [onDisk.eventId, ...(onDisk.editIds ?? []), ...(resident?.editIds ?? [])];
-        if (this.persistEnabled && this.db) this.enqueueDeleteRecord(userId, onDisk.eventId, parkedIds);
-        else this.unparkRedactions(parkedIds); // nothing on disk to rewrite
+        if (this.persistEnabled && this.db) {
+            for (const id of parkedIds) this.claimedParkedIds.add(id);
+            this.enqueueDeleteRecord(userId, onDisk.eventId, parkedIds);
+        } else {
+            this.unparkRedactions(parkedIds); // nothing on disk to rewrite
+        }
     }
 
     /**
@@ -5244,7 +5265,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const dek = this.dek;
         if (ids.length === 0 || !dek || this.closed || epoch !== this.hydrationEpoch) return;
         let changed = false;
-        for (const id of ids) changed = this.pendingRedactions.delete(id) || changed;
+        for (const id of ids) {
+            this.claimedParkedIds.delete(id);
+            changed = this.pendingRedactions.delete(id) || changed;
+        }
         if (changed) await this.writePendingRedactions(userId, dek);
     }
 
@@ -5821,6 +5845,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.openChunkPlainBytes = 0;
         this.nextChunkId = 0;
         this.pendingRedactions.clear();
+        this.claimedParkedIds.clear();
         this.pendingRedactionsRowUnreadable = false; // every row of this user is wiped or discarded with the set
         this.pendingDiskDeletes.clear();
         this.hydrationFailure = undefined;
