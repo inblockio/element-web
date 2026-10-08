@@ -4718,34 +4718,56 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             }
         });
 
-        it("per-flush cost is proportional to the (now 1k) page, not the old 10k one (review-pr-c.md C2-F3)", async () => {
-            // Fill the current page to exactly MANIFEST_PAGE_SIZE first (each in its own flush, so
-            // the *timed* flush below is the one that re-encrypts a genuinely full page, not a
-            // partially-filled one), then time one more flush that touches (dirties) it again.
+        it("per-flush cost is proportional to the (now 1k) page, not the old 10k one or the whole manifest (review-pr-c.md C2-F3)", async () => {
+            // This used to time one flush against a 10 ms bound, which failed under load without any regression. What
+            // the bound stood for is how much a flush re-encrypts, so that is what is counted: the manifest pages the
+            // flush dirtied, never every page there is, and none larger than the 1k page.
+            expect(MANIFEST_PAGE_SIZE).toBeLessThanOrEqual(1_000); // the old 10k page re-encrypted 10x this per flush
             setEventIndexBoundsOverrideForTesting(null);
             const manager = track(new BrowserEventIndexManager());
             await manager.initEventIndex(userId, DEVICE);
             await manager.waitForHydration();
-            for (let i = 0; i < MANIFEST_PAGE_SIZE; i++) {
-                await manager.addEventToIndex(
-                    msg(`$pf${String(i).padStart(5, "0")}`, "x", { room_id: ROOM, origin_server_ts: 3_000_000 + i }),
-                    {},
-                );
-            }
-            await manager.commitLiveEvents(); // one batched flush fills the page
+            const internals = manager as unknown as {
+                manifestPages: Array<Set<string>>;
+                prepareManifestPageWrites: (...args: unknown[]) => Promise<unknown>;
+            };
 
+            // Three manifest pages filled to exactly MANIFEST_PAGE_SIZE entries, each in its own flush.
+            for (let page = 0; page < 3; page++) {
+                for (let i = 0; i < MANIFEST_PAGE_SIZE; i++) {
+                    await manager.addEventToIndex(
+                        msg(`$pf${page}-${String(i).padStart(5, "0")}`, "x", {
+                            room_id: ROOM,
+                            origin_server_ts: 3_000_000 + page * 100_000 + i,
+                        }),
+                        {},
+                    );
+                }
+                await manager.commitLiveEvents();
+            }
+            expect(internals.manifestPages.map((p) => p.size)).toEqual([
+                MANIFEST_PAGE_SIZE,
+                MANIFEST_PAGE_SIZE,
+                MANIFEST_PAGE_SIZE,
+            ]);
+
+            // One more flush; record how many entries each manifest page it re-encrypts holds. Read off the records
+            // the preparation returns (their key ends in the page number), not off the pages it was asked for.
+            const realPrepare = internals.prepareManifestPageWrites.bind(manager);
+            const reencrypted: number[] = [];
+            vi.spyOn(internals, "prepareManifestPageWrites").mockImplementation(async (...args: unknown[]) => {
+                const records = (await realPrepare(...args)) as Array<{ userId: string }>;
+                for (const rec of records) {
+                    reencrypted.push(internals.manifestPages[Number(rec.userId.split(":").pop())].size);
+                }
+                return records;
+            });
             await manager.addEventToIndex(msg("$pfDirty", "x", { room_id: ROOM, origin_server_ts: 4_000_000 }), {});
-            const t0 = performance.now();
-            await manager.commitLiveEvents(); // this flush re-encrypts the now-full page, timed
-            const flushMs = performance.now() - t0;
-            console.log(
-                `review-pr-c.md C2-F3: one flush touching a full ${MANIFEST_PAGE_SIZE}-entry page: ${flushMs.toFixed(2)}ms`,
-            );
-            // Generous headroom over the ~1.6ms the review's own linear scaling predicts for a page
-            // 10x smaller than the original 10k (measured ~15.8ms there) -- loose enough not to be
-            // flaky on a shared CI runner, tight enough to catch a regression back toward the old
-            // page size's cost.
-            expect(flushMs).toBeLessThan(10);
+            await manager.commitLiveEvents();
+
+            expect(reencrypted.length).toBeGreaterThan(0); // control: the flush was seen
+            expect(reencrypted.length).toBeLessThan(internals.manifestPages.length); // not every page there is
+            for (const entries of reencrypted) expect(entries).toBeLessThanOrEqual(MANIFEST_PAGE_SIZE);
         });
     });
 
