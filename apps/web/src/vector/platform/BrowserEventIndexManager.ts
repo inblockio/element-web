@@ -110,8 +110,11 @@ Please see LICENSE files in the repository root for full details.
  * yet, is parked ({@link BrowserEventIndexManager.pendingRedactions}), and the write of the parked-redactions row is
  * queued the same way. Neither waits for the 5s timer; each waits behind whatever the chain already holds, so the
  * window is however long that queue is, not a fixed few seconds. Once a parked redaction's row write has committed it
- * survives a crash: the record is removed from its chunk first and the id leaves the row only after that rewrite has
- * committed, so a crash between the two still finds the record hidden, and a rewrite that fails leaves the id parked.
+ * survives a crash, on the cold-scan path and on hydration's alike: the record is removed from its chunk first and the
+ * id leaves the row only after that rewrite has committed, so a crash between the two still finds the record hidden,
+ * and a rewrite that fails leaves the id parked. The exception is a session whose parked row could not be read ({@link
+ * BrowserEventIndexManager.pendingRedactionsRowUnreadable}): it leaves the row alone, so the redactions it parks itself
+ * are in memory only and a reload loses them.
  */
 
 import { logger } from "matrix-js-sdk/src/logger";
@@ -1900,8 +1903,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * editTargets} for that original cannot exist until the row that would populate it has been
      * decrypted. Parked here by {@link deleteEvent}, and drained by {@link materializeRow} as each
      * row's own `editIds` is checked against this set while it streams in from disk. A redaction of
-     * the message itself is parked too when its row could not be pulled in (the chunk read failed),
-     * and is matched against the row's own id.
+     * the message itself is parked too when its row could not be pulled in (the chunk read failed, or {@link
+     * initEventIndex} had not enabled persistence yet), and is matched against the row's own id.
      *
      * **Durable, bounded, and checked by every reader of disk rows.** Hydration is bounded by the resident budget, so
      * "hydration ended" does not mean "every row was visited"; a redaction parked here used to be dropped at that
@@ -1910,10 +1913,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * pendingRedactionsKey}, {@link schedulePendingRedactionsPersist}), reloaded by {@link loadManifest}, and
      * applied by whichever path decrypts the record first: {@link materializeRow} (hydration, an on-demand pull) or
      * {@link coldScanSessionStep}, which drops the record from disk too ({@link applyParkedRedaction}) and never
-     * serves it, nor shows it as context ({@link coldContextFor}). It is emptied only when that is certain to be
-     * safe: when a hydration run that never hit the resident budget has visited every row ({@link hydrate}); or by
-     * the {@link PENDING_REDACTIONS_MAX} cap, which forgets the oldest (on a large account the set sits at that cap;
-     * see there for what it costs and the planned remedy).
+     * serves it, nor shows it as context ({@link coldContextFor}). An id leaves the set when the chunk rewrite that
+     * removes the record it named has committed ({@link forgetParkedRedactions}), never before, so a rewrite that fails
+     * or a crash before it leaves the record hidden. Otherwise it is emptied only when that is certain to be safe:
+     * when a hydration run that never hit the resident budget has visited every row, which forgets the ids that met no
+     * record and keeps the ones its own walk has claimed for a rewrite ({@link hydrate}, {@link claimedParkedIds}); or
+     * by the {@link PENDING_REDACTIONS_MAX} cap, which forgets the oldest (on a large account the set sits at that cap;
+     * see there for what it costs and the planned remedy). A session whose row could not be read keeps what it parks
+     * in memory only ({@link pendingRedactionsRowUnreadable}).
      */
     private readonly pendingRedactions = new Set<string>();
     /**
@@ -1929,7 +1936,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * True when {@link loadPendingRedactions} could not READ the persisted row this session (a read error, not a
      * failure to decrypt). The set in memory then knows nothing of what the row holds, so {@link
      * writePendingRedactions} leaves the row alone for the rest of the session instead of replacing it with a set
-     * that is missing those ids; the next session reads it again.
+     * that is missing those ids; the next session reads it again. The price: what this session parks is in memory
+     * only, and a reload loses it.
      */
     private pendingRedactionsRowUnreadable = false;
 
@@ -5269,8 +5277,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * without them. Runs inside {@link enqueueDeleteRecord}'s own operation, after its transaction has completed and
      * not otherwise: forgetting them any earlier would let a crash between the two writes leave the record on disk
      * with nothing left to hide it, and a rewrite that fails never gets here, so its ids stay parked, in memory and
-     * in the row, for the next session to apply. The epoch check keeps an operation left over from a previous
-     * session from touching the next session's set.
+     * in the row, for the next session to apply (a complete hydration's drain leaves them alone too: {@link
+     * claimedParkedIds}, released here). The epoch check keeps an operation left over from a previous session from
+     * touching the next session's set.
      */
     private async forgetParkedRedactions(userId: string, epoch: number, ids: readonly string[]): Promise<void> {
         const dek = this.dek;
@@ -5328,10 +5337,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * after its own chunk decrypt resolves, so this method itself no longer needs to -- there is no
      * `await` left inside it for a teardown to land during.
      *
-     * Also drains {@link pendingRedactions}: if this row's own `editIds` names an id a redaction already arrived for
-     * (necessarily before this row could be hydrated to resolve it, an edit never being filed under its own id), the
-     * record this row would have created is redacted on arrival instead of being inserted at all, and its disk row is
-     * queued for deletion. This is the one path through which a redaction that raced hydration still ends up removing
+     * Also drains {@link pendingRedactions}: if this row's own id, or an id in its own `editIds`, is one a redaction
+     * already arrived for (necessarily before this row could be hydrated to resolve it: an edit is never filed under
+     * its own id, and a redaction of the record itself is parked only when it could not be pulled in), the record this
+     * row would have created is redacted on arrival instead of being inserted at all, and its disk row is queued for
+     * deletion. This is the one path through which a redaction that raced hydration still ends up removing
      * content in memory and on disk, which is the invariant this exists to not regress.
      *
      * Belt-and-braces idempotency: every caller is meant to check residency before reaching here
