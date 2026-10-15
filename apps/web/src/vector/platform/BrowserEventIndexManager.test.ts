@@ -8000,6 +8000,45 @@ describe("BrowserEventIndexManager (DC: disk-byte accounting stays exact)", () =
         expect(internals(m).chunkInfo.has(1)).toBe(true);
     });
 
+    it("hydration's over-budget pass waits its turn on the persist chain instead of racing a queued write", async () => {
+        // Off the chain, the pass would delete chunks and assign a total computed from a base that a queued flush can
+        // change under it. Held here by a gate on the chain, as the N2/R2 tests do.
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        await seedOneChunkPerEvent(seed, 10);
+        await seed.closeEventIndex();
+        const real = await realChunkBytes();
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.floor(real / 2) });
+
+        const restoreDecrypt = slowDownDecrypt(20);
+        const m = track(new BrowserEventIndexManager());
+        const deleteSpy = vi.spyOn(internals(m), "deleteRecordsForDiskBudget");
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        try {
+            await m.initEventIndex(userId, DEVICE);
+            const held = (internals(m).persistChain = internals(m).persistChain.then(() => gate));
+            // Wait until hydration has reached its pass: either it queued behind the gate or, without the fix, it
+            // went ahead and deleted.
+            for (let i = 0; i < 250 && internals(m).persistChain === held && deleteSpy.mock.calls.length === 0; i++) {
+                await sleep(20);
+            }
+            expect(internals(m).persistChain).not.toBe(held); // it did reach its pass, and queued behind the gate
+            expect(deleteSpy).not.toHaveBeenCalled();
+            expect(internals(m).hydrating).toBe(true);
+        } finally {
+            release();
+            restoreDecrypt();
+        }
+        await m.waitForHydration();
+        expect(deleteSpy).toHaveBeenCalledTimes(1);
+        const after = await realChunkBytes();
+        expect(after).toBeLessThan(real);
+        expect(internals(m).ciphertextBytes).toBe(after);
+        expect((await metaRow()).diskBytes).toBe(after);
+    });
+
     describe("the one-time disk-byte recount", () => {
         it("corrects a drifted total after a reload, without making initEventIndex wait for it", async () => {
             const { real } = await seedDriftedProfile(6, 777);
