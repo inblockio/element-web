@@ -22,6 +22,7 @@ import { vi, describe, it, expect, afterEach, type Mocked } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 import {
     Direction,
+    EventType,
     type MatrixClient,
     type IEvent,
     MatrixEvent,
@@ -617,6 +618,179 @@ describe("EventIndex crawler on the browser manager: redaction tombstones (S1)",
         expect((results.results ?? []).map((r) => r.result.event_id)).toEqual([]);
         // Kept, not released: the backward crawl passed O while the forward crawl could still deliver an edit of it.
         expect((await manager.getStats()).redactionTombstones).toBe(1);
+        await manager.closeEventIndex();
+    });
+});
+
+describe("EventIndex: a room whose live timeline holds its whole history (S1)", () => {
+    const ROOM = "!room1:id";
+    const SENDER = "@alice:id";
+    const redaction = {
+        event_id: "$r",
+        room_id: ROOM,
+        sender: SENDER,
+        type: "m.room.redaction",
+        origin_server_ts: 40,
+        redacts: "$o",
+        content: {},
+    };
+    const message = (id: string, extra: Record<string, unknown> = {}): any => ({
+        event_id: id,
+        room_id: ROOM,
+        sender: SENDER,
+        type: "m.room.message",
+        origin_server_ts: 10,
+        content: { body: "hello", msgtype: "m.text" },
+        ...extra,
+    });
+    const editOfO = (): any =>
+        message("$e", {
+            origin_server_ts: 20,
+            content: {
+                "body": "* zznotokenedit",
+                "msgtype": "m.text",
+                "m.new_content": { body: "zznotokenedit", msgtype: "m.text" },
+                "m.relates_to": { rel_type: "m.replace", event_id: "$o" },
+            },
+        });
+    const redactedO = (): any =>
+        message("$o", { origin_server_ts: 10, content: {}, unsigned: { redacted_because: redaction } });
+    /** O (redacted), E (the edit of O) and R (the redaction of O), in timeline order, and no back-pagination token. */
+    const wholeHistoryRoom = (): Room => {
+        const timelineEvents = [new MatrixEvent(redactedO()), new MatrixEvent(editOfO()), new MatrixEvent(redaction)];
+        return {
+            roomId: ROOM,
+            getLiveTimeline: () => ({ getPaginationToken: () => null, getEvents: () => timelineEvents }),
+        } as any as Room;
+    };
+    const encryptionEvent = (): MatrixEvent =>
+        new MatrixEvent({
+            type: EventType.RoomEncryption,
+            room_id: ROOM,
+            state_key: "",
+            content: {},
+            sender: SENDER,
+            event_id: "$enc",
+        });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it("applies the redactions of the timeline before it adds the events, whatever the tombstone state", async () => {
+        const calls: string[] = [];
+        const mockIndexingManager = {
+            loadCheckpoints: vi.fn().mockResolvedValue([]),
+            isEventIndexEmpty: vi.fn().mockResolvedValue(false),
+            isRoomIndexed: vi.fn().mockResolvedValue(false),
+            deleteEvent: vi.fn().mockImplementation(async (id: string) => {
+                calls.push(`delete:${id}`);
+                return false;
+            }),
+            addEventToIndex: vi.fn().mockImplementation(async (e: { event_id: string }) => {
+                calls.push(`add:${e.event_id}`);
+            }),
+            releaseRedactionTombstones: vi.fn().mockResolvedValue(undefined),
+        } as any as Mocked<BaseEventIndexManager>;
+        mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
+        getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            ...mockClientMethodsRooms([wholeHistoryRoom()]),
+            isRoomEncrypted: vi.fn().mockReturnValue(true),
+        });
+        const indexer = new EventIndex();
+        await indexer.init();
+
+        // The room turns out to be encrypted while the manager reports it as not indexed (nothing resident yet).
+        await (indexer as any).onRoomStateEvent(encryptionEvent(), { roomId: ROOM });
+
+        expect(mockIndexingManager.deleteEvent).toHaveBeenCalledWith("$o");
+        expect(calls).toContain("add:$e");
+        expect(calls.indexOf("delete:$o")).toBeGreaterThanOrEqual(0);
+        expect(calls.indexOf("delete:$o")).toBeLessThan(calls.indexOf("add:$e"));
+        // This path never releases a tombstone: only a backward crawl batch does.
+        expect(mockIndexingManager.releaseRedactionTombstones).not.toHaveBeenCalled();
+    });
+
+    it("skips a redaction without an associated id and keeps going when one deleteEvent fails", async () => {
+        const noTarget = { ...redaction, event_id: "$r0", redacts: undefined };
+        const second = { ...redaction, event_id: "$r2", redacts: "$o2" };
+        const timelineEvents = [
+            new MatrixEvent(noTarget),
+            new MatrixEvent(redaction),
+            new MatrixEvent(second),
+            new MatrixEvent(message("$m", { content: { body: "zzstillindexed", msgtype: "m.text" } })),
+        ];
+        const room = {
+            roomId: ROOM,
+            getLiveTimeline: () => ({ getPaginationToken: () => null, getEvents: () => timelineEvents }),
+        } as any as Room;
+        const mockIndexingManager = {
+            loadCheckpoints: vi.fn().mockResolvedValue([]),
+            isEventIndexEmpty: vi.fn().mockResolvedValue(false),
+            isRoomIndexed: vi.fn().mockResolvedValue(false),
+            deleteEvent: vi.fn().mockImplementation(async (id: string) => {
+                if (id === "$o") throw new Error("disk says no");
+                return false;
+            }),
+            addEventToIndex: vi.fn().mockResolvedValue(undefined),
+        } as any as Mocked<BaseEventIndexManager>;
+        mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
+        getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            ...mockClientMethodsRooms([room]),
+            isRoomEncrypted: vi.fn().mockReturnValue(true),
+        });
+        const indexer = new EventIndex();
+        await indexer.init();
+
+        await (indexer as any).onRoomStateEvent(encryptionEvent(), { roomId: ROOM });
+
+        // The failure of "$o" and the redaction without a target stopped neither the next redaction nor the adds.
+        expect(mockIndexingManager.deleteEvent).toHaveBeenCalledTimes(2);
+        expect(mockIndexingManager.deleteEvent).toHaveBeenCalledWith("$o");
+        expect(mockIndexingManager.deleteEvent).toHaveBeenCalledWith("$o2");
+        expect(mockIndexingManager.addEventToIndex).toHaveBeenCalledWith(
+            expect.objectContaining({ event_id: "$m" }),
+            expect.anything(),
+        );
+    });
+
+    it("does not bring a deleted and edited message back after its tombstone was released (browser manager)", async () => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        const manager = new BrowserEventIndexManager();
+        mockPlatformPeg({
+            getPickleKey: vi.fn().mockResolvedValue("unit-test-pickle-key"),
+            getEventIndexingManager: () => manager,
+        });
+        await manager.initEventIndex("@nt:id", "DEVICE1");
+        await manager.waitForHydration();
+        await manager.deleteEvent("$o"); // R, live: records the tombstone of O
+        // A backward crawl met O already redacted and no other checkpoint of the room was queued.
+        await manager.releaseRedactionTombstones(["$o"]);
+        getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            ...mockClientMethodsRooms([wholeHistoryRoom()]),
+            isRoomEncrypted: vi.fn().mockReturnValue(true),
+        });
+        vi.spyOn(manager, "loadCheckpoints").mockResolvedValue([]);
+        const indexer = new EventIndex();
+        await indexer.init();
+        // The manager counts a room with nothing resident as not indexed, so this takes the no-token path.
+        expect(await manager.isRoomIndexed(ROOM)).toBe(false);
+
+        await (indexer as any).onRoomStateEvent(encryptionEvent(), { roomId: ROOM });
+        await manager.commitLiveEvents();
+
+        const results = await manager.searchEventIndex({
+            search_term: "zznotokenedit",
+            before_limit: 0,
+            after_limit: 0,
+            order_by_recency: true,
+            limit: 10,
+        });
+        expect((results.results ?? []).map((r) => r.result.event_id)).toEqual([]);
         await manager.closeEventIndex();
     });
 });

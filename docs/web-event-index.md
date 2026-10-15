@@ -822,7 +822,9 @@ starts both directions at one token) may still deliver an edit newer than that t
 batch that is all already indexed, so it can end before it meets the redaction (probe X2). A forward crawl never
 releases, because it meets the original before its edits. A tombstone that a crawl passed while it was held
 back is not released later: it stays until the cap. A failing release is logged and keeps the tombstones,
-which is the safe side.
+which is the safe side. The other source of events after a release, `addRoomCheckpoint` for a room whose live
+timeline holds its whole history (no back-pagination token), applies the redactions of that timeline through
+`deleteEvent` before it adds the events, and never releases.
 
 **Persistence and bound.** The set is mirrored to one encrypted row, written through the persist chain so
 that a tombstone is durable before the crawler batch write that follows it, loaded in the manifest phase as a

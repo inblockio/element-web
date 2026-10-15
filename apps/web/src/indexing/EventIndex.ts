@@ -420,6 +420,29 @@ export default class EventIndex extends EventEmitter {
 
     private async addEventsFromLiveTimeline(timeline: EventTimeline): Promise<void> {
         const events = timeline.getEvents();
+        const indexManager = PlatformPeg.get()?.getEventIndexingManager();
+
+        // Apply the redactions of the timeline first (S1). The timeline holds the original, its edits and the
+        // redaction together, and the adds below must find the redacted id tombstoned whatever the tombstone state
+        // is, so this path does not rely on an earlier live redaction or on a crawl that still holds its tombstone.
+        // Nothing is released here: only a backward crawl batch releases tombstones.
+        if (indexManager) {
+            for (const ev of events) {
+                if (!ev.isRedaction()) continue;
+                const eventId = ev.getAssociatedId();
+
+                if (!eventId) {
+                    this.logger.warn("Redaction event doesn't contain a valid associated event id", ev);
+                    continue;
+                }
+
+                try {
+                    await indexManager.deleteEvent(eventId);
+                } catch (e) {
+                    this.logger.warn("Error deleting event from index", e);
+                }
+            }
+        }
 
         for (let i = 0; i < events.length; i++) {
             const ev = events[i];
