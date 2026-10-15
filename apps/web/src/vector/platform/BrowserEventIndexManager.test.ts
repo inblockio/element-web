@@ -33,6 +33,7 @@ import {
     MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
     MANIFEST_PAGE_SIZE,
     PENDING_REDACTIONS_MAX,
+    REDACTION_TOMBSTONES_MAX,
     replacedEventId,
     RESIDENT_BYTES_PER_EVENT_ESTIMATE,
     tokenize,
@@ -7834,6 +7835,556 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(twin.count).toBe(1);
             expect(resultIds(await m.searchEventIndex(search("beta", { room_id: ROOM })))).toEqual(["$orig"]);
             expect(resultIds(await m.searchEventIndex(search("beta", { room_id: ROOM2 })))).toEqual([]);
+        });
+    });
+
+    // S1 (pre-existing): Element redacts the ORIGINAL of an edited message only; the server never redacts the edit.
+    // A backward crawl meets the redaction first, then delivers the still-unredacted edit, which used to be rebuilt
+    // into a record under the original's id. deleteEvent now records every id it is given as a tombstone, and an
+    // arriving event whose own id or whose target is tombstoned is dropped.
+    describe("S1: a deleted message that had been edited is not rebuilt from its edit", () => {
+        type Priv = {
+            events: Map<string, unknown>;
+            persistChain: Promise<void>;
+            redactionTombstones: Set<string>;
+            redactionTombstonesEvicted: number;
+            loadRedactionTombstones: (...args: unknown[]) => Promise<void>;
+        };
+        const priv = (m: BrowserEventIndexManager): Priv => m as unknown as Priv;
+        const oneEvents = (n: number): number => RESIDENT_BYTES_PER_EVENT_ESTIMATE * n;
+        const ORIG = "$s1-deleted";
+        const EDIT_ID = "$s1-edit";
+        const tombKey = (): string => `${userId}|redactionTombstones`;
+
+        const original = (id = ORIG, body = "zzs1original", ts = 1000): any =>
+            msg(id, body, { room_id: ROOM, origin_server_ts: ts });
+        const editOf = (id = EDIT_ID, orig = ORIG, body = "zzs1edited", ts = 1100): any => ({
+            ...edit(id, orig, body, ts),
+            room_id: ROOM,
+        });
+        const arriving = (ev: any): { event: any; profile: object } => ({ event: ev, profile: {} });
+        const hits = async (m: BrowserEventIndexManager, term: string): Promise<string[]> =>
+            resultIds(await m.searchEventIndex(search(term, { limit: 20 })));
+        const diskHas = async (id: string): Promise<boolean> =>
+            (await decryptAllChunkEvents(pickleKey, DEVICE)).some((r) => r.eventId === id);
+
+        async function openHot(): Promise<BrowserEventIndexManager> {
+            setEventIndexBoundsOverrideForTesting(null);
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            return m;
+        }
+
+        /** Reopen under a four-record resident budget: the oldest records stay on disk. */
+        async function openSmall(): Promise<BrowserEventIndexManager> {
+            setEventIndexBoundsOverrideForTesting({ hotWindowBytes: oneEvents(4) });
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            return m;
+        }
+
+        /** Six newer fillers, plus (when `withOriginal`) ORIG, the oldest record, edited by EDIT_ID; then closed. */
+        async function seed(withOriginal: boolean): Promise<void> {
+            const s = await openHot();
+            if (withOriginal) {
+                await s.addEventToIndex(original(), {});
+                await s.addEventToIndex(editOf(), {});
+            }
+            for (let i = 0; i < 6; i++) {
+                await s.addEventToIndex(
+                    msg(`$s1n${i}`, `zzs1filler ${i}`, { room_id: ROOM, origin_server_ts: 2000 + i }),
+                    {},
+                );
+            }
+            await s.commitLiveEvents();
+            await s.closeEventIndex();
+        }
+
+        /** The edit is not searchable, not resident, and not on disk (once the chain has drained). */
+        async function expectNoTrace(m: BrowserEventIndexManager): Promise<void> {
+            expect(await hits(m, "zzs1edited")).toEqual([]);
+            expect(await hits(m, "zzs1original")).toEqual([]);
+            expect(priv(m).events.has(ORIG)).toBe(false);
+            await m.commitLiveEvents();
+            expect(await diskHas(ORIG)).toBe(false);
+            expect(await hits(m, "zzs1edited")).toEqual([]);
+        }
+
+        function abortNextChunkTransaction(): () => void {
+            const realTransaction = IDBDatabase.prototype.transaction;
+            let aborted = 0;
+            const spy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                this: IDBDatabase,
+                names,
+                mode,
+                ...rest
+            ) {
+                const tx = realTransaction.call(this, names, mode, ...rest);
+                if (aborted === 0 && mode === "readwrite" && Array.isArray(names) && names.includes("chunks")) {
+                    aborted++;
+                    queueMicrotask(() => tx.abort());
+                }
+                return tx;
+            });
+            return () => spy.mockRestore();
+        }
+
+        describe("both crawl orders, in every tier", () => {
+            it("fresh crawl, hot tier: the redaction is met first (nothing indexed), then the edit arrives", async () => {
+                const m = await openHot();
+                expect(await m.deleteEvent(ORIG)).toBe(false); // nothing indexed: no record to remove
+                expect(await m.addHistoricEvents([arriving(editOf())], null, null)).toBe(false);
+                await expectNoTrace(m);
+            });
+
+            it("re-crawl, hot tier (probe P4): the record existed, was deleted, a later back-fill delivers the edit", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                await m.addEventToIndex(editOf(), {});
+                expect(await hits(m, "zzs1edited")).toEqual([ORIG]); // control
+                expect(await m.deleteEvent(ORIG)).toBe(true);
+                expect(await hits(m, "zzs1edited")).toEqual([]);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(m);
+            });
+
+            it("a live edit arriving after the deletion is dropped too", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                expect(await m.deleteEvent(ORIG)).toBe(true);
+                await m.addEventToIndex(editOf(), {}); // federation lag: the edit shows up after the redaction
+                await expectNoTrace(m);
+            });
+
+            it("cold tier, re-crawl order: the record was evicted before the deletion", async () => {
+                await seed(true);
+                const m = await openSmall();
+                expect(priv(m).events.has(ORIG)).toBe(false); // on disk only
+                expect(await hits(m, "zzs1edited")).toEqual([ORIG]); // control: served cold
+                expect(await m.deleteEvent(ORIG)).toBe(true);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(m);
+            });
+
+            it("cold tier, fresh order: nothing indexed for the original, the budget is exceeded", async () => {
+                await seed(false);
+                const m = await openSmall();
+                expect(await m.deleteEvent(ORIG)).toBe(false);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(m);
+            });
+
+            it("after a reload, re-crawl order (hot tier)", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                await m.addEventToIndex(editOf(), {});
+                expect(await m.deleteEvent(ORIG)).toBe(true);
+                await priv(m).persistChain;
+                await m.closeEventIndex();
+
+                const next = await openHot();
+                await next.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(next);
+                expect(priv(next).redactionTombstones.has(ORIG)).toBe(true); // loaded from the row, kept
+            });
+
+            it("after a reload, fresh order (the redaction was met in an earlier session)", async () => {
+                const m = await openHot();
+                expect(await m.deleteEvent(ORIG)).toBe(false);
+                await priv(m).persistChain;
+                await m.closeEventIndex();
+
+                const next = await openHot();
+                await next.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(next);
+            });
+
+            it("after a reload, cold tier", async () => {
+                await seed(true);
+                const m = await openSmall();
+                expect(await m.deleteEvent(ORIG)).toBe(true);
+                await priv(m).persistChain;
+                await m.closeEventIndex();
+
+                const next = await openSmall();
+                await next.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(next);
+            });
+
+            it("a session without persistence gates the same way", async () => {
+                const keyless = vi.fn().mockResolvedValue(null);
+                mockPlatformPeg({ getPickleKey: keyless });
+                const m = track(new BrowserEventIndexManager());
+                await m.initEventIndex(userId, DEVICE);
+                await m.waitForHydration();
+                await m.deleteEvent(ORIG);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                expect(await hits(m, "zzs1edited")).toEqual([]);
+                expect(priv(m).events.size).toBe(0);
+            });
+        });
+
+        describe("what is gated", () => {
+            it("case 1 of addHistoricEvents (an unedited record and a non-edit event) does not change a tombstoned record", async () => {
+                // The state: the tombstone is on disk but the record's chunk rewrite never committed, so the record
+                // is restored by hydration (restored records are not gated) next to its tombstone.
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                await m.commitLiveEvents();
+                const restore = abortNextChunkTransaction();
+                try {
+                    expect(await m.deleteEvent(ORIG)).toBe(true);
+                    await priv(m).persistChain;
+                } finally {
+                    restore();
+                }
+                await m.closeEventIndex();
+
+                const next = await openHot();
+                expect(priv(next).events.has(ORIG)).toBe(true); // restored from disk, not gated
+                const sameBatch = await next.addHistoricEvents(
+                    [arriving(original(ORIG, "zzs1changed"))], // a non-edit event for an unedited record: case 1
+                    null,
+                    null,
+                );
+                expect(sameBatch).toBe(false); // a drop is never "already indexed"
+                expect(await hits(next, "zzs1changed")).toEqual([]);
+                expect(await hits(next, "zzs1original")).toEqual([ORIG]); // untouched
+                await next.commitLiveEvents();
+                expect(await hits(next, "zzs1changed")).toEqual([]);
+                expect(priv(next).redactionTombstones.has(ORIG)).toBe(true); // the restored record sits next to its tombstone
+            });
+
+            it("an edit whose OWN id is tombstoned is dropped, and the message it edited is not touched again", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                await m.addEventToIndex(editOf(), {});
+                // The user deletes the EDIT only: the whole record goes (the pre-edit body was overwritten in place)
+                // and the redacted id is tombstoned as named, not as resolved.
+                expect(await m.deleteEvent(EDIT_ID)).toBe(true);
+                // A back-fill delivers the redacted edit (stale copy) and then the original, which is still a message.
+                await m.addHistoricEvents([arriving(editOf()), arriving(original())], null, null);
+                expect(await hits(m, "zzs1edited")).toEqual([]);
+                expect(await hits(m, "zzs1original")).toEqual([ORIG]);
+                expect(priv(m).redactionTombstones.has(EDIT_ID)).toBe(true); // the id as named ...
+                expect(priv(m).redactionTombstones.has(ORIG)).toBe(false); // ... never as resolved
+            });
+
+            it("a dropped event never makes addHistoricEvents report the batch as already indexed", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original("$s1-kept", "zzs1kept"), {});
+                await m.deleteEvent(ORIG);
+                const batch = [arriving(original("$s1-kept", "zzs1kept")), arriving(editOf())];
+                expect(await m.addHistoricEvents(batch, null, null)).toBe(false);
+                // Control: without the dropped event the same batch is "all already indexed".
+                expect(await m.addHistoricEvents([batch[0]], null, null)).toBe(true);
+            });
+
+            it("an event that is neither tombstoned nor the edit of a tombstoned id is indexed as before", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                await m.addHistoricEvents(
+                    [arriving(original("$s1-other", "zzs1other")), arriving(editOf("$s1-e2", "$s1-other", "zzs1e2"))],
+                    null,
+                    null,
+                );
+                expect(await hits(m, "zzs1e2")).toEqual(["$s1-other"]);
+            });
+        });
+
+        describe("release", () => {
+            it("removes the id, persists the removal, and a release of a never-tombstoned id is a no-op", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                await priv(m).persistChain;
+                expect(await dumpRawKeys("meta")).toContain(tombKey());
+
+                const writes: string[] = [];
+                const realTransaction = IDBDatabase.prototype.transaction;
+                vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
+                    this: IDBDatabase,
+                    names,
+                    mode,
+                    ...rest
+                ) {
+                    if (mode === "readwrite")
+                        writes.push(typeof names === "string" ? names : Array.from(names).join("+"));
+                    return realTransaction.call(this, names, mode, ...rest);
+                });
+                await m.releaseRedactionTombstones(["$s1-never-tombstoned"]);
+                await priv(m).persistChain;
+                expect(writes).toEqual([]);
+                expect(priv(m).redactionTombstones.has(ORIG)).toBe(true);
+
+                await m.releaseRedactionTombstones([ORIG, "$s1-never-tombstoned"]);
+                expect(priv(m).redactionTombstones.has(ORIG)).toBe(false);
+                await priv(m).persistChain;
+                expect(writes).toEqual(["meta"]);
+                expect(await dumpRawKeys("meta")).not.toContain(tombKey()); // an empty set leaves no row
+            });
+
+            it("R, E and O of one batch: the edit is dropped because the release follows addHistoricEvents", async () => {
+                const m = await openHot();
+                // What EventIndex.crawlerFunc does for a backward batch holding the redaction, the edit and the
+                // (already redacted, so not delivered) original.
+                await m.deleteEvent(ORIG);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                await m.releaseRedactionTombstones([ORIG]);
+                await expectNoTrace(m);
+                expect(priv(m).redactionTombstones.size).toBe(0);
+            });
+
+            it("control: released BEFORE the batch's events are added, the edit is rebuilt (why the order matters)", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                await m.releaseRedactionTombstones([ORIG]);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                expect(await hits(m, "zzs1edited")).toEqual([ORIG]);
+            });
+        });
+
+        describe("bound", () => {
+            it("is FIFO at the cap, counts evictions, warns once per session and shows in getStats", async () => {
+                const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+                const m = await openHot();
+                for (let i = 0; i < REDACTION_TOMBSTONES_MAX; i++) await m.deleteEvent(`$j${i}`);
+                expect(priv(m).redactionTombstones.size).toBe(REDACTION_TOMBSTONES_MAX);
+                expect(await m.getStats()).toMatchObject({
+                    redactionTombstones: REDACTION_TOMBSTONES_MAX,
+                    redactionTombstonesEvicted: 0,
+                });
+                const tombstoneWarnings = (): unknown[][] =>
+                    warn.mock.calls.filter((c) => c.some((a) => typeof a === "string" && /tombstone/i.test(a)));
+                expect(tombstoneWarnings()).toHaveLength(0);
+
+                await m.deleteEvent("$j-over-1");
+                await m.deleteEvent("$j-over-2");
+                expect(priv(m).redactionTombstones.size).toBe(REDACTION_TOMBSTONES_MAX);
+                expect(priv(m).redactionTombstones.has("$j0")).toBe(false);
+                expect(priv(m).redactionTombstones.has("$j1")).toBe(false);
+                expect(priv(m).redactionTombstones.has("$j2")).toBe(true);
+                expect(await m.getStats()).toMatchObject({
+                    redactionTombstones: REDACTION_TOMBSTONES_MAX,
+                    redactionTombstonesEvicted: 2,
+                });
+                expect(tombstoneWarnings()).toHaveLength(1); // one per session, not one per eviction
+                const text = tombstoneWarnings()[0].map(String).join(" ");
+                expect(text).toContain(String(REDACTION_TOMBSTONES_MAX));
+                expect(text).not.toContain("$j"); // never an id
+            });
+
+            it("re-recording an id moves it to the newest end", async () => {
+                const m = await openHot();
+                for (let i = 0; i < REDACTION_TOMBSTONES_MAX; i++) await m.deleteEvent(`$j${i}`);
+                await m.deleteEvent("$j0"); // the oldest is recorded again
+                await m.deleteEvent("$j-new"); // evicts $j1, not $j0
+                expect(priv(m).redactionTombstones.has("$j0")).toBe(true);
+                expect(priv(m).redactionTombstones.has("$j1")).toBe(false);
+                expect(priv(m).redactionTombstones.size).toBe(REDACTION_TOMBSTONES_MAX);
+            });
+
+            it("P13-style fill: junk redactions that the crawler meets again (and releases) do not push out a real one", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                for (let i = 0; i < REDACTION_TOMBSTONES_MAX + 50; i++) {
+                    await m.deleteEvent(`$reaction${i}`); // a redacted reaction, say
+                    await m.releaseRedactionTombstones([`$reaction${i}`]); // the batch also held the reaction, redacted
+                }
+                expect(priv(m).redactionTombstones.has(ORIG)).toBe(true);
+                expect(await m.getStats()).toMatchObject({ redactionTombstonesEvicted: 0 });
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                await expectNoTrace(m);
+            });
+
+            it("saturation without releases: past the cap the oldest tombstone is forgotten (the documented limitation)", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                for (let i = 0; i < REDACTION_TOMBSTONES_MAX; i++) await m.deleteEvent(`$live-unreact${i}`);
+                expect(priv(m).redactionTombstones.has(ORIG)).toBe(false);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                expect(await hits(m, "zzs1edited")).toEqual([ORIG]); // the pre-S1 behaviour, now only at saturation
+            });
+        });
+
+        describe("the persisted row", () => {
+            it("is encrypted: neither the ids nor any content is in the clear", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                await m.addEventToIndex(editOf(), {});
+                await m.deleteEvent(ORIG);
+                await m.deleteEvent("$s1-some-other-redacted-event");
+                await priv(m).persistChain;
+                expect(await dumpRawKeys("meta")).toContain(tombKey());
+                const whole = await dumpWholeDb();
+                expect(whole).not.toContain(ORIG);
+                expect(whole).not.toContain(EDIT_ID);
+                expect(whole).not.toContain("$s1-some-other-redacted-event");
+                expect(whole).not.toContain("zzs1edited");
+                expect(whole).not.toContain("zzs1original");
+                expect(whole).not.toContain(ROOM);
+            });
+
+            it("is written behind everything already queued: the tombstone is durable before the batch write that follows", async () => {
+                const m = await openHot();
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                priv(m).persistChain = priv(m).persistChain.then(() => gate);
+                const order: string[] = [];
+                const realPut = IDBObjectStore.prototype.put;
+                vi.spyOn(IDBObjectStore.prototype, "put").mockImplementation(function (
+                    this: IDBObjectStore,
+                    value: any,
+                    key?: IDBValidKey,
+                ) {
+                    order.push(this.name === "meta" && value?.userId === tombKey() ? "tombstones" : this.name);
+                    return realPut.call(this, value, key);
+                });
+                await m.deleteEvent(ORIG); // queued behind the gate
+                await m.addHistoricEvents([arriving(original("$s1-batch", "zzs1batch"))], null, null);
+                release();
+                await priv(m).persistChain;
+                expect(order).toContain("tombstones");
+                expect(order).toContain("chunks");
+                expect(order.indexOf("tombstones")).toBeLessThan(order.indexOf("chunks"));
+            });
+
+            it("is loaded as a union with what was recorded before the load, and never overwritten before it", async () => {
+                const first = await openHot();
+                await first.deleteEvent("$s1-persisted");
+                await priv(first).persistChain;
+                await first.closeEventIndex();
+
+                // Hold the background load of the row.
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                const realLoad = (BrowserEventIndexManager.prototype as unknown as Priv).loadRedactionTombstones;
+                vi.spyOn(
+                    BrowserEventIndexManager.prototype as unknown as Priv,
+                    "loadRedactionTombstones",
+                ).mockImplementation(async function (this: BrowserEventIndexManager, ...args: unknown[]) {
+                    await gate;
+                    return realLoad.apply(this, args);
+                });
+                setEventIndexBoundsOverrideForTesting(null);
+                const m = track(new BrowserEventIndexManager());
+                await m.initEventIndex(userId, DEVICE); // returns without the load: it is never awaited here
+
+                // Recorded while the row is still unread, in memory only so far. (deleteEvent itself goes on to wait
+                // for the manifest, which waits for the held load; the tombstone was recorded before that.)
+                const deletion = m.deleteEvent("$s1-recorded-before-load");
+                expect(priv(m).redactionTombstones.has("$s1-recorded-before-load")).toBe(true);
+                await priv(m).persistChain;
+                const rowIds = async (): Promise<string[] | null> =>
+                    withRawDb(async (db) => {
+                        const meta = (await idbPromise(
+                            db.transaction("meta", "readonly").objectStore("meta").get(userId),
+                        )) as { salt: string };
+                        const dek = await deriveDek(
+                            pickleKey,
+                            decodeBase64(meta.salt) as Uint8Array<ArrayBuffer>,
+                            userId,
+                            DEVICE,
+                        );
+                        const row = (await idbPromise(
+                            db.transaction("meta", "readonly").objectStore("meta").get(tombKey()),
+                        )) as { blob: { iv: string; ct: string } } | undefined;
+                        return row ? decryptJson<string[]>(dek, row.blob, tombKey()) : null;
+                    });
+                expect(await rowIds()).toEqual(["$s1-persisted"]); // NOT overwritten by the pre-load write
+
+                // An arrival that could be dropped waits for the load rather than being checked against a partial set.
+                let arrived = false;
+                const arrival = m
+                    .addHistoricEvents([arriving(editOf(EDIT_ID, "$s1-persisted"))], null, null)
+                    .then((r) => {
+                        arrived = true;
+                        return r;
+                    });
+                for (let i = 0; i < 20; i++) await Promise.resolve();
+                expect(arrived).toBe(false);
+
+                release();
+                await deletion;
+                await arrival;
+                await m.waitForHydration();
+                await priv(m).persistChain;
+                expect(await hits(m, "zzs1edited")).toEqual([]); // dropped: the persisted tombstone was loaded first
+                expect([...priv(m).redactionTombstones].sort()).toEqual(
+                    ["$s1-persisted", "$s1-recorded-before-load"].sort(),
+                );
+                expect((await rowIds())?.sort()).toEqual(["$s1-persisted", "$s1-recorded-before-load"].sort());
+            });
+
+            it("an unreadable row (a read error) is left alone for the session: gating still works, nothing is written", async () => {
+                const first = await openHot();
+                await first.deleteEvent("$s1-persisted");
+                await priv(first).persistChain;
+                await first.closeEventIndex();
+                const before = await dumpRawStore("meta");
+
+                const realGet = IDBObjectStore.prototype.get;
+                vi.spyOn(IDBObjectStore.prototype, "get").mockImplementation(function (
+                    this: IDBObjectStore,
+                    key: IDBValidKey | IDBKeyRange,
+                ) {
+                    if (key === tombKey()) throw new Error("simulated read failure");
+                    return realGet.call(this, key);
+                });
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                await priv(m).persistChain;
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                expect(await hits(m, "zzs1edited")).toEqual([]); // in-memory gating is unaffected
+                const after = await dumpRawStore("meta");
+                const rowOf = (rows: any[]): any => rows.find((r) => r.userId === tombKey());
+                expect(rowOf(after)).toEqual(rowOf(before)); // byte for byte what the last session wrote
+            });
+
+            it("an undecryptable row is treated like any unreadable row: this user's index is wiped", async () => {
+                await seed(true);
+                const m = await openHot();
+                await m.deleteEvent("$s1-x");
+                await priv(m).persistChain;
+                await m.closeEventIndex();
+                await withRawDb(async (db) => {
+                    const tx = db.transaction("meta", "readwrite");
+                    tx.objectStore("meta").put({ userId: tombKey(), blob: { iv: "AAAAAAAAAAAAAAAA", ct: "AAAA" } });
+                    await new Promise<void>((resolve, reject) => {
+                        tx.oncomplete = (): void => resolve();
+                        tx.onerror = (): void => reject(tx.error);
+                    });
+                });
+                const next = await openHot();
+                expect((await next.getStats()).eventCount).toBe(0);
+                expect(await dumpRawKeys("meta")).toEqual([userId]);
+                expect(priv(next).redactionTombstones.size).toBe(0);
+            });
+
+            it("deleting the index removes the row, and closing it keeps the row", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                await priv(m).persistChain;
+                await m.closeEventIndex();
+                expect(await dumpRawKeys("meta")).toContain(tombKey());
+                const again = await openHot();
+                expect(priv(again).redactionTombstones.has(ORIG)).toBe(true);
+                await again.deleteEventIndex();
+                expect(await dumpRawKeys("meta")).not.toContain(tombKey());
+            });
+
+            it("a new session does not inherit the previous session's tombstones in memory", async () => {
+                const m = await openHot();
+                await m.deleteEvent(ORIG);
+                await priv(m).persistChain;
+                await m.deleteEventIndex();
+                await m.initEventIndex(userId, DEVICE); // the same object, a new session
+                await m.waitForHydration();
+                expect(priv(m).redactionTombstones.size).toBe(0);
+                await m.addHistoricEvents([arriving(editOf())], null, null);
+                expect(await hits(m, "zzs1edited")).toEqual([ORIG]); // wiped: no tombstone, nothing heals
+            });
         });
     });
 });

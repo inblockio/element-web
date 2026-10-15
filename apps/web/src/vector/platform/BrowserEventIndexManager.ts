@@ -65,12 +65,16 @@ Please see LICENSE files in the repository root for full details.
  *   salt is not secret by construction. The parked-redactions row's ids are inside its ciphertext; what it adds to
  *   the disclosure is that such a row exists and, from its length, roughly how many (at most {@link
  *   PENDING_REDACTIONS_MAX}) -- the same equality-and-count residue the checkpoints have. On a large account the row
- *   is always there and near that cap, for the reason given at {@link PENDING_REDACTIONS_MAX}.
+ *   is always there and near that cap, for the reason given at {@link PENDING_REDACTIONS_MAX}. The redaction-
+ *   tombstones row ({@link redactionTombstonesKey}) is the same shape and discipline: its ids are inside its
+ *   ciphertext, its key discloses `userId` and a purpose tag, and its length the count of tombstones (at most {@link
+ *   REDACTION_TOMBSTONES_MAX}). It exists whenever any redaction has been met and not yet released, so on a profile
+ *   that deletes messages it is usually there.
  * - Shape: the number of chunk records approximates (events / events-per-chunk), not the event count directly, and
  *   each ciphertext length the size of the events it packs -- coarser than schema v2's one-length-per-event shape.
  *
  * **The complete cleartext key set, across every store, is: `userId`, `chunkId`, the purpose-tagged `meta` keys listed
- * above (manifest pages, `oldestIndexedTs`, parked redactions) and the HKDF salt** -- `eventId` has left it entirely,
+ * above (manifest pages, `oldestIndexedTs`, parked redactions, redaction tombstones) and the HKDF salt** -- `eventId` has left it entirely,
  * on every database this class opens. A v2 (or v1) database is never converted in place: {@link openDb}'s
  * `onupgradeneeded` resets it, dropping the legacy `events` store outright (schema v2's cleartext `[userId, eventId]`
  * primary key and its `byUser` index go with it) rather than reading it to repack its rows into chunks -- see {@link
@@ -116,7 +120,10 @@ Please see LICENSE files in the repository root for full details.
  * id leaves the row only after that rewrite has committed, so a crash between the two still finds the record hidden,
  * and a rewrite that fails leaves the id parked. The exception is a session whose parked row could not be read ({@link
  * BrowserEventIndexManager.pendingRedactionsRowUnreadable}): it leaves the row alone, so the redactions it parks itself
- * are in memory only and a reload loses them.
+ * are in memory only and a reload loses them. The redaction tombstones ({@link
+ * BrowserEventIndexManager.redactionTombstones}) follow the same rule: in memory at once, durable when their row write
+ * has committed behind the writes already queued, so one recorded just before a crash can be lost, and a session whose
+ * tombstone row could not be read keeps what it records in memory only.
  */
 
 import { logger } from "matrix-js-sdk/src/logger";
@@ -1199,6 +1206,41 @@ function pendingRedactionsKey(userId: string): string {
 export const PENDING_REDACTIONS_MAX = 4096;
 
 /**
+ * The primary key -- and AAD -- of the one encrypted row holding {@link
+ * BrowserEventIndexManager.redactionTombstones}: every id a redaction ever named, as named. Same `{userId, blob}`
+ * shape and same "purpose tag, never a room or event id" key discipline as {@link pendingRedactionsKey}; the row
+ * exists only while the set is non-empty. The ids are inside the ciphertext.
+ */
+function redactionTombstonesKey(userId: string): string {
+    return `${userId}|redactionTombstones`;
+}
+
+/**
+ * The most redaction tombstones ({@link BrowserEventIndexManager.redactionTombstones}) kept, in memory and in the
+ * encrypted row alike. Past this many the OLDEST is forgotten (FIFO over insertion order; recording an id again moves
+ * it to the newest end), counted in {@link IIndexStats.redactionTombstonesEvicted} and logged once per session.
+ * About 4096 x 50 B = 200 KiB on disk.
+ *
+ * What a forgotten tombstone costs: if the redacted message's edit is delivered after that, the edit is rebuilt into a
+ * record under the original's id (the S1 defect, back again for that one message). In steady state the set holds
+ * only what no backward crawl will meet again soon: the redacted targets beyond the crawl window, live redactions of
+ * events that are not (and will not be) crawled again -- mostly un-reacts and deletions of messages from this
+ * session -- and the redactions of a crawl in flight. The ids a backward crawl does meet redacted are released as it
+ * meets them ({@link BrowserEventIndexManager.releaseRedactionTombstones}), which is what keeps the crawler's own junk
+ * (redacted reactions, events this index never held) from pushing a real tombstone out. A profile that redacts more
+ * than this many events that no backward crawl visits between a deletion and the late edit it must catch will lose the
+ * oldest. Unlike {@link PENDING_REDACTIONS_MAX}, an index that is large does not sit at this cap on its own account.
+ * @knipignore - exported for tests.
+ */
+export const REDACTION_TOMBSTONES_MAX = 4096;
+
+/** See {@link BrowserEventIndexManager.redactionTombstonesLoad}. */
+interface TombstoneLoadGate {
+    promise: Promise<void>;
+    settle: () => void;
+}
+
+/**
  * One candidate for eviction/deletion by age: an id (an event id for {@link
  * BrowserEventIndexManager.residentHeap}, or `String(chunkId)` for {@link
  * BrowserEventIndexManager.diskChunkHeap}) and the `originServerTs` it was pushed onto a heap with.
@@ -2026,6 +2068,53 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private pendingRedactionsRowUnreadable = false;
 
     /**
+     * Every id a redaction named, as named, whether or not a record was found for it (S1). {@link deleteEvent}
+     * records the id here always -- not only while hydrating or over budget, and never as the record it resolved to --
+     * and an event that arrives later ({@link addEventToIndex}, {@link addHistoricEvents}) is dropped before it can
+     * create or change a record when its own id, or the id it edits, is in the set ({@link isTombstoned}). That is
+     * what keeps a deleted, edited message deleted: Element redacts the original only, the server never redacts the
+     * edit, and a backward crawl meets the redaction BEFORE the edit, so without this the edit is rebuilt into a
+     * record under the original's id with its unredacted text.
+     *
+     * Separate from {@link pendingRedactions} on purpose. That set is a to-do list for a record not yet read from disk
+     * and is emptied the moment the record is met, applied, or proven absent by a complete hydration; a tombstone has
+     * to outlive all of those, because the edit it guards against may arrive any time later. They are released by one
+     * event only: {@link releaseRedactionTombstones}, called by a BACKWARD crawl that has just met the id already
+     * redacted (the original is older than every edit of it, so no edit can still be coming from that crawl).
+     *
+     * Records restored from disk (hydration, {@link materializeRow}, the cold scan) are NOT gated by it: it decides
+     * what may arrive, not what is already stored.
+     *
+     * Durable and bounded: mirrored to one encrypted `meta` row ({@link redactionTombstonesKey}, {@link
+     * scheduleRedactionTombstonesPersist}), loaded by {@link loadManifest} as a union with anything recorded before
+     * the load ({@link loadRedactionTombstones}), at most {@link REDACTION_TOMBSTONES_MAX} long (FIFO, see there).
+     * A session whose row could not be read keeps what it records in memory only ({@link
+     * redactionTombstonesRowUnreadable}).
+     */
+    private readonly redactionTombstones = new Set<string>();
+    /** True while a {@link scheduleRedactionTombstonesPersist} write is queued and has not started. */
+    private redactionTombstonesWriteQueued = false;
+    /**
+     * True when {@link loadRedactionTombstones} could not READ the persisted row this session (a read error, not a
+     * failure to decrypt): the set in memory then knows nothing of what the row holds, so {@link
+     * writeRedactionTombstones} leaves the row alone for the session rather than replace it with a set missing those
+     * ids. What this session records is in memory only; a reload loses it.
+     */
+    private redactionTombstonesRowUnreadable = false;
+    /** Tombstones forgotten at the cap this session; see {@link recordRedactionTombstone}. Reported by {@link getStats}. */
+    private redactionTombstonesEvicted = 0;
+    /**
+     * Non-null from the moment {@link initEventIndex} starts the manifest phase of a persisted index until that phase
+     * has merged the persisted tombstone row into {@link redactionTombstones} (or the session ended). A fresh index
+     * and a memory-only session have no row to wait for and never raise it. An arrival that could be dropped
+     * ({@link addEventToIndex}, {@link addHistoricEvents}) awaits {@link TombstoneLoadGate.promise} first, so that it
+     * is never checked against a set that does not yet hold what an earlier session recorded; and no write of the row
+     * is queued meanwhile ({@link scheduleRedactionTombstonesPersist}), so a partial set cannot replace the row. The
+     * gate waits on IndexedDB reads only, never on {@link persistChain}, and {@link initEventIndex} never awaits it.
+     */
+    private redactionTombstonesLoad: TombstoneLoadGate | null = null;
+
+    /**
      * ids removed from the resident set ({@link removeFromIndex}) by a genuine deletion -- {@link
      * deleteEvent}'s ordinary path, or {@link materializeRow}'s "redacted before it was even
      * hydrated" path -- whose disk chunk has been queued for rewrite ({@link enqueueDeleteRecord})
@@ -2224,7 +2313,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // load, since there is nothing on disk yet for this user at all.
                 this.manifestLoaded = true;
                 this.manifestReadyPromise = Promise.resolve();
+                // No tombstone row can exist yet. What was recorded while the keys were being derived is in memory
+                // only so far.
+                this.scheduleRedactionTombstonesPersist();
             } else {
+                // Arrivals that could be dropped wait from here until the manifest phase has merged the persisted
+                // tombstone row ({@link redactionTombstonesLoad}). Raised in the same synchronous step that starts
+                // that phase, so there is no path on which it is raised and never lowered: it is lowered when the
+                // phase settles, however it ends. {@link EventIndex} registers its listeners and starts its crawler
+                // only after this method has returned, so nothing arrives before this point.
+                const tombstoneGate = this.beginRedactionTombstonesLoad();
                 this.manifestReadyPromise = this.loadManifest(
                     userId,
                     dek,
@@ -2232,6 +2330,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     salt,
                     epoch,
                 );
+                const release = (): void => this.endRedactionTombstonesLoad(tombstoneGate);
+                void this.manifestReadyPromise.then(release, release);
             }
             this.hydrationPromise = this.hydrate(userId, salt, epoch);
             // Owed only by a profile that existed before the accounting was fixed and has not been recounted
@@ -2256,6 +2356,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // schedulePendingRedactionsPersist}), so it must not leave this session believing one is still on its
                 // way, as {@link resetMemory} does for the same reason.
                 this.pendingRedactionsWriteQueued = false;
+                this.redactionTombstonesWriteQueued = false; // likewise
                 this.hydrationEpoch++; // Invalidates the manifest/hydrate work just started above.
                 await this.deleteUserRecords(userId);
                 await this.saveMeta({
@@ -2323,14 +2424,24 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * landing during the await resolves, clears every map via `resetMemory()`, and this method would then carry on to
      * `upsertEvent` a plaintext event straight into the maps teardown just emptied.
      *
+     * An event whose own id, or whose target's id (the message it edits), is a redaction tombstone ({@link
+     * redactionTombstones}) is dropped without a trace: no record, no persist.
+     *
      * @param profile - The sender's display name and avatar *at the time of this event*, so a result can be rendered
      *     without the room being loaded.
      */
     public async addEventToIndex(ev: IMatrixEvent, profile: IMatrixProfile): Promise<void> {
         if (this.closed || !this.userId || !this.featureEnabled()) return;
+        if (this.redactionTombstonesLoad) {
+            await this.redactionTombstonesLoad.promise; // never checked against a set that is not loaded yet
+            if (this.closed || !this.userId) return;
+        }
+        // Before the pull from disk, which a dropped event does not need ...
+        if (this.isTombstoned(ev)) return;
         await this.materializeIfPending(this.targetId(ev));
         if (this.closed || !this.userId) return;
-        this.upsertEvent(ev, profile);
+        // ... and again in upsertEvent, which a redaction landing during that pull has not missed.
+        if (!this.upsertEvent(ev, profile)) return;
         this.schedulePersistEvent(this.targetId(ev));
     }
 
@@ -2350,6 +2461,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * cold scan) to apply as soon as it meets the record, rather than being dropped as a no-op. Parked redactions are
      * persisted, so they survive a reload; see {@link pendingRedactions}.
      *
+     * Independently of all of that, the id is recorded as a redaction tombstone ({@link redactionTombstones}) so that
+     * an edit of it, still unredacted on the server, cannot rebuild the record later.
+     *
      * `!this.hydrating` alone used to be reason enough to skip {@link materializeIfPending} outright (as an
      * optimisation -- that method's own guard makes the skip correct either way): once hydration is bounded, that
      * reasoning no longer holds on its own, since `hydrating` going false no longer implies every disk row has been
@@ -2362,6 +2476,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     public async deleteEvent(eventId: string): Promise<boolean> {
         if (this.closed) return false;
+        // First, and synchronously: whatever else happens below (and whether or not anything is found), no event that
+        // names this id, or edits it, may become a record from now on. The id as named, never the record it resolves to.
+        this.recordRedactionTombstone(eventId);
         // Resolve an edit's id to the record its content was folded into; see the doc above.
         let targetId = this.events.has(eventId) ? eventId : this.editTargets.get(eventId);
         if (targetId === undefined && (this.hydrating || this.residentBudgetExceeded)) {
@@ -2378,6 +2495,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             this.enqueueDeleteRecord(this.userId, targetId);
         }
         return existed;
+    }
+
+    /**
+     * Forget redaction tombstones ({@link redactionTombstones}); see {@link
+     * BaseEventIndexManager.releaseRedactionTombstones}. Ids that are not tombstoned are ignored, and nothing is
+     * written when nothing changed. The removal is persisted like any change to the set.
+     *
+     * Meant to be called with the ids a BACKWARD crawl batch met already redacted, after that batch's own events were
+     * added ({@link addHistoricEvents}), never before: the redaction, the edit and the original can share a batch, and
+     * the edit is only dropped if the tombstone is still there when it arrives. Does not wait for the persisted row to
+     * be merged: an id released before that is read back from the row (the safe side).
+     */
+    public async releaseRedactionTombstones(eventIds: string[]): Promise<void> {
+        if (this.closed) return;
+        let changed = false;
+        for (const id of eventIds) changed = this.redactionTombstones.delete(id) || changed;
+        if (changed) this.scheduleRedactionTombstonesPersist();
     }
 
     /**
@@ -2487,6 +2621,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             storagePersisted: this.storagePersisted,
             manifestBytes: this.manifest.size * MANIFEST_BYTES_PER_ENTRY_ESTIMATE,
             isSearchPartial: this.searchPartial,
+            redactionTombstones: this.redactionTombstones.size,
+            redactionTombstonesEvicted: this.redactionTombstonesEvicted,
         };
     }
 
@@ -3149,6 +3285,10 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         oldCheckpoint: ICrawlerCheckpoint | null,
     ): Promise<boolean> {
         if (this.closed || !this.featureEnabled()) return false;
+        if (this.redactionTombstonesLoad) {
+            await this.redactionTombstonesLoad.promise; // never checked against a set that is not loaded yet
+            if (this.closed) return false;
+        }
         let allAlready = events.length > 0;
         const dirty = new Set<string>();
         // A record changed in place stays un-evictable until its write has committed (see pendingWriteIds), and that
@@ -3171,9 +3311,21 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             //    only the envelope is taken.
             // 3. Anything else -- a new event, or an edit for a record we hold -- is a plain upsert.
             for (const { event, profile } of events) {
+                // A tombstoned event is dropped BEFORE anything is pulled in for it, and this loop's case 1 below
+                // changes a record without going through upsertEvent, so this is the only gate it has. A drop is
+                // never "already indexed": it must not end a crawl early.
+                if (this.isTombstoned(event)) {
+                    allAlready = false;
+                    continue;
+                }
                 const id = this.targetId(event);
                 await this.materializeIfPending(id);
                 if (this.closed) return false;
+                // A redaction can land during the pull above.
+                if (this.isTombstoned(event)) {
+                    allAlready = false;
+                    continue;
+                }
                 const existing = this.events.get(id);
                 const isReplace = replacedEventId(event) !== null;
                 if (existing && !isReplace && existing.edited === false) {
@@ -3196,14 +3348,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     // Original arriving after an edit: keep the new body, take the envelope. That rewrites the record
                     // and schedules a persist, so it must clear the flag -- a batch made only of these would
                     // otherwise report "all already added" and end the back-fill.
-                    this.upsertEvent(event, profile);
-                    markDirty(id);
                     allAlready = false;
+                    if (this.upsertEvent(event, profile)) markDirty(id);
                     continue;
                 }
                 if (!existing) allAlready = false;
                 else if (isReplace) allAlready = false;
-                this.upsertEvent(event, profile);
+                if (!this.upsertEvent(event, profile)) continue;
                 markDirty(id);
             }
             this.enqueueBatchedWrite(Array.from(dirty));
@@ -3570,12 +3721,15 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      *    seen, so case 2 can repair the envelope later without the original reverting the body.
      *
      * @param ev - As received, not the output of {@link effectiveEventForIndex}, which this calls itself. One with no
-     *     `event_id`/`room_id` is dropped silently.
+     *     `event_id`/`room_id` is dropped silently, and so is one whose own id or target is a redaction tombstone
+     *     ({@link redactionTombstones}), checked here first of all: no case below may create or change a record for it.
+     * @returns True when the event was applied; false when it was dropped.
      */
-    private upsertEvent(ev: IMatrixEvent, profile: IMatrixProfile): void {
+    private upsertEvent(ev: IMatrixEvent, profile: IMatrixProfile): boolean {
+        if (this.isTombstoned(ev)) return false;
         const origId = replacedEventId(ev);
         const targetId = origId ?? ev.event_id;
-        if (!targetId || !ev.room_id) return;
+        if (!targetId || !ev.room_id) return false;
 
         const existing = this.events.get(targetId);
         const incoming = effectiveEventForIndex(ev);
@@ -3596,7 +3750,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             existing.hasFile = eventHasFile(existing.event);
             this.rememberEdit(existing, ev.event_id);
             this.indexTokens(existing.eventId, existing.searchText);
-            return;
+            return true;
         }
 
         if (existing && !origId && existing.edited) {
@@ -3623,13 +3777,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                         ? existing.originServerTs
                         : Math.min(this.oldestResidentTs, existing.originServerTs);
             }
-            return;
+            return true;
         }
 
         // Case 3: a duplicate of an unedited record. It cannot be improved from here, and re-indexing would churn the
         // inverted index for nothing.
         if (existing && !origId) {
-            return;
+            return true;
         }
 
         // Case 4: nothing held for this id. `edited` is seeded from whether this is an edit, so an
@@ -3666,6 +3820,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // the heap to find nothing durable to evict, on every one of 200k inserts: O(heap size) per
         // call, on every call, quadratic overall, and it turned a ~2.5s ingest loop into one that
         // did not finish inside a 15-minute harness timeout.
+        return true;
     }
 
     /**
@@ -4936,9 +5091,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             // Redactions that were still waiting for their record when the last session ended; see
             // pendingRedactions. Loaded before hydrate() reads its first chunk (it awaits this method).
             await this.loadPendingRedactions(userId, dek, epoch);
+            // The redaction tombstones (S1); the arrivals held back by it are released when this phase ends.
+            await this.loadRedactionTombstones(userId, dek, epoch);
         } catch {
             log.warn(
-                "EventIndex: a persisted oldestIndexedTs or parked-redaction row could not be decrypted; wiping leftover",
+                "EventIndex: a persisted oldestIndexedTs, parked-redaction or redaction-tombstone row could not be decrypted; wiping leftover",
             );
             this.clearIndexMaps();
             await this.deleteUserRecords(userId);
@@ -5347,6 +5504,158 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
             this.pendingRedactions.has(stored.eventId) ||
             (stored.editIds ?? []).some((id) => this.pendingRedactions.has(id))
         );
+    }
+
+    /**
+     * Whether an arriving event must be dropped: its own id, or the id of the message it edits, is a redaction
+     * tombstone ({@link redactionTombstones}). Cheap when the set is empty, which is the common case.
+     */
+    private isTombstoned(ev: IMatrixEvent): boolean {
+        if (this.redactionTombstones.size === 0) return false;
+        if (this.redactionTombstones.has(ev.event_id)) return true;
+        const replaced = replacedEventId(ev);
+        return replaced !== null && this.redactionTombstones.has(replaced);
+    }
+
+    /**
+     * Record `eventId` as a redaction tombstone, exactly as named: the newest entry (an id already held moves to the
+     * newest end, so FIFO eviction forgets what was named longest ago). Persisted behind everything already queued.
+     */
+    private recordRedactionTombstone(eventId: string): void {
+        if (!eventId) return;
+        this.redactionTombstones.delete(eventId);
+        this.redactionTombstones.add(eventId);
+        this.trimRedactionTombstones();
+        this.scheduleRedactionTombstonesPersist();
+    }
+
+    /**
+     * Forget the oldest tombstones beyond {@link REDACTION_TOMBSTONES_MAX}. Every forgotten one is counted
+     * ({@link redactionTombstonesEvicted}); the first of a session is logged, once, with the count and the cap and no
+     * id.
+     * @returns Whether anything was forgotten.
+     */
+    private trimRedactionTombstones(): boolean {
+        let dropped = 0;
+        while (this.redactionTombstones.size > REDACTION_TOMBSTONES_MAX) {
+            const oldest = this.redactionTombstones.values().next().value;
+            if (oldest === undefined) break;
+            this.redactionTombstones.delete(oldest);
+            dropped++;
+        }
+        if (dropped === 0) return false;
+        const first = this.redactionTombstonesEvicted === 0;
+        this.redactionTombstonesEvicted += dropped;
+        if (first) {
+            log.warn(
+                `EventIndex: redaction tombstones are at their cap of ${REDACTION_TOMBSTONES_MAX}; forgot the ${dropped} oldest, ` +
+                    "so a late edit of such a deleted message can be indexed again (further evictions are counted, not logged)",
+            );
+        }
+        return true;
+    }
+
+    /** Start holding back the arrivals that could be dropped; see {@link redactionTombstonesLoad}. */
+    private beginRedactionTombstonesLoad(): TombstoneLoadGate {
+        this.endRedactionTombstonesLoad(); // a superseded session's waiters are let go
+        let settle!: () => void;
+        const promise = new Promise<void>((resolve) => (settle = resolve));
+        const gate: TombstoneLoadGate = { promise, settle };
+        this.redactionTombstonesLoad = gate;
+        return gate;
+    }
+
+    /** Let the arrivals held by `gate` (default: the current one) go. Idempotent. */
+    private endRedactionTombstonesLoad(gate: TombstoneLoadGate | null = this.redactionTombstonesLoad): void {
+        if (!gate) return;
+        gate.settle();
+        if (this.redactionTombstonesLoad === gate) this.redactionTombstonesLoad = null;
+    }
+
+    /**
+     * Mirror {@link redactionTombstones} to its encrypted `meta` row, coalesced exactly like {@link
+     * schedulePendingRedactionsPersist}: any number of changes before the queued write starts cost one write, which
+     * reads the set as it is THEN (an empty set deletes the row). Queued on {@link persistChain} behind every write
+     * already there, so a tombstone {@link deleteEvent} recorded is durable before the crawler batch write that
+     * follows it. While the persisted row has not been merged into the set yet ({@link redactionTombstonesLoad}) it
+     * queues nothing: a write then would replace the row with a set missing what it holds. {@link
+     * loadRedactionTombstones} queues the write itself once the merge is done.
+     */
+    private scheduleRedactionTombstonesPersist(): void {
+        if (this.redactionTombstonesLoad) return;
+        this.queueRedactionTombstonesWrite();
+    }
+
+    /** The queueing half of {@link scheduleRedactionTombstonesPersist}, for the one caller that is the merge itself. */
+    private queueRedactionTombstonesWrite(): void {
+        if (this.redactionTombstonesWriteQueued) return;
+        if (!this.persistEnabled || !this.dek || !this.db || !this.userId) return;
+        this.redactionTombstonesWriteQueued = true;
+        const userId = this.userId;
+        const dek = this.dek;
+        const epoch = this.hydrationEpoch;
+        this.enqueuePersist(async () => {
+            // As for the parked row: a write left over from a previous session writes nothing and leaves the flag
+            // alone, which now belongs to the session that reset it.
+            if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+            this.redactionTombstonesWriteQueued = false;
+            await this.writeRedactionTombstones(userId, dek);
+        });
+    }
+
+    /**
+     * Write {@link redactionTombstones} as it is now to its row, or delete the row when it is empty. Does nothing when
+     * the row could not be read this session ({@link redactionTombstonesRowUnreadable}).
+     */
+    private async writeRedactionTombstones(userId: string, dek: CryptoKey): Promise<void> {
+        if (!this.db || this.redactionTombstonesRowUnreadable) return;
+        const epoch = this.hydrationEpoch;
+        const key = redactionTombstonesKey(userId);
+        const ids = Array.from(this.redactionTombstones);
+        // Encrypted before the transaction opens, like every other write in this file.
+        const blob = ids.length > 0 ? await encryptJson(dek, ids, key) : null;
+        // A session that was torn down or re-initialised during the encrypt must not replace the row the next
+        // session has written, through the next session's connection.
+        if (this.closed || epoch !== this.hydrationEpoch || !this.db) return;
+        const tx = this.db.transaction("meta", "readwrite");
+        if (blob) tx.objectStore("meta").put({ userId: key, blob } satisfies ManifestPageRecord);
+        else tx.objectStore("meta").delete(key);
+        await txDone(tx);
+    }
+
+    /**
+     * Read and decrypt the persisted {@link redactionTombstones} row, if any, into the set: a union, with the ids
+     * that were recorded before this ran counted as the newest. An absent row is the normal case. A row that fails to
+     * **decrypt** throws, and {@link loadManifest} answers it like any other unreadable row: wipe this user's index.
+     * A row that cannot be **read** is left alone for the rest of the session ({@link
+     * redactionTombstonesRowUnreadable}). If anything was recorded before this ran, the row on disk does not know
+     * about it yet, so the write is queued here -- after the merge, and (the gate still being up) before any arrival
+     * can queue a batch write behind it.
+     */
+    private async loadRedactionTombstones(userId: string, dek: CryptoKey, epoch: number): Promise<void> {
+        if (!this.db) return;
+        const key = redactionTombstonesKey(userId);
+        let row: ManifestPageRecord | undefined;
+        try {
+            const tx = this.db.transaction("meta", "readonly");
+            row = (await idbReq(tx.objectStore("meta").get(key))) as ManifestPageRecord | undefined;
+            await txDone(tx);
+        } catch (e) {
+            log.warn("EventIndex: could not read the redaction-tombstone row; leaving it alone for this session", e);
+            if (!this.closed && epoch === this.hydrationEpoch) this.redactionTombstonesRowUnreadable = true;
+            return;
+        }
+        const persisted = row ? await decryptJson<string[]>(dek, row.blob, key) : [];
+        if (this.closed || epoch !== this.hydrationEpoch) return;
+        const recordedBefore = Array.from(this.redactionTombstones);
+        this.redactionTombstones.clear();
+        for (const id of persisted) this.redactionTombstones.add(id);
+        for (const id of recordedBefore) {
+            this.redactionTombstones.delete(id);
+            this.redactionTombstones.add(id);
+        }
+        const trimmed = this.trimRedactionTombstones();
+        if (recordedBefore.length > 0 || trimmed) this.queueRedactionTombstonesWrite();
     }
 
     /**
@@ -6042,6 +6351,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         for (const key of manifestKeys) metaStore.delete(key);
         metaStore.delete(oldestIndexedTsKey(userId)); // review-pr-c.md C2-F4's own encrypted row
         metaStore.delete(pendingRedactionsKey(userId)); // the parked redactions, see pendingRedactions
+        metaStore.delete(redactionTombstonesKey(userId)); // the redaction tombstones, see redactionTombstones
         await txDone(metaTx);
     }
 
@@ -6156,6 +6466,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.pendingRedactions.clear();
         this.claimedParkedIds.clear();
         this.pendingRedactionsRowUnreadable = false; // every row of this user is wiped or discarded with the set
+        this.redactionTombstones.clear();
+        this.redactionTombstonesRowUnreadable = false; // likewise
         this.pendingDiskDeletes.clear();
         this.hydrationFailure = undefined;
         this.plainTextByteEstimate = 0;
@@ -6191,6 +6503,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // A parked-row write queued by the session being discarded is skipped when it runs (epoch check), so it
         // must not leave the next session believing one is still on its way.
         this.pendingRedactionsWriteQueued = false;
+        this.redactionTombstonesWriteQueued = false; // likewise for the tombstone row
+        this.redactionTombstonesEvicted = 0; // a per-session count
+        this.endRedactionTombstonesLoad(); // whoever is waiting on a session that is over is let go
         this.checkpoints = [];
         this.userVersion = 0;
         this.persistChain = Promise.resolve();

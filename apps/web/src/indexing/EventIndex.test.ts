@@ -337,6 +337,169 @@ describe("EventIndex", () => {
     });
 });
 
+describe("EventIndex crawler: redaction tombstones (S1)", () => {
+    const ROOM = "!room1:id";
+    const SENDER = "@alice:id";
+    const redaction = {
+        event_id: "$r",
+        room_id: ROOM,
+        sender: SENDER,
+        type: "m.room.redaction",
+        origin_server_ts: 40,
+        redacts: "$o",
+        content: {},
+    };
+    const message = (id: string, extra: Record<string, unknown> = {}): any => ({
+        event_id: id,
+        room_id: ROOM,
+        sender: SENDER,
+        type: "m.room.message",
+        origin_server_ts: 10,
+        content: { body: "hello", msgtype: "m.text" },
+        ...extra,
+    });
+    /** The batch a backward crawl gets for a deleted, edited message: R (newest), E, and the redacted O. */
+    const deletedAndEditedBatch = (): any[] => [
+        redaction,
+        message("$e", {
+            origin_server_ts: 20,
+            content: {
+                "body": "* edited",
+                "msgtype": "m.text",
+                "m.new_content": { body: "edited", msgtype: "m.text" },
+                "m.relates_to": { rel_type: "m.replace", event_id: "$o" },
+            },
+        }),
+        message("$o", { origin_server_ts: 10, content: {}, unsigned: { redacted_because: redaction } }),
+        message("$reaction", { type: "m.reaction", content: {}, unsigned: { redacted_because: redaction } }),
+    ];
+
+    async function crawl(
+        checkpoints: ICrawlerCheckpoint[],
+        chunk: any[],
+        manager: Partial<Record<keyof BaseEventIndexManager, unknown>> = {},
+    ): Promise<{ manager: Mocked<BaseEventIndexManager>; client: Mocked<MatrixClient>; stop: () => void }> {
+        const mockIndexingManager = {
+            loadCheckpoints: vi.fn().mockResolvedValue(checkpoints),
+            removeCrawlerCheckpoint: vi.fn().mockResolvedValue(undefined),
+            isEventIndexEmpty: vi.fn().mockResolvedValue(false),
+            shouldCrawl: vi.fn().mockResolvedValue(true),
+            deleteEvent: vi.fn().mockResolvedValue(false),
+            addHistoricEvents: vi.fn().mockResolvedValue(false),
+            releaseRedactionTombstones: vi.fn().mockResolvedValue(undefined),
+            ...manager,
+        } as any as Mocked<BaseEventIndexManager>;
+        mockPlatformPeg({ getEventIndexingManager: () => mockIndexingManager });
+        const room = { roomId: ROOM } as any as Room;
+        const mockClient = getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            createMessagesRequest: vi.fn(),
+            ...mockClientMethodsRooms([room]),
+        });
+        mockClient.createMessagesRequest.mockResolvedValueOnce({ chunk, end: "t-next" } as any);
+        mockClient.createMessagesRequest.mockResolvedValue({ chunk: [] } as any);
+        vi.spyOn(SettingsStore, "getValueAt").mockImplementation((_level, settingName): any => {
+            if (settingName === "crawlerSleepTime") return 0;
+            return undefined;
+        });
+        const indexer = new EventIndex();
+        await indexer.init();
+        indexer.startCrawler();
+        // The second /messages request is the crawler coming back for the continuation checkpoint, i.e. the first
+        // batch has been fully handled (including whatever follows addHistoricEvents).
+        await vi.waitFor(() => expect(mockClient.createMessagesRequest).toHaveBeenCalledTimes(2), { timeout: 4000 });
+        return { manager: mockIndexingManager, client: mockClient, stop: () => indexer.stopCrawler() };
+    }
+
+    const backward = (roomId: string, token: string): ICrawlerCheckpoint =>
+        ({ roomId, token, direction: Direction.Backward }) as ICrawlerCheckpoint;
+    const forward = (roomId: string, token: string): ICrawlerCheckpoint =>
+        ({ roomId, token, direction: Direction.Forward }) as ICrawlerCheckpoint;
+
+    it("a backward batch releases exactly the ids it met redacted, after addHistoricEvents (R, E and O in one batch)", async () => {
+        const { manager, stop } = await crawl([backward(ROOM, "t0")], deletedAndEditedBatch());
+        try {
+            expect(manager.deleteEvent).toHaveBeenCalledWith("$o"); // the redaction is applied first ...
+            const added = manager.addHistoricEvents.mock.calls[0][0];
+            expect(added.map((e: any) => e.event.event_id)).toEqual(["$e"]); // ... the edit is delivered, the original is not
+            expect(manager.releaseRedactionTombstones).toHaveBeenCalledTimes(1);
+            expect(manager.releaseRedactionTombstones).toHaveBeenCalledWith(["$o", "$reaction"]);
+            // The release follows the add of the same batch, never precedes it.
+            expect(manager.deleteEvent.mock.invocationCallOrder[0]).toBeLessThan(
+                manager.addHistoricEvents.mock.invocationCallOrder[0],
+            );
+            expect(manager.addHistoricEvents.mock.invocationCallOrder[0]).toBeLessThan(
+                manager.releaseRedactionTombstones.mock.invocationCallOrder[0],
+            );
+        } finally {
+            stop();
+        }
+    });
+
+    it("releases nothing when the batch met nothing redacted", async () => {
+        const { manager, stop } = await crawl([backward(ROOM, "t0")], [message("$plain")]);
+        try {
+            expect(manager.addHistoricEvents).toHaveBeenCalledTimes(1);
+            expect(manager.releaseRedactionTombstones).not.toHaveBeenCalled();
+        } finally {
+            stop();
+        }
+    });
+
+    it("a forward batch never releases", async () => {
+        const { manager, stop } = await crawl([forward(ROOM, "t0")], deletedAndEditedBatch());
+        try {
+            expect(manager.addHistoricEvents).toHaveBeenCalledTimes(1);
+            expect(manager.deleteEvent).toHaveBeenCalledWith("$o"); // the redaction itself is still applied
+            expect(manager.releaseRedactionTombstones).not.toHaveBeenCalled();
+        } finally {
+            stop();
+        }
+    });
+
+    it("a second backward checkpoint of the same room, queued, suppresses the release", async () => {
+        const { manager, stop } = await crawl(
+            [backward(ROOM, "t0"), backward(ROOM, "t-other")],
+            deletedAndEditedBatch(),
+        );
+        try {
+            expect(manager.addHistoricEvents).toHaveBeenCalledTimes(1);
+            expect(manager.releaseRedactionTombstones).not.toHaveBeenCalled();
+        } finally {
+            stop();
+        }
+    });
+
+    it("a queued checkpoint of another room, or a forward one of the same room, does not suppress it", async () => {
+        const other = await crawl([backward(ROOM, "t0"), backward("!other:id", "t1")], deletedAndEditedBatch());
+        try {
+            expect(other.manager.releaseRedactionTombstones).toHaveBeenCalledWith(["$o", "$reaction"]);
+        } finally {
+            other.stop();
+        }
+        vi.restoreAllMocks();
+        const fwd = await crawl([backward(ROOM, "t0"), forward(ROOM, "t1")], deletedAndEditedBatch());
+        try {
+            expect(fwd.manager.releaseRedactionTombstones).toHaveBeenCalledWith(["$o", "$reaction"]);
+        } finally {
+            fwd.stop();
+        }
+    });
+
+    it("a release that fails only logs: the crawl goes on with the continuation checkpoint", async () => {
+        const { manager, client, stop } = await crawl([backward(ROOM, "t0")], deletedAndEditedBatch(), {
+            releaseRedactionTombstones: vi.fn().mockRejectedValue(new Error("boom")),
+        });
+        try {
+            expect(manager.releaseRedactionTombstones).toHaveBeenCalledTimes(1);
+            expect(manager.addHistoricEvents).toHaveBeenCalledTimes(1); // not retried as a failed batch
+            expect(client.createMessagesRequest).toHaveBeenNthCalledWith(2, ROOM, "t-next", 100, "b");
+        } finally {
+            stop();
+        }
+    });
+});
+
 /**
  * Mock out the `createMessagesRequest` method on the client, with an implementation that will block until a resolver is called.
  *

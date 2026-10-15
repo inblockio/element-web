@@ -126,6 +126,18 @@ export interface IIndexStats {
      * polls {@link loading}.
      */
     isSearchPartial?: boolean;
+    /**
+     * How many redaction tombstones this backend currently holds: ids of redacted events whose edits, if they are
+     * delivered, must be dropped rather than rebuilt into a record (see {@link
+     * BaseEventIndexManager.releaseRedactionTombstones}). Bounded by the backend; absent means "backend keeps none"
+     * (desktop's Seshat), the same convention as {@link loading}.
+     */
+    redactionTombstones?: number;
+    /**
+     * How many redaction tombstones the backend has forgotten at its cap since this session started; non-zero means
+     * a deleted message's late edit can be indexed again. Absent means "not tracked".
+     */
+    redactionTombstonesEvicted?: number;
 }
 
 /**
@@ -308,6 +320,26 @@ export default abstract class BaseEventIndexManager {
      */
     public async shouldCrawl(checkpoint: ICrawlerCheckpoint, clientRoomRank?: number): Promise<boolean> {
         return true;
+    }
+
+    /**
+     * A BACKWARD crawl batch met these events already redacted, after the batch's own events were added; no edit of
+     * them can still arrive from this crawl.
+     *
+     * A backend that keeps redaction tombstones (ids of redacted events, kept so that a still-unredacted edit of a
+     * deleted message is not rebuilt into a record by a later back-fill) may forget the named ones. The crawler calls
+     * this only for a backward checkpoint, only after `addHistoricEvents` has returned for the same batch (the
+     * redaction, the edit and the original can share a batch, and the edit must be dropped first), and only when no
+     * other backward checkpoint for the same room is queued (a second crawl of the room would still need them). A
+     * failure here is logged and the crawl goes on: keeping a tombstone is the safe side. Forward batches never call
+     * it, since a forward crawl meets the original before its edits.
+     *
+     * The default does nothing, for a backend that keeps no tombstones.
+     *
+     * @param eventIds The ids of the events of the batch that were already redacted when the crawler fetched them.
+     */
+    public async releaseRedactionTombstones(eventIds: string[]): Promise<void> {
+        // Nothing is kept by default, so nothing is released.
     }
 
     /**

@@ -60,6 +60,15 @@ so a record cannot be re-filed under another user or chunk id and still decrypt,
 against deletion or rollback. Section 7 records that this closes the leak schema v2 had to admit, where a
 cleartext `eventId` disclosed which rooms were indexed to anyone able to map event ids back to rooms.
 
+**The redaction-tombstone row.** To keep a deleted, edited message deleted (the "S1" subsection of section 7),
+the manager keeps every id a redaction ever named, and persists the set as one more encrypted `meta` row. Its
+key is `userId` plus a purpose tag (`redactionTombstones`), never a room or event id; the ids are inside the
+ciphertext, AAD-bound to the key like every other row. What the row adds to the disclosure is that it exists
+and, from its length, roughly how many ids it holds (at most `REDACTION_TOMBSTONES_MAX`, 4,096): the same
+equality-and-count residue the checkpoints have. Unlike the parked-redactions row it is not a transient to-do
+list, so on a profile that deletes messages it is usually present. It is deleted with the rest of the user's
+rows on logout and on every wipe.
+
 **Migration is a reset, not a conversion.** A v1 or v2 database is dropped in `onupgradeneeded`, inside
 the same `versionchange` transaction that bumps the schema version, before any application code including
 this class ever reads from it, so there is no window of any length in which a live `events` store with
@@ -782,6 +791,60 @@ rather than open-ended precisely because increment C landed first: a reset re-cr
 `CRAWL_WINDOW_DAYS` in at most `CRAWL_ROOM_CAP` rooms, not the account's whole history. The conversion code
 remains on its own branch for reference and is not part of what ships.
 
+### S1. A deleted, edited message stays deleted
+
+**The defect.** Element redacts the original of an edited message only; the server never redacts the edit.
+A backward crawl delivers the newest events first, so it meets the redaction before the edit. The redaction
+finds nothing indexed and does nothing, and the edit, still unredacted, was then rebuilt into a record under
+the original's id with its edited text, while the original itself arrives redacted and is filtered out. The
+same ending was reached by a later back-fill that delivers the edit of a message that had been indexed and
+deleted. A search result then carried the text of a message the timeline shows as deleted.
+
+**The mechanism.** `deleteEvent` always records the id it is given, exactly as named and never as the record
+it resolved to, in a tombstone set; whether or not a record was found, and whether or not the index is
+hydrating. An arriving event whose own id, or the id of the message it edits, is a tombstone is dropped
+before it can create or change a record. That gate sits at the top of `upsertEvent`, in `addEventToIndex`
+ahead of the on-demand disk pull, and at the top of `addHistoricEvents`' per-event loop, which has a path that
+changes an unedited record without going through `upsertEvent`. A dropped event never makes
+`addHistoricEvents` report "all already indexed", so a drop cannot end a crawl early. Records restored from
+disk (hydration, an on-demand pull, the cold scan) are not gated: the set decides what may arrive, not what
+is already stored.
+
+**The release.** A tombstone is released when a backward crawl meets the id already redacted. The original
+is older than every edit of it, so a backward crawl that has reached the original has already delivered the
+edits it is going to deliver. `EventIndex.crawlerFunc` calls `releaseRedactionTombstones` with the ids of
+the events of a backward batch that were already redacted, after `addHistoricEvents` has returned for the
+same batch (the redaction, the edit and the original can share a batch, and the edit has to be dropped
+first), and only when no other backward checkpoint for the same room is queued. A forward crawl never
+releases, because it meets the original before its edits. A failing release is logged and keeps the
+tombstones, which is the safe side.
+
+**Persistence and bound.** The set is mirrored to one encrypted row, written through the persist chain so
+that a tombstone is durable before the crawler batch write that follows it, loaded in the manifest phase as a
+union with anything recorded before the load, and capped at `REDACTION_TOMBSTONES_MAX` entries, FIFO over
+insertion order (recording an id again moves it to the newest end). An arrival that could be dropped waits
+for the load rather than being checked against a partial set, and the row is not written while it is unread,
+so a partial set cannot replace it. Evictions are counted (`redactionTombstonesEvicted` in the stats), and
+the first of a session is logged once with the count and the cap. What stays in the set in steady state is
+what no backward crawl will meet again soon: targets beyond the crawl window, live redactions of events that
+are not crawled again (mostly un-reacts and deletions made in this session), and the redactions of a crawl in
+flight. The ids a crawl does meet redacted are released as it meets them, which is why the crawler's own
+junk, redacted reactions and events this index never held, does not push a real tombstone out.
+
+**Limitations.**
+
+- **The cap.** An account that redacts more than `REDACTION_TOMBSTONES_MAX` events that no backward crawl
+  visits, between a deletion and the late edit it has to catch, loses the oldest tombstones. The edit of such
+  a message is then rebuilt into a record again. `redactionTombstonesEvicted` above zero is that state.
+- **Forward crawl.** A forward crawl delivers an edit before the redaction of its original. Until the
+  redaction is met the edit is searchable, as it always was; once the redaction is met, `deleteEvent` removes
+  the record. This is unchanged.
+- **A late federated edit.** An edit that reaches the server after a backward crawl released the tombstone
+  of its original is not recognised: nothing marks the original as deleted any more. The window is the delay
+  of federation, after the crawl has already walked past the original.
+- **Profiles that already resurrected a message.** A profile that rebuilt a deleted message from its edit on
+  the old code keeps that record until its index is reset. Nothing here heals it.
+
 ## 8. Degradation policy
 
 The order below is the order in which pressure arrives, not an order of severity.
@@ -836,6 +899,7 @@ counts below are for intuition and are not what the code checks.
 | `RESIDENT_BYTES_PER_EVENT_ESTIMATE`                      | 1,024 B                              | same                                | rounds the measured 869 to 914 B per event (B13) up for headroom. Flat per event rather than weighted by text length, because the measured cost is close to a per-event constant                      |
 | `MANIFEST_BYTES_PER_ENTRY_ESTIMATE`                      | 160 B                                | same                                | rounds the measured 136.7 to 171.1 B per entry up, same convention                                                                                                                                    |
 | `LIVE_WRITE_FLUSH_INTERVAL_MS` / `LIVE_WRITE_BUFFER_MAX` | 5,000 ms / 300 events                | same                                | Seshat's `COMMIT_TIME`, converged practice 5; 300 sits inside the measured 200 to 500 records per transaction band                                                                                    |
+| `REDACTION_TOMBSTONES_MAX`                               | 4,096 ids                            | same                                | FIFO cap on the redaction tombstones of section 7 (S1): about 200 KiB of encrypted row. Past it the oldest is forgotten, counted, and logged once per session                                         |
 | `VOCABULARY_MERGE_THRESHOLD`                             | 2,000 terms                          | same                                | at the corpus's own growth rate this merges roughly once per 13,000 indexed events, and the merge is 17.28 ms at V of 200,000                                                                         |
 
 `CHUNK_TARGET_BYTES` deserves its caveat spelled out, because the evidence is weaker than a single number
