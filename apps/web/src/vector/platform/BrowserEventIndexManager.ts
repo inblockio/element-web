@@ -1557,9 +1557,22 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * events, recomputed from {@link chunkMembers} and the manifest every time the chunk is rewritten
      * (cheap: a chunk holds on the order of {@link CHUNK_TARGET_BYTES} / one event's worth of
      * entries, tens of them, never thousands). `minTs` is what {@link diskChunkHeap} orders by --
-     * schema v3's disk budget deletes whole chunks, oldest-chunk-first, not individual events.
+     * schema v3's disk budget deletes whole chunks, oldest-chunk-first, not individual events. An entry exists only
+     * for a chunk whose row exists: a reader that finishes after its chunk was deleted must not add one back (see
+     * {@link deletedChunkIds}).
      */
     private readonly chunkInfo = new Map<number, { bytes: number; minTs: number; maxTs: number }>();
+    /**
+     * Ids of the chunks whose row this session deleted ({@link enqueueDeleteRecord} emptying one, {@link
+     * deleteRecordsForDiskBudget}) and has not written since. {@link readChunkEntries} and {@link hydrate}'s walk
+     * set {@link chunkInfo} and {@link diskChunkHeap} for a chunk after an awaited read and decrypt, guarded only
+     * by `!chunkInfo.has`; a chunk deleted during that await would otherwise get a ghost entry for a row that no
+     * longer exists, which a later {@link enforceDiskBudget} selects and subtracts from {@link ciphertextBytes} a
+     * second time. Chunk ids are never reused within a session ({@link allocateChunkId} only grows), so an id in
+     * this set stays absent from disk; the readers skip it, and {@link deleteRecordsForDiskBudget} refuses to
+     * subtract it again. Bounded by the number of chunks deleted in one session; cleared by {@link clearIndexMaps}.
+     */
+    private readonly deletedChunkIds = new Set<number>();
     /**
      * chunkId -> the event ids currently packed into that chunk, per the manifest ({@link
      * ManifestEntry.chunkId}). Maintained alongside {@link manifest} by {@link manifestAdd}/{@link
@@ -1608,7 +1621,8 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * ({@link deleteRecordsForDiskBudget}), not individual events, so this is a heap of chunks, not
      * of records the way schema v2's equivalent (`diskTsHeap`) was. Populated wherever {@link
      * chunkInfo} is; a popped entry is checked against {@link chunkInfo}'s current `minTs` before
-     * being trusted, the same staleness discipline {@link residentHeap} uses against {@link events}.
+     * being trusted, the same staleness discipline {@link residentHeap} uses against {@link events}. Like {@link
+     * chunkInfo}, it never receives an entry for a chunk in {@link deletedChunkIds}.
      *
      * **A chunk can have several live entries.** An entry is pushed on every rewrite of its chunk, and a
      * rewrite that leaves `maxTs` unchanged (a backward crawl rewriting the open chunk on every batch, an edit
@@ -4151,9 +4165,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 this.ciphertextBytes = newTotal;
                 this.noteChunkForDiskHeal(chunkId, newInfo?.bytes ?? null);
                 if (newInfo) {
+                    this.deletedChunkIds.delete(chunkId); // The row exists again (a rewrite of a chunk this session had deleted).
                     this.chunkInfo.set(chunkId, newInfo);
                     heapPushTs(this.diskChunkHeap, { ts: newInfo.maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
                 } else {
+                    this.deletedChunkIds.add(chunkId); // Same task as the commit: a reader resuming later sees it.
                     this.chunkInfo.delete(chunkId);
                     if (wasOpen) {
                         this.openChunkId = undefined;
@@ -4444,7 +4460,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * residentHeap}/`recordBytes` docstring called "durable by definition the moment it is
      * decrypted". Guarded by `!chunkInfo.has(chunkId)`: only the *first* time this session sees a
      * chunk, never overwriting what a write path (which runs serialized, always current) already
-     * knows with what could be a stale read racing that write's own in-flight commit.
+     * knows with what could be a stale read racing that write's own in-flight commit. Also skipped for a chunk in
+     * {@link deletedChunkIds}: the row this read saw may have been deleted while it was decrypting, and its
+     * bookkeeping would then describe bytes that are no longer on disk.
      */
     private async readChunkEntries(userId: string, dek: CryptoKey, chunkId: number): Promise<Map<string, StoredEvent>> {
         if (!this.db) return new Map();
@@ -4454,7 +4472,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         if (!row) return new Map();
         const arr = await decryptBinaryJson<Array<[string, StoredEvent]>>(dek, row.blob, chunkAad(userId, chunkId));
         const entries = new Map(arr);
-        if (!this.chunkInfo.has(chunkId)) {
+        if (!this.chunkInfo.has(chunkId) && !this.deletedChunkIds.has(chunkId)) {
             const { minTs, maxTs } = tsRangeOf(entries);
             this.chunkInfo.set(chunkId, { bytes: row.blob.ct.length + row.blob.iv.length, minTs, maxTs });
             heapPushTs(this.diskChunkHeap, { ts: maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
@@ -4669,6 +4687,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.oldestIndexedTs = newOldest;
         for (const u of chunkInfoUpdates) {
             this.noteChunkForDiskHeal(u.chunkId, u.bytes);
+            this.deletedChunkIds.delete(u.chunkId); // The row exists (again): see deletedChunkIds.
             this.chunkInfo.set(u.chunkId, { bytes: u.bytes, minTs: u.minTs, maxTs: u.maxTs });
             heapPushTs(this.diskChunkHeap, { ts: u.maxTs, id: String(u.chunkId) }); // D4: order by maxTs, not minTs.
         }
@@ -5166,7 +5185,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                             return;
                         }
                         this.materializingChunks.delete(chunkId);
-                        if (!this.chunkInfo.has(chunkId)) {
+                        // fetchedRows is a snapshot and the decrypt above is awaited: the chunk may have been deleted
+                        // since (deletedChunkIds), in which case it has no bookkeeping to create.
+                        if (!this.chunkInfo.has(chunkId) && !this.deletedChunkIds.has(chunkId)) {
                             const { minTs, maxTs } = tsRangeOf(chunkEntries);
                             this.chunkInfo.set(chunkId, {
                                 bytes: row.blob.ct.length + row.blob.iv.length,
@@ -5786,7 +5807,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // many times a caller names it.
         const chunkIds = Array.from(new Set(requestedChunkIds));
         let newTotal = this.ciphertextBytes;
-        for (const chunkId of chunkIds) newTotal -= this.chunkInfo.get(chunkId)?.bytes ?? 0;
+        // A chunk already deleted this session is not on disk and is not in the total: whatever chunkInfo says about
+        // it is a ghost (see deletedChunkIds), and subtracting it would make the persisted total under-count.
+        for (const chunkId of chunkIds) {
+            if (!this.deletedChunkIds.has(chunkId)) newTotal -= this.chunkInfo.get(chunkId)?.bytes ?? 0;
+        }
 
         // Maintained here too, per the manifest's own docstring: every event of a chunk genuinely
         // leaving disk must leave the manifest, or hydrate() would later try (and harmlessly fail) to
@@ -5829,6 +5854,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.diskBudgetDropped = true;
         for (const chunkId of chunkIds) {
             this.noteChunkForDiskHeal(chunkId, null);
+            this.deletedChunkIds.add(chunkId);
             this.chunkInfo.delete(chunkId);
             if (chunkId === this.openChunkId) {
                 // The open chunk itself was old enough to be dropped (a long-idle session, or a very
@@ -6106,6 +6132,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.ciphertextBytes = 0;
         this.diskHealRun = null; // A recount in flight belongs to the state being thrown away.
         this.chunkInfo.clear();
+        this.deletedChunkIds.clear();
         this.chunkMembers.clear();
         this.residentHeap.length = 0;
         this.diskChunkHeap.length = 0;

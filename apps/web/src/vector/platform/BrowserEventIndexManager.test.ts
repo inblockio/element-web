@@ -8039,6 +8039,154 @@ describe("BrowserEventIndexManager (DC: disk-byte accounting stays exact)", () =
         expect((await metaRow()).diskBytes).toBe(after);
     });
 
+    /**
+     * Hold the first decrypt of chunk `chunkId`'s ciphertext (recognised by its AAD) until `release()` is called;
+     * every other decrypt, including a later one of the same chunk, runs straight through. `entered` settles once the
+     * held decrypt has started, i.e. once its caller has read the row and is suspended before touching any state.
+     */
+    function holdChunkDecrypt(chunkId: number): { entered: Promise<void>; release: () => void; restore: () => void } {
+        const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+        const aad = chunkAad(userId, chunkId);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        let enter!: () => void;
+        const entered = new Promise<void>((resolve) => (enter = resolve));
+        let held = false;
+        const spy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+            const params = args[0] as { additionalData?: BufferSource };
+            if (!held && params.additionalData && new TextDecoder().decode(params.additionalData) === aad) {
+                held = true;
+                enter();
+                await gate;
+            }
+            return realDecrypt(...(args as Parameters<typeof realDecrypt>));
+        });
+        return { entered, release, restore: () => spy.mockRestore() };
+    }
+
+    /** Run one disk-budget pass on the persist chain and let it finish. */
+    async function runBudgetPass(m: BrowserEventIndexManager, diskBudgetBytes: number): Promise<void> {
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes });
+        await internals(m).enforceDiskBudgetOnChain(userId, internals(m).hydrationEpoch);
+    }
+
+    /** The ways a chunk can be deleted while a reader is suspended between its read and its bookkeeping. */
+    const DELETERS: Array<[string, (m: BrowserEventIndexManager, chunkId: number) => Promise<void>]> = [
+        [
+            "a redaction empties it",
+            async (m, chunkId) => {
+                expect(await m.deleteEvent(`$e${String(chunkId).padStart(3, "0")}`)).toBe(true); // chunk i holds event i
+                await internals(m).persistChain; // the chunk rewrite (here: its deletion) is a queued operation
+            },
+        ],
+        [
+            "the disk budget deletes it",
+            async (m, chunkId) => {
+                await internals(m).deleteRecordsForDiskBudget(userId, [chunkId]);
+            },
+        ],
+    ];
+
+    /** How many disk-chunk heap entries name `chunkId`. Entries pushed by earlier writes stay (stale) after a delete. */
+    const heapEntriesFor = (m: BrowserEventIndexManager, chunkId: number): number =>
+        internals(m).diskChunkHeap.filter((e: { id: string }) => e.id === String(chunkId)).length;
+
+    /**
+     * After a chunk was deleted under a reader and the reader finished: it added no bookkeeping (`heapEntriesBefore`
+     * is the heap's count for that chunk taken while the reader was still suspended), and a budget pass leaves counted
+     * bytes equal to real ones.
+     */
+    async function expectNoGhostAndExactBytes(
+        m: BrowserEventIndexManager,
+        deletedChunkId: number,
+        heapEntriesBefore: number,
+    ): Promise<void> {
+        expect(internals(m).chunkInfo.has(deletedChunkId)).toBe(false);
+        expect(heapEntriesFor(m, deletedChunkId)).toBe(heapEntriesBefore);
+
+        const realBefore = await realChunkBytes();
+        expect(internals(m).ciphertextBytes).toBe(realBefore); // the deletion itself was counted exactly once
+        await runBudgetPass(m, Math.floor(realBefore / 2));
+        const realAfter = await realChunkBytes();
+        expect(realAfter).toBeLessThan(realBefore); // the pass did evict, so it had candidates to choose from
+        expect(internals(m).ciphertextBytes).toBe(realAfter);
+        expect((await metaRow()).diskBytes).toBe(realAfter);
+    }
+
+    describe.each(DELETERS)("a chunk deleted while a reader awaits its decrypt (%s)", (_name, deleteChunk) => {
+        it("readChunkEntries does not re-create bookkeeping for the deleted chunk", async () => {
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            await m.waitForHydration();
+            await seedOneChunkPerEvent(m, 4);
+            expect(internals(m).ciphertextBytes).toBe(await realChunkBytes());
+
+            const hold = holdChunkDecrypt(0);
+            let heapEntriesBefore = -1;
+            try {
+                const reader = internals(m).readChunkEntries(userId, internals(m).dek, 0);
+                await hold.entered; // the row is read; the reader is suspended before it records anything
+                await deleteChunk(m, 0);
+                expect((await dumpRawStore("chunks")).some((r) => r.userId === userId && r.chunkId === 0)).toBe(false);
+                heapEntriesBefore = heapEntriesFor(m, 0);
+                hold.release();
+                await reader;
+            } finally {
+                hold.release();
+                hold.restore();
+            }
+
+            await expectNoGhostAndExactBytes(m, 0, heapEntriesBefore);
+        });
+    });
+
+    it("hydration's walk does not re-create bookkeeping for a chunk the disk budget deleted under its decrypt", async () => {
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        await seedOneChunkPerEvent(seed, 4);
+        await seed.closeEventIndex();
+
+        const m = track(new BrowserEventIndexManager());
+        const hold = holdChunkDecrypt(1);
+        let heapEntriesBefore = -1;
+        try {
+            await m.initEventIndex(userId, DEVICE);
+            await hold.entered; // the walk has read chunk 1's row and is suspended on its decrypt
+            // Another reader makes the chunk known to this session first, as the budget only ever selects chunks the
+            // session knows; then the chunk goes away under the walk. (A redaction cannot empty it here: its read of
+            // the not-yet-hydrated chunk shares the walk's own in-flight decrypt, see decryptChunkOnce.)
+            await internals(m).readChunkEntries(userId, internals(m).dek, 1);
+            await internals(m).deleteRecordsForDiskBudget(userId, [1]);
+            heapEntriesBefore = heapEntriesFor(m, 1);
+            hold.release();
+            await m.waitForHydration();
+        } finally {
+            hold.release();
+            hold.restore();
+        }
+
+        await expectNoGhostAndExactBytes(m, 1, heapEntriesBefore);
+    });
+
+    it("deleteRecordsForDiskBudget does not subtract a chunk it has already deleted, even if bookkeeping reappeared", async () => {
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await seedOneChunkPerEvent(m, 3);
+        await internals(m).deleteRecordsForDiskBudget(userId, [0]);
+        const after = await realChunkBytes();
+        expect(internals(m).ciphertextBytes).toBe(after);
+
+        // A ghost entry for the deleted chunk, as a late reader used to leave behind.
+        internals(m).chunkInfo.set(0, { bytes: 123, minTs: 1, maxTs: 2 });
+        await internals(m).deleteRecordsForDiskBudget(userId, [0]);
+
+        expect(internals(m).ciphertextBytes).toBe(after);
+        expect((await metaRow()).diskBytes).toBe(after);
+        expect(internals(m).chunkInfo.has(0)).toBe(false);
+    });
+
     describe("the one-time disk-byte recount", () => {
         it("corrects a drifted total after a reload, without making initEventIndex wait for it", async () => {
             const { real } = await seedDriftedProfile(6, 777);
