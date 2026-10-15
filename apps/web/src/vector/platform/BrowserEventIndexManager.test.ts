@@ -9112,5 +9112,39 @@ describe("BrowserEventIndexManager (DC: disk-byte accounting stays exact)", () =
             expect(after.diskBytesHealed).toBeUndefined(); // so the next session tries again
             expect(internals(reloaded).ciphertextBytes).toBe(0);
         });
+
+        it("and setUserVersion landing during it both keep their write (H3)", async () => {
+            const { real } = await seedDriftedProfile(6, 777);
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            const healed = reloaded.waitForDiskBytesHeal();
+
+            // Hold setUserVersion's write after it has read the row, until the recount has committed its own. Once
+            // that write is ordered on the persist chain the recount waits behind it instead, so the hold also ends
+            // after a short real-time bound; either way the two writes must not overwrite each other.
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const realSave = internals(reloaded).saveMeta;
+            vi.spyOn(internals(reloaded), "saveMeta").mockImplementation(async function (
+                this: BrowserEventIndexManager,
+                meta: any,
+            ) {
+                if (meta.userVersion === 7) await gate;
+                return realSave.call(this, meta);
+            });
+            const setting = reloaded.setUserVersion(7);
+            await Promise.race([healed, sleep(300)]);
+            release();
+            await setting;
+            await reloaded.waitForDiskBytesHeal();
+            await internals(reloaded).persistChain;
+
+            const row = await metaRow();
+            expect(row.userVersion).toBe(7);
+            expect(row.diskBytesHealed).toBe(true);
+            expect(row.diskBytes).toBe(real);
+            expect(internals(reloaded).ciphertextBytes).toBe(real);
+            expect(await reloaded.getUserVersion()).toBe(7);
+        });
     });
 });

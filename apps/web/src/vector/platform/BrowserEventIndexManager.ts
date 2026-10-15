@@ -2642,19 +2642,30 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
-     * Record the caller's schema version; see {@link BaseEventIndexManager.setUserVersion}. Written straight through to
-     * the `meta` row rather than onto the persistence chain, because the caller expects it to have taken effect when
-     * the promise resolves. Skipped when there is no existing row to update.
+     * Record the caller's schema version; see {@link BaseEventIndexManager.setUserVersion}. The `meta` row is updated
+     * by an operation on {@link persistChain}, and the promise resolves once that operation has run, so the caller
+     * still sees it in effect when it resolves. On the chain because every other writer of the row reads it and puts
+     * it back whole from there (a flush, a record deletion, a budget pass, the last slice of {@link healDiskBytes}): a
+     * read and write of the row off the chain could interleave with one of those, and whichever put landed second
+     * would discard the other's change (the recount's figure and flag, or this version, which a later start reads to
+     * decide whether to wipe the index). Nothing on the chain waits for a caller of this method, so it cannot
+     * deadlock. Skipped when there is no existing row to update, or when the session has changed by the time the
+     * operation runs.
      */
     public async setUserVersion(version: number): Promise<void> {
         this.userVersion = version;
-        if (this.persistEnabled && this.db && this.userId) {
-            const meta = await this.loadMeta(this.userId);
-            if (meta) {
-                meta.userVersion = version;
-                await this.saveMeta(meta);
-            }
-        }
+        if (!this.persistEnabled || !this.db || !this.userId) return;
+        const userId = this.userId;
+        const epoch = this.hydrationEpoch;
+        const stale = (): boolean =>
+            this.closed || epoch !== this.hydrationEpoch || this.userId !== userId || !this.persistEnabled;
+        await this.enqueuePersistResult(async () => {
+            if (stale()) return;
+            const meta = await this.loadMeta(userId);
+            if (!meta || stale()) return;
+            meta.userVersion = version;
+            await this.saveMeta(meta);
+        });
     }
 
     /**
