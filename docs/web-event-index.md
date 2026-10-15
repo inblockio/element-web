@@ -50,8 +50,10 @@ chunkId]`, where `chunkId` is a per-user monotonic counter with no relationship 
 timestamp, and every event the chunk holds, ids included, lives inside its ciphertext. Checkpoint records
 are keyed by an HMAC of the checkpoint tuple, so no room id, token or direction is on disk in the clear,
 though equality and count still are. The `meta` store carries `userId`, the salt, `userVersion` and small
-scalar bookkeeping (chunk and page counts, the open chunk id); the manifest pages and the oldest-indexed
-timestamp live there as their own encrypted rows. What remains is shape: the number of chunk records
+scalar bookkeeping (chunk and page counts, the open chunk id, the persisted disk-byte total, and a
+`diskBytesHealed` flag that reveals only that the one-time recount of that total, described in section 7
+under D-core, has nothing left to do); the manifest pages and the oldest-indexed timestamp live there as
+their own encrypted rows. What remains is shape: the number of chunk records
 approximates events divided by events per chunk, and each ciphertext length the size of the events it
 packs, which is coarser than schema v2's one length per event. Every record is AAD-bound to its own key,
 so a record cannot be re-filed under another user or chunk id and still decrypt, which is no defence
@@ -703,6 +705,34 @@ comparable for that reason. The 500k figure is two runs that agree within 0.2%. 
 never exceeded settled heap by more than 3.3%, against the 15% that B17's experiment asked for, which
 settles the paged-read half of that assumption.
 
+**Disk-byte accounting stays exact, and a profile that drifted is recounted once.** The disk budget is
+enforced against `ciphertextBytes`, which is persisted as `meta.diskBytes` in the same transaction as every
+chunk write and delete and restored from there at init, so an error in it is never forgotten: it is
+reloaded and compounds. One such error was found by a memory audit. The disk-chunk heap gets an entry on
+every chunk rewrite, including rewrites that leave the chunk's `maxTs` unchanged (a backward crawl
+rewrites the open chunk on every batch, and an edit or a redaction rewrites a sealed one), and
+`enforceDiskBudget` skipped an entry only when its chunk was gone or its `maxTs` had moved. A chunk with
+several live entries was therefore selected once per entry, and its bytes were subtracted once per
+selection. After one pass over a 40-batch backward crawl the index counted 21,860 B against 34,252 B on
+disk, against a budget of 23,146 B, and the manifest ceiling above, which is self-enforcing only through
+`diskBudgetBytes`, eroded with the count. The fix selects each chunk once (a set of chosen ids in
+`enforceDiskBudget`) and, defensively, deduplicates the ids `deleteRecordsForDiskBudget` is given. The heap
+itself still grows by one entry per rewrite; bounding that is separate work.
+
+Profiles that already went through a budget pass may persist a total below the truth, so a one-time recount
+heals them: it sums `ct.length + iv.length` over the user's `chunks` rows without decrypting anything,
+writes the exact figure to `meta.diskBytes` and sets `meta.diskBytesHealed`, and so runs at most once per
+profile. A brand-new profile (and one reset by a schema migration or a wipe) is created with the flag set
+and never scans. The recount is chained behind hydration with a yield in between, so it is never on the
+app-start path and `initEventIndex` never waits for it. It runs as slices of 32 rows, each its own
+operation on the persist chain, so it never holds the main thread for more than the clone of about 1.5 MB.
+Between slices other writes run, and the recount stays exact because it keeps a per-chunk byte map for the
+chunks it has already read, which every chunk write, rewrite and delete updates in the same task as its own
+commit; chunks above the cursor are read by later slices, and a new chunk always has an id above every
+existing one. There is no skip condition for profiles that "cannot have drifted": nothing persisted records
+whether a budget deletion ever ran (the encrypted `oldestIndexedTs` row is rewritten by every flush, and a
+redaction deletes chunks too), so every existing profile is recounted once.
+
 The storage layout also does what it was meant to do for disk. Measured as directory size against the
 manager's own ciphertext accounting, the overhead multiplier falls from 3.65x to 2.45x at the small tier,
 466.68 MiB down to 313.32 MiB, and from 3.21x to 2.28x at the desktop tier, 1,116.24 MiB down to
@@ -762,7 +792,7 @@ The order below is the order in which pressure arrives, not an order of severity
 | 1. Query truncation         | hits reach two pages                                                       | this query stops scanning                                                                 | a resume cursor                                                                          | Element's existing "more results" through `next_batch`                         |
 | 2. Hot-window bound         | resident bytes exceed `HOT_WINDOW_BYTES`                                   | the oldest resident events lose postings and payload                                      | they remain reachable through the cold scan, in milliseconds to hundreds of milliseconds | results keep arriving; nothing is hidden                                       |
 | 3. Crawl window or room cap | age beyond `CRAWL_WINDOW_DAYS`, or a room outside the top `CRAWL_ROOM_CAP` | those messages are never fetched                                                          | everything newer, and every capped room                                                  | "Search covers messages newer than {date}", plus a per-room "not indexed" note |
-| 4. Disk budget              | `ciphertextBytes` over `DISK_BUDGET_BYTES`, or `QuotaExceededError`        | the oldest chunks are deleted                                                             | the newest are retained                                                                  | the date in step 3 moves forward                                               |
+| 4. Disk budget              | `ciphertextBytes` over `DISK_BUDGET_BYTES`, or `QuotaExceededError`        | the oldest chunks are deleted, each counted once however many heap entries name it        | the newest are retained                                                                  | the date in step 3 moves forward                                               |
 | 5. Substring and CJK        | a scan exceeds the slice deadline                                          | the scan is spread across slices, never disabled                                          | correctness                                                                              | results arrive progressively; labs names CJK as scan-only                      |
 | 6. Small tier               | `navigator.deviceMemory` at 4 or below, or absent                          | smaller constants (section 9)                                                             | the same feature and the same code paths                                                 | the date in step 3 is nearer                                                   |
 

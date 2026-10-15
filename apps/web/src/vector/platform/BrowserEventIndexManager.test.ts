@@ -1559,6 +1559,7 @@ describe("BrowserEventIndexManager (IndexedDB backed)", () => {
         // derived from the manifest at open, never a cleartext meta field, and this exact key set is
         // what pins that it cannot come back.
         expect(Object.keys((await dumpRawStore("meta"))[0]).sort()).toEqual([
+            "diskBytesHealed", // reveals only that the disk-byte recount has nothing left to do
             "manifestPageCount",
             "nextChunkId",
             "salt",
@@ -4853,6 +4854,7 @@ describe("BrowserEventIndexManager (increment C: bounds)", () => {
             expect(await dumpRawKeys("meta")).toEqual([userId]);
             const metaRow = (await dumpRawStore("meta"))[0];
             expect(Object.keys(metaRow).sort()).toEqual([
+                "diskBytesHealed", // reveals only that the disk-byte recount has nothing left to do
                 "manifestPageCount",
                 "nextChunkId",
                 "salt",
@@ -7832,6 +7834,318 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(twin.count).toBe(1);
             expect(resultIds(await m.searchEventIndex(search("beta", { room_id: ROOM })))).toEqual(["$orig"]);
             expect(resultIds(await m.searchEventIndex(search("beta", { room_id: ROOM2 })))).toEqual([]);
+        });
+    });
+});
+
+describe("BrowserEventIndexManager (DC: disk-byte accounting stays exact)", () => {
+    const DEVICE = "DEVICE1";
+    const pickleKey = "unit-test-pickle-key";
+    const ROOM = "!dc:example.org";
+
+    let userCounter = 0;
+    let userId: string;
+    let toClose: BrowserEventIndexManager[] = [];
+
+    function track(m: BrowserEventIndexManager): BrowserEventIndexManager {
+        toClose.push(m);
+        return m;
+    }
+
+    /** The private accounting fields the assertions compare; read, never written, by these tests. */
+    const internals = (m: BrowserEventIndexManager): any => m as unknown as any;
+
+    /** Ciphertext bytes of every `chunks` row actually on disk for `forUser`, exactly as the accounting defines them. */
+    async function realChunkBytes(forUser = userId): Promise<number> {
+        const rows = (await dumpRawStore("chunks")).filter((r) => r.userId === forUser);
+        return rows.reduce((sum, r) => sum + r.blob.ct.length + r.blob.iv.length, 0);
+    }
+
+    /** Rewrite fields of this user's raw `meta` row, as an older build (or a drifted profile) would have left them. */
+    async function patchMeta(patch: Record<string, unknown>, remove: string[] = []): Promise<void> {
+        await withRawDb(async (db) => {
+            const tx = db.transaction("meta", "readwrite");
+            const store = tx.objectStore("meta");
+            const row = (await idbPromise(store.get(userId))) as Record<string, unknown>;
+            for (const key of remove) delete row[key];
+            store.put({ ...row, ...patch });
+            await new Promise<void>((resolve, reject) => {
+                tx.oncomplete = (): void => resolve();
+                tx.onerror = (): void => reject(tx.error);
+            });
+        });
+    }
+
+    async function metaRow(): Promise<any> {
+        return (await dumpRawStore("meta")).find((r) => r.userId === userId);
+    }
+
+    /** One event per chunk (chunk target of 1 byte), committed one at a time: chunk i holds event i. */
+    async function seedOneChunkPerEvent(m: BrowserEventIndexManager, n: number): Promise<void> {
+        setChunkTargetBytesOverrideForTesting(1);
+        for (let i = 0; i < n; i++) {
+            await m.addEventToIndex(
+                msg(`$e${String(i).padStart(3, "0")}`, `dc body number ${i} lorem ipsum`, {
+                    origin_server_ts: 1_000_000 + i,
+                }),
+                {},
+            );
+            await m.commitLiveEvents();
+        }
+    }
+
+    /**
+     * Count the disk-byte recount's reads: a `getAll(range, count)` on `chunks`. Nothing else in the class reads that
+     * store this way (hydration uses `get`), and this file's own `dumpRawStore` calls `getAll()` with no arguments.
+     * `onScan` runs synchronously inside the call, i.e. while that slice's persist-chain operation is in flight.
+     */
+    function spyOnChunkScans(onScan?: (n: number) => void): { count: () => number } {
+        const realGetAll = IDBObjectStore.prototype.getAll;
+        let n = 0;
+        vi.spyOn(IDBObjectStore.prototype, "getAll").mockImplementation(function (
+            this: IDBObjectStore,
+            ...args: Parameters<IDBObjectStore["getAll"]>
+        ): IDBRequest {
+            if (this.name === "chunks" && args.length >= 2) {
+                n++;
+                onScan?.(n);
+            }
+            return realGetAll.apply(this, args);
+        });
+        return { count: () => n };
+    }
+
+    /** A profile an older build left behind: `diskBytes` off by `drift`, and no `diskBytesHealed` flag. */
+    async function seedDriftedProfile(chunks: number, drift: number): Promise<{ real: number }> {
+        const seed = track(new BrowserEventIndexManager());
+        await seed.initEventIndex(userId, DEVICE);
+        await seed.waitForHydration();
+        await seedOneChunkPerEvent(seed, chunks);
+        await seed.closeEventIndex();
+        const real = await realChunkBytes();
+        await patchMeta({ diskBytes: real - drift }, ["diskBytesHealed"]);
+        return { real };
+    }
+
+    beforeEach(() => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        userId = `@dc${++userCounter}:example.org`;
+        mockPlatformPeg({ getPickleKey: vi.fn().mockResolvedValue(pickleKey) });
+        toClose = [];
+    });
+
+    afterEach(async () => {
+        setEventIndexBoundsOverrideForTesting(null);
+        setChunkTargetBytesOverrideForTesting(null);
+        for (const m of toClose.splice(0)) await m.closeEventIndex();
+        vi.unstubAllGlobals();
+        vi.restoreAllMocks();
+    });
+
+    it("P1: counted disk bytes equal the real chunk bytes after a budget pass over a backward crawl", async () => {
+        // A backward crawl rewrites the open chunk on every batch with an UNCHANGED maxTs (each batch is older
+        // than the last), so the disk-chunk heap collects one entry per rewrite for the same chunk. Before the
+        // dedupe, every such entry survived enforceDiskBudget's staleness check and the chunk's bytes were
+        // subtracted once per duplicate.
+        setChunkTargetBytesOverrideForTesting(1500);
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        let ts = 1_000_000;
+        for (let b = 0; b < 40; b++) {
+            const batch = [];
+            for (let i = 0; i < 3; i++) {
+                batch.push({
+                    event: msg(`$c${b}_${i}`, `crawl body ${b} ${i} lorem ipsum`, {
+                        room_id: ROOM,
+                        origin_server_ts: ts--,
+                    }),
+                    profile: {},
+                });
+            }
+            await m.addHistoricEvents(batch, null, null);
+        }
+        await m.commitLiveEvents();
+        const realBefore = await realChunkBytes();
+        expect(internals(m).ciphertextBytes).toBe(realBefore);
+
+        const budget = Math.floor(realBefore / 2);
+        setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: budget });
+        await m.addEventToIndex(msg("$live", "trigger flush", { room_id: ROOM, origin_server_ts: 2_000_000 }), {});
+        await m.commitLiveEvents();
+
+        const realAfter = await realChunkBytes();
+        expect(realAfter).toBeLessThan(realBefore); // the pass did evict
+        expect(internals(m).ciphertextBytes).toBe(realAfter);
+        expect((await metaRow()).diskBytes).toBe(realAfter);
+    }, 60000);
+
+    it("deleteRecordsForDiskBudget subtracts a chunk once however many times it is named", async () => {
+        const m = track(new BrowserEventIndexManager());
+        await m.initEventIndex(userId, DEVICE);
+        await m.waitForHydration();
+        await seedOneChunkPerEvent(m, 3);
+        const before = await realChunkBytes();
+        expect(internals(m).ciphertextBytes).toBe(before);
+        const chunk0Bytes = internals(m).chunkInfo.get(0).bytes;
+
+        await internals(m).deleteRecordsForDiskBudget(userId, [0, 0, 0]);
+
+        const after = await realChunkBytes();
+        expect(after).toBe(before - chunk0Bytes);
+        expect(internals(m).ciphertextBytes).toBe(after);
+        expect((await metaRow()).diskBytes).toBe(after);
+        expect(internals(m).chunkInfo.has(0)).toBe(false);
+        expect(internals(m).chunkInfo.has(1)).toBe(true);
+    });
+
+    describe("the one-time disk-byte recount", () => {
+        it("corrects a drifted total after a reload, without making initEventIndex wait for it", async () => {
+            const { real } = await seedDriftedProfile(6, 777);
+            const order: string[] = [];
+            const scans = spyOnChunkScans(() => order.push(`scan:hydrating=${internals(reloaded).hydrating}`));
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            order.push("init resolved");
+            // The drifted figure is what the index opens with; nothing has been recounted yet.
+            expect(scans.count()).toBe(0);
+            expect(internals(reloaded).ciphertextBytes).toBe(real - 777);
+
+            await reloaded.waitForHydration();
+            await reloaded.waitForDiskBytesHeal();
+
+            expect(scans.count()).toBeGreaterThan(0);
+            // After init returned, and only once hydration was over.
+            expect(order[0]).toBe("init resolved");
+            expect(order[1]).toBe("scan:hydrating=false");
+            expect(internals(reloaded).ciphertextBytes).toBe(real);
+            const row = await metaRow();
+            expect(row.diskBytes).toBe(real);
+            expect(row.diskBytesHealed).toBe(true);
+            expect((await reloaded.getStats()).size).toBe(real);
+        });
+
+        it("runs once per profile: the flag stops a second scan", async () => {
+            await seedDriftedProfile(6, 777);
+            const first = track(new BrowserEventIndexManager());
+            await first.initEventIndex(userId, DEVICE);
+            await first.waitForDiskBytesHeal();
+            await first.closeEventIndex();
+
+            const scans = spyOnChunkScans();
+            const second = track(new BrowserEventIndexManager());
+            await second.initEventIndex(userId, DEVICE);
+            await second.waitForHydration();
+            await second.waitForDiskBytesHeal();
+            expect(scans.count()).toBe(0);
+            expect(internals(second).ciphertextBytes).toBe(await realChunkBytes());
+        });
+
+        it("never scans a brand-new profile, which is created already marked as recounted", async () => {
+            const scans = spyOnChunkScans();
+            const m = track(new BrowserEventIndexManager());
+            await m.initEventIndex(userId, DEVICE);
+            expect((await metaRow()).diskBytesHealed).toBe(true);
+            await m.waitForHydration();
+            await seedOneChunkPerEvent(m, 3);
+            await m.waitForDiskBytesHeal();
+            expect(scans.count()).toBe(0);
+            await m.closeEventIndex();
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+            await reloaded.waitForDiskBytesHeal();
+            expect(scans.count()).toBe(0);
+        });
+
+        it("stays exact when chunk writes, rewrites and deletes land between two slices", async () => {
+            // 70 chunks: three slices of 32 rows (32 + 32 + 6), so there is a gap before and after the middle one.
+            const { real } = await seedDriftedProfile(70, 1234);
+            let landed: Promise<void> | undefined;
+            const scans = spyOnChunkScans((n) => {
+                if (n !== 1) return;
+                // Kicked off while the first slice (chunks 0..31) is reading; every operation below reaches the
+                // persist chain behind it and ahead of the second slice, which is only queued once the first is done.
+                landed = (async (): Promise<void> => {
+                    await reloaded.deleteEvent("$e000"); // chunk 0, already covered: its entry must go
+                    await reloaded.addEventToIndex(edit("$ed1", "$e001", "edited in the first range"), {}); // chunk 1: rewritten, covered
+                    await reloaded.addEventToIndex(edit("$ed2", "$e060", "edited in the second range"), {}); // chunk 60: not yet covered
+                    await reloaded.addEventToIndex(
+                        msg("$new", "a brand new chunk", { origin_server_ts: 2_000_000 }),
+                        {},
+                    );
+                    await reloaded.commitLiveEvents();
+                })();
+            });
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+            await reloaded.waitForDiskBytesHeal();
+            await landed;
+            await reloaded.commitLiveEvents();
+
+            expect(scans.count()).toBeGreaterThanOrEqual(3);
+            const rows = (await dumpRawStore("chunks")).filter((r) => r.userId === userId);
+            expect(rows.some((r) => r.chunkId === 0)).toBe(false); // the delete landed
+            expect(rows.some((r) => r.chunkId >= 70)).toBe(true); // so did the new chunk (ids 0..69 were the seed's)
+            const realNow = await realChunkBytes();
+            expect(realNow).not.toBe(real); // the writes really changed the total the scan started from
+            expect(internals(reloaded).ciphertextBytes).toBe(realNow);
+            const row = await metaRow();
+            expect(row.diskBytes).toBe(realNow);
+            expect(row.diskBytesHealed).toBe(true);
+        });
+
+        it("stays exact when a budget deletion lands between two slices", async () => {
+            const { real } = await seedDriftedProfile(70, 1234);
+            const scans = spyOnChunkScans((n) => {
+                if (n !== 1) return;
+                // A budget that fits about half the chunks, then a write to run the pass: it deletes the oldest
+                // chunks, all of them already covered by the first slice.
+                setEventIndexBoundsOverrideForTesting({ diskBudgetBytes: Math.floor(real / 2) });
+                void (async (): Promise<void> => {
+                    await reloaded.addEventToIndex(
+                        msg("$trigger", "run the budget pass", { origin_server_ts: 3_000_000 }),
+                        {},
+                    );
+                    await reloaded.commitLiveEvents();
+                })();
+            });
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+            await reloaded.waitForDiskBytesHeal();
+            await reloaded.commitLiveEvents();
+
+            expect(scans.count()).toBeGreaterThanOrEqual(3);
+            const realNow = await realChunkBytes();
+            expect(realNow).toBeLessThan(real); // chunks really were deleted
+            expect(internals(reloaded).ciphertextBytes).toBe(realNow);
+            expect((await metaRow()).diskBytes).toBe(realNow);
+        });
+
+        it("is abandoned, not completed into a dead session, when the index is closed mid-scan", async () => {
+            await seedDriftedProfile(70, 500);
+            const before = await metaRow();
+            const scans = spyOnChunkScans((n) => {
+                if (n === 1) void reloaded.closeEventIndex();
+            });
+
+            const reloaded = track(new BrowserEventIndexManager());
+            await reloaded.initEventIndex(userId, DEVICE);
+            await reloaded.waitForHydration();
+            await reloaded.waitForDiskBytesHeal();
+
+            expect(scans.count()).toBe(1); // no second slice once the session is gone
+            const after = await metaRow();
+            expect(after.diskBytes).toBe(before.diskBytes); // nothing written
+            expect(after.diskBytesHealed).toBeUndefined(); // so the next session tries again
+            expect(internals(reloaded).ciphertextBytes).toBe(0);
         });
     });
 });

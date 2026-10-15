@@ -56,7 +56,9 @@ Please see LICENSE files in the repository root for full details.
  *   a room with a crawl checkpoint but no indexed events yet is not disclosed at all, and a guessed room id cannot be
  *   confirmed offline by hashing it. What it does disclose is **equality and count**.
  * - `meta`: `userId`, the HKDF `salt`, `userVersion` and the small scalar bookkeeping fields on {@link MetaRecord}
- *   (chunk/page counts, the currently-open chunk id) -- all counts or ids, nothing content-shaped. Manifest pages
+ *   (chunk/page counts, the currently-open chunk id, the persisted disk-byte total and the {@link
+ *   MetaRecord.diskBytesHealed} flag, which reveals only that the one-time recount of that total has run) -- all
+ *   counts, ids or booleans, nothing content-shaped. Manifest pages
  *   ({@link ManifestPageRecord}), the persisted {@link BrowserEventIndexManager.oldestIndexedTs} row and, only while
  *   some redaction is still waiting for its record, the parked-redactions row ({@link pendingRedactionsKey}) live in
  *   this same store, keyed by a string that embeds `userId` and a page/purpose tag, never a room or event id. The
@@ -270,8 +272,25 @@ interface MetaRecord {
      * disclosure: the same total is already recoverable by an attacker with database read access
      * simply by summing every row's own ciphertext length (see the class threat model's "Shape"
      * bullet), which this field only saves them the arithmetic for.
+     *
+     * **Exact only if every writer kept it so, and one did not.** Until {@link
+     * BrowserEventIndexManager.enforceDiskBudget} learned to select a chunk once however many heap
+     * entries name it, a budget pass subtracted a chunk's bytes once per entry, so a profile that ever
+     * went through one may persist a total smaller than its rows add up to, and the shortfall
+     * compounded on every reload (the total is restored from here). {@link diskBytesHealed} marks the
+     * profiles whose total has been recomputed from the rows since.
      */
     diskBytes?: number;
+    /**
+     * `true` once {@link diskBytes} is known to equal the sum of this user's `chunks` rows: set at
+     * creation (a brand-new index has no drift to heal) and by the one-time recount that
+     * {@link BrowserEventIndexManager.healDiskBytes} runs in the background for a profile created
+     * before the accounting was fixed. Absent means "that recount has not run for this profile yet".
+     * Cleartext, like the rest of this row, and it discloses nothing beyond the fact that the recount
+     * ran (see the class threat model's "Shape" bullet: the total itself is already recoverable from
+     * the rows).
+     */
+    diskBytesHealed?: true;
     /**
      * Number of manifest pages currently persisted for this user (see {@link ManifestPageRecord}),
      * so {@link BrowserEventIndexManager.loadManifest} knows how many `manifest:<page>` rows to
@@ -801,9 +820,10 @@ function checkpointAad(userId: string, id: string): string {
  * sharing this store under a composite key (see {@link ManifestPageRecord}'s own docstring) is
  * deleted outright, since the manifest and chunk bookkeeping they describe no longer correspond to
  * anything on disk (see {@link resetMetaForV3}). `manifestPageCount`/`nextChunkId` are written back
- * as `0`, exactly as a fresh v3 install's own first {@link BrowserEventIndexManager.saveMeta} call
- * does, so the very next open takes the ordinary {@link BrowserEventIndexManager.loadManifest} path
- * rather than dispatching to a self-heal scan that has nothing left to scan.
+ * as `0` (and `diskBytesHealed` as `true`: no chunk row survives to be recounted), exactly as a fresh v3
+ * install's own first {@link BrowserEventIndexManager.saveMeta} call does, so the very next open takes the
+ * ordinary {@link BrowserEventIndexManager.loadManifest} path rather than dispatching to a self-heal scan
+ * that has nothing left to scan.
  */
 function migrateToV3(tx: IDBTransaction, db: IDBDatabase): void {
     if (db.objectStoreNames.contains("events")) db.deleteObjectStore("events");
@@ -839,6 +859,7 @@ function resetMetaForV3(meta: IDBObjectStore): void {
                 userVersion: rec.userVersion,
                 manifestPageCount: 0,
                 nextChunkId: 0,
+                diskBytesHealed: true, // No chunk rows survive the reset, so there is nothing to recount.
             });
         }
         cursor.continue();
@@ -949,6 +970,31 @@ const HYDRATION_CHUNK_BATCH = 64;
  *     clock forcing the deadline to have elapsed) rather than duplicating the literal `30`.
  */
 export const HYDRATION_SLICE_DEADLINE_MS = 30;
+
+/**
+ * Chunk rows one slice of the one-time disk-byte recount ({@link BrowserEventIndexManager.healDiskBytes}) reads
+ * in a single transaction. A chunk is about {@link CHUNK_TARGET_BYTES} of ciphertext, so a slice clones roughly
+ * 1.5 MB (a few milliseconds), and a 10,000-chunk profile (about 480 MB) takes some 300 slices, each its own
+ * persist-chain operation with a yield to the event loop after it: one transaction over the whole store would
+ * clone the entire database in a single task.
+ */
+const DISK_HEAL_SLICE_ROWS = 32;
+
+/** The state of one running disk-byte recount; see {@link BrowserEventIndexManager.healDiskBytes}. */
+interface DiskHealRun {
+    /** The {@link BrowserEventIndexManager.hydrationEpoch} this run belongs to. */
+    epoch: number;
+    /**
+     * chunkId -> ciphertext bytes, for every chunk id at or below {@link cursor}. Filled by the slices, and kept
+     * current by every chunk write/rewrite/delete that commits while the run is in flight
+     * ({@link BrowserEventIndexManager.noteChunkForDiskHeal}).
+     */
+    counts: Map<number, number>;
+    /** Highest chunk id a finished slice has covered, whether or not a row existed for every id below it. */
+    cursor: number;
+    /** Slices run so far. */
+    slices: number;
+}
 
 /**
  * The resident cost of one indexed event, for checking {@link
@@ -1465,9 +1511,25 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     /**
      * Running total of ciphertext bytes, reported as {@link getStats} `size`. Kept equal to the sum
      * of {@link chunkInfo}'s `bytes` rather than accumulated: a rewrite replaces a chunk's
-     * contribution instead of adding a second one.
+     * contribution instead of adding a second one, and a deletion (a redaction that empties a chunk,
+     * or {@link deleteRecordsForDiskBudget}) removes a chunk's contribution exactly once. Restored
+     * from {@link MetaRecord.diskBytes} at {@link initEventIndex}; a profile whose persisted total
+     * predates the dedupe in {@link enforceDiskBudget} is recounted once, in the background, by {@link
+     * healDiskBytes}.
      */
     private ciphertextBytes = 0;
+    /**
+     * The one-time disk-byte recount in flight for this session, if any; see {@link healDiskBytes}. Read by every
+     * site that commits a chunk write, rewrite or delete ({@link noteChunkForDiskHeal}) so a slice that has already
+     * covered that chunk is kept current, and cleared with the rest of the session's state by {@link clearIndexMaps}.
+     */
+    private diskHealRun: DiskHealRun | null = null;
+    /**
+     * Settles when the recount scheduled by the most recent {@link initEventIndex} has finished or been abandoned;
+     * immediately if none was owed (a new profile, or one already healed). Never rejects. Production code never
+     * awaits it; see the public {@link waitForDiskBytesHeal} wrapper.
+     */
+    private diskHealPromise: Promise<void> = Promise.resolve();
     /**
      * Running total of {@link StoredEvent.searchText} length (plus a flat 64 bytes/record), for {@link
      * estimatePlainSize} -- the `size` stat's fallback when nothing is persisted. Maintained incrementally, the same
@@ -1547,6 +1609,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * of records the way schema v2's equivalent (`diskTsHeap`) was. Populated wherever {@link
      * chunkInfo} is; a popped entry is checked against {@link chunkInfo}'s current `minTs` before
      * being trusted, the same staleness discipline {@link residentHeap} uses against {@link events}.
+     *
+     * **A chunk can have several live entries.** An entry is pushed on every rewrite of its chunk, and a
+     * rewrite that leaves `maxTs` unchanged (a backward crawl rewriting the open chunk on every batch, an edit
+     * or a redaction rewriting a sealed one) makes the older entries indistinguishable from the newest by the
+     * staleness check. {@link enforceDiskBudget} therefore selects each chunk id once however many entries name
+     * it, and {@link deleteRecordsForDiskBudget} deduplicates its input again: either alone would keep a chunk's
+     * bytes from leaving {@link ciphertextBytes} more than once. The heap itself still grows by one entry per
+     * rewrite; nothing here bounds that.
      *
      * A known limitation, named rather than silently accepted: this heap, like {@link chunkInfo},
      * only ever contains chunks this *session* has written or decrypted at least once. A chunk from a
@@ -2105,6 +2175,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userVersion: this.userVersion,
                     manifestPageCount: 0,
                     nextChunkId: 0,
+                    diskBytesHealed: true, // Nothing to recount: see MetaRecord.diskBytesHealed.
                 });
                 // Asked once, right here at creation, never again on a later re-open of this same
                 // index (see storagePersisted's docstring). Fire-and-forget: some browsers show a
@@ -2149,6 +2220,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 );
             }
             this.hydrationPromise = this.hydrate(userId, salt, epoch);
+            // Owed only by a profile that existed before the accounting was fixed and has not been recounted
+            // since: a brand-new index (no meta row yet) was created with the flag set, so it never scans. Chained
+            // behind hydration and never awaited here; see healDiskBytes.
+            this.diskHealPromise =
+                existingMeta && !existingMeta.diskBytesHealed
+                    ? this.hydrationPromise.then(() => this.healDiskBytes(userId, epoch))
+                    : Promise.resolve();
 
             const loaded = await this.loadCrawlerCheckpoints(userId);
             if (!loaded) {
@@ -2172,6 +2250,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userVersion: 0,
                     manifestPageCount: 0,
                     nextChunkId: this.nextChunkId,
+                    diskBytesHealed: true, // The wipe left no rows to recount.
                 });
                 this.userVersion = 0;
                 this.hydrating = false; // Nothing will hydrate after a wipe; the restore this flag guarded is over.
@@ -2200,6 +2279,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     public async waitForHydration(): Promise<void> {
         await this.hydrationPromise;
+    }
+
+    /**
+     * Resolve once the one-time disk-byte recount ({@link healDiskBytes}) scheduled by the most recent {@link
+     * initEventIndex} has finished or been abandoned, or immediately if none was owed. Production code must never
+     * call this, for the same reason as {@link waitForHydration}.
+     * @knipignore - exported for tests
+     */
+    public async waitForDiskBytesHeal(): Promise<void> {
+        await this.diskHealPromise;
     }
 
     /**
@@ -4060,6 +4149,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 committed = true;
 
                 this.ciphertextBytes = newTotal;
+                this.noteChunkForDiskHeal(chunkId, newInfo?.bytes ?? null);
                 if (newInfo) {
                     this.chunkInfo.set(chunkId, newInfo);
                     heapPushTs(this.diskChunkHeap, { ts: newInfo.maxTs, id: String(chunkId) }); // D4: order by maxTs, not minTs.
@@ -4578,6 +4668,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         // backward here exactly as before, on genuine discovery of an older record.
         this.oldestIndexedTs = newOldest;
         for (const u of chunkInfoUpdates) {
+            this.noteChunkForDiskHeal(u.chunkId, u.bytes);
             this.chunkInfo.set(u.chunkId, { bytes: u.bytes, minTs: u.minTs, maxTs: u.maxTs });
             heapPushTs(this.diskChunkHeap, { ts: u.maxTs, id: String(u.chunkId) }); // D4: order by maxTs, not minTs.
         }
@@ -4632,6 +4723,23 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     private enqueuePersist(op: () => Promise<void>): void {
         this.persistChain = this.persistChain.then(op).catch((e) => {
             log.warn("EventIndex persist failed", e);
+        });
+    }
+
+    /**
+     * {@link enqueuePersist} for an operation whose caller needs its result: resolves with it once the operation has
+     * run, or rejects with what it threw. The chain itself is unaffected by the rejection (the operation is wrapped,
+     * so the chain's own catch never sees it): a failed operation here delays nothing queued behind it.
+     */
+    private enqueuePersistResult<T>(op: () => Promise<T>): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            this.enqueuePersist(async () => {
+                try {
+                    resolve(await op());
+                } catch (e) {
+                    reject(e);
+                }
+            });
         });
     }
 
@@ -4772,6 +4880,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                     userVersion: 0,
                     manifestPageCount: 0,
                     nextChunkId: this.nextChunkId,
+                    diskBytesHealed: true, // The wipe left no rows to recount.
                 });
                 this.userVersion = 0;
                 this.manifestLoaded = true;
@@ -4820,6 +4929,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 userVersion: 0,
                 manifestPageCount: 0,
                 nextChunkId: this.nextChunkId,
+                diskBytesHealed: true, // The wipe left no rows to recount.
             });
             this.userVersion = 0;
             this.manifestLoaded = true;
@@ -5050,6 +5160,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                                 userVersion: 0,
                                 manifestPageCount: 0,
                                 nextChunkId: this.nextChunkId,
+                                diskBytesHealed: true, // The wipe left no rows to recount.
                             });
                             this.userVersion = 0;
                             return;
@@ -5123,7 +5234,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 // to let a disk that was *already* over budget when this session started (restored
                 // from meta) self-correct as hydration's own decrypts populate diskChunkHeap with
                 // candidates, rather than waiting for an unrelated future write to trigger it.
-                if (this.persistEnabled) await this.enforceDiskBudget(userId);
+                // Run on the persist chain, like the pass at the end of every flush, and only when there is something
+                // to delete, so a restore that is within budget (the overwhelmingly common case) never waits for the
+                // chain, however long a stalled write keeps it. The pass commits chunk deletions and a new
+                // ciphertextBytes/diskBytes, which run here, off the chain, would race a queued flush's own total (a
+                // lost update) and the disk-byte recount's bookkeeping (healDiskBytes).
+                if (this.persistEnabled && this.ciphertextBytes > getEventIndexBounds().diskBudgetBytes) {
+                    await this.enforceDiskBudgetOnChain(userId, epoch);
+                }
                 if (this.closed || epoch !== this.hydrationEpoch) return;
             }
             walkComplete = true;
@@ -5583,6 +5701,13 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * reconcile, no partial-chunk rewrite. A cheap no-op in the overwhelmingly common case
      * (`ciphertextBytes` already under budget).
      *
+     * **Each chunk is selected once.** {@link diskChunkHeap} can hold several live entries for one chunk (one per
+     * rewrite that kept its `maxTs`), and {@link chunkInfo} is only cleared by {@link deleteRecordsForDiskBudget},
+     * after this selection is over, so the staleness check below cannot reject the second entry. A set of chosen
+     * ids does: without it a chunk's bytes were subtracted from the projected total, and then from {@link
+     * ciphertextBytes} and the persisted `diskBytes`, once per entry, and the persisted under-count compounded on
+     * every reload (see {@link MetaRecord.diskBytes} and {@link healDiskBytes}).
+     *
      * Candidates come from {@link diskChunkHeap}, which -- see that field's docstring -- only knows
      * about chunks this session has written or decrypted at least once. If it runs dry before the
      * total is back under budget (nothing left to pop, or every remaining entry turns out stale),
@@ -5614,12 +5739,19 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         const bounds = getEventIndexBounds();
         if (this.ciphertextBytes <= bounds.diskBudgetBytes) return;
         const toDelete: number[] = [];
+        // A chunk rewritten with an unchanged maxTs (a backward crawl rewrites the open chunk on every batch; an
+        // edit or a redaction rewrites a sealed one) leaves several live heap entries for the same chunk, and
+        // chunkInfo is only cleared after deleteRecordsForDiskBudget has run, so the staleness check below cannot
+        // tell the second entry from the first. Selecting a chunk twice would subtract its bytes twice.
+        const selected = new Set<number>();
         let projected = this.ciphertextBytes;
         while (projected > bounds.diskBudgetBytes && this.diskChunkHeap.length > 0) {
             const top = heapPopMinTs(this.diskChunkHeap)!;
             const chunkId = Number(top.id);
             const info = this.chunkInfo.get(chunkId);
             if (!info || info.maxTs !== top.ts) continue; // Stale: gone, or its maxTs moved since.
+            if (selected.has(chunkId)) continue; // A duplicate heap entry for a chunk already chosen.
+            selected.add(chunkId);
             toDelete.push(chunkId);
             projected -= info.bytes;
         }
@@ -5648,8 +5780,11 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * manifest} already reflects every removal by the time this reads it (`manifestRemove` below
      * runs first), so the scan is exact and free of that assumption.
      */
-    private async deleteRecordsForDiskBudget(userId: string, chunkIds: number[]): Promise<void> {
-        if (!this.db || chunkIds.length === 0) return;
+    private async deleteRecordsForDiskBudget(userId: string, requestedChunkIds: number[]): Promise<void> {
+        if (!this.db || requestedChunkIds.length === 0) return;
+        // Defensive, on top of enforceDiskBudget's own dedupe: a chunk's bytes leave the total exactly once, however
+        // many times a caller names it.
+        const chunkIds = Array.from(new Set(requestedChunkIds));
         let newTotal = this.ciphertextBytes;
         for (const chunkId of chunkIds) newTotal -= this.chunkInfo.get(chunkId)?.bytes ?? 0;
 
@@ -5693,6 +5828,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.oldestIndexedTs = newOldest;
         this.diskBudgetDropped = true;
         for (const chunkId of chunkIds) {
+            this.noteChunkForDiskHeal(chunkId, null);
             this.chunkInfo.delete(chunkId);
             if (chunkId === this.openChunkId) {
                 // The open chunk itself was old enough to be dropped (a long-idle session, or a very
@@ -5705,6 +5841,130 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         for (const id of evictedIds) {
             if (this.events.has(id)) this.removeFromIndex(id);
         }
+    }
+
+    /**
+     * Run {@link enforceDiskBudget} as an operation on {@link persistChain} and resolve once it has, for {@link
+     * hydrate}, which is not on the chain itself ({@link flushLiveWrites} calls it from inside its own chain
+     * operation). A budget pass run from hydrate directly would interleave with a queued flush at every await: both
+     * read {@link ciphertextBytes} early and assign a total computed from that stale base after their transaction
+     * commits, so whichever finishes second silently discards the other's change to the persisted `diskBytes`.
+     */
+    private enforceDiskBudgetOnChain(userId: string, epoch: number): Promise<void> {
+        return this.enqueuePersistResult(async () => {
+            if (this.closed || epoch !== this.hydrationEpoch) return; // A newer session owns the state now.
+            await this.enforceDiskBudget(userId);
+        });
+    }
+
+    /**
+     * Keep a running {@link healDiskBytes} recount in step with a chunk row an operation on {@link persistChain} has
+     * just committed: `bytes` for a row written or rewritten, `null` for one deleted. Called synchronously after the
+     * transaction's `txDone`, in the same task as the matching {@link ciphertextBytes} update, so no recount slice can
+     * run between the commit and this note. A chunk above the recount's cursor is ignored: no slice has read it yet, and
+     * the one that does reads the committed row.
+     */
+    private noteChunkForDiskHeal(chunkId: number, bytes: number | null): void {
+        const run = this.diskHealRun;
+        if (!run || chunkId > run.cursor) return;
+        if (bytes === null) run.counts.delete(chunkId);
+        else run.counts.set(chunkId, bytes);
+    }
+
+    /**
+     * The one-time recount of {@link MetaRecord.diskBytes} for a profile created before {@link enforceDiskBudget}
+     * selected each chunk once: sums `ct.length + iv.length` over this user's `chunks` rows (no decryption), then
+     * replaces {@link ciphertextBytes} and the persisted `diskBytes` with the exact figure and sets {@link
+     * MetaRecord.diskBytesHealed}, so it never runs twice for a profile. Started by {@link initEventIndex} chained
+     * behind {@link hydrate} and never awaited on the start-up path; it additionally yields to the event loop first,
+     * so it never shares a task with the end of the restore.
+     *
+     * **Sliced, and exact under concurrent writes.** Each slice is its own operation on {@link persistChain}
+     * (so it is serialised with every chunk write, rewrite and delete, none of which can interleave inside a
+     * slice), reads at most {@link DISK_HEAL_SLICE_ROWS} chunk rows above the previous slice's cursor in one
+     * read-only transaction, and then yields to the event loop. Between slices, other operations run. The run
+     * keeps `counts` (chunkId -> bytes) for every chunk at or below its cursor, and each of those operations
+     * updates the entry of the chunk it wrote or deleted ({@link noteChunkForDiskHeal}); a chunk above the cursor
+     * needs no entry, because the slice that reaches it reads the row as committed by then, and a brand-new chunk
+     * always has an id above every existing one. The last slice (the first to read fewer than a full page) sums
+     * `counts` and writes the total in its own transaction, so the figure it commits is exact as of the end of
+     * that operation, and every later operation moves it by an exact per-chunk delta from there.
+     *
+     * No skip condition: nothing persisted records whether a budget deletion ever ran. The encrypted `oldestIndexedTs`
+     * row is written by every {@link flushLiveWrites} (not only by {@link deleteRecordsForDiskBudget}), and a chunk
+     * deleted by a redaction leaves the same trace in `nextChunkId` as one deleted by the budget, so neither can
+     * tell a drifted profile from a clean one. The scan is cheap to be unconditional: it reads rows without
+     * decrypting them, in bounded slices, once per profile.
+     *
+     * Abandoned (and retried by the next session, since the flag is not set) when the session ends, the database goes
+     * away, or anything throws; it never writes into a newer session ({@link hydrationEpoch}, checked after every
+     * await) and never rejects.
+     */
+    private async healDiskBytes(userId: string, epoch: number): Promise<void> {
+        const run: DiskHealRun = { epoch, counts: new Map(), cursor: -1, slices: 0 };
+        try {
+            await yieldToEventLoop();
+            if (this.closed || epoch !== this.hydrationEpoch || !this.db || this.userId !== userId) return;
+            this.diskHealRun = run;
+            while (this.diskHealRun === run) {
+                if (await this.enqueuePersistResult(() => this.healDiskBytesSlice(userId, run))) return;
+                await yieldToEventLoop();
+            }
+        } catch (e) {
+            log.warn("EventIndex: the one-time disk-byte recount failed; it will run again next session", e);
+        } finally {
+            if (this.diskHealRun === run) this.diskHealRun = null;
+        }
+    }
+
+    /**
+     * One slice of {@link healDiskBytes}, run as an operation on {@link persistChain}. Resolves `true` when the run is
+     * over (finished, or abandoned because the session or the profile changed under it) and `false` when another
+     * slice is needed.
+     */
+    private async healDiskBytesSlice(userId: string, run: DiskHealRun): Promise<boolean> {
+        const stale = (): boolean =>
+            this.diskHealRun !== run ||
+            this.closed ||
+            run.epoch !== this.hydrationEpoch ||
+            this.userId !== userId ||
+            !this.db;
+        if (stale()) return true;
+        if (run.slices === 0) {
+            // Re-read from disk rather than trusting what initEventIndex saw: a wipe since then sets the flag, and
+            // there is nothing left to count.
+            const meta = await this.loadMeta(userId);
+            if (stale() || !meta || meta.diskBytesHealed) return true;
+        }
+        run.slices++;
+
+        const tx = this.db!.transaction("chunks", "readonly");
+        const range = IDBKeyRange.bound([userId, run.cursor], [userId, Infinity], true, false);
+        const rows = (await idbReq(tx.objectStore("chunks").getAll(range, DISK_HEAL_SLICE_ROWS))) as ChunkRecord[];
+        await txDone(tx);
+        if (stale()) return true;
+        for (const row of rows) {
+            run.counts.set(row.chunkId, row.blob.ct.length + row.blob.iv.length);
+            run.cursor = row.chunkId;
+        }
+        if (rows.length >= DISK_HEAL_SLICE_ROWS) return false;
+
+        // The last slice: `counts` now describes every row this user has, as of this operation. No other persist
+        // operation can run until it returns, so what is summed here is what the transaction below commits over.
+        const meta = await this.loadMeta(userId);
+        if (stale() || !meta) return true;
+        let total = 0;
+        for (const bytes of run.counts.values()) total += bytes;
+        const writeTx = this.db!.transaction("meta", "readwrite");
+        writeTx.objectStore("meta").put({ ...meta, diskBytes: total, diskBytesHealed: true } satisfies MetaRecord);
+        await txDone(writeTx);
+        if (stale()) return true;
+        const old = this.ciphertextBytes;
+        this.ciphertextBytes = total;
+        log.info(
+            `EventIndex: recounted disk bytes over ${run.counts.size} chunks in ${run.slices} slices: was ${old}, now ${total}, drift ${total - old}`,
+        );
+        return true;
     }
 
     /**
@@ -5844,6 +6104,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.inverted.clear();
         this.roomOrder.clear();
         this.ciphertextBytes = 0;
+        this.diskHealRun = null; // A recount in flight belongs to the state being thrown away.
         this.chunkInfo.clear();
         this.chunkMembers.clear();
         this.residentHeap.length = 0;
