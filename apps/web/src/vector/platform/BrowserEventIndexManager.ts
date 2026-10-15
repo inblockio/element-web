@@ -5557,7 +5557,6 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
 
     /** Start holding back the arrivals that could be dropped; see {@link redactionTombstonesLoad}. */
     private beginRedactionTombstonesLoad(): TombstoneLoadGate {
-        this.endRedactionTombstonesLoad(); // a superseded session's waiters are let go
         let settle!: () => void;
         const promise = new Promise<void>((resolve) => (settle = resolve));
         const gate: TombstoneLoadGate = { promise, settle };
@@ -5565,9 +5564,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         return gate;
     }
 
-    /** Let the arrivals held by `gate` (default: the current one) go. Idempotent. */
-    private endRedactionTombstonesLoad(gate: TombstoneLoadGate | null = this.redactionTombstonesLoad): void {
-        if (!gate) return;
+    /**
+     * Let the arrivals held by `gate` go. Idempotent. Called when the manifest phase that was to merge the row has
+     * settled, however it ended; {@link resetMemory} only detaches a gate, it never releases one, so that an arrival
+     * held by a session that is being torn down resumes after the teardown has finished and sees it closed.
+     */
+    private endRedactionTombstonesLoad(gate: TombstoneLoadGate): void {
         gate.settle();
         if (this.redactionTombstonesLoad === gate) this.redactionTombstonesLoad = null;
     }
@@ -6505,7 +6507,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         this.pendingRedactionsWriteQueued = false;
         this.redactionTombstonesWriteQueued = false; // likewise for the tombstone row
         this.redactionTombstonesEvicted = 0; // a per-session count
-        this.endRedactionTombstonesLoad(); // whoever is waiting on a session that is over is let go
+        this.redactionTombstonesLoad = null; // detached, not released: see endRedactionTombstonesLoad
         this.checkpoints = [];
         this.userVersion = 0;
         this.persistChain = Promise.resolve();

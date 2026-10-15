@@ -7868,6 +7868,24 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         const diskHas = async (id: string): Promise<boolean> =>
             (await decryptAllChunkEvents(pickleKey, DEVICE)).some((r) => r.eventId === id);
 
+        /** The ids the persisted tombstone row holds, decrypted off a raw second connection; null when there is no row. */
+        const rowIds = async (): Promise<string[] | null> =>
+            withRawDb(async (db) => {
+                const meta = (await idbPromise(db.transaction("meta", "readonly").objectStore("meta").get(userId))) as {
+                    salt: string;
+                };
+                const dek = await deriveDek(
+                    pickleKey,
+                    decodeBase64(meta.salt) as Uint8Array<ArrayBuffer>,
+                    userId,
+                    DEVICE,
+                );
+                const row = (await idbPromise(
+                    db.transaction("meta", "readonly").objectStore("meta").get(tombKey()),
+                )) as { blob: { iv: string; ct: string } } | undefined;
+                return row ? decryptJson<string[]>(dek, row.blob, tombKey()) : null;
+            });
+
         async function openHot(): Promise<BrowserEventIndexManager> {
             setEventIndexBoundsOverrideForTesting(null);
             const m = track(new BrowserEventIndexManager());
@@ -8011,6 +8029,40 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 const next = await openSmall();
                 await next.addHistoricEvents([arriving(editOf())], null, null);
                 await expectNoTrace(next);
+            });
+
+            it("a redaction that lands while the event waits for its disk pull still drops the event", async () => {
+                const m = await openHot();
+                const arrival = m.addEventToIndex(editOf(), {}); // suspended at the (empty) pull
+                expect(await m.deleteEvent(ORIG)).toBe(false); // lands, and is over, before the arrival resumes
+                await arrival;
+                await expectNoTrace(m);
+            });
+
+            it("a dropped event does not cost a read of the chunk its target lives in", async () => {
+                // The tombstone is on disk but the record's rewrite never committed: after the reload the record is
+                // on disk, not resident, and its tombstone is loaded.
+                await seed(true);
+                const m = await openSmall();
+                const restore = abortNextChunkTransaction();
+                try {
+                    expect(await m.deleteEvent(ORIG)).toBe(true);
+                    await priv(m).persistChain;
+                } finally {
+                    restore();
+                }
+                await m.closeEventIndex();
+
+                const next = await openSmall();
+                expect(priv(next).events.has(ORIG)).toBe(false);
+                const pull = vi.spyOn(
+                    next as unknown as { decryptChunkOnce: () => Promise<unknown> },
+                    "decryptChunkOnce",
+                );
+                expect(await next.addHistoricEvents([arriving(editOf())], null, null)).toBe(false);
+                await next.addEventToIndex(editOf("$s1-edit-2"), {});
+                expect(pull).not.toHaveBeenCalled();
+                expect(priv(next).events.has(ORIG)).toBe(false);
             });
 
             it("a session without persistence gates the same way", async () => {
@@ -8226,6 +8278,21 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 expect(whole).not.toContain(ROOM);
             });
 
+            it("adds exactly one purpose-tagged key to the cleartext key set of the meta store", async () => {
+                const m = await openHot();
+                await m.addEventToIndex(original(), {});
+                await m.commitLiveEvents();
+                const before = (await dumpRawKeys("meta")).sort();
+                expect(before).toEqual([userId, `${userId}|manifest:0`, `${userId}|oldestIndexedTs`].sort());
+
+                await m.deleteEvent("$s1-some-other-redacted-event");
+                await priv(m).persistChain;
+                // userId plus a purpose tag: no room id, no event id, no token.
+                expect((await dumpRawKeys("meta")).sort()).toEqual([...before, `${userId}|redactionTombstones`].sort());
+                const row = (await dumpRawStore("meta")).find((r) => r.userId === tombKey());
+                expect(Object.keys(row).sort()).toEqual(["blob", "userId"]);
+            });
+
             it("is written behind everything already queued: the tombstone is durable before the batch write that follows", async () => {
                 const m = await openHot();
                 let release!: () => void;
@@ -8276,38 +8343,31 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 const deletion = m.deleteEvent("$s1-recorded-before-load");
                 expect(priv(m).redactionTombstones.has("$s1-recorded-before-load")).toBe(true);
                 await priv(m).persistChain;
-                const rowIds = async (): Promise<string[] | null> =>
-                    withRawDb(async (db) => {
-                        const meta = (await idbPromise(
-                            db.transaction("meta", "readonly").objectStore("meta").get(userId),
-                        )) as { salt: string };
-                        const dek = await deriveDek(
-                            pickleKey,
-                            decodeBase64(meta.salt) as Uint8Array<ArrayBuffer>,
-                            userId,
-                            DEVICE,
-                        );
-                        const row = (await idbPromise(
-                            db.transaction("meta", "readonly").objectStore("meta").get(tombKey()),
-                        )) as { blob: { iv: string; ct: string } } | undefined;
-                        return row ? decryptJson<string[]>(dek, row.blob, tombKey()) : null;
-                    });
                 expect(await rowIds()).toEqual(["$s1-persisted"]); // NOT overwritten by the pre-load write
 
-                // An arrival that could be dropped waits for the load rather than being checked against a partial set.
-                let arrived = false;
+                // An arrival that could be dropped waits for the load rather than being checked against a partial set:
+                // it does not even get as far as the disk pull its first check is there to save.
+                const pull = vi.spyOn(
+                    m as unknown as { materializeIfPending: (id: string) => Promise<void> },
+                    "materializeIfPending",
+                );
+                let arrived = 0;
+                const done = (r: unknown): unknown => {
+                    arrived++;
+                    return r;
+                };
                 const arrival = m
                     .addHistoricEvents([arriving(editOf(EDIT_ID, "$s1-persisted"))], null, null)
-                    .then((r) => {
-                        arrived = true;
-                        return r;
-                    });
+                    .then(done);
+                const liveArrival = m.addEventToIndex(editOf("$s1-edit-live", "$s1-persisted"), {}).then(done);
                 for (let i = 0; i < 20; i++) await Promise.resolve();
-                expect(arrived).toBe(false);
+                expect(arrived).toBe(0);
+                expect(pull).not.toHaveBeenCalledWith("$s1-persisted");
 
                 release();
                 await deletion;
                 await arrival;
+                await liveArrival;
                 await m.waitForHydration();
                 await priv(m).persistChain;
                 expect(await hits(m, "zzs1edited")).toEqual([]); // dropped: the persisted tombstone was loaded first
@@ -8315,6 +8375,96 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                     ["$s1-persisted", "$s1-recorded-before-load"].sort(),
                 );
                 expect((await rowIds())?.sort()).toEqual(["$s1-persisted", "$s1-recorded-before-load"].sort());
+            });
+
+            it("what was recorded before the load is written after the merge even when no row existed yet", async () => {
+                const first = await openHot(); // creates the index, but never records a tombstone
+                await first.addEventToIndex(original(), {});
+                await first.commitLiveEvents();
+                await first.closeEventIndex();
+                expect(await dumpRawKeys("meta")).not.toContain(tombKey());
+
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                const realLoad = (BrowserEventIndexManager.prototype as unknown as Priv).loadRedactionTombstones;
+                vi.spyOn(
+                    BrowserEventIndexManager.prototype as unknown as Priv,
+                    "loadRedactionTombstones",
+                ).mockImplementation(async function (this: BrowserEventIndexManager, ...args: unknown[]) {
+                    await gate;
+                    return realLoad.apply(this, args);
+                });
+                const m = track(new BrowserEventIndexManager());
+                await m.initEventIndex(userId, DEVICE);
+                const deletion = m.deleteEvent(ORIG);
+                release();
+                await deletion;
+                await m.waitForHydration();
+                await priv(m).persistChain;
+                expect(await dumpRawKeys("meta")).toContain(tombKey());
+                await m.closeEventIndex();
+                const next = await openHot();
+                expect(priv(next).redactionTombstones.has(ORIG)).toBe(true);
+            });
+
+            it("a write left over from a re-initialised session cannot replace the next session's row", async () => {
+                const m = await openHot();
+                await m.deleteEvent("$s1-persisted");
+                await priv(m).persistChain;
+
+                // Hold the encrypt of the next row write, so that it is mid-flight when the session is replaced.
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                const realEncrypt = crypto.subtle.encrypt.bind(crypto.subtle);
+                let held = false;
+                const encrypt = vi.spyOn(crypto.subtle, "encrypt").mockImplementation(async (...args) => {
+                    if (!held) {
+                        held = true;
+                        await gate;
+                    }
+                    return realEncrypt(...(args as Parameters<typeof realEncrypt>));
+                });
+                await m.deleteEvent("$s1-late"); // its row write starts and stops at the encrypt
+                await vi.waitFor(() => expect(encrypt).toHaveBeenCalled());
+
+                await m.initEventIndex(userId, DEVICE); // a re-initialisation without a close
+                await m.waitForHydration();
+                expect([...priv(m).redactionTombstones]).toEqual(["$s1-persisted"]); // the new session's set
+                release();
+                await new Promise((resolve) => setTimeout(resolve, 50)); // the old write, if it ever lands, lands now
+                expect(await rowIds()).toEqual(["$s1-persisted"]); // the old session's "$s1-late" did not replace it
+            });
+
+            it("an arrival held back by the load while the index is closed indexes nothing", async () => {
+                const first = await openHot();
+                await first.deleteEvent("$s1-persisted");
+                await priv(first).persistChain;
+                await first.closeEventIndex();
+
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                const realLoad = (BrowserEventIndexManager.prototype as unknown as Priv).loadRedactionTombstones;
+                vi.spyOn(
+                    BrowserEventIndexManager.prototype as unknown as Priv,
+                    "loadRedactionTombstones",
+                ).mockImplementation(async function (this: BrowserEventIndexManager, ...args: unknown[]) {
+                    await gate;
+                    return realLoad.apply(this, args);
+                });
+                const m = track(new BrowserEventIndexManager());
+                await m.initEventIndex(userId, DEVICE);
+                const arrival = m.addEventToIndex(original("$s1-after-close", "zzs1late"), {});
+                const historic = m.addHistoricEvents(
+                    [arriving(original("$s1-after-close-2", "zzs1late2"))],
+                    null,
+                    null,
+                );
+                await m.closeEventIndex(); // while the arrivals wait
+                release();
+                await arrival;
+                expect(await historic).toBe(false);
+                expect(priv(m).events.size).toBe(0);
+                expect(await dumpRawKeys("meta")).toContain(tombKey());
             });
 
             it("an unreadable row (a read error) is left alone for the session: gating still works, nothing is written", async () => {
