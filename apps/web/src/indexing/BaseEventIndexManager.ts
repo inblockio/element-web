@@ -330,9 +330,10 @@ export default abstract class BaseEventIndexManager {
      * deleted message is not rebuilt into a record by a later back-fill) may forget the named ones. The crawler calls
      * this only for a backward checkpoint, only after `addHistoricEvents` has returned for the same batch (the
      * redaction, the edit and the original can share a batch, and the edit must be dropped first), and only when no
-     * other backward checkpoint for the same room is queued (a second crawl of the room would still need them). A
-     * failure here is logged and the crawl goes on: keeping a tombstone is the safe side. Forward batches never call
-     * it, since a forward crawl meets the original before its edits.
+     * other checkpoint of the same room is queued, in either direction (a second backward crawl may not have met the
+     * edits yet, and a forward crawl may still deliver an edit and stop before it meets the redaction). A failure
+     * here is logged and the crawl goes on: keeping a tombstone is the safe side. Forward batches never call it,
+     * since a forward crawl meets the original before its edits.
      *
      * The default does nothing, for a backend that keeps no tombstones.
      *

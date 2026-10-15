@@ -678,14 +678,14 @@ export default class EventIndex extends EventEmitter {
                 // after the batch's own events were added: the redaction, the edit and the original can share a
                 // batch, and the edit must have been dropped by then. Only for a BACKWARD crawl, which meets every
                 // edit of a message before the message itself; a forward crawl meets the original first and its
-                // edits after it. And not while another backward crawl of the same room is queued (two of them after
-                // a timeline reset): it may not have met the edits yet. A failure keeps the tombstones (the safe
-                // side) and never stops the crawl.
+                // edits after it. And not while any other checkpoint of the same room is queued: another backward
+                // crawl (two of them after a timeline reset) may not have met the edits yet, and a forward crawl
+                // (the initial pair starts both directions at one token) may still deliver an edit newer than that
+                // token and stop at an already-indexed batch before it meets the redaction. A failure keeps the
+                // tombstones (the safe side) and never stops the crawl.
                 if (
                     checkpoint.direction === Direction.Backward &&
-                    !this.crawlerCheckpoints.some(
-                        (other) => other.roomId === checkpoint.roomId && other.direction === Direction.Backward,
-                    )
+                    !this.crawlerCheckpoints.some((other) => other.roomId === checkpoint.roomId)
                 ) {
                     const metRedacted = matrixEvents
                         .filter((ev) => ev.isRedacted())

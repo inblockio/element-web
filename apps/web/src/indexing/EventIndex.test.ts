@@ -16,7 +16,10 @@ limitations under the License.
 
 // @vitest-environment happy-dom
 
+import "fake-indexeddb/auto";
+
 import { vi, describe, it, expect, afterEach, type Mocked } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
 import {
     Direction,
     type MatrixClient,
@@ -39,6 +42,7 @@ import {
 import type BaseEventIndexManager from "./BaseEventIndexManager.ts";
 import { type ICrawlerCheckpoint } from "./BaseEventIndexManager.ts";
 import SettingsStore from "../settings/SettingsStore.ts";
+import { BrowserEventIndexManager } from "../vector/platform/BrowserEventIndexManager.ts";
 
 afterEach(() => {
     vi.restoreAllMocks();
@@ -470,19 +474,27 @@ describe("EventIndex crawler: redaction tombstones (S1)", () => {
         }
     });
 
-    it("a queued checkpoint of another room, or a forward one of the same room, does not suppress it", async () => {
-        const other = await crawl([backward(ROOM, "t0"), backward("!other:id", "t1")], deletedAndEditedBatch());
+    it("a queued forward checkpoint of the same room suppresses it too", async () => {
+        // The forward crawl may still deliver an edit of the original (probe X2): it starts where the backward one
+        // did and walks towards the present, so it meets the edits the backward crawl never sees.
+        const { manager, stop } = await crawl([backward(ROOM, "t0"), forward(ROOM, "t1")], deletedAndEditedBatch());
         try {
-            expect(other.manager.releaseRedactionTombstones).toHaveBeenCalledWith(["$o", "$reaction"]);
+            expect(manager.addHistoricEvents).toHaveBeenCalledTimes(1);
+            expect(manager.releaseRedactionTombstones).not.toHaveBeenCalled();
         } finally {
-            other.stop();
+            stop();
         }
-        vi.restoreAllMocks();
-        const fwd = await crawl([backward(ROOM, "t0"), forward(ROOM, "t1")], deletedAndEditedBatch());
+    });
+
+    it("a queued checkpoint of another room does not suppress it", async () => {
+        const { manager, stop } = await crawl(
+            [backward(ROOM, "t0"), backward("!other:id", "t1"), forward("!other:id", "t1")],
+            deletedAndEditedBatch(),
+        );
         try {
-            expect(fwd.manager.releaseRedactionTombstones).toHaveBeenCalledWith(["$o", "$reaction"]);
+            expect(manager.releaseRedactionTombstones).toHaveBeenCalledWith(["$o", "$reaction"]);
         } finally {
-            fwd.stop();
+            stop();
         }
     });
 
@@ -497,6 +509,115 @@ describe("EventIndex crawler: redaction tombstones (S1)", () => {
         } finally {
             stop();
         }
+    });
+});
+
+describe("EventIndex crawler on the browser manager: redaction tombstones (S1)", () => {
+    const ROOM = "!room1:id";
+    const SENDER = "@alice:id";
+    const redaction = {
+        event_id: "$r",
+        room_id: ROOM,
+        sender: SENDER,
+        type: "m.room.redaction",
+        origin_server_ts: 40,
+        redacts: "$o",
+        content: {},
+    };
+    const message = (id: string, extra: Record<string, unknown> = {}): any => ({
+        event_id: id,
+        room_id: ROOM,
+        sender: SENDER,
+        type: "m.room.message",
+        origin_server_ts: 10,
+        content: { body: "hello", msgtype: "m.text" },
+        ...extra,
+    });
+    const editOfO = (): any =>
+        message("$e", {
+            origin_server_ts: 20,
+            content: {
+                "body": "* zzcrawledit",
+                "msgtype": "m.text",
+                "m.new_content": { body: "zzcrawledit", msgtype: "m.text" },
+                "m.relates_to": { rel_type: "m.replace", event_id: "$o" },
+            },
+        });
+    const redactedO = (): any =>
+        message("$o", { origin_server_ts: 10, content: {}, unsigned: { redacted_because: redaction } });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it("a backward crawl that meets the original redacted keeps its tombstone while a forward crawl of the room is queued (X2)", async () => {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
+        vi.spyOn(SettingsStore, "getValueAt").mockImplementation((_level, settingName): any =>
+            settingName === "crawlerSleepTime" ? 0 : undefined,
+        );
+        const manager = new BrowserEventIndexManager();
+        mockPlatformPeg({
+            getPickleKey: vi.fn().mockResolvedValue("unit-test-pickle-key"),
+            getEventIndexingManager: () => manager,
+        });
+        await manager.initEventIndex("@x2:id", "DEVICE1");
+        await manager.waitForHydration();
+        // R arrives live and records the tombstone of O; a newer live message is indexed too.
+        const live = message("$live", { origin_server_ts: 50, content: { body: "zzlivealready", msgtype: "m.text" } });
+        await manager.deleteEvent("$o");
+        await manager.addEventToIndex(live, {});
+
+        // The initial pair of checkpoints of one room. The backward crawl meets O already redacted; the forward one
+        // then delivers E, and stops at its next batch, which holds only what is already indexed: it never meets R.
+        const pages: Record<string, { chunk: any[]; end?: string }> = {
+            "b:t0": { chunk: [redactedO()], end: "tb1" },
+            "f:t0": { chunk: [editOfO()], end: "tf1" },
+            "f:tf1": { chunk: [live], end: "tf2" },
+            "f:tf2": { chunk: [redaction], end: "tf3" }, // never reached
+        };
+        vi.spyOn(manager, "loadCheckpoints").mockResolvedValue([
+            { roomId: ROOM, token: "t0", direction: Direction.Backward } as ICrawlerCheckpoint,
+            { roomId: ROOM, token: "t0", direction: Direction.Forward } as ICrawlerCheckpoint,
+        ]);
+        vi.spyOn(manager, "shouldCrawl").mockResolvedValue(true);
+        const removed = vi.spyOn(manager, "removeCrawlerCheckpoint");
+        const room = { roomId: ROOM } as any as Room;
+        const client = getMockClientWithEventEmitter({
+            getEventMapper: () => (obj: Partial<IEvent>) => new MatrixEvent(obj),
+            createMessagesRequest: vi.fn(),
+            ...mockClientMethodsRooms([room]),
+        });
+        const requested: string[] = [];
+        client.createMessagesRequest.mockImplementation(async (_roomId, token, _limit, dir) => {
+            requested.push(`${dir}:${token}`);
+            return (pages[`${dir}:${token}`] ?? { chunk: [] }) as any;
+        });
+
+        const indexer = new EventIndex();
+        await indexer.init();
+        indexer.startCrawler();
+        try {
+            // The forward crawl ending: its continuation is retired because the batch was all already indexed.
+            await vi.waitFor(() => expect(removed).toHaveBeenCalledWith(expect.objectContaining({ token: "tf2" })), {
+                timeout: 4000,
+            });
+        } finally {
+            indexer.stopCrawler();
+        }
+        expect(requested).toEqual(["b:t0", "f:t0", "b:tb1", "f:tf1"]);
+
+        const results = await manager.searchEventIndex({
+            search_term: "zzcrawledit",
+            before_limit: 0,
+            after_limit: 0,
+            order_by_recency: true,
+            limit: 10,
+        });
+        expect((results.results ?? []).map((r) => r.result.event_id)).toEqual([]);
+        // Kept, not released: the backward crawl passed O while the forward crawl could still deliver an edit of it.
+        expect((await manager.getStats()).redactionTombstones).toBe(1);
+        await manager.closeEventIndex();
     });
 });
 

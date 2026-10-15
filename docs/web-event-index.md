@@ -815,9 +815,13 @@ is older than every edit of it, so a backward crawl that has reached the origina
 edits it is going to deliver. `EventIndex.crawlerFunc` calls `releaseRedactionTombstones` with the ids of
 the events of a backward batch that were already redacted, after `addHistoricEvents` has returned for the
 same batch (the redaction, the edit and the original can share a batch, and the edit has to be dropped
-first), and only when no other backward checkpoint for the same room is queued. A forward crawl never
-releases, because it meets the original before its edits. A failing release is logged and keeps the
-tombstones, which is the safe side.
+first), and only when no other checkpoint of the same room is queued, in either direction. A second backward
+crawl (two of them after a timeline reset) may not have met the edits yet. A forward crawl (the initial pair
+starts both directions at one token) may still deliver an edit newer than that token, and it stops at the first
+batch that is all already indexed, so it can end before it meets the redaction (probe X2). A forward crawl never
+releases, because it meets the original before its edits. A tombstone that a crawl passed while it was held
+back is not released later: it stays until the cap. A failing release is logged and keeps the tombstones,
+which is the safe side.
 
 **Persistence and bound.** The set is mirrored to one encrypted row, written through the persist chain so
 that a tombstone is durable before the crawler batch write that follows it, loaded in the manifest phase as a
@@ -836,9 +840,11 @@ junk, redacted reactions and events this index never held, does not push a real 
 - **The cap.** An account that redacts more than `REDACTION_TOMBSTONES_MAX` events that no backward crawl
   visits, between a deletion and the late edit it has to catch, loses the oldest tombstones. The edit of such
   a message is then rebuilt into a record again. `redactionTombstonesEvicted` above zero is that state.
-- **Forward crawl.** A forward crawl delivers an edit before the redaction of its original. Until the
-  redaction is met the edit is searchable, as it always was; once the redaction is met, `deleteEvent` removes
-  the record. This is unchanged.
+- **Forward crawl.** A forward crawl delivers an edit before the redaction of its original, and it may stop
+  at an already-indexed batch before it reaches the redaction. When the redaction was already recorded (it
+  arrived live, or a crawl met it), the tombstone drops the edit: a backward crawl of the same room does not
+  release it while the forward checkpoint is queued. When it was not recorded yet, the edit is searchable
+  until the redaction is met, as it always was, and then `deleteEvent` removes the record.
 - **A late federated edit.** An edit that reaches the server after a backward crawl released the tombstone
   of its original is not recognised: nothing marks the original as deleted any more. The window is the delay
   of federation, after the crawl has already walked past the original.
