@@ -7080,6 +7080,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             manifest: Map<string, unknown>;
             persistChain: Promise<void>;
             pendingRedactions: Set<string>;
+            claimedParkedIds: Set<string>;
             readChunkEntries: (...args: unknown[]) => Promise<unknown>;
             decryptChunkOnce: (...args: unknown[]) => Promise<unknown>;
             pendingRedactionsWriteQueued: boolean;
@@ -7156,7 +7157,16 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
          * Make the next readwrite transaction over `chunks` and `meta` really ABORT, rather than throw: `abort()` runs
          * in a microtask, after the caller has queued its requests and while it awaits the transaction's completion.
          */
-        function abortNextChunkTransaction(): { restore: () => void; aborted: () => number } {
+        /**
+         * Abort the next chunk write of `m`'s own connection. Only `m`'s: the spy sits on the prototype, so a write of
+         * any other connection still open in this process (a manager an earlier test left behind, flushing its live
+         * buffer on a timer) would otherwise take the abort, and the write under test would commit.
+         */
+        function abortNextChunkTransaction(m: BrowserEventIndexManager): {
+            restore: () => void;
+            aborted: () => number;
+        } {
+            const own = (m as unknown as { db: IDBDatabase | null }).db;
             const realTransaction = IDBDatabase.prototype.transaction;
             let aborted = 0;
             const spy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
@@ -7166,13 +7176,71 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 ...rest
             ) {
                 const tx = realTransaction.call(this, names, mode, ...rest);
-                if (aborted === 0 && mode === "readwrite" && Array.isArray(names) && names.includes("chunks")) {
+                if (
+                    aborted === 0 &&
+                    this === own &&
+                    mode === "readwrite" &&
+                    Array.isArray(names) &&
+                    names.includes("chunks")
+                ) {
                     aborted++;
                     queueMicrotask(() => tx.abort());
                 }
                 return tx;
             });
             return { restore: () => spy.mockRestore(), aborted: () => aborted };
+        }
+
+        /**
+         * Hold every chunk decrypt (the hydration walk reading a chunk) until `release` is called, so that whatever
+         * the test does before the release happens while hydration is running, with nothing left to timing. Other
+         * decrypts (the manifest, the parked row) are not held.
+         */
+        function holdChunkDecrypts(): { release: () => void; restore: () => void } {
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => (release = resolve));
+            const realDecrypt = crypto.subtle.decrypt.bind(crypto.subtle);
+            const spy = vi.spyOn(crypto.subtle, "decrypt").mockImplementation(async (...args) => {
+                const aad = (args[0] as AesGcmParams).additionalData;
+                if (aad && new TextDecoder().decode(aad as Uint8Array).includes("|chunk:")) await gate;
+                return realDecrypt(...(args as Parameters<typeof realDecrypt>));
+            });
+            return { release, restore: () => spy.mockRestore() };
+        }
+
+        /**
+         * Decide whether the walk yields at its slice deadline after a chunk, instead of leaving it to how long the
+         * chunk took to decrypt (the 30 ms deadline against a 30 ms decrypt delay is what this test used to race):
+         * the clock the deadline reads either moves past the deadline on every reading or stands still. A yield waits
+         * for the persist chain, so a chunk rewrite the walk has just queued runs, and fails, before the walk goes on
+         * to its end-of-walk drain. Without a yield the drain runs first, before the rewrite has started.
+         */
+        function controlSliceDeadline(
+            m: BrowserEventIndexManager,
+            yieldAtDeadline: boolean,
+        ): { yieldsAfterClaim: () => number; restore: () => void } {
+            let clock = 0;
+            const nowSpy = vi
+                .spyOn(performance, "now")
+                .mockImplementation(() => (yieldAtDeadline ? (clock += HYDRATION_SLICE_DEADLINE_MS) : clock));
+            const scope = globalThis as { scheduler?: unknown };
+            const hadScheduler = "scheduler" in scope;
+            const previous = scope.scheduler;
+            let yieldsAfterClaim = 0;
+            scope.scheduler = {
+                yield: async (): Promise<void> => {
+                    if (priv(m).claimedParkedIds.has(EDIT)) yieldsAfterClaim++;
+                    await priv(m).persistChain;
+                },
+            };
+            return {
+                yieldsAfterClaim: () => yieldsAfterClaim,
+                restore: () => {
+                    nowSpy.mockRestore();
+                    if (hadScheduler) scope.scheduler = previous;
+                    else delete scope.scheduler;
+                },
+            };
         }
 
         it("the cold tier stops serving the redacted edit's body, and the record is removed from disk when first met", async () => {
@@ -7281,49 +7349,57 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
         // R1: a complete hydration forgets the parked ids nothing met a record for, but not the ones its own walk has
         // just handed to a rewrite that has not committed yet.
         for (const failure of ["abort", "read"] as const) {
-            it(`a chunk rewrite that ${failure === "abort" ? "aborts" : "cannot read its chunk"} during a complete hydration keeps the id parked`, async () => {
-                await seedEdited();
-                setEventIndexBoundsOverrideForTesting(null);
-                const restoreDecrypt = slowDownDecrypt(30); // the redaction below lands while hydration is running
-                const m = track(new BrowserEventIndexManager());
-                let aborter: ReturnType<typeof abortNextChunkTransaction> | undefined;
-                let readSpy: { mockRestore: () => void } | undefined;
-                try {
-                    await m.initEventIndex(userId, DEVICE);
-                    expect(await m.deleteEvent(EDIT)).toBe(false); // parked: $old has not been hydrated yet
-                    expect(priv(m).events.has("$old")).toBe(false);
-                    await priv(m).persistChain; // the parking write: the row holds EDIT
+            for (const yieldAtDeadline of [true, false]) {
+                it(`a chunk rewrite that ${failure === "abort" ? "aborts" : "cannot read its chunk"} during a complete hydration keeps the id parked (${yieldAtDeadline ? "it fails while the walk yields at its slice deadline" : "the walk drains before it runs"})`, async () => {
+                    await seedEdited();
+                    setEventIndexBoundsOverrideForTesting(null);
+                    const walk = holdChunkDecrypts(); // the redaction below lands while hydration is running
+                    const m = track(new BrowserEventIndexManager());
+                    const slice = controlSliceDeadline(m, yieldAtDeadline);
+                    let aborter: ReturnType<typeof abortNextChunkTransaction> | undefined;
+                    let readSpy: { mockRestore: () => void } | undefined;
+                    try {
+                        await m.initEventIndex(userId, DEVICE);
+                        expect(await m.deleteEvent(EDIT)).toBe(false); // parked: $old has not been hydrated yet
+                        expect(priv(m).events.has("$old")).toBe(false);
+                        await priv(m).persistChain; // the parking write: the row holds EDIT
 
-                    // From here on the rewrite of $old's chunk, which the walk queues when it meets the record, fails.
-                    if (failure === "abort") aborter = abortNextChunkTransaction();
-                    else {
-                        readSpy = vi
-                            .spyOn(priv(m), "readChunkEntries")
-                            .mockRejectedValue(new Error("simulated read failure"));
+                        // From here on the rewrite of $old's chunk, which the walk queues when it meets the record, fails.
+                        if (failure === "abort") aborter = abortNextChunkTransaction(m);
+                        else {
+                            readSpy = vi
+                                .spyOn(priv(m), "readChunkEntries")
+                                .mockRejectedValue(new Error("simulated read failure"));
+                        }
+                        walk.release();
+                        await m.waitForHydration();
+                        await priv(m).persistChain;
+                        if (aborter) expect(aborter.aborted()).toBe(1); // control: the transaction was really aborted
+                        // control: the interleaving this case is about
+                        if (yieldAtDeadline) expect(slice.yieldsAfterClaim()).toBeGreaterThan(0);
+                        else expect(slice.yieldsAfterClaim()).toBe(0);
+                    } finally {
+                        aborter?.restore();
+                        readSpy?.mockRestore();
+                        slice.restore();
+                        walk.restore();
                     }
-                    await m.waitForHydration();
-                    await priv(m).persistChain;
-                    if (aborter) expect(aborter.aborted()).toBe(1); // control: the transaction was really aborted
-                } finally {
-                    aborter?.restore();
-                    readSpy?.mockRestore();
-                    restoreDecrypt();
-                }
 
-                // The record is still in its chunk, so the id that hides it must still be parked: in memory and on disk.
-                expect(priv(m).events.has("$old")).toBe(false);
-                expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
-                expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
-                expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
-                await m.closeEventIndex();
+                    // The record is still in its chunk, so the id that hides it must still be parked: in memory and on disk.
+                    expect(priv(m).events.has("$old")).toBe(false);
+                    expect(priv(m).pendingRedactions.has(EDIT)).toBe(true);
+                    expect(await diskState("$old")).toEqual({ recordOnDisk: true, parked: [EDIT] });
+                    expect(resultIds(await m.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+                    await m.closeEventIndex();
 
-                // The next session still hides it, and this time the rewrite goes through.
-                const next = await reopenFull();
-                expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
-                expect(priv(next).events.has("$old")).toBe(false);
-                await priv(next).persistChain;
-                expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
-            });
+                    // The next session still hides it, and this time the rewrite goes through.
+                    const next = await reopenFull();
+                    expect(resultIds(await next.searchEventIndex(search("zzeditedsecret")))).toEqual([]);
+                    expect(priv(next).events.has("$old")).toBe(false);
+                    await priv(next).persistChain;
+                    expect(await diskState("$old")).toEqual({ recordOnDisk: false, parked: null });
+                });
+            }
         }
 
         it("a parking write still queued when a hydration meets the record cannot drop the id before the rewrite has run", async () => {
@@ -7930,7 +8006,9 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
             expect(await hits(m, "zzs1edited")).toEqual([]);
         }
 
-        function abortNextChunkTransaction(): () => void {
+        /** Abort the next chunk write of `m`'s own connection; only `m`'s, as in the N2 helper of the same name. */
+        function abortNextChunkTransaction(m: BrowserEventIndexManager): () => void {
+            const own = (m as unknown as { db: IDBDatabase | null }).db;
             const realTransaction = IDBDatabase.prototype.transaction;
             let aborted = 0;
             const spy = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (
@@ -7940,7 +8018,13 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 ...rest
             ) {
                 const tx = realTransaction.call(this, names, mode, ...rest);
-                if (aborted === 0 && mode === "readwrite" && Array.isArray(names) && names.includes("chunks")) {
+                if (
+                    aborted === 0 &&
+                    this === own &&
+                    mode === "readwrite" &&
+                    Array.isArray(names) &&
+                    names.includes("chunks")
+                ) {
                     aborted++;
                     queueMicrotask(() => tx.abort());
                 }
@@ -8044,7 +8128,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 // on disk, not resident, and its tombstone is loaded.
                 await seed(true);
                 const m = await openSmall();
-                const restore = abortNextChunkTransaction();
+                const restore = abortNextChunkTransaction(m);
                 try {
                     expect(await m.deleteEvent(ORIG)).toBe(true);
                     await priv(m).persistChain;
@@ -8085,7 +8169,7 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 const m = await openHot();
                 await m.addEventToIndex(original(), {});
                 await m.commitLiveEvents();
-                const restore = abortNextChunkTransaction();
+                const restore = abortNextChunkTransaction(m);
                 try {
                     expect(await m.deleteEvent(ORIG)).toBe(true);
                     await priv(m).persistChain;
