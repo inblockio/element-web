@@ -8680,6 +8680,10 @@ describe("BrowserEventIndexManager (DC: disk-byte accounting stays exact)", () =
         expect(realAfter).toBeLessThan(realBefore); // the pass did evict
         expect(internals(m).ciphertextBytes).toBe(realAfter);
         expect((await metaRow()).diskBytes).toBe(realAfter);
+        // ... and evicted enough: a chunk named twice in the selection would lower the projected total twice, and
+        // the pass would stop above the budget.
+        expect(internals(m).ciphertextBytes).toBeLessThanOrEqual(budget);
+        expect(realAfter).toBeLessThanOrEqual(budget);
     }, 60000);
 
     it("deleteRecordsForDiskBudget subtracts a chunk once however many times it is named", async () => {
