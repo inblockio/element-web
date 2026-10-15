@@ -2422,7 +2422,9 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      * protect *itself* -- they say nothing about what runs after it returns. So `closed` (and `userId`, cleared on the
      * same teardown paths) is re-checked immediately afterwards: without that, a `closeEventIndex()`/`deleteEventIndex()`
      * landing during the await resolves, clears every map via `resetMemory()`, and this method would then carry on to
-     * `upsertEvent` a plaintext event straight into the maps teardown just emptied.
+     * `upsertEvent` a plaintext event straight into the maps teardown just emptied. So is {@link hydrationEpoch}, after
+     * this await and the tombstone gate's: a close followed by a new `initEventIndex` (another account, without a
+     * reload) leaves `closed` false and `userId` set again, and the event would land in that account's index.
      *
      * An event whose own id, or whose target's id (the message it edits), is a redaction tombstone ({@link
      * redactionTombstones}) is dropped without a trace: no record, no persist.
@@ -2432,14 +2434,18 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
      */
     public async addEventToIndex(ev: IMatrixEvent, profile: IMatrixProfile): Promise<void> {
         if (this.closed || !this.userId || !this.featureEnabled()) return;
+        // The session this arrival belongs to. Re-checked after every await below: a close followed by a new
+        // initEventIndex (another account, without a reload) leaves the index open again, so `closed` alone cannot
+        // tell this arrival that it would land in somebody else's index.
+        const epoch = this.hydrationEpoch;
         if (this.redactionTombstonesLoad) {
             await this.redactionTombstonesLoad.promise; // never checked against a set that is not loaded yet
-            if (this.closed || !this.userId) return;
+            if (this.closed || !this.userId || epoch !== this.hydrationEpoch) return;
         }
         // Before the pull from disk, which a dropped event does not need ...
         if (this.isTombstoned(ev)) return;
         await this.materializeIfPending(this.targetId(ev));
-        if (this.closed || !this.userId) return;
+        if (this.closed || !this.userId || epoch !== this.hydrationEpoch) return;
         // ... and again in upsertEvent, which a redaction landing during that pull has not missed.
         if (!this.upsertEvent(ev, profile)) return;
         this.schedulePersistEvent(this.targetId(ev));
@@ -3285,9 +3291,12 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         oldCheckpoint: ICrawlerCheckpoint | null,
     ): Promise<boolean> {
         if (this.closed || !this.featureEnabled()) return false;
+        // The session this batch belongs to; re-checked after every await, as in addEventToIndex.
+        const epoch = this.hydrationEpoch;
+        const stale = (): boolean => this.closed || epoch !== this.hydrationEpoch;
         if (this.redactionTombstonesLoad) {
             await this.redactionTombstonesLoad.promise; // never checked against a set that is not loaded yet
-            if (this.closed) return false;
+            if (stale()) return false;
         }
         let allAlready = events.length > 0;
         const dirty = new Set<string>();
@@ -3320,7 +3329,7 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
                 }
                 const id = this.targetId(event);
                 await this.materializeIfPending(id);
-                if (this.closed) return false;
+                if (stale()) return false;
                 // A redaction can land during the pull above.
                 if (this.isTombstoned(event)) {
                     allAlready = false;
@@ -3361,8 +3370,14 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
         } finally {
             for (const id of dirty) this.releasePendingWrite(id);
         }
-        if (oldCheckpoint) await this.removeCrawlerCheckpoint(oldCheckpoint);
-        if (checkpoint) await this.addCrawlerCheckpoint(checkpoint);
+        if (oldCheckpoint) {
+            await this.removeCrawlerCheckpoint(oldCheckpoint);
+            if (stale()) return false;
+        }
+        if (checkpoint) {
+            await this.addCrawlerCheckpoint(checkpoint);
+            if (stale()) return false;
+        }
         return allAlready;
     }
 

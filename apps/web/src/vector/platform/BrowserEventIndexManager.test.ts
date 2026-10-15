@@ -8467,6 +8467,79 @@ describe("BrowserEventIndexManager (increment E: cold tier)", () => {
                 expect(await dumpRawKeys("meta")).toContain(tombKey());
             });
 
+            // G1: the same manager closed and opened again for another account while the arrivals wait. They resume
+            // into a session that is open, so only the session stamp (hydrationEpoch) tells them it is not theirs.
+            const otherUser = (): string => userId.replace("@", "@other-");
+            async function expectNothingFor(m: BrowserEventIndexManager, user: string, terms: string[]): Promise<void> {
+                await m.waitForHydration();
+                await m.commitLiveEvents();
+                expect(priv(m).events.size).toBe(0);
+                for (const term of terms) expect(await hits(m, term)).toEqual([]);
+                expect((await dumpRawStore("chunks")).filter((r) => r.userId === user)).toEqual([]);
+            }
+
+            it("an arrival held back by the load does not land in the next account's index (G1)", async () => {
+                const first = await openHot();
+                await first.deleteEvent("$s1-persisted");
+                await priv(first).persistChain;
+                await first.closeEventIndex();
+
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                const realLoad = (BrowserEventIndexManager.prototype as unknown as Priv).loadRedactionTombstones;
+                vi.spyOn(
+                    BrowserEventIndexManager.prototype as unknown as Priv,
+                    "loadRedactionTombstones",
+                ).mockImplementation(async function (this: BrowserEventIndexManager, ...args: unknown[]) {
+                    await gate;
+                    return realLoad.apply(this, args);
+                });
+                const m = track(new BrowserEventIndexManager());
+                await m.initEventIndex(userId, DEVICE);
+                const arrival = m.addEventToIndex(original("$s1-from-a", "zzs1fromaccounta"), {});
+                const historic = m.addHistoricEvents(
+                    [arriving(original("$s1-from-a-2", "zzs1fromaccountatoo"))],
+                    null,
+                    null,
+                );
+                await m.closeEventIndex(); // while the arrivals wait ...
+                const userB = otherUser();
+                await m.initEventIndex(userB, DEVICE); // ... and the manager is opened again for another account
+                release();
+                await arrival;
+                expect(await historic).toBe(false);
+                await expectNothingFor(m, userB, ["zzs1fromaccounta", "zzs1fromaccountatoo"]);
+            });
+
+            it("an arrival waiting for its disk pull does not land in the next account's index (G1)", async () => {
+                await seed(true);
+                const m = await openSmall(); // ORIG stays on disk: an edit of it pulls the row in first
+                let release!: () => void;
+                const gate = new Promise<void>((resolve) => (release = resolve));
+                const internals = m as unknown as { decryptChunkOnce: (...args: unknown[]) => Promise<unknown> };
+                const realDecrypt = internals.decryptChunkOnce;
+                vi.spyOn(internals, "decryptChunkOnce").mockImplementation(async function (
+                    this: BrowserEventIndexManager,
+                    ...args: unknown[]
+                ) {
+                    await gate;
+                    return realDecrypt.apply(this, args);
+                });
+                const arrival = m.addEventToIndex(editOf("$s1-edit-a", ORIG, "zzs1coldfroma", 1200), {});
+                const historic = m.addHistoricEvents(
+                    [arriving(editOf("$s1-edit-a2", ORIG, "zzs1coldfromatoo", 1300))],
+                    null,
+                    null,
+                );
+                await m.closeEventIndex(); // while both wait for the chunk ...
+                const userB = otherUser();
+                await m.initEventIndex(userB, DEVICE); // ... and the manager is opened again for another account
+                release();
+                await arrival;
+                expect(await historic).toBe(false);
+                await expectNothingFor(m, userB, ["zzs1coldfroma", "zzs1coldfromatoo"]);
+            });
+
             it("an unreadable row (a read error) is left alone for the session: gating still works, nothing is written", async () => {
                 const first = await openHot();
                 await first.deleteEvent("$s1-persisted");
