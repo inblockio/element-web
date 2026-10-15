@@ -66,7 +66,8 @@ key is `userId` plus a purpose tag (`redactionTombstones`), never a room or even
 ciphertext, AAD-bound to the key like every other row. What the row adds to the disclosure is that it exists
 and, from its length, roughly how many ids it holds (at most `REDACTION_TOMBSTONES_MAX`, 4,096): the same
 equality-and-count residue the checkpoints have. Unlike the parked-redactions row it is not a transient to-do
-list, so on a profile that deletes messages it is usually present. It is deleted with the rest of the user's
+list, so it is usually present, and on a long-lived profile in active rooms its length sits at the cap
+(section 7), while its changes over time still reveal redaction activity. It is deleted with the rest of the user's
 rows on logout and on every wipe.
 
 **Migration is a reset, not a conversion.** A v1 or v2 database is dropped in `onupgradeneeded`, inside
@@ -829,17 +830,21 @@ union with anything recorded before the load, and capped at `REDACTION_TOMBSTONE
 insertion order (recording an id again moves it to the newest end). An arrival that could be dropped waits
 for the load rather than being checked against a partial set, and the row is not written while it is unread,
 so a partial set cannot replace it. Evictions are counted (`redactionTombstonesEvicted` in the stats), and
-the first of a session is logged once with the count and the cap. What stays in the set in steady state is
-what no backward crawl will meet again soon: targets beyond the crawl window, live redactions of events that
-are not crawled again (mostly un-reacts and deletions made in this session), and the redactions of a crawl in
-flight. The ids a crawl does meet redacted are released as it meets them, which is why the crawler's own
-junk, redacted reactions and events this index never held, does not push a real tombstone out.
+the first of a session is logged once with the count and the cap. The set does not stay small. Every live
+redaction is recorded: anyone's un-react, any deletion, and the redactions met in UI scroll-back. Only a
+backward crawl that meets an id already redacted releases it, and backward crawls do not revisit live events,
+so these are never released. A long-lived profile in active encrypted rooms therefore climbs to the cap and
+stays there: what the set protects is the last 4,096 unreleased redactions seen in the account's encrypted
+rooms. The release still matters for the crawler's own junk, redacted reactions and events this index never
+held, which it removes as the crawl meets them, so that junk does not push a real tombstone out.
 
 **Limitations.**
 
-- **The cap.** An account that redacts more than `REDACTION_TOMBSTONES_MAX` events that no backward crawl
-  visits, between a deletion and the late edit it has to catch, loses the oldest tombstones. The edit of such
-  a message is then rebuilt into a record again. `redactionTombstonesEvicted` above zero is that state.
+- **The cap.** Because live redactions are never released, a long-lived profile reaches
+  `REDACTION_TOMBSTONES_MAX` (probe J-b) and from then on every new redaction evicts the oldest tombstone,
+  which can be that of a real deleted and edited message. If its edit is delivered after the eviction, the
+  edit is rebuilt into a record under the original's id. Each eviction is counted
+  (`redactionTombstonesEvicted` in the stats) and the first of a session logs one warning.
 - **Forward crawl.** A forward crawl delivers an edit before the redaction of its original, and it may stop
   at an already-indexed batch before it reaches the redaction. When the redaction was already recorded (it
   arrived live, or a crawl met it), the tombstone drops the edit: a backward crawl of the same room does not

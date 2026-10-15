@@ -68,8 +68,8 @@ Please see LICENSE files in the repository root for full details.
  *   is always there and near that cap, for the reason given at {@link PENDING_REDACTIONS_MAX}. The redaction-
  *   tombstones row ({@link redactionTombstonesKey}) is the same shape and discipline: its ids are inside its
  *   ciphertext, its key discloses `userId` and a purpose tag, and its length the count of tombstones (at most {@link
- *   REDACTION_TOMBSTONES_MAX}). It exists whenever any redaction has been met and not yet released, so on a profile
- *   that deletes messages it is usually there.
+ *   REDACTION_TOMBSTONES_MAX}). It exists whenever any redaction has been met and not yet released, so it is
+ *   usually there, and on a long-lived profile in active rooms it sits at that cap (see there).
  * - Shape: the number of chunk records approximates (events / events-per-chunk), not the event count directly, and
  *   each ciphertext length the size of the events it packs -- coarser than schema v2's one-length-per-event shape.
  *
@@ -1221,15 +1221,17 @@ function redactionTombstonesKey(userId: string): string {
  * it to the newest end), counted in {@link IIndexStats.redactionTombstonesEvicted} and logged once per session.
  * About 4096 x 50 B = 200 KiB on disk.
  *
- * What a forgotten tombstone costs: if the redacted message's edit is delivered after that, the edit is rebuilt into a
- * record under the original's id (the S1 defect, back again for that one message). In steady state the set holds
- * only what no backward crawl will meet again soon: the redacted targets beyond the crawl window, live redactions of
- * events that are not (and will not be) crawled again -- mostly un-reacts and deletions of messages from this
- * session -- and the redactions of a crawl in flight. The ids a backward crawl does meet redacted are released as it
- * meets them ({@link BrowserEventIndexManager.releaseRedactionTombstones}), which is what keeps the crawler's own junk
- * (redacted reactions, events this index never held) from pushing a real tombstone out. A profile that redacts more
- * than this many events that no backward crawl visits between a deletion and the late edit it must catch will lose the
- * oldest. Unlike {@link PENDING_REDACTIONS_MAX}, an index that is large does not sit at this cap on its own account.
+ * A long-lived profile reaches this cap. Every live redaction is recorded: anyone's un-react, any deletion, and the
+ * redactions met in UI scroll-back. Only a backward crawl that meets the id already redacted releases it ({@link
+ * BrowserEventIndexManager.releaseRedactionTombstones}), and backward crawls do not revisit live events, so these
+ * are never released. In active encrypted rooms the set climbs to the cap and stays there, and what it protects is
+ * the last 4,096 unreleased redactions seen in the account's encrypted rooms. The release does keep the crawler's
+ * own junk (redacted reactions, events this index never held) from pushing a real tombstone out.
+ *
+ * At the cap each new id evicts the oldest, which can be the tombstone of a real deleted and edited message. If that
+ * message's edit is delivered after the eviction, the edit is rebuilt into a record under the original's id (the S1
+ * defect, back again for that one message). Every eviction is counted ({@link
+ * IIndexStats.redactionTombstonesEvicted} in the stats), and the first of a session logs one warning.
  * @knipignore - exported for tests.
  */
 export const REDACTION_TOMBSTONES_MAX = 4096;
