@@ -68,6 +68,17 @@ export default class EventIndex extends EventEmitter {
 
     /**
      * A list of checkpoints which are awaiting processing by the crawler, once it has done with `currentCheckpoint`.
+     *
+     * Processed FIFO (`shift`/`push`), which is round-robin across rooms but not breadth-first *by
+     * week* the way SYNTHESIS.md §3.5 (element-meta#3252's recommendation) would prefer. That
+     * reordering was evaluated for this increment and deferred rather than implemented here: a
+     * checkpoint carries only an opaque, server-assigned pagination `token` (see {@link
+     * ICrawlerCheckpoint}) with no notion of "how many weeks back" it represents, so ordering by
+     * week would need either a schema change recording each room's crawl progress as a timestamp
+     * (increment D's chunked schema territory; the same limitation {@link
+     * BrowserEventIndexManager}'s `HYDRATION_KEY_ORDER` already documents for hydration order) or an
+     * extra request per checkpoint just to *learn* its age before deciding where to queue it,
+     * neither of which fits in a small, current-schema change. FIFO is left as is.
      */
     private crawlerCheckpoints: ICrawlerCheckpoint[] = [];
 
@@ -159,12 +170,18 @@ export default class EventIndex extends EventEmitter {
             Boolean(await client.getCrypto()?.isEncryptionEnabledInRoom(room.roomId)),
         );
 
+        // Ranked by the client's own recency (Room.getLastActiveTimestamp()) -- Element's stated
+        // policy of crawling the most recently active rooms first -- because on a fresh index none
+        // of these rooms has any crawled history of its own yet for the manager to rank by itself;
+        // see BaseEventIndexManager.shouldCrawl's `clientRoomRank` param (review-pr-c.md C-F4).
+        const rankedRooms = [...encryptedRooms].sort((a, b) => b.getLastActiveTimestamp() - a.getLastActiveTimestamp());
+
         this.logger.debug("addInitialCheckpoints: starting");
 
         // Gather the prev_batch tokens and create checkpoints for
         // our message crawler.
         await Promise.all(
-            encryptedRooms.map(async (room): Promise<void> => {
+            rankedRooms.map(async (room, rank): Promise<void> => {
                 const timeline = room.getLiveTimeline();
                 const token = timeline.getPaginationToken(Direction.Backward);
 
@@ -173,6 +190,18 @@ export default class EventIndex extends EventEmitter {
                     return;
                 }
                 this.logger.debug(`addInitialCheckpoints: Adding initial checkpoints for room ${room.roomId}`);
+
+                // Same crawl bound as crawlerFunc's own check, consulted here too so a room the
+                // manager would decline never gets a checkpoint persisted for it in the first
+                // place. Checked once per room: both directions share the same bound.
+                if (
+                    !(await indexManager.shouldCrawl(
+                        { roomId: room.roomId, token, direction: Direction.Backward },
+                        rank,
+                    ))
+                ) {
+                    return;
+                }
 
                 const backCheckpoint: ICrawlerCheckpoint = {
                     roomId: room.roomId,
@@ -403,6 +432,29 @@ export default class EventIndex extends EventEmitter {
 
     private async addEventsFromLiveTimeline(timeline: EventTimeline): Promise<void> {
         const events = timeline.getEvents();
+        const indexManager = PlatformPeg.get()?.getEventIndexingManager();
+
+        // Apply the redactions of the timeline first (S1). The timeline holds the original, its edits and the
+        // redaction together, and the adds below must find the redacted id tombstoned whatever the tombstone state
+        // is, so this path does not rely on an earlier live redaction or on a crawl that still holds its tombstone.
+        // Nothing is released here: only a backward crawl batch releases tombstones.
+        if (indexManager) {
+            for (const ev of events) {
+                if (!ev.isRedaction()) continue;
+                const eventId = ev.getAssociatedId();
+
+                if (!eventId) {
+                    this.logger.warn("Redaction event doesn't contain a valid associated event id", ev);
+                    continue;
+                }
+
+                try {
+                    await indexManager.deleteEvent(eventId);
+                } catch (e) {
+                    this.logger.warn("Error deleting event from index", e);
+                }
+            }
+        }
 
         for (let i = 0; i < events.length; i++) {
             const ev = events[i];
@@ -487,13 +539,28 @@ export default class EventIndex extends EventEmitter {
                 this.emitNewCheckpoint();
             }
 
+            // Drain checkpoints outside the crawl bound (BaseEventIndexManager.shouldCrawl) before
+            // the sleep below, not one per loop iteration: declining is handled the same way as
+            // having caught up with this room's history (the checkpoint is removed, not retried,
+            // so it does not spin), but paying the sleep between each decline cost roughly two
+            // crawlerSleepTimes per out-of-bound room, head-of-line-blocking every in-bound
+            // checkpoint behind a possibly large declined backlog (review-pr-c.md C-F4).
+            let checkpoint = this.crawlerCheckpoints.shift();
+            while (checkpoint !== undefined && !(await indexManager.shouldCrawl(checkpoint))) {
+                this.logger.debug("Declining checkpoint outside the crawl bound", JSON.stringify(checkpoint));
+                try {
+                    await indexManager.removeCrawlerCheckpoint(checkpoint);
+                } catch (e) {
+                    this.logger.warn(`Error removing declined checkpoint ${JSON.stringify(checkpoint)}:`, e);
+                }
+                checkpoint = this.crawlerCheckpoints.shift();
+            }
+
             await sleep(sleepTime);
 
             if (cancelled) {
                 break;
             }
-
-            const checkpoint = this.crawlerCheckpoints.shift();
 
             /// There is no checkpoint available currently, one may appear if
             // a sync with limited room timelines happens, so go back to sleep.
@@ -641,6 +708,32 @@ export default class EventIndex extends EventEmitter {
                 }
 
                 const eventsAlreadyAdded = await indexManager.addHistoricEvents(events, newCheckpoint, checkpoint);
+
+                // Release the redaction tombstones of the events this batch met already redacted (S1). Only now,
+                // after the batch's own events were added: the redaction, the edit and the original can share a
+                // batch, and the edit must have been dropped by then. Only for a BACKWARD crawl, which meets every
+                // edit of a message before the message itself; a forward crawl meets the original first and its
+                // edits after it. And not while any other checkpoint of the same room is queued: another backward
+                // crawl (two of them after a timeline reset) may not have met the edits yet, and a forward crawl
+                // (the initial pair starts both directions at one token) may still deliver an edit newer than that
+                // token and stop at an already-indexed batch before it meets the redaction. A failure keeps the
+                // tombstones (the safe side) and never stops the crawl.
+                if (
+                    checkpoint.direction === Direction.Backward &&
+                    !this.crawlerCheckpoints.some((other) => other.roomId === checkpoint.roomId)
+                ) {
+                    const metRedacted = matrixEvents
+                        .filter((ev) => ev.isRedacted())
+                        .map((ev) => ev.getId())
+                        .filter((id): id is string => !!id);
+                    if (metRedacted.length > 0) {
+                        try {
+                            await indexManager.releaseRedactionTombstones(metRedacted);
+                        } catch (e) {
+                            this.logger.warn("Error releasing redaction tombstones; keeping them", e);
+                        }
+                    }
+                }
 
                 // We didn't get a valid new checkpoint from the server, nothing
                 // to do here anymore.
