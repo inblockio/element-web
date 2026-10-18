@@ -910,6 +910,10 @@ describe("BrowserEventIndex support gating", () => {
         vi.spyOn(SettingsStore, "getValue").mockReturnValue(true);
         expect(await manager.supportsEventIndexing()).toBe(true);
     });
+
+    it("does not offer tokenizer modes: it has one fixed tokenizer", () => {
+        expect(new BrowserEventIndexManager().supportsTokenizerModes()).toBe(false);
+    });
 });
 
 describe("BrowserEventIndexManager (IndexedDB backed)", () => {

@@ -11,7 +11,7 @@ Please see LICENSE files in the repository root for full details.
 import React from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "test-utils-rtl";
-import { flushPromises } from "test-utils";
+import { flushPromises, mockPlatformPeg } from "test-utils";
 
 import ManageEventIndexDialog from "./ManageEventIndexDialog";
 import Modal from "../../../../Modal";
@@ -123,6 +123,38 @@ describe("<ManageEventIndexDialog />", () => {
         await waitFor(() =>
             expect(setValueSpy).toHaveBeenCalledWith("tokenizerMode", null, SettingLevel.DEVICE, "language"),
         );
+        expect(onFinished).toHaveBeenCalled();
+    });
+
+    it("offers the tokenizer mode when the index backend honours it", async () => {
+        setUpDefaults("language");
+        mockPlatformPeg({ getEventIndexingManager: () => ({ supportsTokenizerModes: () => true }) as any });
+
+        render(<ManageEventIndexDialog onFinished={vi.fn()} />);
+        await flushPromises();
+
+        expect(screen.getByRole("heading", { name: "Search tokenizer mode" })).toBeInTheDocument();
+        expect(screen.getByRole("radio", { name: "N-gram" })).toBeInTheDocument();
+    });
+
+    it("does not offer the tokenizer mode when the index backend has a single fixed tokenizer", async () => {
+        setUpDefaults("language");
+        mockPlatformPeg({ getEventIndexingManager: () => ({ supportsTokenizerModes: () => false }) as any });
+        const onFinished = vi.fn();
+        const createDialogSpy = vi.spyOn(Modal, "createDialog").mockReturnValue({} as any);
+        const initEventIndexSpy = vi.spyOn(EventIndexPeg, "initEventIndex").mockResolvedValue(true);
+
+        render(<ManageEventIndexDialog onFinished={onFinished} />);
+        await flushPromises();
+
+        expect(screen.queryByRole("heading", { name: "Search tokenizer mode" })).not.toBeInTheDocument();
+        expect(screen.queryByRole("radio", { name: "N-gram" })).not.toBeInTheDocument();
+        expect(screen.queryByRole("radio", { name: "Language-based" })).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole("button", { name: /done/i }));
+
+        expect(createDialogSpy).not.toHaveBeenCalled();
+        expect(initEventIndexSpy).not.toHaveBeenCalled();
         expect(onFinished).toHaveBeenCalled();
     });
 });

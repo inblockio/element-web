@@ -161,6 +161,17 @@ export default abstract class BaseEventIndexManager {
     public async supportsEventIndexing(): Promise<boolean> {
         return true;
     }
+
+    /**
+     * Whether this backend honours the `tokenizerMode` argument of {@link initEventIndex}, so that the settings UI
+     * should offer the choice. A backend with one fixed tokenizer returns false and the choice is not shown: changing
+     * it there would promise a rebuild of the index that changes nothing.
+     *
+     * @returns {boolean} True if the tokenizer mode setting applies to this backend.
+     */
+    public supportsTokenizerModes(): boolean {
+        return true;
+    }
     /**
      * Initialize the event index for the given user.
      *

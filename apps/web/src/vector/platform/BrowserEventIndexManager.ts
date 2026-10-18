@@ -2155,6 +2155,16 @@ export class BrowserEventIndexManager extends BaseEventIndexManager {
     }
 
     /**
+     * Always false: this index has one tokenizer ({@link tokenize}, with {@link substringHits} catching scripts that do
+     * not separate words), so the `tokenizerMode` setting does not apply here, {@link initEventIndex} ignores the
+     * argument, and the settings dialog does not offer the choice; see {@link
+     * BaseEventIndexManager.supportsTokenizerModes}.
+     */
+    public supportsTokenizerModes(): boolean {
+        return false;
+    }
+
+    /**
      * Open the index for a user and make it usable; see {@link BaseEventIndexManager.initEventIndex}. The order up to
      * that point is load-bearing: discard any previous state, connection and key material (the settings panel can
      * re-initialise without closing first, and a leaked handle would later block deleting the database); read this

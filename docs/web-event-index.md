@@ -888,6 +888,12 @@ the user sees understates reach rather than overstating it. Step 6's trigger is 
 named in section 5, since an absent `navigator.deviceMemory` currently sends every Firefox and Safari
 desktop user down this step; correcting that is E's first item.
 
+**Tokenizer mode does not apply.** Desktop's search tokenizer mode (language-based or N-gram, element-web
+#33048) is a Seshat setting. This index has one tokenizer, so `supportsTokenizerModes()` returns false,
+`initEventIndex` ignores the mode it is passed, and the Manage dialog does not offer the choice, which
+there would promise a rebuild that changes nothing. CJK text stays on step 5's substring scan; CJK bigrams
+remain roadmap item F.
+
 ## 9. Constants
 
 These are the values the code ships, read from

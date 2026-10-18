@@ -16,6 +16,7 @@ import SettingsStore from "../../../../settings/SettingsStore";
 import Modal from "../../../../Modal";
 import { formatBytes, formatCountLong } from "../../../../utils/FormattingUtils";
 import EventIndexPeg from "../../../../indexing/EventIndexPeg";
+import PlatformPeg from "../../../../PlatformPeg";
 import { SettingLevel } from "../../../../settings/SettingLevel";
 import Field from "../../../../components/views/elements/Field";
 import BaseDialog from "../../../../components/views/dialogs/BaseDialog";
@@ -60,8 +61,16 @@ interface IState {
  * Allows the user to introspect the event index state and disable it.
  */
 export default class ManageEventIndexDialog extends React.Component<IProps, IState> {
+    /**
+     * Whether the index backend honours the tokenizer mode. Only a backend that says it does not (one with a single,
+     * fixed tokenizer) hides the choice; every other backend, Seshat included, keeps it.
+     */
+    private readonly offerTokenizerMode: boolean;
+
     public constructor(props: IProps) {
         super(props);
+
+        this.offerTokenizerMode = PlatformPeg.get()?.getEventIndexingManager()?.supportsTokenizerModes() !== false;
 
         const initialTokenizerMode = SettingsStore.getValueAt(SettingLevel.DEVICE, "tokenizerMode");
         this.state = {
@@ -218,37 +227,45 @@ export default class ManageEventIndexDialog extends React.Component<IProps, ISta
                         value={this.state.crawlerSleepTime.toString()}
                         onChange={this.onCrawlerSleepTimeChange}
                     />
-                    <h3>{_t("settings|security|tokenizer_mode")}</h3>
-                    <Root>
-                        <InlineField
-                            name="tokenizerMode"
-                            control={
-                                <RadioControl
+                    {this.offerTokenizerMode && (
+                        <>
+                            <h3>{_t("settings|security|tokenizer_mode")}</h3>
+                            <Root>
+                                <InlineField
                                     name="tokenizerMode"
-                                    value={TokenizerMode.Ngram}
-                                    checked={this.state.tokenizerMode === TokenizerMode.Ngram}
-                                    onChange={this.onTokenizerModeChange}
-                                />
-                            }
-                        >
-                            <Label>{_t("settings|security|tokenizer_mode_ngram")}</Label>
-                            <HelpMessage>{_t("settings|security|tokenizer_mode_ngram_description")}</HelpMessage>
-                        </InlineField>
-                        <InlineField
-                            name="tokenizerMode"
-                            control={
-                                <RadioControl
+                                    control={
+                                        <RadioControl
+                                            name="tokenizerMode"
+                                            value={TokenizerMode.Ngram}
+                                            checked={this.state.tokenizerMode === TokenizerMode.Ngram}
+                                            onChange={this.onTokenizerModeChange}
+                                        />
+                                    }
+                                >
+                                    <Label>{_t("settings|security|tokenizer_mode_ngram")}</Label>
+                                    <HelpMessage>
+                                        {_t("settings|security|tokenizer_mode_ngram_description")}
+                                    </HelpMessage>
+                                </InlineField>
+                                <InlineField
                                     name="tokenizerMode"
-                                    value={TokenizerMode.Language}
-                                    checked={this.state.tokenizerMode === TokenizerMode.Language}
-                                    onChange={this.onTokenizerModeChange}
-                                />
-                            }
-                        >
-                            <Label>{_t("settings|security|tokenizer_mode_language")}</Label>
-                            <HelpMessage>{_t("settings|security|tokenizer_mode_language_description")}</HelpMessage>
-                        </InlineField>
-                    </Root>
+                                    control={
+                                        <RadioControl
+                                            name="tokenizerMode"
+                                            value={TokenizerMode.Language}
+                                            checked={this.state.tokenizerMode === TokenizerMode.Language}
+                                            onChange={this.onTokenizerModeChange}
+                                        />
+                                    }
+                                >
+                                    <Label>{_t("settings|security|tokenizer_mode_language")}</Label>
+                                    <HelpMessage>
+                                        {_t("settings|security|tokenizer_mode_language_description")}
+                                    </HelpMessage>
+                                </InlineField>
+                            </Root>
+                        </>
+                    )}
                 </div>
             </div>
         );
