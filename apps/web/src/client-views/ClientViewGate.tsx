@@ -41,6 +41,9 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
     return (
         <iframe
             ref={attach}
+            // The kit reads the bridge from its own window, so it stays same-origin, as modal widgets do.
+            // oxlint-disable-next-line react/iframe-missing-sandbox
+            sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-downloads"
             title={view.name}
             src={view.url}
             data-client-view={view.id}

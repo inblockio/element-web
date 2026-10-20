@@ -43,7 +43,11 @@ describe("client view registry", () => {
     it("lists kits from code and from config.json, ignoring invalid entries", () => {
         registerClientView(fixture);
         SdkConfig.put({
-            client_views: [{ id: "other", name: "Other", url: "/kits/other/" }, { id: "stock", name: "x", url: "/" }, 7],
+            client_views: [
+                { id: "other", name: "Other", url: "/kits/other/" },
+                { id: "stock", name: "x", url: "/" },
+                7,
+            ],
         } as never);
         expect(getClientViews().map((v) => v.id)).toEqual(["fixture", "other"]);
     });

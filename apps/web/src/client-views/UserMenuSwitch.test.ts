@@ -9,7 +9,12 @@
 
 import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 import { vi, describe, it, expect, beforeEach, afterEach, type MockedObject } from "vitest";
-import { getMockClientWithEventEmitter, mockClientMethodsServer, mockClientMethodsUser, TestSDKContext } from "test-utils";
+import {
+    getMockClientWithEventEmitter,
+    mockClientMethodsServer,
+    mockClientMethodsUser,
+    TestSDKContext,
+} from "test-utils";
 
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { MatrixDispatcher } from "../dispatcher/dispatcher";
@@ -45,7 +50,9 @@ describe("user menu client view entries", () => {
         labs = false;
         const getValue = SettingsStore.getValue;
         vi.spyOn(SettingsStore, "getValue").mockImplementation(((name: string, ...rest: unknown[]) =>
-            name === "feature_client_views" ? labs : (getValue as (...a: unknown[]) => unknown)(name, ...rest)) as never);
+            name === "feature_client_views"
+                ? labs
+                : (getValue as (...a: unknown[]) => unknown)(name, ...rest)) as never);
         vi.spyOn(SettingsStore, "setValue").mockResolvedValue();
         registerClientView({ id: "fixture", name: "Fixture", url: "/kits/fixture/index.html" });
     });

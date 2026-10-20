@@ -5,19 +5,24 @@ SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Com
 Please see LICENSE files in the repository root for full details.
 */
 
+import path from "node:path";
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { test, expect } from "../../element-web-test";
 
-const FIXTURE_KIT = readFileSync(join(__dirname, "fixture-kit", "index.html"), "utf8");
+const FIXTURE_KIT = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "fixture-kit", "index.html"),
+    "utf8",
+);
 
 test.describe("Client views", () => {
     test.use({
         displayName: "Alice",
         botCreateOpts: { displayName: "Bob" },
         labsFlags: ["feature_client_views"],
-        config: { client_views: [{ id: "fixture", name: "Fixture", url: "/kits/fixture/index.html" }] },
+        // client_views is not in IConfigOptions (the host reads it untyped, like registry.ts), so widen here.
+        config: { client_views: [{ id: "fixture", name: "Fixture", url: "/kits/fixture/index.html" }] } as object,
     });
 
     test.beforeEach(async ({ page }) => {
@@ -28,13 +33,12 @@ test.describe("Client views", () => {
     });
 
     test("switches to a kit from the user menu and back, on the same session", async ({ page, app, bot }) => {
-        const roomId = await app.client.createRoom({ name: "General", invite: [bot.credentials.userId] });
+        const roomId = await app.client.createRoom({ name: "General", invite: [bot.credentials!.userId] });
         await bot.joinRoom(roomId);
         await bot.sendMessage(roomId, "Hi Alice!");
         await bot.sendMessage(roomId, "🎉");
 
-        const deviceId = () =>
-            page.evaluate(() => (window as any).mxMatrixClientPeg.get().getDeviceId() as string);
+        const deviceId = () => page.evaluate(() => (window as any).mxMatrixClientPeg.get().getDeviceId() as string);
         const before = await deviceId();
 
         await page.getByRole("button", { name: "User menu", exact: true }).click();
@@ -42,7 +46,10 @@ test.describe("Client views", () => {
 
         const kit = page.frameLocator('iframe[title="Fixture"]');
         await expect(kit.getByText("Alice (")).toBeVisible();
-        await kit.getByRole("navigation", { name: "Rooms" }).getByRole("button", { name: /^General/ }).click();
+        await kit
+            .getByRole("navigation", { name: "Rooms" })
+            .getByRole("button", { name: /^General/ })
+            .click();
         const messages = kit.getByRole("main", { name: "Messages" });
         await expect(messages.getByText("Bob: Hi Alice!")).toBeVisible();
         // Emoji-only bodies arrive as text although the body view-model renders them as elements.

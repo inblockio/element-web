@@ -5,8 +5,8 @@
  * Please see LICENSE files in the repository root for full details.
  */
 
-import { type MatrixClient, type MatrixEvent, EventType } from "matrix-js-sdk/src/matrix";
-import { type EventTimelineItem, RoomStatusBarState, type TimelineItem } from "@element-hq/web-shared-components";
+import { type MatrixClient, type MatrixEvent, type Room, EventType } from "matrix-js-sdk/src/matrix";
+import { type TimelineItem, RoomStatusBarState } from "@element-hq/web-shared-components";
 
 import { SDKContextClass } from "../contexts/SDKContextClass";
 import { TimelineRenderingType } from "../contexts/RoomContext";
@@ -107,6 +107,8 @@ class EventRow {
  * A ClientViewBridge fed only from shipped view-model snapshots. View-models are built outside their legacy
  * parent components; the matrix-js-sdk objects they need as props are passed through, never read for data.
  */
+type EventItem = Extract<TimelineItem, { kind: "event" }>;
+
 export class ViewModelBridge implements ClientViewBridge {
     public readonly version = 1;
 
@@ -128,7 +130,12 @@ export class ViewModelBridge implements ClientViewBridge {
             spaceStore: SDKContextClass.instance.spaceStore,
         });
         this.disposers.push(this.roomList.subscribe(() => this.syncRooms()));
-        this.userMenu = new UserMenuViewModel({ ownProfileStore: OwnProfileStore.instance }, defaultDispatcher, client, false);
+        this.userMenu = new UserMenuViewModel(
+            { ownProfileStore: OwnProfileStore.instance },
+            defaultDispatcher,
+            client,
+            false,
+        );
         this.disposers.push(this.userMenu.subscribe(() => this.emit({ kind: "me" })));
         this.syncRooms();
     }
@@ -150,8 +157,10 @@ export class ViewModelBridge implements ClientViewBridge {
                 this.disposers.push(item.subscribe(() => this.syncRooms()));
             }
             const s = item.getSnapshot();
-            rooms.push(toViewRoom(s, rooms.length, avatarUrlForRoom(s.room, AVATAR_PX, AVATAR_PX, "crop") ?? undefined));
-            if (!this.statusBar) this.watchConnection(s.room);
+            const room = this.client.getRoom(id);
+            const avatarUrl = room ? (avatarUrlForRoom(room, AVATAR_PX, AVATAR_PX, "crop") ?? undefined) : undefined;
+            rooms.push(toViewRoom(s, rooms.length, avatarUrl));
+            if (!this.statusBar && room) this.watchConnection(room);
         }
         if (JSON.stringify(rooms) === JSON.stringify(this.roomCache)) return;
         this.roomCache = rooms;
@@ -159,7 +168,7 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /** The sync state is global; the room status bar view-model exposes it for whichever room it is given. */
-    private watchConnection(room: ConstructorParameters<typeof RoomStatusBarViewModel>[0]["room"]): void {
+    private watchConnection(room: Room): void {
         this.statusBar = new RoomStatusBarViewModel({ room });
         this.disposers.push(
             this.statusBar.subscribe(() => {
@@ -175,7 +184,10 @@ export class ViewModelBridge implements ClientViewBridge {
     private ensureTimeline(roomId: string): RoomTimelineViewModel | undefined {
         const existing = this.timelines.get(roomId);
         if (existing) return existing;
-        const room = this.roomList.getRoomItemViewModel(roomId)?.getSnapshot().room;
+        // The snapshot's room is opaque (a preview row holds no Room), so the Room the view-model needs comes from
+        // the client; it only wires the view-model, the data still comes from its snapshot.
+        if (!this.roomList.getRoomItemViewModel(roomId)) return undefined;
+        const room = this.client.getRoom(roomId);
         if (!room) return undefined;
         const vm = new RoomTimelineViewModel({ client: this.client, room });
         this.timelines.set(roomId, vm);
@@ -184,7 +196,7 @@ export class ViewModelBridge implements ClientViewBridge {
         return vm;
     }
 
-    private row(item: EventTimelineItem, roomId: string): EventRow {
+    private row(item: EventItem, roomId: string): EventRow {
         const ev = item.event as MatrixEvent;
         const key = ev.getId()!;
         let row = this.rows.get(key);
@@ -211,8 +223,8 @@ export class ViewModelBridge implements ClientViewBridge {
         if (!vm) return [];
         const messages: ViewMessage[] = [];
         for (const item of vm.getSnapshot().items) {
-            if ((item as TimelineItem).kind !== "event") continue;
-            const eventItem = item as EventTimelineItem;
+            if (item.kind !== "event") continue;
+            const eventItem = item;
             if (eventItem.sendState && eventItem.sendState !== "sent") continue;
             const id = (eventItem.event as MatrixEvent).getId();
             if (!id || id.startsWith("~")) continue;

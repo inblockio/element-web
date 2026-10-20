@@ -14,24 +14,30 @@ import { type JSX } from "react";
 import { bodyToNode } from "../HtmlUtils";
 import { nodeText, toViewMessage, toViewRoom } from "./mapping";
 
-const tile = (over: { msgtype?: string; eventId?: string; senderId?: string; rawDisplayName?: string } = {}) => ({
-    event: {
-        eventType: "m.room.message",
-        msgtype: over.msgtype ?? MsgType.Text,
-        eventId: "eventId" in over ? over.eventId : "$ev1",
-        isState: false,
-        eventTs: 1000,
-        isLocalEcho: false,
-    },
-    sender: {
-        senderId: over.senderId ?? "@alice:example.org",
-        member: over.rawDisplayName
-            ? { userId: "@alice:example.org", roomId: "!r", rawDisplayName: over.rawDisplayName, disambiguate: false }
-            : null,
-        isEmote: over.msgtype === MsgType.Emote,
-    },
-    timestamp: { show: true, value: 1234, displayState: "default" },
-}) as unknown as Parameters<typeof toViewMessage>[1];
+const tile = (over: { msgtype?: string; eventId?: string; senderId?: string; rawDisplayName?: string } = {}) =>
+    ({
+        event: {
+            eventType: "m.room.message",
+            msgtype: over.msgtype ?? MsgType.Text,
+            eventId: "eventId" in over ? over.eventId : "$ev1",
+            isState: false,
+            eventTs: 1000,
+            isLocalEcho: false,
+        },
+        sender: {
+            senderId: over.senderId ?? "@alice:example.org",
+            member: over.rawDisplayName
+                ? {
+                      userId: "@alice:example.org",
+                      roomId: "!r",
+                      rawDisplayName: over.rawDisplayName,
+                      disambiguate: false,
+                  }
+                : null,
+            isEmote: over.msgtype === MsgType.Emote,
+        },
+        timestamp: { show: true, value: 1234, displayState: "default" },
+    }) as unknown as Parameters<typeof toViewMessage>[1];
 
 describe("client view mapping", () => {
     it("reads an emoji-only body as a string although the body view-model returns elements", () => {

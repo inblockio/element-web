@@ -10,6 +10,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 
+import { ViewModelBridge } from "./ViewModelBridge";
+import { selectClientView } from "./registry";
+import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
+
 /*
  * The bridge only wires view-models together; the view-models themselves are replaced by small fakes here so the
  * test pins what the bridge reads from each snapshot and which shipped action it calls.
@@ -79,16 +83,14 @@ vi.mock("./registry", () => ({
     selectClientView: vi.fn(async () => {}),
 }));
 
-import { ViewModelBridge } from "./ViewModelBridge";
-import { selectClientView } from "./registry";
-import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
-
 describe("ViewModelBridge", () => {
     let bridge: ViewModelBridge;
 
     beforeEach(() => {
         vi.clearAllMocks();
-        bridge = new ViewModelBridge({} as MatrixClient);
+        bridge = new ViewModelBridge({
+            getRoom: (id: string) => (id === "!a" ? h.room : null),
+        } as unknown as MatrixClient);
     });
 
     it("maps the room list and the user menu snapshots", () => {
