@@ -16,9 +16,12 @@ import {
     clientViewsAvailable,
     getActiveClientView,
     getClientViews,
+    isHandedOver,
     registerClientView,
     selectClientView,
+    setHandedOver,
     unregisterClientView,
+    watchHandOver,
 } from "./registry";
 
 const fixture = { id: "fixture", name: "Fixture", url: "/kits/fixture/index.html" };
@@ -85,5 +88,21 @@ describe("client view registry", () => {
         expect(clientViewsAvailable()).toBe(false);
         registerClientView(fixture);
         expect(clientViewsAvailable()).toBe(true);
+    });
+
+    it("ends a hand-over on any switch, the already selected kit included, and tells the watchers", async () => {
+        registerClientView(fixture);
+        await selectClientView("fixture");
+        const watcher = vi.fn();
+        const unwatch = watchHandOver(watcher);
+        setHandedOver(true);
+        setHandedOver(true);
+        expect(isHandedOver()).toBe(true);
+        expect(watcher).toHaveBeenCalledTimes(1);
+        await selectClientView("fixture");
+        expect(isHandedOver()).toBe(false);
+        expect(watcher).toHaveBeenCalledTimes(2);
+        unwatch();
+        expect(settings.clientView).toBe("fixture");
     });
 });

@@ -63,8 +63,34 @@ export function getActiveClientView(): ClientViewDescriptor | undefined {
     return getClientViews().find((v) => v.id === id);
 }
 
-/** Selects a view for this device ("stock" = Element's UI). An unknown id selects the stock UI. */
+/** Set while a host room view (a call, a notification) shows Element's UI over the selected kit; never persisted. */
+let handedOver = false;
+const handOverWatchers = new Set<() => void>();
+
+/** Whether Element's UI is shown for now although a kit is selected. */
+export function isHandedOver(): boolean {
+    return handedOver;
+}
+
+/** Shows Element's UI over the selected kit until the next view switch (on) or ends that (off). */
+export function setHandedOver(on: boolean): void {
+    if (handedOver === on) return;
+    handedOver = on;
+    handOverWatchers.forEach((cb) => cb());
+}
+
+/** Calls `cb` when the hand-over starts or ends; returns the unsubscribe. */
+export function watchHandOver(cb: () => void): () => void {
+    handOverWatchers.add(cb);
+    return () => void handOverWatchers.delete(cb);
+}
+
+/**
+ * Selects a view for this device ("stock" = Element's UI). An unknown id selects the stock UI. Any switch ends a
+ * hand-over, so picking the kit that is already selected brings it back.
+ */
 export function selectClientView(id: string): Promise<void> {
+    setHandedOver(false);
     const known = id === STOCK_VIEW || getClientViews().some((v) => v.id === id);
     return SettingsStore.setValue("clientView", null, SettingLevel.DEVICE, known ? id : STOCK_VIEW);
 }

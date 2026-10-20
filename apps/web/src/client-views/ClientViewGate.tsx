@@ -12,6 +12,10 @@ import { type MatrixCall } from "matrix-js-sdk/src/webrtc/call";
 import SettingsStore from "../settings/SettingsStore";
 import { SDKContext } from "../contexts/SDKContext";
 import { LegacyCallHandlerEvent } from "../LegacyCallHandler";
+import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
+import { type ActionPayload } from "../dispatcher/payloads";
+import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
 import { _t } from "../languageHandler";
 import AccessibleButton from "../components/views/elements/AccessibleButton";
 import ToastContainer from "../components/structures/ToastContainer";
@@ -19,7 +23,7 @@ import NonUrgentToastContainer from "../components/structures/NonUrgentToastCont
 import { PipContainer } from "../components/structures/PipContainer";
 import { MatrixClientContextProvider } from "../components/structures/MatrixClientContextProvider";
 import AudioFeedArrayForLegacyCall from "../components/views/voip/AudioFeedArrayForLegacyCall";
-import { getActiveClientView, selectClientView } from "./registry";
+import { getActiveClientView, isHandedOver, selectClientView, setHandedOver, watchHandOver } from "./registry";
 import { ViewModelBridge } from "./ViewModelBridge";
 import { BRIDGE_GLOBAL, type ClientViewDescriptor, STOCK_VIEW } from "./types";
 
@@ -30,6 +34,19 @@ export const BOOT_TIMEOUT_MS = 15000;
 
 /** `?client_view=stock` in the page URL selects Element's own UI, a way back that needs no working kit. */
 const ESCAPE_PARAM = "client_view";
+
+/** Host room views whose UI lives in Element's tree: an answered or placed legacy call, a clicked notification. */
+const HAND_OVER_TRIGGERS = new Set<ViewRoomPayload["metricsTrigger"]>(["WebAcceptCall", "WebDialPad", "Notification"]);
+
+/**
+ * Whether a dispatched action needs Element's own UI for its room: the call views and the call lobby live in
+ * RoomView, which a kit replaces. A start-up room view (last room, URL) does not hand over.
+ */
+export function needsStockUi(payload: ActionPayload): boolean {
+    if (payload.action !== Action.ViewRoom) return false;
+    const { view_call: viewCall, metricsTrigger } = payload as ViewRoomPayload;
+    return !!viewCall || HAND_OVER_TRIGGERS.has(metricsTrigger);
+}
 
 /** The calls whose remote audio LoggedInView plays; a kit replaces that tree, so the host plays them here. */
 function useActiveLegacyCalls(): MatrixCall[] {
@@ -136,9 +153,28 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
     );
 }
 
-/** Renders the selected client view instead of its children (Element's UI) while one is selected. */
+/**
+ * Renders the selected client view instead of its children (Element's UI) while one is selected. A host room view
+ * that needs Element's UI (see needsStockUi) shows the children for that room until the next view switch.
+ */
 export function ClientViewGate({ client, children }: { client: MatrixClient; children: ReactNode }): JSX.Element {
     const [view, setView] = useState(getActiveClientView);
+    const [handedOver, setHandedOverState] = useState(isHandedOver);
+    useEffect(() => {
+        const unwatch = watchHandOver(() => setHandedOverState(isHandedOver()));
+        return () => {
+            unwatch();
+            setHandedOver(false);
+        };
+    }, []);
+    useEffect(() => {
+        if (!view || handedOver) return;
+        // RoomViewStore and MatrixChat handle the room view as usual; the gate only stops hiding their tree.
+        const ref = defaultDispatcher.register((payload) => {
+            if (needsStockUi(payload)) setHandedOver(true);
+        });
+        return () => defaultDispatcher.unregister(ref);
+    }, [view, handedOver]);
     useEffect(() => {
         if (new URLSearchParams(window.location.search).get(ESCAPE_PARAM) === STOCK_VIEW) {
             void selectClientView(STOCK_VIEW);
@@ -152,6 +188,6 @@ export function ClientViewGate({ client, children }: { client: MatrixClient; chi
         ];
         return () => refs.forEach((r) => SettingsStore.unwatchSetting(r));
     }, []);
-    if (!view) return <>{children}</>;
+    if (!view || handedOver) return <>{children}</>;
     return <ClientViewHost key={view.id} client={client} view={view} />;
 }
