@@ -22,9 +22,13 @@ import type { MatrixClient } from "matrix-js-sdk/src/matrix";
 import { clearAllUserStatus } from "../../utils/userStatus";
 import { type SetStatusViewModel, UserMenuSetStatusViewModel } from "../status/SetStatusViewModel";
 import SettingsStore from "../../settings/SettingsStore";
+import { clientViewsAvailable, getClientViews, selectClientView } from "../../client-views/registry";
 
 // Matches maximum size of an avatar in the UserMenu
 const AVATAR_PX = 88;
+
+const switchableViews = (): UserMenuSnapshot["views"] =>
+    clientViewsAvailable() ? getClientViews().map(({ id, name }) => ({ id, name })) : [];
 
 interface UserMenuViewModelProps {
     ownProfileStore: OwnProfileStore;
@@ -61,6 +65,7 @@ export class UserMenuViewModel
             userStatus: ownProfileStore.userStatus,
             showUserStatus: SettingsStore.getValue("feature_user_status") && isAuthenticated,
             setStatusViewModel,
+            views: switchableViews(),
             actions: {
                 createAccount: !isAuthenticated,
                 signIn: !isAuthenticated,
@@ -98,7 +103,7 @@ export class UserMenuViewModel
     };
 
     public readonly setOpen = (isOpen: boolean): void => {
-        this.snapshot.merge({ open: isOpen });
+        this.snapshot.merge(isOpen ? { open: isOpen, views: switchableViews() } : { open: isOpen });
     };
 
     public readonly setExpanded = (expanded: boolean): void => {
@@ -146,6 +151,13 @@ export class UserMenuViewModel
         this.setOpen(false);
         this.dispatcher.dispatch({
             action: Action.ViewUserSettings,
+        });
+    };
+
+    public readonly switchView = (viewId: string): void => {
+        this.setOpen(false);
+        selectClientView(viewId).catch((err) => {
+            logger.warn("Failed to switch client view", err);
         });
     };
 

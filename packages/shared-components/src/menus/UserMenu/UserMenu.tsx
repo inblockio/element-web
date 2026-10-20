@@ -10,6 +10,7 @@ import { Avatar, Button, Link, Menu, MenuItem, Separator, Text } from "@vector-i
 import {
     ChatProblemIcon,
     DevicesIcon,
+    GridIcon,
     HomeIcon,
     LockIcon,
     SettingsIcon,
@@ -62,6 +63,10 @@ export interface UserMenuViewSnapshot {
      */
     setStatusViewModel: SetStatusViewModel;
     /**
+     * Alternative client views the user can switch to, one menu entry each.
+     */
+    views?: { id: string; name: string }[];
+    /**
      * A set of actions that the user can perform from the menu.
      */
     actions: Partial<{
@@ -112,6 +117,10 @@ export declare interface UserMenuViewActions {
      * Called when the user clicks the button to clear their status.
      */
     clearStatus: () => void;
+    /**
+     * Called to switch to the client view with the given id. Only needed when the snapshot lists views.
+     */
+    switchView?: (viewId: string) => void;
 }
 
 export type UserMenuViewProps = {
@@ -134,6 +143,7 @@ export function UserMenuView({ vm, className }: UserMenuViewProps): JSX.Element 
         userStatus,
         setStatusViewModel,
         showUserStatus = true,
+        views,
     } = useViewModel(vm);
     const { translate: _t } = useI18n();
     const trigger = (
@@ -228,6 +238,14 @@ export function UserMenuView({ vm, className }: UserMenuViewProps): JSX.Element 
                             onSelect={vm.openFeedback}
                         />
                     )}
+                    {views?.map((view) => (
+                        <MenuItem
+                            key={view.id}
+                            Icon={GridIcon}
+                            label={_t("user_menu|switch_view", { name: view.name })}
+                            onSelect={() => vm.switchView?.(view.id)}
+                        />
+                    ))}
                     {actions.openSettings && (
                         <MenuItem
                             Icon={SettingsIcon}

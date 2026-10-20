@@ -391,7 +391,8 @@
         "open_feedback": "Feedback",
         "open_home": "Home",
         "open_security": "Security & Privacy",
-        "open_settings": "All settings"
+        "open_settings": "All settings",
+        "switch_view": "Switch to %(name)s"
     },
     "voip": {
         "element_call_mock": {
