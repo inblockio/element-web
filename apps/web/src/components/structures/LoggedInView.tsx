@@ -58,6 +58,7 @@ import { KeyBindingAction } from "../../accessibility/KeyboardShortcuts";
 import { type SwitchSpacePayload } from "../../dispatcher/payloads/SwitchSpacePayload";
 import LeftPanelLiveShareWarning from "../views/beacon/LeftPanelLiveShareWarning";
 import HomePage from "./HomePage";
+import { isRcKitEnabled, RcKitHost } from "../../element-views/RcKitHost";
 import { PipContainer } from "./PipContainer";
 import { monitorSyncedPushRules } from "../../utils/pushRules/monitorSyncedPushRules";
 import { MatrixClientContextProvider } from "./MatrixClientContextProvider";
@@ -618,6 +619,7 @@ class LoggedInView extends React.Component<IProps, IState> {
     };
 
     public render(): React.ReactNode {
+        if (isRcKitEnabled()) return <RcKitHost client={this._matrixClient} />;
         let pageElement;
 
         const moduleRenderer = this.props.page_type
