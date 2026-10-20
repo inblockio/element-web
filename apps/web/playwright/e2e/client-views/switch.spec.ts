@@ -9,6 +9,8 @@ import path from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
+import { rejectToastIfExists } from "@element-hq/element-web-playwright-common";
+
 import { test, expect } from "../../element-web-test";
 
 const FIXTURE_KIT = readFileSync(
@@ -46,10 +48,20 @@ test.describe("Client views", () => {
 
         const kit = page.frameLocator('iframe[title="Fixture"]');
         await expect(kit.getByText("Alice (")).toBeVisible();
-        await kit
-            .getByRole("navigation", { name: "Rooms" })
-            .getByRole("button", { name: /^General/ })
-            .click();
+        // The host's toasts stay above the kit, where they cover it as they cover the stock room list: the new
+        // device's "Verify this device" toast is shown over the kit. Dismiss toasts as openRoom() does.
+        await expect(page.getByRole("alert").filter({ hasText: "Verify this device" })).toBeVisible();
+        const general = kit.getByRole("navigation", { name: "Rooms" }).getByRole("button", { name: /^General/ });
+        for (let attemptsLeft = 10; ; attemptsLeft--) {
+            await rejectToastIfExists(page, "Verify this device", { timeout: 50 });
+            await rejectToastIfExists(page, "Notifications", { timeout: 50 });
+            try {
+                await general.click({ timeout: 500 });
+                break;
+            } catch (e) {
+                if (attemptsLeft === 1) throw e;
+            }
+        }
         const messages = kit.getByRole("main", { name: "Messages" });
         await expect(messages.getByText("Bob: Hi Alice!")).toBeVisible();
         // Emoji-only bodies arrive as text although the body view-model renders them as elements.
