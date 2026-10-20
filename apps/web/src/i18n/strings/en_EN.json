@@ -1515,6 +1515,8 @@
         "bridge_state_manager": "This bridge is managed by <user />.",
         "bridge_state_workspace": "Workspace: <networkLink/>",
         "click_for_info": "More info",
+        "client_views": "Client views",
+        "client_views_description": "Switch to another user interface for your chats from the user menu, if your server provides one.",
         "config_only": "Your account provider must enable this in config.json.",
         "currently_experimental": "Currently experimental.",
         "document_previews": "Experimental document previews",
