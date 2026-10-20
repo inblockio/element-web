@@ -1,0 +1,62 @@
+<!doctype html>
+<!--
+Copyright 2026 inblock.io
+
+SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE files in the repository root for full details.
+-->
+<!--
+    The smallest possible client view: a room list, the open room's messages and a way back, drawn only from the
+    ClientViewBridge the host sets on this frame. Used by the client-views Playwright tests.
+-->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Fixture view</title>
+    </head>
+    <body>
+        <header>
+            <span data-testid="me"></span> · <span data-testid="connection"></span>
+            <button type="button" id="back">Back to Element</button>
+        </header>
+        <nav aria-label="Rooms"><ul id="rooms"></ul></nav>
+        <main aria-label="Messages"><ol id="messages"></ol></main>
+        <script>
+            const bridge = window.__clientViewBridge || window.parent.__clientViewBridge;
+            let openRoom;
+
+            function render() {
+                const me = bridge.me();
+                document.querySelector("[data-testid=me]").textContent = me.displayName + " (" + me.userId + ")";
+                document.querySelector("[data-testid=connection]").textContent = bridge.connection();
+                document.getElementById("rooms").replaceChildren(
+                    ...bridge.rooms().map((room) => {
+                        const li = document.createElement("li");
+                        const button = document.createElement("button");
+                        button.type = "button";
+                        button.textContent = room.name + (room.unreadCount ? " (" + room.unreadCount + ")" : "");
+                        button.onclick = () => {
+                            openRoom = room.id;
+                            bridge.markRead(room.id);
+                            render();
+                        };
+                        li.append(button);
+                        return li;
+                    }),
+                );
+                const messages = openRoom ? bridge.timeline(openRoom) : [];
+                document.getElementById("messages").replaceChildren(
+                    ...messages.map((m) => {
+                        const li = document.createElement("li");
+                        li.textContent = m.senderName + ": " + m.body;
+                        return li;
+                    }),
+                );
+            }
+
+            document.getElementById("back").onclick = () => bridge.switchTo("stock");
+            bridge.onChange(render);
+            render();
+        </script>
+    </body>
+</html>
