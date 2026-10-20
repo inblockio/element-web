@@ -41,9 +41,10 @@ const h = vi.hoisted(() => {
         room,
         notification: { hasUnreadCount: true, count: 2, isMention: false },
     });
-    const timeline = Object.assign(new FakeVm({ items: [] as unknown[] }), {
+    const timeline = Object.assign(new FakeVm({ items: [] as unknown[], atLiveEnd: false }), {
         start: vi.fn(),
         onMarkAllAsRead: vi.fn(),
+        onJumpToLive: vi.fn(),
     });
     const statusBar = new FakeVm<{ state: string | null }>({ state: null });
     return { FakeVm, room, item, timeline, statusBar };
@@ -88,6 +89,8 @@ describe("ViewModelBridge", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        // The fakes outlive each test's bridge; drop the previous bridge's subscriptions.
+        h.timeline.listeners.clear();
         bridge = new ViewModelBridge({
             getRoom: (id: string) => (id === "!a" ? h.room : null),
         } as unknown as MatrixClient);
@@ -123,6 +126,23 @@ describe("ViewModelBridge", () => {
         expect(h.timeline.onMarkAllAsRead).toHaveBeenCalledTimes(1);
         bridge.timeline("!a");
         expect(h.timeline.start).toHaveBeenCalledTimes(1);
+    });
+
+    it("opens a kit's timeline at the live end once, not on the stock UI's saved scroll window", () => {
+        h.timeline.snapshot = { items: [], atLiveEnd: false };
+        bridge.timeline("!a");
+        expect(h.timeline.onJumpToLive).not.toHaveBeenCalled();
+        h.timeline.set({ items: [{ kind: "virtual" }] });
+        expect(h.timeline.onJumpToLive).toHaveBeenCalledTimes(1);
+        h.timeline.set({ items: [{ kind: "virtual" }, { kind: "virtual" }] });
+        expect(h.timeline.onJumpToLive).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not reload a timeline that opened at the live end", () => {
+        h.timeline.snapshot = { items: [], atLiveEnd: false };
+        bridge.timeline("!a");
+        h.timeline.set({ items: [{ kind: "virtual" }], atLiveEnd: true });
+        expect(h.timeline.onJumpToLive).not.toHaveBeenCalled();
     });
 
     it("reports offline while the status bar view-model shows a lost connection", () => {

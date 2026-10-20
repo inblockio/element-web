@@ -122,6 +122,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
     private lastConnection: ViewConnection = "online";
+    /** Whether a kit has read anything from this bridge yet: the host's sign that the kit started. */
+    public used = false;
 
     public constructor(private readonly client: MatrixClient) {
         this.roomList = new RoomListViewModel({
@@ -191,7 +193,20 @@ export class ViewModelBridge implements ClientViewBridge {
         if (!room) return undefined;
         const vm = new RoomTimelineViewModel({ client: this.client, room });
         this.timelines.set(roomId, vm);
-        this.disposers.push(vm.subscribe(() => this.emit({ kind: "timeline", roomId })));
+        // start() opens on the reader's saved scroll position in the stock UI, which may be a window without the
+        // newest messages. A kit shows a room from its live end, so once the first window has loaded, ask the
+        // view-model for the live end the way its "Jump to live" button does (no scroll: the kit has no list view).
+        let opened = false;
+        this.disposers.push(
+            vm.subscribe(() => {
+                const s = vm.getSnapshot();
+                if (!opened && s.items.length > 0) {
+                    opened = true;
+                    if (!s.atLiveEnd) vm.onJumpToLive(() => {});
+                }
+                this.emit({ kind: "timeline", roomId });
+            }),
+        );
         vm.start();
         return vm;
     }
@@ -210,15 +225,18 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public me(): ViewMe {
+        this.used = true;
         const s = this.userMenu.getSnapshot();
         return { userId: s.userId, displayName: s.displayName, avatarUrl: s.avatarUrl };
     }
 
     public rooms(): ViewRoom[] {
+        this.used = true;
         return this.roomCache;
     }
 
     public timeline(roomId: string): ViewMessage[] {
+        this.used = true;
         const vm = this.ensureTimeline(roomId);
         if (!vm) return [];
         const messages: ViewMessage[] = [];
@@ -257,6 +275,7 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public onChange(cb: (e: ChangeEvent) => void): () => void {
+        this.used = true;
         this.listeners.add(cb);
         return () => this.listeners.delete(cb);
     }
