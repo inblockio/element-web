@@ -22,7 +22,7 @@ import ActiveWidgetStore, { ActiveWidgetStoreEvent } from "../stores/ActiveWidge
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
-import { BOOT_TIMEOUT_MS, ClientViewGate } from "./ClientViewGate";
+import { BOOT_TIMEOUT_MS, ClientViewGate, relayMediaAuth } from "./ClientViewGate";
 import { getActiveClientView, selectClientView } from "./registry";
 
 const h = vi.hoisted(() => ({ used: false, handedOver: false, watchers: new Set<() => void>() }));
@@ -238,5 +238,23 @@ describe("ClientViewGate", () => {
         calls.getAllActiveCalls.mockReturnValue([]);
         act(() => void calls.emit(LegacyCallHandlerEvent.CallState));
         expect(screen.getByTitle("Fixture")).toBeTruthy();
+    });
+});
+
+describe("relayMediaAuth", () => {
+    afterEach(() => {
+        delete (navigator as { serviceWorker?: unknown }).serviceWorker;
+    });
+
+    it("hands the worker's userinfo question from the kit frame to this window's handler, nothing else", () => {
+        const host = new EventTarget();
+        Object.defineProperty(navigator, "serviceWorker", { value: host, configurable: true });
+        const seen: unknown[] = [];
+        host.addEventListener("message", (e) => seen.push((e as MessageEvent).data));
+        const frameWorker = new EventTarget();
+        relayMediaAuth({ navigator: { serviceWorker: frameWorker } } as unknown as Window);
+        frameWorker.dispatchEvent(new MessageEvent("message", { data: { type: "userinfo", responseKey: 7 } }));
+        frameWorker.dispatchEvent(new MessageEvent("message", { data: { type: "other" } }));
+        expect(seen).toEqual([{ type: "userinfo", responseKey: 7 }]);
     });
 });

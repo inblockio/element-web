@@ -21,6 +21,7 @@ import { EventTileViewModel } from "../viewmodels/room/timeline/event-tile/Event
 import { EventContentBodyViewModel } from "../viewmodels/message-body/EventContentBodyViewModel";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
+import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewMessage, toViewRoom } from "./mapping";
 import {
@@ -119,11 +120,24 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly watchedItems = new Set<string>();
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
     private readonly rows = new Map<string, EventRow>();
+    private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
     private lastConnection: ViewConnection = "online";
+    private isUsed = false;
+    /** Called when a kit document first reads the bridge, from inside its scripts (before its DOMContentLoaded). */
+    public onUse?: () => void;
+
     /** Whether a kit has read anything from this bridge yet: the host's sign that the kit started. */
-    public used = false;
+    public get used(): boolean {
+        return this.isUsed;
+    }
+
+    public set used(value: boolean) {
+        const first = value && !this.isUsed;
+        this.isUsed = value;
+        if (first) this.onUse?.();
+    }
 
     public constructor(private readonly client: MatrixClient) {
         this.roomList = new RoomListViewModel({
@@ -224,6 +238,20 @@ export class ViewModelBridge implements ClientViewBridge {
         return row;
     }
 
+    /** The sender's avatar from the member avatar view-model, one per (room, sender), the way EventTile shows it. */
+    private senderAvatarUrl(roomId: string, senderId: string): string | undefined {
+        const key = `${roomId}\n${senderId}`;
+        let vm = this.senderAvatars.get(key);
+        if (!vm) {
+            const member = this.client.getRoom(roomId)?.getMember(senderId);
+            if (!member) return undefined;
+            vm = new MemberAvatarViewModel({ member, size: AVATAR_PX, cli: this.client });
+            this.senderAvatars.set(key, vm);
+            this.disposers.push(vm.subscribe(() => this.emit({ kind: "timeline", roomId })));
+        }
+        return vm.getSnapshot().url;
+    }
+
     public me(): ViewMe {
         this.used = true;
         const s = this.userMenu.getSnapshot();
@@ -249,8 +277,10 @@ export class ViewModelBridge implements ClientViewBridge {
             const row = this.row(eventItem, roomId);
             const tile = row.tile.getSnapshot().snapshot;
             if (tile.event.eventType !== EventType.RoomMessage || tile.event.isLocalEcho) continue;
-            // No shipped view-model exposes a sender avatar URL outside the legacy avatar component: left undefined.
-            const message = toViewMessage(roomId, tile, row.body.getSnapshot());
+            const senderAvatarUrl = tile.sender.senderId
+                ? this.senderAvatarUrl(roomId, tile.sender.senderId)
+                : undefined;
+            const message = toViewMessage(roomId, tile, row.body.getSnapshot(), senderAvatarUrl);
             if (message) messages.push(message);
         }
         return messages.sort((a, b) => a.ts - b.ts);
@@ -262,7 +292,8 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public connection(): ViewConnection {
-        // The status bar view-model distinguishes only "connection lost"; "connecting" has no view-model source.
+        // The status bar view-model distinguishes only "connection lost"; "connecting" has no view-model source
+        // (an N/A row in the kit's capability table).
         return this.statusBar?.getSnapshot().state === RoomStatusBarState.ConnectionLost ? "offline" : "online";
     }
 
@@ -283,6 +314,7 @@ export class ViewModelBridge implements ClientViewBridge {
     public dispose(): void {
         this.disposers.forEach((d) => d());
         this.rows.forEach((r) => r.dispose());
+        this.senderAvatars.forEach((a) => a.dispose());
         this.timelines.forEach((t) => t.dispose());
         this.statusBar?.dispose();
         this.userMenu.dispose();

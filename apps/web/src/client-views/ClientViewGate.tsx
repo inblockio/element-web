@@ -5,7 +5,7 @@
  * Please see LICENSE files in the repository root for full details.
  */
 
-import React, { type JSX, type ReactNode, useCallback, useContext, useEffect, useState } from "react";
+import React, { type JSX, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 import { type MatrixCall } from "matrix-js-sdk/src/webrtc/call";
 
@@ -130,6 +130,18 @@ function BootFailed({ view }: { view: ClientViewDescriptor }): JSX.Element {
 }
 
 /**
+ * Authenticated media: Element's service worker adds the access token to a media request after asking the requesting
+ * client (here the kit's frame) for the user's ids over postMessage, and only Element's own window answers that. The
+ * frame's question is handed, unchanged, to this window's handler, which replies straight to the worker.
+ */
+export function relayMediaAuth(frame: Window): void {
+    frame.navigator.serviceWorker?.addEventListener("message", (event: MessageEvent) => {
+        if (event.data?.type !== "userinfo") return;
+        navigator.serviceWorker?.dispatchEvent(new MessageEvent("message", { data: event.data, source: event.source }));
+    });
+}
+
+/**
  * Hosts one kit in a full-size same-origin iframe on the signed-in client. The bridge is set on the frame's
  * window before the kit document loads (same-origin navigation from the initial about:blank keeps that window)
  * and on this window as a fallback. Unmounting removes the frame, so the kit's document and styles go with it.
@@ -137,8 +149,15 @@ function BootFailed({ view }: { view: ClientViewDescriptor }): JSX.Element {
 function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientViewDescriptor }): JSX.Element {
     const [bridge, setBridge] = useState<ViewModelBridge>();
     const [failed, setFailed] = useState(false);
+    const frameRef = useRef<HTMLIFrameElement | null>(null);
     useEffect(() => {
         const b = new ViewModelBridge(client);
+        // The worker's question reaches only listeners present when the document's message queue opens
+        // (DOMContentLoaded), so the relay goes on when the kit's scripts first read the bridge, on every load.
+        b.onUse = () => {
+            const frame = frameRef.current?.contentWindow;
+            if (frame) relayMediaAuth(frame);
+        };
         (window as BridgeHolder)[BRIDGE_GLOBAL] = b;
         setBridge(b);
         return () => {
@@ -148,6 +167,7 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
     }, [client]);
     const attach = useCallback(
         (frame: HTMLIFrameElement | null) => {
+            frameRef.current = frame;
             if (frame?.contentWindow && bridge) (frame.contentWindow as BridgeHolder)[BRIDGE_GLOBAL] = bridge;
         },
         [bridge],

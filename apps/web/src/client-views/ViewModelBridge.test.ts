@@ -13,6 +13,7 @@ import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 import { ViewModelBridge } from "./ViewModelBridge";
 import { selectClientView } from "./registry";
 import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
+import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 
 /*
  * The bridge only wires view-models together; the view-models themselves are replaced by small fakes here so the
@@ -33,7 +34,8 @@ const h = vi.hoisted(() => {
         }
         public dispose = vi.fn();
     }
-    const room = { roomId: "!a" };
+    const member = { userId: "@bob:example.org", roomId: "!a" };
+    const room = { roomId: "!a", getMember: () => member };
     const item = new FakeVm({
         id: "!a",
         name: "General",
@@ -47,7 +49,8 @@ const h = vi.hoisted(() => {
         onJumpToLive: vi.fn(),
     });
     const statusBar = new FakeVm<{ state: string | null }>({ state: null });
-    return { FakeVm, room, item, timeline, statusBar };
+    const avatar = new FakeVm<{ url?: string }>({ url: "http://avatar/bob" });
+    return { FakeVm, room, item, timeline, statusBar, member, avatar };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -76,6 +79,32 @@ vi.mock("../viewmodels/room/RoomStatusBar", () => ({
         return h.statusBar;
     }),
 }));
+vi.mock("../components/viewmodels/avatars/MemberAvatarViewModel", () => ({
+    MemberAvatarViewModel: vi.fn(function () {
+        return h.avatar;
+    }),
+}));
+vi.mock("../viewmodels/room/timeline/event-tile/EventTileViewModel", () => ({
+    EventTileViewModel: class extends h.FakeVm<object> {
+        public constructor({ mxEvent }: { mxEvent: { getId: () => string } }) {
+            super({
+                snapshot: {
+                    event: { eventId: mxEvent.getId(), eventType: "m.room.message", msgtype: "m.text" },
+                    sender: { senderId: "@bob:example.org" },
+                    timestamp: { value: 1 },
+                },
+            });
+        }
+    },
+}));
+vi.mock("../viewmodels/message-body/EventContentBodyViewModel", () => ({
+    EventContentBodyViewModel: class extends h.FakeVm<object> {
+        public constructor() {
+            super({ body: "hi" });
+        }
+    },
+}));
+vi.mock("../settings/SettingsStore", () => ({ default: { getValue: () => false } }));
 vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => "http://avatar/room" }));
@@ -93,6 +122,7 @@ describe("ViewModelBridge", () => {
         h.timeline.listeners.clear();
         bridge = new ViewModelBridge({
             getRoom: (id: string) => (id === "!a" ? h.room : null),
+            getUserId: () => "@me:example.org",
         } as unknown as MatrixClient);
     });
 
@@ -162,6 +192,43 @@ describe("ViewModelBridge", () => {
         ]);
         bridge.switchTo("stock");
         expect(selectClientView).toHaveBeenCalledWith("stock");
+    });
+
+    it("fills the sender avatar from the member avatar view-model, one per sender, and follows its changes", () => {
+        const event = {
+            getId: () => "$1",
+            getContent: () => ({}),
+            getRoomId: () => "!a",
+            getSender: () => "@bob:example.org",
+        };
+        h.timeline.snapshot = {
+            items: [
+                { kind: "event", event, continuation: false },
+                { kind: "event", event: { ...event, getId: () => "$2" }, continuation: true },
+            ],
+            atLiveEnd: true,
+        };
+        const seen: string[] = [];
+        bridge.onChange((e) => seen.push(e.kind));
+        expect(bridge.timeline("!a").map((m) => m.senderAvatarUrl)).toEqual(["http://avatar/bob", "http://avatar/bob"]);
+        expect(MemberAvatarViewModel).toHaveBeenCalledTimes(1);
+        expect(MemberAvatarViewModel).toHaveBeenCalledWith({ member: h.member, size: 64, cli: expect.anything() });
+        h.avatar.set({ url: "http://avatar/bob2" });
+        expect(seen).toContain("timeline");
+        expect(bridge.timeline("!a")[0].senderAvatarUrl).toBe("http://avatar/bob2");
+        bridge.dispose();
+        expect(h.avatar.dispose).toHaveBeenCalled();
+    });
+
+    it("calls onUse when a kit first reads the bridge, again after a reset, not on later reads", () => {
+        const onUse = vi.fn();
+        bridge.onUse = onUse;
+        bridge.rooms();
+        bridge.me();
+        expect(onUse).toHaveBeenCalledTimes(1);
+        bridge.used = false;
+        bridge.onChange(() => {});
+        expect(onUse).toHaveBeenCalledTimes(2);
     });
 
     it("disposes the view-models it built", () => {
