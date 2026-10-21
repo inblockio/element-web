@@ -18,6 +18,7 @@ import { type SDKContextClass } from "../contexts/SDKContextClass";
 import ToastStore from "../stores/ToastStore";
 import { UPDATE_EVENT } from "../stores/AsyncStore";
 import { LegacyCallHandlerEvent } from "../LegacyCallHandler";
+import ActiveWidgetStore, { ActiveWidgetStoreEvent } from "../stores/ActiveWidgetStore";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
@@ -46,6 +47,9 @@ vi.mock("./ViewModelBridge", () => ({
     ViewModelBridge: class {
         public get used(): boolean {
             return h.used;
+        }
+        public set used(on: boolean) {
+            h.used = on;
         }
         public dispose = vi.fn();
     },
@@ -131,6 +135,36 @@ describe("ClientViewGate", () => {
         loadKit();
         act(() => void vi.advanceTimersByTime(BOOT_TIMEOUT_MS));
         expect(screen.queryByText("Fixture did not start.")).toBeNull();
+    });
+
+    it("checks every reload of the kit, not only its first boot (G4)", () => {
+        renderGate();
+        h.used = true;
+        loadKit();
+        act(() => void vi.advanceTimersByTime(BOOT_TIMEOUT_MS));
+        expect(screen.queryByText("Fixture did not start.")).toBeNull();
+
+        // A reload inside the frame: the old document unloads, the new one never reads the bridge.
+        const frame = screen.getByTitle("Fixture") as HTMLIFrameElement;
+        act(() => void frame.contentWindow!.dispatchEvent(new Event("pagehide")));
+        loadKit();
+        act(() => void vi.advanceTimersByTime(BOOT_TIMEOUT_MS));
+        expect(screen.getByText("Fixture did not start.")).toBeTruthy();
+    });
+
+    it("keeps Element's UI while a call widget is live, since a fresh picture-in-picture would hide it (G1)", () => {
+        const persistent = vi.spyOn(ActiveWidgetStore.instance, "getPersistentWidgetId").mockReturnValue("ec");
+        try {
+            renderGate();
+            expect(screen.getByText("stock UI")).toBeTruthy();
+            expect(screen.queryByTitle("Fixture")).toBeNull();
+
+            persistent.mockReturnValue(null);
+            act(() => void ActiveWidgetStore.instance.emit(ActiveWidgetStoreEvent.Persistence));
+            expect(screen.getByTitle("Fixture")).toBeTruthy();
+        } finally {
+            persistent.mockRestore();
+        }
     });
 
     it("selects Element's UI when the page is opened with ?client_view=stock", () => {

@@ -17,6 +17,7 @@ import { Action } from "../dispatcher/actions";
 import { type ActionPayload } from "../dispatcher/payloads";
 import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
 import { UPDATE_EVENT } from "../stores/AsyncStore";
+import ActiveWidgetStore, { ActiveWidgetStoreEvent } from "../stores/ActiveWidgetStore";
 import { _t } from "../languageHandler";
 import AccessibleButton from "../components/views/elements/AccessibleButton";
 import ToastContainer from "../components/structures/ToastContainer";
@@ -71,6 +72,20 @@ function useViewedRoomId(): string | null {
         return () => void roomViewStore.off(UPDATE_EVENT, update);
     }, [roomViewStore]);
     return roomId;
+}
+
+/**
+ * Whether a call widget (Element Call, Jitsi) is live. A PipContainer mounted while one is live starts with the widget
+ * hidden (it shows it only on a later persistence or dock change), so the host's overlay above a kit would lose it.
+ */
+function usePersistentWidgetLive(): boolean {
+    const [live, setLive] = useState(() => !!ActiveWidgetStore.instance.getPersistentWidgetId());
+    useEffect(() => {
+        const update = (): void => setLive(!!ActiveWidgetStore.instance.getPersistentWidgetId());
+        ActiveWidgetStore.instance.on(ActiveWidgetStoreEvent.Persistence, update);
+        return () => void ActiveWidgetStore.instance.off(ActiveWidgetStoreEvent.Persistence, update);
+    }, []);
+    return live;
 }
 
 /** The host's own overlays (toasts, incoming calls, picture-in-picture, call audio), drawn above the kit. */
@@ -145,7 +160,17 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
         const timer = window.setTimeout(() => setFailed(!bridge.used), BOOT_TIMEOUT_MS);
         return () => window.clearTimeout(timer);
     }, [bridge, loads]);
-    const onLoad = useCallback(() => setLoads((n) => n + 1), []);
+    const onLoad = useCallback(
+        (e: React.SyntheticEvent<HTMLIFrameElement>) => {
+            // A reload inside the frame must start the kit again: the bridge counts as unused from the old document's
+            // unload, so the next load's deadline checks the new document, not the first boot.
+            e.currentTarget.contentWindow?.addEventListener("pagehide", () => bridge && (bridge.used = false), {
+                once: true,
+            });
+            setLoads((n) => n + 1);
+        },
+        [bridge],
+    );
     if (!bridge) return <div />;
     return (
         <>
@@ -203,10 +228,12 @@ export function ClientViewGate({ client, children }: { client: MatrixClient; chi
         return () => refs.forEach((r) => SettingsStore.unwatchSetting(r));
     }, []);
     // Picture-in-picture leaves out a live legacy call in the viewed room (its controls are in RoomView), so a kit
-    // never covers it: Element's UI stays until the call ends or the user views another room.
+    // never covers it: Element's UI stays until the call ends or the user views another room. A live call widget
+    // keeps Element's UI until it ends, since a fresh PipContainer would not show it (G1).
     const calls = useActiveLegacyCalls();
     const viewedRoomId = useViewedRoomId();
-    const callInView = calls.some((call) => call.roomId === viewedRoomId);
+    const widgetLive = usePersistentWidgetLive();
+    const callInView = calls.some((call) => call.roomId === viewedRoomId) || widgetLive;
     if (!view || handedOver || callInView) return <>{children}</>;
     return <ClientViewHost key={view.id} client={client} view={view} />;
 }
