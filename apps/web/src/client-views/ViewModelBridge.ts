@@ -109,6 +109,8 @@ export interface ReactionPermissions {
 
 /** Element's reaction picker over the kit: what the host renders (ReactionPickerOverlay) until `finish`. */
 export interface ReactionPickerRequest {
+    /** Unique per request (event id plus a counter): the host keys the picker by it so a replacement remounts. */
+    key: string;
     room: Room;
     mxEvent: MatrixEvent;
     reactions: Relations | null | undefined;
@@ -440,12 +442,8 @@ class EventRow {
         return { eventId: parentId, senderId, senderName, text };
     }
 
-    /**
-     * The message's reactions as the reactions row shows them: per key, one vote per sender, the count and selection from
-     * its button view-model. The buttons carry the stock disabled rule (ReactionsRowAdapter: can react, and can redact
-     * for a reaction of the user's own), so `pressReaction` can call their click.
-     */
-    public reactions(): ViewReaction[] | undefined {
+    /** The message's reaction relations now; rebinds the change listeners when the Relations object changed. */
+    private currentReactionRelations(): Relations | undefined {
         const room = this.client.getRoom(this.ev.getRoomId() ?? "");
         const relations =
             (room &&
@@ -461,6 +459,16 @@ class EventRow {
             this.reactionRelations = relations;
             this.bindReactions(relations, "on");
         }
+        return relations;
+    }
+
+    /**
+     * The message's reactions as the reactions row shows them: per key, one vote per sender, the count and selection from
+     * its button view-model. The buttons carry the stock disabled rule (ReactionsRowAdapter: can react, and can redact
+     * for a reaction of the user's own), so `pressReaction` can call their click.
+     */
+    public reactions(): ViewReaction[] | undefined {
+        const relations = this.currentReactionRelations();
         // The stock row shows no chips where the content is not actionable (redacted, undecryptable, an edit not yet
         // decrypted): neither does the view. The listeners stay bound, so a later decryption re-reads them.
         if (!isContentActionable(this.ev)) return undefined;
@@ -542,9 +550,15 @@ class EventRow {
         }
     }
 
-    /** Whether the user's reaction `key` is on the message now, as the snapshot would show it. */
+    /**
+     * Whether the user has a live (not redacted) reaction `key` in the room's relations now. Read from the relations
+     * directly: unlike the snapshot it does not depend on the content being actionable, so an undecryptable edit in
+     * between cannot make a reaction that is still there look gone.
+     */
     public isMine(key: string): boolean {
-        return this.reactions()?.find((r) => r.key === key)?.mine ?? false;
+        const me = this.client.getUserId();
+        const mine = me ? this.currentReactionRelations()?.getAnnotationsBySender()?.[me] : undefined;
+        return [...(mine ?? [])].some((e) => !e.isRedacted() && e.getRelation()?.key === key);
     }
 
     /**
@@ -956,6 +970,7 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly reacting = new Map<string, Promise<ActionOutcome>>();
     private readonly reactionWaits = new Set<() => void>();
     /** The reaction picker the host shows over the kit, with the call that waits for its close. */
+    private pickerCount = 0;
     private picker?: { request: ReactionPickerRequest; resolve: (o: ActionOutcome) => void };
     private readonly pickerListeners = new Set<(request: ReactionPickerRequest | null) => void>();
     private isUsed = false;
@@ -1330,6 +1345,7 @@ export class ViewModelBridge implements ClientViewBridge {
         this.closeReactionPicker();
         return new Promise<ActionOutcome>((resolve) => {
             const request: ReactionPickerRequest = {
+                key: `${eventId}#${++this.pickerCount}`,
                 room,
                 mxEvent: row.event,
                 reactions: row.relations(),

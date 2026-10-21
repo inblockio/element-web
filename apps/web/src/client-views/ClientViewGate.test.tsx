@@ -30,6 +30,8 @@ const h = vi.hoisted(() => ({
     handedOver: false,
     watchers: new Set<() => void>(),
     pickerListeners: new Set<(request: unknown) => void>(),
+    pickerMounts: [] as string[],
+    pickerUnmounts: [] as string[],
     aboveLeftOf: vi.fn((rect: unknown) => ({ placedAt: rect })),
 }));
 
@@ -85,6 +87,11 @@ vi.mock("../components/views/emojipicker/ReactionPicker", async () => {
             onFinished: () => void;
         }) {
             const { canReact, canSelfRedact } = React.useContext(RoomContext);
+            React.useEffect(() => {
+                const id = mxEvent.getId();
+                h.pickerMounts.push(id);
+                return () => void h.pickerUnmounts.push(id);
+            }, []); // eslint-disable-line react-hooks/exhaustive-deps
             return (
                 <button onClick={onFinished}>
                     {`picker ${mxEvent.getId()} canReact=${canReact} canSelfRedact=${canSelfRedact}`}
@@ -123,6 +130,8 @@ describe("ClientViewGate", () => {
     const loadKit = () => fireEvent.load(screen.getByTitle("Fixture"));
 
     beforeEach(() => {
+        h.pickerMounts.length = 0;
+        h.pickerUnmounts.length = 0;
         vi.useFakeTimers();
         h.used = false;
         h.handedOver = false;
@@ -162,6 +171,7 @@ describe("ClientViewGate", () => {
         expect(screen.queryByTestId("menu")).toBeNull();
         const finish = vi.fn();
         const request = {
+            key: "$1#1",
             room: {},
             mxEvent: { getId: () => "$1" },
             reactions: null,
@@ -178,6 +188,27 @@ describe("ClientViewGate", () => {
         expect(finish).toHaveBeenCalledTimes(2);
         act(() => h.pickerListeners.forEach((cb) => cb(null)));
         expect(screen.queryByTestId("menu")).toBeNull();
+    });
+
+    it("replacing the open picker unmounts the old instance (a new one mounts), so no listeners leak (F2)", () => {
+        renderGate();
+        const make = (id: string, n: number) => ({
+            key: `${id}#${n}`,
+            room: {},
+            mxEvent: { getId: () => id },
+            reactions: null,
+            permissions: { canReact: true, canSelfRedact: false },
+            anchor: { x: 0, y: 0, width: 1, height: 1 },
+            finish: vi.fn(),
+        });
+        act(() => h.pickerListeners.forEach((cb) => cb(make("$A", 1))));
+        expect(h.pickerMounts).toEqual(["$A"]);
+        act(() => {
+            h.pickerListeners.forEach((cb) => cb(null));
+            h.pickerListeners.forEach((cb) => cb(make("$B", 2)));
+        });
+        expect(h.pickerMounts).toEqual(["$A", "$B"]);
+        expect(h.pickerUnmounts).toEqual(["$A"]);
     });
 
     it("offers the way back to Element when a kit never reads the bridge", () => {

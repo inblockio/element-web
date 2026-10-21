@@ -1080,6 +1080,30 @@ describe("ViewModelBridge", () => {
                 expect(h.reactionButtons[0].onClick).toHaveBeenCalledTimes(1);
             });
 
+            it("a toggle-off is not done while the annotation is there, even when the message turns unreadable meanwhile (F1)", async () => {
+                // Reads like an undecryptable edit applied over the message: getContent() has no msgtype or body.
+                let content: Record<string, unknown> = { msgtype: "m.text", body: "hi" };
+                const mine = reaction("@me:example.org", "👍");
+                groups = [["👍", [reaction("@bob:example.org", "👍"), mine]]];
+                mineList = [mine];
+                present();
+                // A row keeps its first event, so this one is a message of its own.
+                read(fakeEvent("$f1", { getContent: () => content }));
+                const call = bridge.react("!a", "$f1", "👍");
+                let settled = false;
+                void call.then(() => (settled = true));
+                content = {};
+                emit();
+                await vi.advanceTimersByTimeAsync(600);
+                expect(settled).toBe(false);
+                // The redaction lands (the unreadable edit is still there): now it is done.
+                groups = [["👍", [reaction("@bob:example.org", "👍")]]];
+                mineList = [];
+                present();
+                await vi.advanceTimersByTimeAsync(300);
+                await expect(call).resolves.toMatchObject({ status: "done" });
+            });
+
             it("one call per (event, key): a repeat joins the pending one and sends nothing more", async () => {
                 const first = bridge.react("!a", "$1", "👍");
                 const second = bridge.react("!a", "$1", "👍");
@@ -1178,6 +1202,11 @@ describe("ViewModelBridge", () => {
                 const first = bridge.openReactionPicker("!a", "$1", { x: 0, y: 0, width: 1, height: 1 });
                 const second = bridge.openReactionPicker("!a", "$1", { x: 5, y: 5, width: 1, height: 1 });
                 await expect(first).resolves.toMatchObject({ status: "done" });
+                // Each request has its own key, so the host remounts the picker instead of reusing the instance.
+                const keys = shown.filter(Boolean).map((r) => (r as { key: string }).key);
+                expect(keys).toHaveLength(2);
+                expect(new Set(keys).size).toBe(2);
+                expect(keys[0]).toContain("$1");
                 bridge.dispose();
                 await expect(second).resolves.toMatchObject({ status: "done" });
             });

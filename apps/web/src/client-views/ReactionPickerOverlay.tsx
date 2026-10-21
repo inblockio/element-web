@@ -58,7 +58,7 @@ export function HostReactionPicker({
     useEffect(() => bridge.onReactionPicker(setRequest), [bridge]);
     return request ? (
         <MatrixClientContextProvider client={client}>
-            <ReactionPickerOverlay request={request} />
+            <ReactionPickerOverlay key={request.key} request={request} />
         </MatrixClientContextProvider>
     ) : null;
 }
