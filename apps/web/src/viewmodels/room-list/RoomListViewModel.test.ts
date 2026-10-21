@@ -310,6 +310,19 @@ describe("RoomListViewModel", () => {
             expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(1);
         });
 
+        it("should mark a room that is already open when the list is created as active", async () => {
+            // Element's UI mounted again (after a client view) while the room stays open: no ActiveRoomChanged follows
+            vi.spyOn(SDKContextClass.instance.roomViewStore, "getRoomId").mockReturnValue("!room2:server");
+            viewModel = new RoomListViewModel({
+                client: matrixClient,
+                spaceStore: SDKContextClass.instance.spaceStore,
+                roomViewStore: SDKContextClass.instance.roomViewStore,
+            });
+
+            await flushPromises();
+            expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(1);
+        });
+
         it("should return undefined active room index when no room is selected", async () => {
             viewModel = new RoomListViewModel({
                 client: matrixClient,

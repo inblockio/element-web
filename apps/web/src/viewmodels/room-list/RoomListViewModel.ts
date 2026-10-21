@@ -299,8 +299,10 @@ export class RoomListViewModel
             this.previewItem?.dispose();
         });
 
-        // A room may already be open when the list is created
-        this.onRoomViewStoreUpdate();
+        // A room may already be open when the list is created (Element's UI mounted again after a client view):
+        // mark it as active now, no ActiveRoomChanged follows
+        if (props.roomViewStore.getRoomId()) void this.updateRoomListData();
+        else this.onRoomViewStoreUpdate();
     }
 
     private readonly onRoomViewStoreUpdate = (): void => {
