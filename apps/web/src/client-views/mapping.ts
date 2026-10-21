@@ -12,6 +12,7 @@
 
 import { isValidElement, type ReactNode } from "react";
 import { MsgType } from "matrix-js-sdk/src/matrix";
+import { type UrlPreview } from "shared-types";
 import {
     DecryptionFailureReason,
     FileBodyViewState,
@@ -34,6 +35,7 @@ import {
     type ViewReply,
     type ViewRoom,
     type ViewThread,
+    type ViewUrlPreview,
 } from "./types";
 
 /** The shape of `_t` the mappings need: a translation key and optional variables. */
@@ -160,6 +162,7 @@ export function toViewMessage(
     reactions?: ViewReaction[],
     thread?: ViewThread,
     media?: ViewMedia,
+    urlPreviews?: ViewUrlPreview[],
 ): ViewMessage | undefined {
     const id = tile.event.eventId;
     if (!id) return undefined;
@@ -181,6 +184,7 @@ export function toViewMessage(
         ...(reactions?.length ? { reactions } : {}),
         ...(thread ? { thread } : {}),
         ...(media ? { media } : {}),
+        ...(urlPreviews?.length ? { urlPreviews } : {}),
     };
 }
 
@@ -247,4 +251,37 @@ export function toViewMedia(
                 ...size,
             };
     }
+}
+
+/**
+ * An audio body as a ViewMedia. The label is the one the audio player shows (`presentableTextForFile`); `url` is the
+ * media helper's URL and `error` Element's text when that URL could not be fetched or decrypted.
+ */
+export function toViewAudio(name: string, url: string | null | undefined, error?: string): ViewMedia {
+    if (error !== undefined) return { kind: "audio", state: "error", name, label: error };
+    return url ? { kind: "audio", state: "ready", url, name } : { kind: "audio", state: "loading", name };
+}
+
+/** The previews of a URL preview group snapshot as plain data; undefined for none. */
+export function toViewUrlPreviews(previews: UrlPreview[]): ViewUrlPreview[] | undefined {
+    if (!previews.length) return undefined;
+    return previews.map((p) => ({
+        link: p.link,
+        title: p.title,
+        siteName: p.siteName,
+        ...(p.description ? { description: p.description } : {}),
+        ...(p.siteIcon ? { siteIcon: p.siteIcon } : {}),
+        ...(p.ogUrl ? { ogUrl: p.ogUrl } : {}),
+        ...(p.author ? { author: p.author } : {}),
+        ...(p.image
+            ? {
+                  image: {
+                      url: p.image.imageThumb,
+                      ...(p.image.width !== undefined ? { width: p.image.width } : {}),
+                      ...(p.image.height !== undefined ? { height: p.image.height } : {}),
+                      ...(p.image.alt ? { alt: p.image.alt } : {}),
+                  },
+              }
+            : {}),
+    }));
 }

@@ -48,20 +48,27 @@ export interface ViewMessage {
     reactions?: ViewReaction[];
     /** The thread this message roots, from the thread summary view-model. Absent for a message without replies. */
     thread?: ViewThread;
-    /** The image, file or video of a media message, from its body view-model. Absent for any other message. */
+    /** The image, file, video or audio of a media message, from its body view-model. Absent for any other message. */
     media?: ViewMedia;
+    /**
+     * The link previews of the message, from the URL preview group view-model, in Element's order. Absent when Element
+     * shows none: previews hidden by the setting (room or encrypted-room default), by the user, or no link.
+     */
+    urlPreviews?: ViewUrlPreview[];
 }
 
 /**
- * A media body as the image, file or video body view-model shows it. URLs are plain strings the kit's frame can load
+ * A media body as the image, file, video or audio body view-model shows it. URLs are plain strings the kit's frame can load
  * (authenticated media goes through Element's service worker, encrypted media is the view-model's decrypted blob URL).
  * `state` "hidden" = Element's media-visibility setting hides it (`label` = the reveal text Element shows),
  * "error" = Element shows its error (`label` = that text), "loading" = no URL yet.
- * `name` is the label Element shows: the image alt, the video title, or the file label (which already carries the size).
- * `width` and `height` are the frame size the view-model suggests for an image or video.
+ * `name` is the label Element shows: the image alt, the video title, or the file or audio label (which already
+ * carries the size). `width` and `height` are the frame size the view-model suggests for an image or video.
+ * An audio message (a voice message included) has no body view-model here: Element's one decodes the whole file to
+ * play it, so `url` is the media helper's (the homeserver URL, or the decrypted blob URL) and the kit's frame plays it.
  */
 export interface ViewMedia {
-    kind: "image" | "file" | "video";
+    kind: "image" | "file" | "video" | "audio";
     state: "ready" | "loading" | "hidden" | "error";
     url?: string;
     thumbnailUrl?: string;
@@ -69,6 +76,21 @@ export interface ViewMedia {
     width?: number;
     height?: number;
     label?: string;
+}
+
+/**
+ * A link preview as the URL preview group view-model shows it. `image.url` is the thumbnail it fetched (absent when
+ * Element's media-visibility setting hides media); `ogUrl` is the page's own canonical URL, if it differs from `link`.
+ */
+export interface ViewUrlPreview {
+    link: string;
+    title: string;
+    siteName: string;
+    description?: string;
+    siteIcon?: string;
+    ogUrl?: string;
+    author?: string;
+    image?: { url: string; width?: number; height?: number; alt?: string };
 }
 
 /**

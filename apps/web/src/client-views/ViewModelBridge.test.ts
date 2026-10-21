@@ -82,7 +82,25 @@ const h = vi.hoisted(() => {
             onPlay: ReturnType<typeof vi.fn>;
         }
     > = [];
-    const mediaHelpers: Array<{ destroy: ReturnType<typeof vi.fn>; event?: unknown }> = [];
+    const mediaHelpers: Array<{
+        destroy: ReturnType<typeof vi.fn>;
+        event?: unknown;
+        resolveUrl: (url: string | null) => void;
+        rejectUrl: (e: unknown) => void;
+    }> = [];
+    const settings: Record<string, unknown> = {};
+    const roomEncrypted = { value: true };
+    const watchers = new Map<string, { name: string; roomId: string | null; cb: () => void }>();
+    const urlPreviewVms: Array<
+        InstanceType<typeof FakeVm<Record<string, unknown>>> & {
+            props: Record<string, unknown>;
+            hidden: boolean;
+            elements: Array<{ html: string; links: string[] }>;
+            updateEventElement: ReturnType<typeof vi.fn>;
+            updateUrlPreviewVisible: ReturnType<typeof vi.fn>;
+            updateMediaVisible: ReturnType<typeof vi.fn>;
+        }
+    > = [];
     const mediaVisible = { value: true };
     const mediaVm = (kind: "image" | "video" | "file", state: Record<string, unknown>) =>
         class extends FakeVm<Record<string, unknown>> {
@@ -103,6 +121,10 @@ const h = vi.hoisted(() => {
         mediaVms,
         mediaHelpers,
         mediaVisible,
+        settings,
+        roomEncrypted,
+        watchers,
+        urlPreviewVms,
         threadSummaries,
         releaseThreadSummary,
         room,
@@ -244,13 +266,67 @@ vi.mock("../viewmodels/message-body/FileBodyViewModel", () => ({
 vi.mock("../utils/MediaEventHelper", () => ({
     MediaEventHelper: class {
         public destroy = vi.fn();
+        public resolveUrl!: (url: string | null) => void;
+        public rejectUrl!: (e: unknown) => void;
+        public sourceUrl!: { value: Promise<string | null> };
         public constructor(public event: unknown) {
+            const url = new Promise<string | null>((resolve, reject) => {
+                this.resolveUrl = resolve;
+                this.rejectUrl = reject;
+            });
+            this.sourceUrl = { value: url };
             h.mediaHelpers.push(this);
         }
     },
 }));
+vi.mock("../utils/FileUtils", () => ({
+    presentableTextForFile: (content: { filename?: string; body?: string }) => content.filename ?? content.body,
+}));
+vi.mock("../viewmodels/message-body/UrlPreviewGroupViewModel", () => ({
+    BUNDLED_LINK_PREVIEWS: "com.beeper.linkpreviews",
+    UrlPreviewGroupViewModel: class extends h.FakeVm<Record<string, unknown>> {
+        public hidden = false;
+        public elements: Array<{ html: string; links: string[] }> = [];
+        public updateEventElement = vi.fn(async (el: Element) => {
+            this.elements.push({
+                html: el.innerHTML,
+                links: [...el.querySelectorAll("a")].map((a) => a.getAttribute("href") ?? ""),
+            });
+        });
+        public updateUrlPreviewVisible = vi.fn(async () => {});
+        public updateMediaVisible = vi.fn(async () => {});
+        public get isPreviewHiddenByUser(): boolean {
+            return this.hidden;
+        }
+        public constructor(public props: Record<string, unknown>) {
+            super({ previews: [], totalPreviewCount: 0, previewsLimited: true, overPreviewLimit: false });
+            h.urlPreviewVms.push(this as never);
+        }
+    },
+}));
+// bodyToNode linkifies through the logged-in client's settings; the fake linkifies a plain URL the way the stock body shows it.
+vi.mock("../HtmlUtils", () => ({
+    bodyToNode: (content: { body: string; formatted_body?: string }) => ({
+        strippedBody: content.body,
+        formattedBody:
+            content.formatted_body ?? content.body.replace(/(https?:\/\/\S+)/g, '<a href="$1">$1</a>'),
+    }),
+}));
+vi.mock("../modules/Api", () => ({ ModuleApi: { instance: { urlPreviews: { module: "url-preview-api" } } } }));
 vi.mock("../utils/media/mediaVisibility", () => ({ getMediaVisibility: () => h.mediaVisible.value }));
-vi.mock("../settings/SettingsStore", () => ({ default: { getValue: () => false } }));
+vi.mock("../settings/SettingsStore", () => ({
+    default: {
+        getValue: (name: string) => h.settings[name] ?? false,
+        watchSetting: vi.fn((name: string, roomId: string | null, cb: () => void) => {
+            const id = `w${h.watchers.size}_${name}_${Math.random()}`;
+            h.watchers.set(id, { name, roomId, cb });
+            return id;
+        }),
+        unwatchSetting: vi.fn((id: string) => {
+            h.watchers.delete(id);
+        }),
+    },
+}));
 vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => "http://avatar/room" }));
@@ -296,7 +372,7 @@ describe("ViewModelBridge", () => {
         bridge = new ViewModelBridge({
             getRoom: (id: string) => (id === "!a" ? h.room : null),
             getUserId: () => "@me:example.org",
-            isRoomEncrypted: () => true,
+            isRoomEncrypted: () => h.roomEncrypted.value,
             getCrypto: () => undefined,
             getEventTimeline: h.getEventTimeline,
             on: vi.fn(),
@@ -310,6 +386,11 @@ describe("ViewModelBridge", () => {
         h.mediaVms.length = 0;
         h.mediaHelpers.length = 0;
         h.mediaVisible.value = true;
+        h.urlPreviewVms.length = 0;
+        h.watchers.clear();
+        for (const k of Object.keys(h.settings)) delete h.settings[k];
+        h.settings.urlPreviewsEnabled = true;
+        h.roomEncrypted.value = true;
         h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
         h.room.findEventById.mockImplementation(() => undefined);
     });
@@ -1254,6 +1335,343 @@ describe("ViewModelBridge", () => {
             bridge.dispose();
             expect(h.mediaVms[0].dispose).toHaveBeenCalledTimes(1);
             expect(h.mediaHelpers[0].destroy).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe("audio bodies", () => {
+        const audioEvent = (id: string, over: Record<string, unknown> = {}, content: Record<string, unknown> = {}) =>
+            fakeEvent(id, {
+                getContent: () => ({ msgtype: "m.audio", body: "song.ogg", url: "mxc://hs/a", ...content }),
+                ...over,
+            });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        const settle = () => new Promise((r) => setTimeout(r, 0));
+
+        it("builds no view-model (that would decode the whole file for every row): the helper's URL, the label Element shows", async () => {
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            const ev = audioEvent("$a");
+            expect(read(ev)[0].media).toEqual({ kind: "audio", state: "loading", name: "song.ogg" });
+            expect(h.mediaVms).toHaveLength(0);
+            expect(h.mediaHelpers).toHaveLength(1);
+            h.mediaHelpers[0].resolveUrl("http://hs/media/a");
+            await settle();
+            expect(seen).toContain("timeline");
+            expect(read(ev)[0].media).toEqual({
+                kind: "audio",
+                state: "ready",
+                url: "http://hs/media/a",
+                name: "song.ogg",
+            });
+            // one helper, one URL request per message
+            expect(h.mediaHelpers).toHaveLength(1);
+        });
+
+        it("a voice message is the same audio body", async () => {
+            const ev = audioEvent("$v", {}, { body: "Voice message", "org.matrix.msc3245.voice": {} });
+            read(ev);
+            h.mediaHelpers[0].resolveUrl("blob:voice");
+            await settle();
+            expect(read(ev)[0].media).toMatchObject({ kind: "audio", state: "ready", url: "blob:voice" });
+        });
+
+        it("a URL that cannot be fetched or decrypted is Element's error text", async () => {
+            const ev = audioEvent("$e");
+            read(ev);
+            h.mediaHelpers[0].rejectUrl(new Error("decrypt"));
+            await settle();
+            expect(read(ev)[0].media).toEqual({
+                kind: "audio",
+                state: "error",
+                name: "song.ogg",
+                label: _t("timeline|m.audio|error_processing_audio"),
+            });
+        });
+
+        it("rebuilds for another file, and releases the helper of a redacted message", async () => {
+            let content: Record<string, unknown> = { msgtype: "m.audio", body: "a.ogg", url: "mxc://hs/a" };
+            let redacted = false;
+            const ev = fakeEvent("$r", { getContent: () => (redacted ? {} : content), isRedacted: () => redacted });
+            read(ev);
+            content = { msgtype: "m.audio", body: "b.ogg", url: "mxc://hs/b" };
+            expect(read(ev)[0].media).toMatchObject({ name: "b.ogg", state: "loading" });
+            expect(h.mediaHelpers).toHaveLength(2);
+            expect(h.mediaHelpers[0].destroy).toHaveBeenCalledTimes(1);
+            redacted = true;
+            expect(read(ev)[0]).not.toHaveProperty("media");
+            expect(h.mediaHelpers[1].destroy).toHaveBeenCalledTimes(1);
+        });
+
+        it("a URL that arrives after the message was released is not used, and a blob URL is revoked", async () => {
+            const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+            let redacted = false;
+            const ev = fakeEvent("$late", {
+                getContent: () => (redacted ? {} : { msgtype: "m.audio", body: "a.ogg", url: "mxc://hs/a" }),
+                isRedacted: () => redacted,
+            });
+            read(ev);
+            redacted = true;
+            read(ev);
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            h.mediaHelpers[0].resolveUrl("blob:late");
+            await settle();
+            expect(revoke).toHaveBeenCalledWith("blob:late");
+            expect(seen).toEqual([]);
+            revoke.mockRestore();
+        });
+    });
+
+    describe("media visibility follows Element's settings while the room is open (grok F5)", () => {
+        const imageEvent = (id: string) =>
+            fakeEvent(id, { getContent: () => ({ msgtype: "m.image", body: "x", url: "mxc://hs/a" }) });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        const watching = (name: string) => [...h.watchers.values()].filter((w) => w.name === name);
+
+        it("watches the room's media preview setting and the per-event overrides for a media row, and nothing for a text row", () => {
+            read(fakeEvent("$t"));
+            expect(h.watchers.size).toBe(0);
+            read(imageEvent("$i"));
+            expect(watching("mediaPreviewConfig").map((w) => w.roomId)).toEqual(["!a"]);
+            expect(watching("showMediaEventIds")).toHaveLength(1);
+        });
+
+        it("a change of either setting re-emits the timeline, and the next read applies the new visibility once", () => {
+            const ev = imageEvent("$i");
+            read(ev);
+            const seen: Array<string | undefined> = [];
+            bridge.onChange((e) => seen.push(`${e.kind}:${e.roomId}`));
+            h.mediaVisible.value = false;
+            watching("mediaPreviewConfig")[0].cb();
+            expect(seen).toEqual(["timeline:!a"]);
+            read(ev);
+            read(ev);
+            expect(h.mediaVms[0].setMediaVisible).toHaveBeenCalledTimes(1);
+            expect(h.mediaVms[0].setMediaVisible).toHaveBeenCalledWith(false);
+            h.mediaVisible.value = true;
+            watching("showMediaEventIds")[0].cb();
+            expect(seen).toEqual(["timeline:!a", "timeline:!a"]);
+            read(ev);
+            expect(h.mediaVms[0].setMediaVisible).toHaveBeenLastCalledWith(true);
+        });
+
+        it("stops watching when the media is released (redacted, another file) and when the bridge goes", () => {
+            let redacted = false;
+            const ev = fakeEvent("$r", {
+                getContent: () => (redacted ? {} : { msgtype: "m.image", body: "x", url: "mxc://hs/a" }),
+                isRedacted: () => redacted,
+            });
+            read(ev);
+            expect(h.watchers.size).toBe(2);
+            redacted = true;
+            read(ev);
+            expect(h.watchers.size).toBe(0);
+            redacted = false;
+            read(ev);
+            expect(h.watchers.size).toBe(2);
+            bridge.dispose();
+            expect(h.watchers.size).toBe(0);
+        });
+    });
+
+    describe("URL previews", () => {
+        const textEvent = (id: string, content: Record<string, unknown>, over: Record<string, unknown> = {}) =>
+            fakeEvent(id, { getContent: () => content, ...over });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        const preview = {
+            link: "https://example.org/post",
+            showTooltipOnLink: false,
+            title: "A post",
+            siteName: "Example",
+            description: "About a post",
+            image: { imageThumb: "http://hs/thumb", imageFull: "http://hs/full", mxcImageFull: "mxc://hs/f", playable: false },
+        };
+        const linkText = { msgtype: "m.text", body: "see https://example.org/post now" };
+
+        beforeEach(() => {
+            h.roomEncrypted.value = false;
+        });
+
+        it("builds the shipped view-model for a message with a link, from its linkified body, and maps its previews", async () => {
+            const ev = textEvent("$u", linkText);
+            expect(read(ev)[0]).not.toHaveProperty("urlPreviews");
+            expect(h.urlPreviewVms).toHaveLength(1);
+            const vm = h.urlPreviewVms[0];
+            expect(vm.props).toMatchObject({
+                client: expect.anything(),
+                mxEvent: ev,
+                visible: true,
+                mediaVisible: true,
+                urlPreviewKind: "fetchonly",
+                moduleUrlPreviewApi: { module: "url-preview-api" },
+            });
+            // the view-model finds its links in an element: the body, linkified as the tile shows it, after this read
+            expect(vm.updateEventElement).not.toHaveBeenCalled();
+            await Promise.resolve();
+            expect(vm.updateEventElement).toHaveBeenCalledTimes(1);
+            expect(vm.elements[0].links).toEqual(["https://example.org/post"]);
+            vm.set({ previews: [preview] });
+            expect(read(ev)[0].urlPreviews).toEqual([
+                {
+                    link: "https://example.org/post",
+                    title: "A post",
+                    siteName: "Example",
+                    description: "About a post",
+                    image: { url: "http://hs/thumb" },
+                },
+            ]);
+        });
+
+        it("takes the links of a formatted body from its sanitized HTML", async () => {
+            const ev = textEvent("$f", {
+                msgtype: "m.text",
+                body: "a post",
+                format: "org.matrix.custom.html",
+                formatted_body: 'a <a href="https://example.org/post">post</a>',
+            });
+            read(ev);
+            await Promise.resolve();
+            expect(h.urlPreviewVms[0].elements[0].links).toEqual(["https://example.org/post"]);
+        });
+
+        it("builds nothing for a message without a link, a media message or an unreadable one", () => {
+            read(
+                textEvent("$1", { msgtype: "m.text", body: "no link here" }),
+                textEvent("$2", { msgtype: "m.image", body: "https://example.org/x.png", url: "mxc://hs/a" }),
+                textEvent("$3", { msgtype: "m.bad.encrypted", body: "https://example.org/" }),
+            );
+            expect(h.urlPreviewVms).toHaveLength(0);
+        });
+
+        it("hidden means none: the room setting off builds no view-model and hands over nothing", () => {
+            h.settings.urlPreviewsEnabled = false;
+            expect(read(textEvent("$h", linkText))[0]).not.toHaveProperty("urlPreviews");
+            expect(h.urlPreviewVms).toHaveLength(0);
+        });
+
+        it("an encrypted room follows the e2ee setting, off by default", () => {
+            h.roomEncrypted.value = true;
+            h.settings.urlPreviewsEnabled_e2ee = false;
+            read(textEvent("$e", linkText));
+            expect(h.urlPreviewVms).toHaveLength(0);
+        });
+
+        it("an encrypted room with the e2ee setting on is bundled-only when the bundle feature and its option are on", () => {
+            h.roomEncrypted.value = true;
+            h.settings.urlPreviewsEnabled_e2ee = true;
+            h.settings.feature_msc4095_url_preview_bundle = true;
+            h.settings.urlPreviewsEnabled_e2ee_bundled_only = true;
+            read(textEvent("$b", linkText));
+            expect(h.urlPreviewVms[0].props).toMatchObject({ visible: true, urlPreviewKind: "bundledonly" });
+        });
+
+        it("with the bundle feature on, a plain room prefers the bundle", () => {
+            h.settings.feature_msc4095_url_preview_bundle = true;
+            read(textEvent("$p", linkText));
+            expect(h.urlPreviewVms[0].props).toMatchObject({ urlPreviewKind: "preferbundled" });
+        });
+
+        it("a preview the user hid is none, even when the snapshot still holds it", () => {
+            const ev = textEvent("$x", linkText);
+            read(ev);
+            const vm = h.urlPreviewVms[0];
+            vm.set({ previews: [preview] });
+            expect(read(ev)[0].urlPreviews).toHaveLength(1);
+            vm.hidden = true;
+            expect(read(ev)[0]).not.toHaveProperty("urlPreviews");
+        });
+
+        it("tells the view-model about a visibility change once, and re-reads on a setting change", () => {
+            const ev = textEvent("$s", linkText);
+            read(ev);
+            const vm = h.urlPreviewVms[0];
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            expect(h.watchers.size).toBeGreaterThan(0);
+            h.settings.urlPreviewsEnabled = false;
+            [...h.watchers.values()].find((w) => w.name === "urlPreviewsEnabled")!.cb();
+            expect(seen).toEqual(["timeline"]);
+            read(ev);
+            read(ev);
+            expect(vm.updateUrlPreviewVisible).toHaveBeenCalledTimes(1);
+            expect(vm.updateUrlPreviewVisible).toHaveBeenCalledWith(false);
+            h.mediaVisible.value = false;
+            read(ev);
+            read(ev);
+            expect(vm.updateMediaVisible).toHaveBeenCalledTimes(1);
+            expect(vm.updateMediaVisible).toHaveBeenCalledWith(false);
+        });
+
+        it("a setting that was off builds the view-model once it is turned on", () => {
+            h.settings.urlPreviewsEnabled = false;
+            const ev = textEvent("$o", linkText);
+            read(ev);
+            expect(h.urlPreviewVms).toHaveLength(0);
+            h.settings.urlPreviewsEnabled = true;
+            [...h.watchers.values()].find((w) => w.name === "urlPreviewsEnabled")!.cb();
+            read(ev);
+            expect(h.urlPreviewVms).toHaveLength(1);
+        });
+
+        it("follows an edit: new links are handed to the same view-model, an unchanged read is not", async () => {
+            let content: Record<string, unknown> = { msgtype: "m.text", body: "no link yet" };
+            const ev = textEvent("$ed", {}, { getContent: () => content });
+            read(ev);
+            expect(h.urlPreviewVms).toHaveLength(0);
+            content = linkText;
+            read(ev);
+            read(ev);
+            await Promise.resolve();
+            expect(h.urlPreviewVms).toHaveLength(1);
+            expect(h.urlPreviewVms[0].updateEventElement).toHaveBeenCalledTimes(1);
+            content = { msgtype: "m.text", body: "now https://example.org/other" };
+            read(ev);
+            await Promise.resolve();
+            expect(h.urlPreviewVms).toHaveLength(1);
+            expect(h.urlPreviewVms[0].updateEventElement).toHaveBeenCalledTimes(2);
+            expect(h.urlPreviewVms[0].elements[1].links).toEqual(["https://example.org/other"]);
+        });
+
+        it("drops the previews of a redacted message and releases the view-model and its watchers", () => {
+            let redacted = false;
+            const ev = textEvent("$rd", {}, { getContent: () => (redacted ? {} : linkText), isRedacted: () => redacted });
+            read(ev);
+            const vm = h.urlPreviewVms[0];
+            vm.set({ previews: [preview] });
+            expect(read(ev)[0].urlPreviews).toHaveLength(1);
+            redacted = true;
+            expect(read(ev)[0]).not.toHaveProperty("urlPreviews");
+            expect(vm.dispose).toHaveBeenCalledTimes(1);
+            expect(vm.listeners.size).toBe(0);
+            expect(h.watchers.size).toBe(0);
+        });
+
+        it("disposes the view-model, its subscription and its watchers with the bridge", () => {
+            read(textEvent("$d", linkText));
+            const vm = h.urlPreviewVms[0];
+            expect(vm.listeners.size).toBe(1);
+            bridge.dispose();
+            expect(vm.dispose).toHaveBeenCalledTimes(1);
+            expect(vm.listeners.size).toBe(0);
+            expect(h.watchers.size).toBe(0);
         });
     });
 });

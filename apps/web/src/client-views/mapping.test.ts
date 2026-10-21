@@ -28,8 +28,10 @@ import {
     nodeText,
     padlockWarning,
     toViewE2e,
+    toViewAudio,
     toViewMedia,
     toViewMessage,
+    toViewUrlPreviews,
     toViewRoom,
 } from "./mapping";
 import { type EventTileE2ePadlockViewState } from "../viewmodels/room/timeline/event-tile/EventTileE2eState";
@@ -363,6 +365,32 @@ describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
             });
         });
 
+        it("audio is ready with its URL and the label Element shows, loading without one, error with Element's text", () => {
+            expect(toViewAudio("voice.ogg (3 KB)", "blob:a")).toEqual({
+                kind: "audio",
+                state: "ready",
+                url: "blob:a",
+                name: "voice.ogg (3 KB)",
+            });
+            expect(toViewAudio("voice.ogg", undefined)).toEqual({ kind: "audio", state: "loading", name: "voice.ogg" });
+            expect(toViewAudio("voice.ogg", null)).toEqual({ kind: "audio", state: "loading", name: "voice.ogg" });
+            expect(toViewAudio("voice.ogg", undefined, "Error processing audio message")).toEqual({
+                kind: "audio",
+                state: "error",
+                name: "voice.ogg",
+                label: "Error processing audio message",
+            });
+        });
+
+        it("toViewMessage carries the URL previews when given, and none when the list is empty", () => {
+            const urlPreviews = [{ link: "https://example.org/a", title: "A", siteName: "Example" }];
+            const none = [undefined, undefined, undefined, undefined, undefined, undefined] as const;
+            const m = toViewMessage("!a", tile({}), { body: "a" }, ...none, urlPreviews);
+            expect(m?.urlPreviews).toEqual(urlPreviews);
+            expect(toViewMessage("!a", tile({}), { body: "a" })).not.toHaveProperty("urlPreviews");
+            expect(toViewMessage("!a", tile({}), { body: "a" }, ...none, [])).not.toHaveProperty("urlPreviews");
+        });
+
         it("toViewMessage carries the media when given", () => {
             const media = { kind: "image", state: "ready", name: "a" } as const;
             const m = toViewMessage(
@@ -378,6 +406,52 @@ describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
             );
             expect(m?.media).toEqual(media);
             expect(toViewMessage("!a", tile({}), { body: "a" })).not.toHaveProperty("media");
+        });
+    });
+
+    describe("toViewUrlPreviews", () => {
+        const preview = {
+            link: "https://example.org/post",
+            showTooltipOnLink: true,
+            title: "A post",
+            siteName: "Example",
+            ogUrl: "https://example.org/canonical",
+            siteIcon: "https://example.org/icon.png",
+            description: "About a post",
+            author: "Alice",
+            image: {
+                imageThumb: "http://hs/thumb",
+                imageFull: "http://hs/full",
+                mxcImageFull: "mxc://hs/full",
+                width: 320,
+                height: 180,
+                alt: "cover",
+                playable: false,
+            },
+        };
+
+        it("maps a preview to plain fields; the image is the thumbnail the view-model fetched", () => {
+            expect(toViewUrlPreviews([preview])).toEqual([
+                {
+                    link: "https://example.org/post",
+                    title: "A post",
+                    siteName: "Example",
+                    ogUrl: "https://example.org/canonical",
+                    siteIcon: "https://example.org/icon.png",
+                    description: "About a post",
+                    author: "Alice",
+                    image: { url: "http://hs/thumb", width: 320, height: 180, alt: "cover" },
+                },
+            ]);
+        });
+
+        it("leaves out what the preview does not have", () => {
+            const [p] = toViewUrlPreviews([{ link: "https://e.org", showTooltipOnLink: false, title: "T", siteName: "" }])!;
+            expect(p).toEqual({ link: "https://e.org", title: "T", siteName: "" });
+        });
+
+        it("is undefined for no previews", () => {
+            expect(toViewUrlPreviews([])).toBeUndefined();
         });
     });
 });

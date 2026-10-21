@@ -21,6 +21,8 @@ import {
 } from "matrix-js-sdk/src/matrix";
 import { uniq, uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
+import { type MediaEventContent } from "matrix-js-sdk/src/types";
+import { logger } from "matrix-js-sdk/src/logger";
 import type { RefObject } from "react";
 import {
     type FileBodyViewSnapshot,
@@ -46,6 +48,15 @@ import { EventContentBodyViewModel } from "../viewmodels/message-body/EventConte
 import { ImageBodyViewModel } from "../viewmodels/message-body/ImageBodyViewModel";
 import { VideoBodyViewModel } from "../viewmodels/message-body/VideoBodyViewModel";
 import { FileBodyViewModel } from "../viewmodels/message-body/FileBodyViewModel";
+import {
+    BUNDLED_LINK_PREVIEWS,
+    UrlPreviewGroupViewModel,
+    type UrlPreviewKind,
+} from "../viewmodels/message-body/UrlPreviewGroupViewModel";
+import { ModuleApi } from "../modules/Api";
+import { bodyToNode } from "../HtmlUtils";
+import { presentableTextForFile } from "../utils/FileUtils";
+import { type SettingKey } from "../settings/Settings";
 import { MediaEventHelper } from "../utils/MediaEventHelper";
 import { getMediaVisibility } from "../utils/media/mediaVisibility";
 import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/ReplyTileViewModel";
@@ -59,7 +70,7 @@ import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
-import { toViewE2e, toViewMedia, toViewMessage, toViewRoom } from "./mapping";
+import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import {
     type ClientViewBridge,
     type ViewConnection,
@@ -71,6 +82,7 @@ import {
     type ViewReply,
     type ViewRoom,
     type ViewThread,
+    type ViewUrlPreview,
     STOCK_VIEW,
 } from "./types";
 
@@ -85,6 +97,24 @@ const unreadable = (ev: MatrixEvent): boolean =>
     [ev, ev.replacingEvent()].some(
         (e) => !!e && (e.isDecryptionFailure() || (e.isEncrypted() && e.getClearContent() === null)),
     );
+
+interface MediaBodyBase {
+    helper: MediaEventHelper;
+    /** The file the body was built for (content `url` / `file.url`): another file, as an edit brings, rebuilds it. */
+    identity: string;
+    unsubscribe: () => void;
+}
+/** An audio message: the media helper's URL once it is there, `failed` if it could not be fetched or decrypted. */
+type AudioMediaBody = MediaBodyBase & { kind: "audio"; url?: string; failed: boolean };
+/** An image, video or file message: its body view-model. */
+type ViewModelMediaBody = MediaBodyBase & {
+    kind: "image" | "video" | "file";
+    vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
+    visible: boolean;
+    /** Whether `onPlay` was asked for: an encrypted video decrypts only on play, and it must not be asked twice. */
+    played: boolean;
+};
+type MediaBody = AudioMediaBody | ViewModelMediaBody;
 
 /**
  * The tile, body and E2E view-models of one timeline event, built the way EventTile builds them. `changed` runs when
@@ -113,17 +143,18 @@ class EventRow {
     private threadSummaryRelease?: () => void;
     /** The latest thread reply's edit, followed: the preview listens on the reply, which a bundled edit leaves silent. */
     private lastReplyEdit: MatrixEvent | null = null;
-    /** The image, video or file body view-model of a media message, as MBodyFactory builds it, built on first read. */
-    private mediaBody?: {
-        kind: ViewMedia["kind"];
-        vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
-        helper: MediaEventHelper;
-        /** The file the view-model was built for (content `url` / `file.url`): another file, as an edit brings, rebuilds it. */
-        identity: string;
+    /** The image, video, file or audio body of a media message, as MBodyFactory builds it, built on first read. */
+    private mediaBody?: MediaBody;
+    /** The link previews of a text message that has a link, built on first read (see `urlPreviews`). */
+    private urlPreview?: {
+        kind: UrlPreviewKind;
+        vm?: UrlPreviewGroupViewModel;
+        /** What the view-model was last told, so a read tells it only a change. */
         visible: boolean;
-        /** Whether `onPlay` was asked for: an encrypted video decrypts only on play, and it must not be asked twice. */
-        played: boolean;
-        unsubscribe: () => void;
+        mediaVisible: boolean;
+        contentKey: string;
+        unsubscribe?: () => void;
+        unwatch: () => void;
     };
     private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
@@ -527,7 +558,9 @@ class EventRow {
                   ? "video"
                   : content.msgtype === MsgType.File
                     ? "file"
-                    : undefined;
+                    : content.msgtype === MsgType.Audio
+                      ? "audio"
+                      : undefined;
         const identity = `${content.url ?? ""}|${content.file?.url ?? ""}`;
         if (this.disposed || kind !== this.mediaBody?.kind || identity !== this.mediaBody?.identity) {
             this.releaseMedia();
@@ -536,6 +569,11 @@ class EventRow {
         const visible = getMediaVisibility(this.ev, this.client);
         if (!this.mediaBody) this.mediaBody = this.newMedia(kind, identity, visible);
         const body = this.mediaBody;
+        if (body.kind === "audio") {
+            // The label the audio player shows (a voice message is the same body); nothing here decodes the file.
+            const name = presentableTextForFile(this.ev.getContent<MediaEventContent>(), undefined, false);
+            return toViewAudio(name, body.url, body.failed ? _t("timeline|m.audio|error_processing_audio") : undefined);
+        }
         // Called only on a change: the setters notify, and a kit's read must not loop.
         if (body.kind !== "file" && body.visible !== visible) {
             body.visible = visible;
@@ -547,7 +585,7 @@ class EventRow {
             body.played = true;
             const player = body.vm as VideoBodyViewModel;
             queueMicrotask(() => {
-                if (!this.disposed && this.mediaBody?.vm === player) void player.onPlay();
+                if (!this.disposed && this.mediaVm() === player) void player.onPlay();
             });
         }
         switch (kind) {
@@ -560,8 +598,9 @@ class EventRow {
         }
     }
 
-    private newMedia(kind: ViewMedia["kind"], identity: string, visible: boolean): NonNullable<EventRow["mediaBody"]> {
+    private newMedia(kind: ViewMedia["kind"], identity: string, visible: boolean): MediaBody {
         const helper = new MediaEventHelper(this.ev);
+        if (kind === "audio") return this.newAudio(helper, identity);
         let vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
         if (kind === "image") {
             vm = new ImageBodyViewModel({
@@ -588,15 +627,61 @@ class EventRow {
                 documentPreviewsEnabled: false,
             });
         }
-        const unsubscribe = vm.subscribe(this.changed);
+        const unsubscribeVm = vm.subscribe(this.changed);
+        // The media-visibility setting and the per-event reveals: the view-model is told on the next read.
+        const unwatch =
+            kind === "file"
+                ? () => {}
+                : this.watchSettings([
+                      ["mediaPreviewConfig", this.ev.getRoomId() ?? null],
+                      ["showMediaEventIds", null],
+                  ]);
+        const unsubscribe = (): void => {
+            unsubscribeVm();
+            unwatch();
+        };
         if (kind !== "file") {
             // Start after the read that built it: the first snapshot may land synchronously.
             const loader = vm as ImageBodyViewModel | VideoBodyViewModel;
             queueMicrotask(() => {
-                if (!this.disposed && this.mediaBody?.vm === loader) loader.loadInitialMediaIfVisible();
+                if (!this.disposed && this.mediaVm() === loader) loader.loadInitialMediaIfVisible();
             });
         }
         return { kind, vm, helper, identity, visible, played: false, unsubscribe };
+    }
+
+    /** The view-model of the current image, video or file body. */
+    private mediaVm(): ViewModelMediaBody["vm"] | undefined {
+        const body = this.mediaBody;
+        return body && body.kind !== "audio" ? body.vm : undefined;
+    }
+
+    /**
+     * An audio body has no view-model here: Element's audio player view-model needs the decoded file (a Playback),
+     * which would decode every audio message of the room just to list it. The URL is the media helper's, as MAudioBody
+     * reads its source: the homeserver URL, or the decrypted blob URL.
+     */
+    private newAudio(helper: MediaEventHelper, identity: string): AudioMediaBody {
+        const body: AudioMediaBody = { kind: "audio", helper, identity, failed: false, unsubscribe: () => {} };
+        const current = (): boolean => !this.disposed && this.mediaBody === body;
+        helper.sourceUrl.value.then(
+            (url) => {
+                if (!current()) {
+                    // Released while it was fetched or decrypted: the helper's cleanup ran before this blob existed.
+                    if (url?.startsWith("blob:")) URL.revokeObjectURL(url);
+                    return;
+                }
+                if (url) body.url = url;
+                else body.failed = true;
+                this.changed();
+            },
+            () => {
+                if (!current()) return;
+                body.failed = true;
+                this.changed();
+            },
+        );
+        return body;
     }
 
     private releaseMedia(): void {
@@ -604,13 +689,132 @@ class EventRow {
         if (!body) return;
         this.mediaBody = undefined;
         body.unsubscribe();
-        body.vm.dispose();
+        if (body.kind !== "audio") body.vm.dispose();
         body.helper.destroy();
+    }
+
+    /** Watches settings; `changed` runs when one of them does, and the returned function stops it. */
+    private watchSettings(settings: Array<[SettingKey, string | null]>): () => void {
+        const refs = settings.map(([name, roomId]) => SettingsStore.watchSetting(name, roomId, () => this.changed()));
+        return () => refs.forEach((ref) => SettingsStore.unwatchSetting(ref));
+    }
+
+    /**
+     * The link previews of a text message, from the URL preview group view-model as TextualBodyFactory builds it. The
+     * view-model finds its links in an element, which the stock body supplies: here it is built from the body's own
+     * linkified, sanitized HTML (what `bodyToNode` gives the stock body), in an inert document. Nothing is built or
+     * fetched while Element hides previews (the setting of the room, or of an encrypted room, off), and a preview the
+     * user hid stays hidden: both hand over nothing. The row follows the settings and an edit; an unchanged read
+     * tells the view-model nothing.
+     */
+    public urlPreviews(): ViewUrlPreview[] | undefined {
+        const content: Record<string, unknown> = this.ev.isRedacted() ? {} : this.ev.getContent();
+        const bundle = content[BUNDLED_LINK_PREVIEWS];
+        const str = (value: unknown): string => (typeof value === "string" ? value : "");
+        const text = `${str(content.body)}\n${str(content.formatted_body)}`;
+        const textual = [MsgType.Text, MsgType.Notice, MsgType.Emote].includes(content.msgtype as MsgType);
+        const candidate =
+            !this.disposed && textual && (/https?:\/\//i.test(text) || (Array.isArray(bundle) && bundle.length > 0));
+        if (!candidate) {
+            this.releaseUrlPreview();
+            return undefined;
+        }
+        const encrypted = this.isRoomEncrypted();
+        const visible = !!SettingsStore.getValue(encrypted ? "urlPreviewsEnabled_e2ee" : "urlPreviewsEnabled");
+        const kind: UrlPreviewKind = SettingsStore.getValue("feature_msc4095_url_preview_bundle")
+            ? encrypted && SettingsStore.getValue("urlPreviewsEnabled_e2ee_bundled_only")
+                ? "bundledonly"
+                : "preferbundled"
+            : "fetchonly";
+        const mediaVisible = getMediaVisibility(this.ev, this.client);
+        // The kind is a prop the view-model cannot change.
+        if (this.urlPreview && this.urlPreview.kind !== kind) this.releaseUrlPreview();
+        const state = (this.urlPreview ??= {
+            kind,
+            visible,
+            mediaVisible,
+            contentKey: "",
+            unwatch: this.watchSettings([
+                ["urlPreviewsEnabled", null],
+                ["urlPreviewsEnabled_e2ee", null],
+                ["urlPreviewsEnabled_e2ee_bundled_only", null],
+                ["feature_msc4095_url_preview_bundle", null],
+                ["mediaPreviewConfig", this.ev.getRoomId() ?? null],
+                ["showMediaEventIds", null],
+            ]),
+        });
+        if (visible && !state.vm) {
+            const vm = new UrlPreviewGroupViewModel({
+                client: this.client,
+                mxEvent: this.ev,
+                visible,
+                mediaVisible,
+                showTooltips: false,
+                onImageClicked: () => {},
+                urlPreviewKind: kind,
+                moduleUrlPreviewApi: ModuleApi.instance.urlPreviews,
+            });
+            state.vm = vm;
+            state.visible = visible;
+            state.mediaVisible = mediaVisible;
+            state.unsubscribe = vm.subscribe(this.changed);
+        }
+        const vm = state.vm;
+        if (!vm) return undefined;
+        // Called only on a change: the updaters recompute (and may fetch), and a kit's read must not loop.
+        const warn =
+            (what: string) =>
+            (error: unknown): void =>
+                logger.warn(`Client views: URL preview ${what} failed`, error);
+        if (state.visible !== visible) {
+            state.visible = visible;
+            void vm.updateUrlPreviewVisible(visible).catch(warn("visibility"));
+        }
+        if (state.mediaVisible !== mediaVisible) {
+            state.mediaVisible = mediaVisible;
+            void vm.updateMediaVisible(mediaVisible).catch(warn("media visibility"));
+        }
+        const contentKey = `${text}\n${JSON.stringify(bundle ?? null)}`;
+        if (visible && state.contentKey !== contentKey) {
+            state.contentKey = contentKey;
+            const element = this.previewElement(content);
+            // After the read that built it: the first snapshot may land synchronously.
+            queueMicrotask(() => {
+                if (this.disposed || this.urlPreview?.vm !== vm) return;
+                void vm.updateEventElement(element).catch(warn("links"));
+            });
+        }
+        if (!visible || vm.isPreviewHiddenByUser) return undefined;
+        return toViewUrlPreviews(vm.getSnapshot().previews);
+    }
+
+    /** The body as an element of its linkified, sanitized HTML, for the view-model to read the links from. */
+    private previewElement(content: Record<string, unknown>): HTMLDivElement {
+        const { formattedBody, strippedBody } = bodyToNode(content, undefined, {
+            stripReplyFallback: true,
+            disableBigEmoji: true,
+            linkify: true,
+        });
+        // An inert document: the sanitized HTML is parsed, but its images and other resources are not loaded.
+        const element = new DOMParser().parseFromString("", "text/html").createElement("div");
+        if (formattedBody !== undefined) element.innerHTML = formattedBody;
+        else element.textContent = strippedBody;
+        return element;
+    }
+
+    private releaseUrlPreview(): void {
+        const state = this.urlPreview;
+        if (!state) return;
+        this.urlPreview = undefined;
+        state.unsubscribe?.();
+        state.vm?.dispose();
+        state.unwatch();
     }
 
     public dispose(): void {
         this.disposed = true;
         this.releaseMedia();
+        this.releaseUrlPreview();
         this.bindReactions(this.reactionRelations, "off");
         this.reactionRelations = undefined;
         this.reactionButtons.forEach((b) => b.dispose());
@@ -900,6 +1104,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.reactions(),
                 row.threadSummary(),
                 row.media(),
+                row.urlPreviews(),
             );
             if (message) messages.push(message);
         }
