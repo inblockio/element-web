@@ -7,7 +7,7 @@
 
 // @vitest-environment happy-dom
 
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 import { DecryptionFailureCode } from "matrix-js-sdk/src/crypto-api";
 
@@ -44,6 +44,8 @@ const h = vi.hoisted(() => {
         findEventById: vi.fn((_id: string): unknown => undefined),
         findThreadForEvent: () => null,
         getUnfilteredTimelineSet: () => timelineSet,
+        getMyMembership: () => "join",
+        currentState: { maySendEvent: vi.fn((_type: string, _user: string): boolean => true) },
         on: vi.fn(),
         off: vi.fn(),
     };
@@ -68,8 +70,12 @@ const h = vi.hoisted(() => {
     const getEventTimeline = vi.fn(async (..._args: unknown[]) => undefined);
     const reactionButtons: Array<{
         props: { content: string; disabled?: boolean };
+        getSnapshot: () => { isDisabled: boolean };
         dispose: ReturnType<typeof vi.fn>;
+        onClick: ReturnType<typeof vi.fn>;
     }> = [];
+    /** What a press on a reaction button does in the fake (the real one sends or redacts). */
+    const buttonClick = { run: (_content: string): void => {} };
     const threadSummaries: Array<FakeVm<{ isVisible: boolean; previewVm: FakeVm<object> }> & Record<string, unknown>> =
         [];
     const releaseThreadSummary = vi.fn();
@@ -139,6 +145,7 @@ const h = vi.hoisted(() => {
         bodies,
         replies,
         reactionButtons,
+        buttonClick,
         getEventTimeline,
     };
 });
@@ -241,14 +248,24 @@ vi.mock("../viewmodels/room/timeline/event-tile/ReplyTileViewModel", () => ({
     },
 }));
 vi.mock("../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel", () => ({
-    ReactionsRowButtonViewModel: class extends h.FakeVm<{ count: number; isSelected: boolean }> {
-        public constructor(public props: { content: string; count: number; myReactionEvent?: unknown }) {
-            super({ count: props.count, isSelected: !!props.myReactionEvent });
+    ReactionsRowButtonViewModel: class extends h.FakeVm<{ count: number; isSelected: boolean; isDisabled: boolean }> {
+        public constructor(
+            public props: { content: string; count: number; myReactionEvent?: unknown; disabled?: boolean },
+        ) {
+            super({ count: props.count, isSelected: !!props.myReactionEvent, isDisabled: !!props.disabled });
             h.reactionButtons.push(this as never);
         }
         public setReactionData = vi.fn();
         public setCount = (count: number): void => this.set({ count });
         public setMyReactionEvent = (ev?: unknown): void => this.set({ isSelected: !!ev });
+        public setDisabled = (disabled?: boolean): void => {
+            this.props = { ...this.props, disabled };
+            this.set({ isDisabled: !!disabled });
+        };
+        // The real click is a no-op while disabled, else it sends or redacts.
+        public onClick = vi.fn(() => {
+            if (!this.props.disabled) h.buttonClick.run(this.props.content);
+        });
     },
 }));
 vi.mock("../viewmodels/message-body/ImageBodyViewModel", () => ({
@@ -396,6 +413,8 @@ describe("ViewModelBridge", () => {
         h.roomEncrypted.value = true;
         h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
         h.room.findEventById.mockImplementation(() => undefined);
+        h.room.currentState.maySendEvent.mockImplementation(() => true);
+        h.buttonClick.run = () => {};
     });
 
     it("maps the room list and the user menu snapshots", () => {
@@ -978,8 +997,189 @@ describe("ViewModelBridge", () => {
                 { key: "👍", count: 2, mine: true, senderIds: ["@bob:example.org", "@me:example.org"] },
                 { key: "🎉", count: 1, mine: false, senderIds: ["@bob:example.org"] },
             ]);
-            // Read-only: the buttons never send (adding or toggling a reaction is N/A in a client view).
-            expect(h.reactionButtons.every((b) => b.props.disabled === true)).toBe(true);
+            // The stock disabled rule: this user can react and redact, so nothing is disabled.
+            expect(h.reactionButtons.map((b) => b.props.disabled)).toEqual([false, false]);
+        });
+
+        it("builds the buttons with the stock disabled rule: no right to react, or an own reaction without the right to redact", () => {
+            const mine = reaction("@me:example.org", "👍");
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(
+                relationsOf(
+                    [
+                        ["👍", [mine]],
+                        ["🎉", [reaction("@bob:example.org", "🎉")]],
+                    ],
+                    [mine],
+                ),
+            );
+            h.room.currentState.maySendEvent.mockImplementation((type: string) => type !== "m.room.redaction");
+            read(fakeEvent("$1"));
+            expect(h.reactionButtons.map((b) => [b.props.content, b.props.disabled])).toEqual([
+                ["👍", true],
+                ["🎉", false],
+            ]);
+            h.room.currentState.maySendEvent.mockImplementation(() => false);
+            read(fakeEvent("$1"));
+            expect(h.reactionButtons.map((b) => b.getSnapshot().isDisabled)).toEqual([true, true]);
+        });
+
+        describe("react (A2)", () => {
+            let mineList: ReturnType<typeof reaction>[];
+            let groups: Array<[string, ReturnType<typeof reaction>[]]>;
+            let relations: ReturnType<typeof relationsOf>;
+            const present = (): void => {
+                relations = {
+                    ...relationsOf(groups, mineList),
+                    getSortedAnnotationsByKey: () => groups.map(([key, events]) => [key, new Set(events)]),
+                    getAnnotationsBySender: () => ({ "@me:example.org": new Set(mineList) }),
+                };
+                h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(relations);
+            };
+            const emit = (): void => {
+                relations.on.mock.calls.find(([name]) => name === "Relations.add")![1]();
+            };
+            beforeEach(() => {
+                vi.useFakeTimers();
+                mineList = [];
+                groups = [["👍", [reaction("@bob:example.org", "👍")]]];
+                present();
+                read(fakeEvent("$1"));
+            });
+            afterEach(() => vi.useRealTimers());
+
+            it("presses the chip's own click and resolves done once the snapshot shows the user's reaction", async () => {
+                h.buttonClick.run = (content) => {
+                    // The echo of the sent annotation.
+                    const mine = reaction("@me:example.org", content, { getId: () => "$mine" });
+                    groups = [[content, [...groups[0][1], mine]]];
+                    mineList = [mine];
+                    present();
+                };
+                const call = bridge.react("!a", "$1", "👍");
+                expect(h.reactionButtons[0].onClick).toHaveBeenCalledTimes(1);
+                await expect(call).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$1" });
+                expect(read(fakeEvent("$1"))[0].reactions).toEqual([
+                    { key: "👍", count: 2, mine: true, senderIds: ["@bob:example.org", "@me:example.org"] },
+                ]);
+            });
+
+            it("redacts through the same click when the user's reaction is there, done when it is gone", async () => {
+                const mine = reaction("@me:example.org", "👍");
+                groups = [["👍", [reaction("@bob:example.org", "👍"), mine]]];
+                mineList = [mine];
+                present();
+                read(fakeEvent("$1"));
+                h.buttonClick.run = () => {
+                    groups = [["👍", [reaction("@bob:example.org", "👍")]]];
+                    mineList = [];
+                    present();
+                };
+                const call = bridge.react("!a", "$1", "👍");
+                emit();
+                await expect(call).resolves.toMatchObject({ status: "done" });
+                expect(h.reactionButtons[0].onClick).toHaveBeenCalledTimes(1);
+            });
+
+            it("one call per (event, key): a repeat joins the pending one and sends nothing more", async () => {
+                const first = bridge.react("!a", "$1", "👍");
+                const second = bridge.react("!a", "$1", "👍");
+                expect(second).toBe(first);
+                expect(h.reactionButtons[0].onClick).toHaveBeenCalledTimes(1);
+                const mine = reaction("@me:example.org", "👍");
+                groups = [["👍", [...groups[0][1], mine]]];
+                mineList = [mine];
+                present();
+                await vi.advanceTimersByTimeAsync(300);
+                await expect(first).resolves.toMatchObject({ status: "done" });
+                // Settled: the next press is a new call.
+                expect(bridge.react("!a", "$1", "👍")).not.toBe(first);
+            });
+
+            it("gives a key without a chip a fresh button view-model, clicks it and releases it", async () => {
+                h.buttonClick.run = (content) => {
+                    const mine = reaction("@me:example.org", content);
+                    groups = [...groups, [content, [mine]]];
+                    mineList = [mine];
+                    present();
+                };
+                const call = bridge.react("!a", "$1", "🎉");
+                const fresh = h.reactionButtons.find((b) => b.props.content === "🎉")!;
+                expect(fresh.props).toMatchObject({ count: 0, disabled: false });
+                expect(fresh.onClick).toHaveBeenCalledTimes(1);
+                expect(fresh.dispose).toHaveBeenCalledTimes(1);
+                await expect(call).resolves.toMatchObject({ status: "done" });
+            });
+
+            it("is forbidden where the stock disabled rule blocks, and sends nothing", async () => {
+                h.room.currentState.maySendEvent.mockImplementation(() => false);
+                await expect(bridge.react("!a", "$1", "👍")).rejects.toMatchObject({ code: "forbidden" });
+                await expect(bridge.react("!a", "$1", "🎉")).rejects.toMatchObject({ code: "forbidden" });
+                expect(h.reactionButtons.every((b) => b.onClick.mock.calls.length === 0 || b.props.disabled)).toBe(
+                    true,
+                );
+            });
+
+            it("names an unknown room or event", async () => {
+                await expect(bridge.react("!nope", "$1", "👍")).rejects.toMatchObject({ code: "unknown_room" });
+                await expect(bridge.react("!a", "$nope", "👍")).rejects.toMatchObject({ code: "unknown_event" });
+            });
+
+            it("fails after 15 s when the snapshot never shows the change", async () => {
+                const call = bridge.react("!a", "$1", "👍");
+                const outcome = call.catch((e: unknown) => e);
+                await vi.advanceTimersByTimeAsync(15_001);
+                expect(await outcome).toMatchObject({ code: "failed" });
+                // A new press is allowed once the call has ended.
+                expect(bridge.react("!a", "$1", "👍")).not.toBe(call);
+            });
+
+            it("opens Element's picker for the host to render, done when it closes (choice or dismissal alike)", async () => {
+                const shown: Array<unknown> = [];
+                bridge.onReactionPicker((r) => shown.push(r));
+                const call = bridge.openReactionPicker("!a", "$1", { x: 10, y: 20, width: 30, height: 40 });
+                const request = shown[0] as {
+                    anchor: unknown;
+                    permissions: unknown;
+                    reactions: unknown;
+                    finish(): void;
+                };
+                expect(request.anchor).toEqual({ x: 10, y: 20, width: 30, height: 40 });
+                expect(request.permissions).toEqual({ canReact: true, canSelfRedact: true });
+                expect(request.reactions).toBe(relations);
+                request.finish();
+                request.finish();
+                await expect(call).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$1" });
+                expect(shown).toEqual([request, null]);
+            });
+
+            it("a second picker replaces the first (its call is done), and dispose closes the open one", async () => {
+                const shown: Array<unknown> = [];
+                bridge.onReactionPicker((r) => shown.push(r));
+                const first = bridge.openReactionPicker("!a", "$1", { x: 0, y: 0, width: 1, height: 1 });
+                const second = bridge.openReactionPicker("!a", "$1", { x: 5, y: 5, width: 1, height: 1 });
+                await expect(first).resolves.toMatchObject({ status: "done" });
+                bridge.dispose();
+                await expect(second).resolves.toMatchObject({ status: "done" });
+            });
+
+            it("refuses a picker where the user cannot react, and for an unknown room or event", async () => {
+                await expect(
+                    bridge.openReactionPicker("!nope", "$1", { x: 0, y: 0, width: 1, height: 1 }),
+                ).rejects.toMatchObject({
+                    code: "unknown_room",
+                });
+                await expect(
+                    bridge.openReactionPicker("!a", "$nope", { x: 0, y: 0, width: 1, height: 1 }),
+                ).rejects.toMatchObject({
+                    code: "unknown_event",
+                });
+                h.room.currentState.maySendEvent.mockImplementation(() => false);
+                await expect(
+                    bridge.openReactionPicker("!a", "$1", { x: 0, y: 0, width: 1, height: 1 }),
+                ).rejects.toMatchObject({
+                    code: "forbidden",
+                });
+            });
         });
 
         it("does not count a redacted own reaction as selected and drops an emptied key", () => {

@@ -25,7 +25,13 @@ import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
 import { BOOT_TIMEOUT_MS, ClientViewGate, relayMediaAuth } from "./ClientViewGate";
 import { getActiveClientView, selectClientView } from "./registry";
 
-const h = vi.hoisted(() => ({ used: false, handedOver: false, watchers: new Set<() => void>() }));
+const h = vi.hoisted(() => ({
+    used: false,
+    handedOver: false,
+    watchers: new Set<() => void>(),
+    pickerListeners: new Set<(request: unknown) => void>(),
+    aboveLeftOf: vi.fn((rect: unknown) => ({ placedAt: rect })),
+}));
 
 vi.mock("./registry", () => {
     const setHandedOver = (on: boolean): void => {
@@ -52,8 +58,41 @@ vi.mock("./ViewModelBridge", () => ({
             h.used = on;
         }
         public dispose = vi.fn();
+        public onReactionPicker = (cb: (request: unknown) => void): (() => void) => {
+            h.pickerListeners.add(cb);
+            return () => void h.pickerListeners.delete(cb);
+        };
     },
 }));
+// The picker stack (menu, emoji grid) is Element's own; the stubs pin what the host hands it.
+vi.mock("../components/structures/ContextMenu", () => ({
+    default: ({ children, onFinished }: { children: React.ReactNode; onFinished: () => void }) => (
+        <div data-testid="menu">
+            <button onClick={onFinished}>dismiss</button>
+            {children}
+        </div>
+    ),
+    aboveLeftOf: (rect: unknown) => h.aboveLeftOf(rect),
+}));
+vi.mock("../components/views/emojipicker/ReactionPicker", async () => {
+    const { default: RoomContext } = await import("../contexts/RoomContext");
+    return {
+        default: function PickerStub({
+            mxEvent,
+            onFinished,
+        }: {
+            mxEvent: { getId(): string };
+            onFinished: () => void;
+        }) {
+            const { canReact, canSelfRedact } = React.useContext(RoomContext);
+            return (
+                <button onClick={onFinished}>
+                    {`picker ${mxEvent.getId()} canReact=${canReact} canSelfRedact=${canSelfRedact}`}
+                </button>
+            );
+        },
+    };
+});
 // The overlays below need the whole call and widget stack; stubs pin only that the gate draws them.
 vi.mock("../components/structures/PipContainer", () => ({ PipContainer: () => <div data-testid="pip" /> }));
 vi.mock("../components/views/voip/AudioFeedArrayForLegacyCall", () => ({
@@ -116,6 +155,29 @@ describe("ClientViewGate", () => {
         calls.getAllActiveCalls.mockReturnValue([{ callId: "c1" }]);
         act(() => void calls.emit(LegacyCallHandlerEvent.CallState));
         expect(screen.getByTestId("audio-c1")).toBeTruthy();
+    });
+
+    it("draws Element's reaction picker above the kit from the bridge's request, at the kit's anchor", () => {
+        renderGate();
+        expect(screen.queryByTestId("menu")).toBeNull();
+        const finish = vi.fn();
+        const request = {
+            room: {},
+            mxEvent: { getId: () => "$1" },
+            reactions: null,
+            permissions: { canReact: true, canSelfRedact: false },
+            anchor: { x: 10, y: 20, width: 30, height: 40 },
+            finish,
+        };
+        act(() => h.pickerListeners.forEach((cb) => cb(request)));
+        expect(screen.getByRole("button", { name: "picker $1 canReact=true canSelfRedact=false" })).toBeTruthy();
+        expect(h.aboveLeftOf).toHaveBeenCalledWith({ left: 10, right: 40, top: 20, bottom: 60 });
+        fireEvent.click(screen.getByRole("button", { name: "dismiss" }));
+        expect(finish).toHaveBeenCalledTimes(1);
+        fireEvent.click(screen.getByRole("button", { name: /^picker/ }));
+        expect(finish).toHaveBeenCalledTimes(2);
+        act(() => h.pickerListeners.forEach((cb) => cb(null)));
+        expect(screen.queryByTestId("menu")).toBeNull();
     });
 
     it("offers the way back to Element when a kit never reads the bridge", () => {

@@ -27,6 +27,7 @@ import { MatrixClientContextProvider } from "../components/structures/MatrixClie
 import AudioFeedArrayForLegacyCall from "../components/views/voip/AudioFeedArrayForLegacyCall";
 import { getActiveClientView, isHandedOver, selectClientView, setHandedOver, watchHandOver } from "./registry";
 import { ViewModelBridge } from "./ViewModelBridge";
+import { HostReactionPicker } from "./ReactionPickerOverlay";
 import { BRIDGE_GLOBAL, type ClientViewDescriptor, STOCK_VIEW } from "./types";
 
 type BridgeHolder = { [BRIDGE_GLOBAL]?: ViewModelBridge };
@@ -220,6 +221,7 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
                 style={{ border: 0, position: "fixed", inset: 0, width: "100vw", height: "100vh" }}
             />
             <HostOverlays client={client} />
+            <HostReactionPicker client={client} bridge={bridge} />
             {failed && <BootFailed view={view} />}
         </>
     );

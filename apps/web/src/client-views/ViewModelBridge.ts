@@ -12,6 +12,7 @@ import {
     type Relations,
     type Thread,
     EventType,
+    KnownMembership,
     MatrixEventEvent,
     MsgType,
     RelationsEvent,
@@ -75,6 +76,7 @@ import { sendText } from "./InterimActions";
 import {
     type ActionOutcome,
     type ClientViewBridge,
+    type ViewAnchor,
     type ViewConnection,
     type ViewE2e,
     type ViewMe,
@@ -85,6 +87,7 @@ import {
     type ViewRoom,
     type ViewThread,
     type ViewUrlPreview,
+    ClientViewActionError,
     STOCK_VIEW,
 } from "./types";
 
@@ -93,6 +96,26 @@ type ChangeEvent = Parameters<Parameters<ClientViewBridge["onChange"]>[0]>[0];
 const AVATAR_PX = 64;
 /** The pause before a failed fetch of a replied event outside the timeline is tried again. */
 const REPLY_RETRY_MS = 30_000;
+/** How long a reaction press waits for the snapshot to show it before it is reported failed. */
+export const REACTION_TIMEOUT_MS = 15_000;
+/** How often a waiting reaction press re-reads the row (a first reaction on a message emits nothing of its own). */
+const REACTION_POLL_MS = 200;
+
+/** What ReactionsRowAdapter reads from RoomContext for the disabled rule of its buttons (RoomView.updatePermissions). */
+export interface ReactionPermissions {
+    canReact: boolean;
+    canSelfRedact: boolean;
+}
+
+/** Element's reaction picker over the kit: what the host renders (ReactionPickerOverlay) until `finish`. */
+export interface ReactionPickerRequest {
+    room: Room;
+    mxEvent: MatrixEvent;
+    reactions: Relations | null | undefined;
+    permissions: ReactionPermissions;
+    anchor: ViewAnchor;
+    finish: () => void;
+}
 
 /** An event, or the replacement it shows, that is still waiting for its key or failed to decrypt. */
 const unreadable = (ev: MatrixEvent): boolean =>
@@ -125,6 +148,11 @@ type MediaBody = AudioMediaBody | ViewModelMediaBody;
 class EventRow {
     public readonly tile: EventTileViewModel;
     public readonly body: EventContentBodyViewModel;
+    public readonly roomId: string;
+    /** The Matrix event this row shows. */
+    public get event(): MatrixEvent {
+        return this.ev;
+    }
     /** The padlock view-model, as EventTile builds it (EventTile.tsx, e2eViewModel). */
     private padlock: EventTileE2eViewModel;
     private padlockUnsubscribe: () => void;
@@ -170,7 +198,10 @@ class EventRow {
         private readonly isRoomEncrypted: () => boolean,
         /** Whether the crypto answer for the room has settled (RoomView awaits it before it computes showUrlPreview). */
         private readonly isEncryptionSettled: () => boolean,
+        /** The user's power in the room, for the disabled rule of the reaction buttons (re-read on every use). */
+        private readonly permissions: () => ReactionPermissions,
     ) {
+        this.roomId = ev.getRoomId() ?? "";
         // EventTile.createViewModelProps reads only two values from the legacy RoomContext:
         // showHiddenEvents and timelineRenderingType. Everything else is EventTile props or utilities.
         this.tile = new EventTileViewModel(
@@ -411,7 +442,8 @@ class EventRow {
 
     /**
      * The message's reactions as the reactions row shows them: per key, one vote per sender, the count and selection from
-     * its button view-model. The buttons are disabled: adding or toggling a reaction is a send, N/A in a client view.
+     * its button view-model. The buttons carry the stock disabled rule (ReactionsRowAdapter: can react, and can redact
+     * for a reaction of the user's own), so `pressReaction` can call their click.
      */
     public reactions(): ViewReaction[] | undefined {
         const room = this.client.getRoom(this.ev.getRoomId() ?? "");
@@ -434,11 +466,13 @@ class EventRow {
         if (!isContentActionable(this.ev)) return undefined;
         const me = this.client.getUserId();
         const mine = (me && relations?.getAnnotationsBySender()?.[me]) || new Set<MatrixEvent>();
+        const { canReact, canSelfRedact } = this.permissions();
         const reactions: ViewReaction[] = [];
         for (const [key, events] of relations?.getSortedAnnotationsByKey() ?? []) {
             const senders = uniqBy([...events], (e) => e.getSender());
             if (!senders.length) continue;
             const myReactionEvent = [...mine].find((e) => !e.isRedacted() && e.getRelation()?.key === key);
+            const disabled = !canReact || (!!myReactionEvent && !myReactionEvent.isRedacted() && !canSelfRedact);
             let button = this.reactionButtons.get(key);
             if (!button) {
                 button = new ReactionsRowButtonViewModel({
@@ -448,13 +482,14 @@ class EventRow {
                     count: senders.length,
                     reactionEvents: senders,
                     myReactionEvent,
-                    disabled: true,
+                    disabled,
                 });
                 this.reactionButtons.set(key, button);
             } else {
                 button.setReactionData(key, senders);
                 button.setCount(senders.length);
                 button.setMyReactionEvent(myReactionEvent);
+                button.setDisabled(disabled);
             }
             const { count, isSelected } = button.getSnapshot();
             reactions.push({ key, count, mine: isSelected, senderIds: senders.map((e) => e.getSender() ?? "") });
@@ -465,6 +500,51 @@ class EventRow {
             this.reactionButtons.delete(key);
         }
         return reactions.length ? reactions : undefined;
+    }
+
+    /** The relations the picker follows to mark the user's reactions (null when the message has none yet). */
+    public relations(): Relations | undefined {
+        this.reactions();
+        return this.reactionRelations;
+    }
+
+    /** Whether the stock row would show this message's reactions and add button (the content is actionable). */
+    public actionable(): boolean {
+        return isContentActionable(this.ev);
+    }
+
+    /**
+     * Presses the chip of `key` the way the stock row does: the button view-model's own click sends the annotation or
+     * redacts the user's own (D1: nothing re-implemented here). A key without a chip gets a fresh button view-model for
+     * it. Returns the user's state of that key before the press, or undefined when the disabled rule blocks it.
+     */
+    public pressReaction(key: string): { wasMine: boolean } | undefined {
+        if (!isContentActionable(this.ev)) return undefined;
+        const shown = this.reactions() ?? [];
+        const existing = this.reactionButtons.get(key);
+        const button =
+            existing ??
+            new ReactionsRowButtonViewModel({
+                client: this.client,
+                mxEvent: this.ev,
+                content: key,
+                count: 0,
+                reactionEvents: [],
+                disabled: !this.permissions().canReact,
+            });
+        try {
+            if (button.getSnapshot().isDisabled) return undefined;
+            const wasMine = shown.find((r) => r.key === key)?.mine ?? false;
+            button.onClick();
+            return { wasMine };
+        } finally {
+            if (!existing) button.dispose();
+        }
+    }
+
+    /** Whether the user's reaction `key` is on the message now, as the snapshot would show it. */
+    public isMine(key: string): boolean {
+        return this.reactions()?.find((r) => r.key === key)?.mine ?? false;
     }
 
     /**
@@ -872,6 +952,12 @@ export class ViewModelBridge implements ClientViewBridge {
     private lastConnection: ViewConnection = "online";
     /** Whether the signed-in user's cross-signing identity is verified: the stock UI's "local device verified" state. */
     private localDeviceVerified = false;
+    /** Reaction presses waiting for their snapshot change, per (event, key): a repeat joins the pending one. */
+    private readonly reacting = new Map<string, Promise<ActionOutcome>>();
+    private readonly reactionWaits = new Set<() => void>();
+    /** The reaction picker the host shows over the kit, with the call that waits for its close. */
+    private picker?: { request: ReactionPickerRequest; resolve: (o: ActionOutcome) => void };
+    private readonly pickerListeners = new Set<(request: ReactionPickerRequest | null) => void>();
     private isUsed = false;
     /** Called when a kit document first reads the bridge, from inside its scripts (before its DOMContentLoaded). */
     public onUse?: () => void;
@@ -1062,8 +1148,32 @@ export class ViewModelBridge implements ClientViewBridge {
                 () => this.emit({ kind: "timeline", roomId }),
                 () => this.isRoomEncrypted(roomId),
                 () => this.isEncryptionSettled(roomId),
+                () => this.reactionPermissions(roomId),
             );
             this.rows.set(key, row);
+        }
+        return row;
+    }
+
+    /** What RoomView.updatePermissions computes for the stock reactions row, read at the moment of use. */
+    private reactionPermissions(roomId: string): ReactionPermissions {
+        const room = this.client.getRoom(roomId);
+        const me = this.client.getUserId() ?? "";
+        return {
+            canReact:
+                !!room &&
+                room.getMyMembership() === KnownMembership.Join &&
+                room.currentState.maySendEvent(EventType.Reaction, me),
+            canSelfRedact: !!room && room.currentState.maySendEvent(EventType.RoomRedaction, me),
+        };
+    }
+
+    /** The row of a message the kit was handed (every action targets a message of a snapshot it read). */
+    private actionRow(roomId: string, eventId: string): EventRow {
+        if (!this.client.getRoom(roomId)) throw new ClientViewActionError("unknown_room", `unknown room ${roomId}`);
+        const row = this.rows.get(eventId);
+        if (!row || row.roomId !== roomId) {
+            throw new ClientViewActionError("unknown_event", `unknown event ${eventId} in ${roomId}`);
         }
         return row;
     }
@@ -1140,6 +1250,112 @@ export class ViewModelBridge implements ClientViewBridge {
         return event.getTxnId() ?? event.getUnsigned().transaction_id;
     }
 
+    /**
+     * Toggles the user's reaction `key` on a message through the reactions row button view-model (its click sends or
+     * redacts). One press per (event, key) is in flight: a repeat gets the pending call. Resolves `done` once the
+     * snapshot shows the user's state of that key flipped, `failed` after REACTION_TIMEOUT_MS.
+     */
+    public react(roomId: string, eventId: string, key: string): Promise<ActionOutcome> {
+        this.used = true;
+        const flight = `${eventId}\n${key}`;
+        const pending = this.reacting.get(flight);
+        if (pending) return pending;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const pressed = row.pressReaction(key);
+        if (!pressed) {
+            return Promise.reject(new ClientViewActionError("forbidden", "reacting is not allowed on this message"));
+        }
+        const call = new Promise<ActionOutcome>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                end();
+                reject(
+                    new ClientViewActionError("failed", `the reaction did not show within ${REACTION_TIMEOUT_MS} ms`),
+                );
+            }, REACTION_TIMEOUT_MS);
+            const poll = setInterval(() => check(), REACTION_POLL_MS);
+            const onChange = (e: ChangeEvent): void => {
+                if (e.kind === "timeline" && e.roomId === roomId) check();
+            };
+            const cancel = (): void => {
+                end();
+                reject(new ClientViewActionError("failed", "the bridge was disposed"));
+            };
+            const end = (): void => {
+                clearTimeout(timer);
+                clearInterval(poll);
+                this.listeners.delete(onChange);
+                this.reactionWaits.delete(cancel);
+                this.reacting.delete(flight);
+            };
+            const check = (): void => {
+                if (row.isMine(key) === pressed.wasMine) return;
+                end();
+                resolve({ status: "done", roomId, eventId });
+            };
+            this.listeners.add(onChange);
+            this.reactionWaits.add(cancel);
+            check();
+        });
+        this.reacting.set(flight, call);
+        return call;
+    }
+
+    /**
+     * Opens Element's reaction picker (the one the reactions row's add button opens) over the kit, beside the host's
+     * overlays. It resolves `done` when the picker closes: ReactionPicker calls `onFinished` for a choice and a
+     * dismiss alike, and a chosen reaction arrives as a timeline change.
+     */
+    public openReactionPicker(roomId: string, eventId: string, anchor: ViewAnchor): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const room = this.client.getRoom(roomId)!;
+        const permissions = this.reactionPermissions(roomId);
+        // The stock row shows the add button only where the user can react and the content is actionable.
+        if (!permissions.canReact || !row.actionable()) {
+            return Promise.reject(new ClientViewActionError("forbidden", "reacting is not allowed on this message"));
+        }
+        this.closeReactionPicker();
+        return new Promise<ActionOutcome>((resolve) => {
+            const request: ReactionPickerRequest = {
+                room,
+                mxEvent: row.event,
+                reactions: row.relations(),
+                permissions,
+                anchor,
+                finish: () => {
+                    if (this.picker?.request !== request) return;
+                    this.picker = undefined;
+                    this.pickerListeners.forEach((cb) => cb(null));
+                    resolve({ status: "done", roomId, eventId });
+                },
+            };
+            this.picker = { request, resolve };
+            this.pickerListeners.forEach((cb) => cb(request));
+        });
+    }
+
+    /** Closes an open picker (a new one replaces it, the bridge going away ends it): its call resolves `done`. */
+    private closeReactionPicker(): void {
+        this.picker?.request.finish();
+    }
+
+    /** The host's hook: called with the picker to show, and with null when it is gone. Returns the unsubscribe. */
+    public onReactionPicker(cb: (request: ReactionPickerRequest | null) => void): () => void {
+        this.pickerListeners.add(cb);
+        if (this.picker) cb(this.picker.request);
+        return () => this.pickerListeners.delete(cb);
+    }
+
     public markRead(roomId: string): void {
         // The timeline view-model's "mark all as read" = the room list's "Mark as read" path.
         this.ensureTimeline(roomId)?.onMarkAllAsRead();
@@ -1170,6 +1386,8 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public dispose(): void {
+        this.closeReactionPicker();
+        [...this.reactionWaits].forEach((cancel) => cancel());
         this.disposers.forEach((d) => d());
         this.rows.forEach((r) => r.dispose());
         this.senderAvatars.forEach((a) => a.dispose());
