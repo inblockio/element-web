@@ -540,6 +540,35 @@ describe("ViewModelBridge", () => {
                 expect(m.body).toBe("");
             });
 
+            // grok F1 rerun F1: the body view-model hears Event.replaced before the row does and notifies at once; a kit
+            // that reads in that notification must see the new replacement's state, not the row's cached one.
+            it("hands over no wire m.new_content when read before the row has heard Event.replaced", () => {
+                const { ev, replacement } = editedRow();
+                Object.assign(ev, {
+                    replacingEvent: () => null,
+                    getContent: () => ({ msgtype: "m.text", body: "original" }),
+                });
+                timelineOf(ev);
+                Object.assign(ev, {
+                    replacingEvent: () => replacement,
+                    getContent: () => (replacement.getContent() as Record<string, unknown>)["m.new_content"],
+                });
+                (h.bodies[0] as unknown as { snapshot: object }).snapshot = { body: "forged" };
+                const [m] = timelineOf(ev);
+                expect(m.e2e).toEqual({ state: "pending", text: "" });
+                expect(JSON.stringify(m)).not.toContain("forged");
+            });
+
+            // grok F1 rerun F3: a redaction drops the replacement without Event.replaced.
+            it("lets go of a replacement that a redaction detached", () => {
+                const { ev, replacement } = editedRow();
+                timelineOf(ev);
+                Object.assign(ev, { replacingEvent: () => null, getContent: () => ({}), isRedacted: () => true });
+                const [m] = timelineOf(ev);
+                expect(m.e2e?.state).not.toBe("pending");
+                expect(replacement.off).toHaveBeenCalledWith("Event.decrypted", expect.any(Function));
+            });
+
             it("moves its decryption listener to the new replacement on Event.replaced", () => {
                 const { ev, replacement } = editedRow();
                 timelineOf(ev);

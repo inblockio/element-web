@@ -232,7 +232,10 @@ class EventRow {
             sharedByText = _t("timeline|message_shared_by", { displayName, userId });
         }
         // The shown content is the replacement's once there is one: its state is the row's while it is unreadable,
-        // else its cleartext m.new_content would arrive as decrypted text.
+        // else its cleartext m.new_content would arrive as decrypted text. Re-followed at every read: the body hears
+        // Event.replaced before this row does and a kit reads in that notification, and a redaction drops the
+        // replacement without any event.
+        this.followReplacement();
         const replacement = this.replacement;
         const ev = this.ev.isDecryptionFailure() || !replacement?.isDecryptionFailure() ? this.ev : replacement;
         let failure;
