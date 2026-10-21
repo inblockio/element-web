@@ -1567,6 +1567,88 @@ describe("ViewModelBridge", () => {
             expect(h.urlPreviewVms).toHaveLength(0);
         });
 
+        describe("before the crypto answer for the room has settled (grok inc 8/4 F1)", () => {
+            // The state flag says "not encrypted" (m.room.encryption removed: a downgrade); the crypto store knows better,
+            // but later. Stock Element awaits getIsRoomEncrypted before it computes showUrlPreview.
+            const cryptoBridge = (answer: Promise<boolean>) => {
+                const isEncryptionEnabledInRoom = vi.fn(() => answer);
+                const b = new ViewModelBridge({
+                    getRoom: (id: string) => (id === "!a" ? h.room : null),
+                    getUserId: () => "@me:example.org",
+                    isRoomEncrypted: () => false,
+                    getCrypto: () => ({
+                        isEncryptionEnabledInRoom,
+                        getUserVerificationStatus: async () => ({ isCrossSigningVerified: () => false }),
+                    }),
+                    on: vi.fn(),
+                    off: vi.fn(),
+                } as unknown as MatrixClient);
+                const readWith = (...events: ReturnType<typeof fakeEvent>[]) => {
+                    h.timeline.snapshot = {
+                        items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                        atLiveEnd: true,
+                    };
+                    return b.timeline("!a");
+                };
+                return { b, readWith };
+            };
+            const settle = () => new Promise((r) => setTimeout(r, 0));
+
+            it("builds nothing and fetches nothing until the room is known to be encrypted, then stays off with the e2ee setting off", async () => {
+                h.settings.urlPreviewsEnabled_e2ee = false;
+                let resolve!: (v: boolean) => void;
+                const { b, readWith } = cryptoBridge(new Promise<boolean>((r) => (resolve = r)));
+                const ev = textEvent("$f1", linkText);
+                const seen: string[] = [];
+                b.onChange((e) => seen.push(e.kind));
+                expect(readWith(ev)[0]).not.toHaveProperty("urlPreviews");
+                await settle();
+                expect(h.urlPreviewVms).toHaveLength(0);
+                resolve(true);
+                await settle();
+                expect(seen).toContain("timeline");
+                expect(readWith(ev)[0]).not.toHaveProperty("urlPreviews");
+                await settle();
+                expect(h.urlPreviewVms).toHaveLength(0);
+                b.dispose();
+            });
+
+            it("builds the preview of an unencrypted room once the crypto answer says so, and re-emits the timeline for it", async () => {
+                let resolve!: (v: boolean) => void;
+                const { b, readWith } = cryptoBridge(new Promise<boolean>((r) => (resolve = r)));
+                const ev = textEvent("$f2", linkText);
+                const seen: string[] = [];
+                b.onChange((e) => seen.push(e.kind));
+                readWith(ev);
+                await settle();
+                expect(h.urlPreviewVms).toHaveLength(0);
+                expect(seen).not.toContain("timeline");
+                resolve(false);
+                await settle();
+                expect(seen).toContain("timeline");
+                readWith(ev);
+                expect(h.urlPreviewVms).toHaveLength(1);
+                expect(h.urlPreviewVms[0].props).toMatchObject({ visible: true, urlPreviewKind: "fetchonly" });
+                b.dispose();
+            });
+
+            it("a failed crypto answer settles too: the state flag stands", async () => {
+                let reject!: (e: unknown) => void;
+                const { b, readWith } = cryptoBridge(new Promise<boolean>((_, r) => (reject = r)));
+                const ev = textEvent("$f3", linkText);
+                const seen: string[] = [];
+                b.onChange((e) => seen.push(e.kind));
+                readWith(ev);
+                expect(h.urlPreviewVms).toHaveLength(0);
+                reject(new Error("no crypto"));
+                await settle();
+                expect(seen).toContain("timeline");
+                readWith(ev);
+                expect(h.urlPreviewVms).toHaveLength(1);
+                b.dispose();
+            });
+        });
+
         it("an encrypted room follows the e2ee setting, off by default", () => {
             h.roomEncrypted.value = true;
             h.settings.urlPreviewsEnabled_e2ee = false;
