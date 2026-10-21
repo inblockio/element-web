@@ -145,6 +145,7 @@ const fakeEvent = (id: string, over: Record<string, unknown> = {}) => {
         getClearContent: () => null,
         decryptionFailureReason: null,
         status: null,
+        replacingEvent: () => null,
         on: vi.fn(),
         off: vi.fn(),
         ...over,
@@ -410,6 +411,88 @@ describe("ViewModelBridge", () => {
             onState({ getType: () => "m.room.encryption", getRoomId: () => "!a" });
             expect(isEncryptionEnabledInRoom).toHaveBeenCalledTimes(2);
             downgraded.dispose();
+        });
+
+        describe("a bundled encrypted edit (the SDK applies it before it decrypts)", () => {
+            const forged = { "m.new_content": { msgtype: "m.text", body: "forged" } };
+            /** A decrypted original whose replacement is still m.room.encrypted with a cleartext m.new_content. */
+            const editedRow = () => {
+                const replacement = fakeEvent("$r", {
+                    getType: () => "m.room.encrypted",
+                    getContent: () => forged,
+                    isEncrypted: () => true,
+                });
+                const ev = fakeEvent("$o", {
+                    isEncrypted: () => true,
+                    getClearContent: () => ({ msgtype: "m.text", body: "original" }),
+                    getContent: () => (replacement.getContent() as Record<string, unknown>)["m.new_content"],
+                    replacingEvent: () => replacement,
+                });
+                return { ev, replacement };
+            };
+            const handler = (e: ReturnType<typeof fakeEvent>, name: string) =>
+                e.on.mock.calls.find(([n]) => n === name)?.[1] as () => void;
+
+            it("never hands over the wire m.new_content of an undecrypted replacement as decrypted text", () => {
+                const { ev } = editedRow();
+                timelineOf(ev);
+                (h.bodies[0] as unknown as { snapshot: object }).snapshot = { body: "forged" };
+                const [m] = timelineOf(ev);
+                expect(m.e2e).toEqual({ state: "pending", text: "" });
+                expect(m.body).toBe("");
+                expect(JSON.stringify(m)).not.toContain("forged");
+            });
+
+            it("updates the body and re-verifies the padlock when the replacement decrypts", () => {
+                const { ev, replacement } = editedRow();
+                timelineOf(ev);
+                const content = { "m.new_content": { msgtype: "m.text", body: "edited" } };
+                Object.assign(replacement, {
+                    getType: () => "m.room.message",
+                    getContent: () => content,
+                    getClearContent: () => content,
+                });
+                const seen: string[] = [];
+                bridge.onChange((e) => seen.push(e.kind));
+                handler(replacement, "Event.decrypted")();
+                expect(h.bodies[0].setEventContent).toHaveBeenLastCalledWith(ev, content["m.new_content"]);
+                expect(seen).toContain("timeline");
+                // A fresh padlock view-model runs the verification against the now readable replacement.
+                expect(h.padlocks).toHaveLength(2);
+                expect(h.padlocks[1].start).toHaveBeenCalledTimes(1);
+                expect(
+                    (h.padlocks[0] as unknown as { dispose: { mock: { calls: unknown[] } } }).dispose.mock.calls,
+                ).toHaveLength(1);
+                expect(timelineOf(ev)[0].e2e).toEqual({ state: "decrypted" });
+            });
+
+            it("reports the replacement's decryption failure as failed", () => {
+                const { ev, replacement } = editedRow();
+                timelineOf(ev);
+                Object.assign(replacement, {
+                    getType: () => "m.room.message",
+                    getContent: () => badContent,
+                    getClearContent: () => badContent,
+                    isDecryptionFailure: () => true,
+                    decryptionFailureReason: DecryptionFailureCode.MEGOLM_UNKNOWN_INBOUND_SESSION_ID,
+                });
+                handler(replacement, "Event.decrypted")();
+                const [m] = timelineOf(ev);
+                expect(m.e2e).toEqual({ state: "failed", text: _t("timeline|decryption_failure|unable_to_decrypt") });
+                expect(m.body).toBe("");
+            });
+
+            it("moves its decryption listener to the new replacement on Event.replaced", () => {
+                const { ev, replacement } = editedRow();
+                timelineOf(ev);
+                const next = fakeEvent("$r2", { isEncrypted: () => true, getClearContent: () => ({}) });
+                Object.assign(ev, { replacingEvent: () => next });
+                handler(ev, "Event.replaced")();
+                expect(replacement.off).toHaveBeenCalledWith("Event.decrypted", expect.any(Function));
+                expect(handler(next, "Event.decrypted")).toBeInstanceOf(Function);
+                bridge.dispose();
+                expect(next.off).toHaveBeenCalledWith("Event.decrypted", expect.any(Function));
+            });
         });
 
         it("leaves a plain message in an unencrypted room without an e2e field", () => {

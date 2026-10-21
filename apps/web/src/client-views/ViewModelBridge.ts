@@ -57,7 +57,10 @@ class EventRow {
     public readonly tile: EventTileViewModel;
     public readonly body: EventContentBodyViewModel;
     /** The padlock view-model, as EventTile builds it (EventTile.tsx, e2eViewModel). */
-    public readonly padlock: EventTileE2eViewModel;
+    private padlock: EventTileE2eViewModel;
+    private padlockUnsubscribe: () => void;
+    /** The replacement the row listens on: the SDK applies a bundled encrypted edit before it decrypts. */
+    private replacement: MatrixEvent | null = null;
     private decryption?: DecryptionFailureBodyViewModel;
     private decryptionCode?: unknown;
     private readonly unsubscribe: Array<() => void> = [];
@@ -123,29 +126,62 @@ class EventRow {
             linkify: false,
             client,
         });
-        this.padlock = new EventTileE2eViewModel({
-            cli: client,
-            mxEvent: ev,
-            isRoomEncrypted: isRoomEncrypted(),
-            eventSendStatus: ev.status,
-            enableListeners: true,
-        });
-        this.unsubscribe.push(
-            this.tile.subscribe(changed),
-            this.body.subscribe(changed),
-            this.padlock.subscribe(changed),
-        );
+        this.padlock = this.newPadlock();
+        this.padlockUnsubscribe = this.padlock.subscribe(changed);
+        this.unsubscribe.push(this.tile.subscribe(changed), this.body.subscribe(changed));
         // A late key turns a decryption failure into a message: the body view-model reads its content once, so it is
         // told the new content (the stock EventTile re-renders with it). Edits it follows itself (Event.replaced).
         // Only this event tells it: getContent() of an unreadable replacement is a new {} on every read, so a content
         // check on each read would re-render forever.
         ev.on(MatrixEventEvent.Decrypted, this.onDecrypted);
         this.unsubscribe.push(() => ev.off(MatrixEventEvent.Decrypted, this.onDecrypted));
+        // An edit the SDK applies before it decrypts emits nothing on this event when it later decrypts or fails
+        // (Event.replaced fires only on a new replacement), so the row listens on the replacement itself.
+        ev.on(MatrixEventEvent.Replaced, this.onReplaced);
+        this.unsubscribe.push(() => ev.off(MatrixEventEvent.Replaced, this.onReplaced));
+        this.followReplacement();
         this.padlock.start();
+    }
+
+    private newPadlock(): EventTileE2eViewModel {
+        return new EventTileE2eViewModel({
+            cli: this.client,
+            mxEvent: this.ev,
+            isRoomEncrypted: this.isRoomEncrypted(),
+            eventSendStatus: this.ev.status,
+            enableListeners: true,
+        });
+    }
+
+    private followReplacement(): void {
+        const next = this.ev.replacingEvent();
+        if (next === this.replacement) return;
+        this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
+        this.replacement = next;
+        this.replacement?.on(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
     }
 
     private readonly onDecrypted = (): void => {
         this.body.setEventContent(this.ev, this.ev.getContent());
+        this.changed();
+    };
+
+    private readonly onReplaced = (): void => {
+        this.followReplacement();
+        this.changed();
+    };
+
+    /**
+     * The replacement decrypted or failed: the body reads the new content, and a fresh padlock view-model verifies the
+     * replacement (the shipped one re-verifies only on events of the original).
+     */
+    private readonly onReplacementDecrypted = (): void => {
+        this.body.setEventContent(this.ev, this.ev.getContent());
+        this.padlockUnsubscribe();
+        this.padlock.dispose();
+        this.padlock = this.newPadlock();
+        this.padlockUnsubscribe = this.padlock.subscribe(this.changed);
+        this.padlock.start();
         this.changed();
     };
 
@@ -155,10 +191,9 @@ class EventRow {
      * LocalDeviceVerificationStateContext.
      */
     public e2e(localDeviceVerified: boolean): ViewE2e | undefined {
-        const ev = this.ev;
         this.padlock.setProps({
             isRoomEncrypted: this.isRoomEncrypted(),
-            eventSendStatus: ev.status,
+            eventSendStatus: this.ev.status,
         });
         const padlock = this.padlock.getSnapshot();
         let sharedByText: string | undefined;
@@ -172,6 +207,10 @@ class EventRow {
             const { displayName, userId } = shared.getSnapshot();
             sharedByText = _t("timeline|message_shared_by", { displayName, userId });
         }
+        // The shown content is the replacement's once there is one: its state is the row's while it is unreadable,
+        // else its cleartext m.new_content would arrive as decrypted text.
+        const replacement = this.replacement;
+        const ev = this.ev.isDecryptionFailure() || !replacement?.isDecryptionFailure() ? this.ev : replacement;
         let failure;
         if (ev.isDecryptionFailure()) {
             if (!this.decryption) {
@@ -194,11 +233,11 @@ class EventRow {
             failure = { reason: s.decryptionFailureReason, isLocalDeviceVerified: s.isLocalDeviceVerified };
         }
         return toViewE2e({
-            pending: ev.isEncrypted() && ev.getClearContent() === null,
+            pending: [this.ev, replacement].some((e) => e?.isEncrypted() && e.getClearContent() === null),
             failure,
             padlock,
             sharedByText,
-            encrypted: ev.isEncrypted(),
+            encrypted: this.ev.isEncrypted(),
             t: _t,
         });
     }
@@ -206,6 +245,9 @@ class EventRow {
     public dispose(): void {
         this.unsubscribe.forEach((u) => u());
         this.unsubscribe.length = 0;
+        this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
+        this.replacement = null;
+        this.padlockUnsubscribe();
         this.tile.dispose();
         this.body.dispose();
         this.padlock.dispose();
