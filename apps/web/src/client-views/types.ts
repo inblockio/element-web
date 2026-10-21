@@ -162,6 +162,14 @@ export class ClientViewActionError extends Error {
     }
 }
 
+/** Where a kit's control sits, in page coordinates (the kit's frame covers the page from its origin). */
+export interface ViewAnchor {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}
+
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
     readonly version: 2;
@@ -183,6 +191,10 @@ export interface ClientViewBridge {
      */
     sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome>;
     onChange(cb: (e: { kind: "rooms" | "timeline" | "me" | "connection"; roomId?: string }) => void): () => void;
+    /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
+    react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
+    /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
+    openReactionPicker(roomId: string, eventId: string, anchor: ViewAnchor): Promise<ActionOutcome>;
 }
 
 /** A kit that runs in a same-origin iframe loaded from `url`. */
