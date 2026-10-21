@@ -116,6 +116,7 @@ const h = vi.hoisted(() => {
             }
         };
     return {
+        sendText: vi.fn(),
         mediaVm,
         FakeVm,
         mediaVms,
@@ -329,6 +330,7 @@ vi.mock("../settings/SettingsStore", () => ({
 vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => "http://avatar/room" }));
+vi.mock("./InterimActions", () => ({ sendText: (...args: unknown[]) => h.sendText(...args) }));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
     selectClientView: vi.fn(async () => {}),
@@ -352,6 +354,8 @@ const fakeEvent = (id: string, over: Record<string, unknown> = {}) => {
         isRedacted: () => false,
         getWireContent: () => ({}),
         getTs: () => 1,
+        getTxnId: () => undefined as string | undefined,
+        getUnsigned: () => ({}) as { transaction_id?: string },
         getThread: () => null,
         getRelation: () => null,
         replyEventId: undefined as string | undefined,
@@ -451,6 +455,32 @@ describe("ViewModelBridge", () => {
         expect(bridge.connection()).toBe("offline");
         expect(seen).toEqual(["connection"]);
         h.statusBar.set({ state: null });
+    });
+
+    it("is bridge version 2 and hands the send to the interim action", async () => {
+        expect(bridge.version).toBe(2);
+        h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
+        await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
+        expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" });
+    });
+
+    it("hands over the transaction id of an own message, from the local echo or the sync echo, not of others", () => {
+        const own = (id: string, over: Record<string, unknown>) =>
+            fakeEvent(id, { getSender: () => "@me:example.org", ...over });
+        h.timeline.snapshot = {
+            items: [
+                { kind: "event", event: own("$1", { getTxnId: () => "rc-1" }), continuation: false },
+                {
+                    kind: "event",
+                    event: own("$2", { getUnsigned: () => ({ transaction_id: "rc-2" }) }),
+                    continuation: false,
+                },
+                { kind: "event", event: own("$3", {}), continuation: false },
+                { kind: "event", event: fakeEvent("$4", { getTxnId: () => "theirs" }), continuation: false },
+            ],
+            atLiveEnd: true,
+        };
+        expect(bridge.timeline("!a").map((m) => m.txnId)).toEqual(["rc-1", "rc-2", undefined, undefined]);
     });
 
     it("lists the stock view first and switches through the registry", () => {

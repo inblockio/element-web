@@ -48,6 +48,11 @@ export interface ViewMessage {
     reactions?: ViewReaction[];
     /** The thread this message roots, from the thread summary view-model. Absent for a message without replies. */
     thread?: ViewThread;
+    /**
+     * Own messages: the transaction id the message was sent with (`getTxnId()`, else the echo's
+     * `unsigned.transaction_id`). A kit that sent it with a txnId of its own recognises its optimistic copy by it.
+     */
+    txnId?: string;
     /** The image, file, video or audio of a media message, from its body view-model. Absent for any other message. */
     media?: ViewMedia;
     /**
@@ -132,9 +137,34 @@ export interface ViewMe {
 
 export type ViewConnection = "online" | "connecting" | "offline";
 
+/**
+ * What an action resolved with. `done`: the effect happened (the server answered, the snapshot changed, the dialog
+ * returned). `cancelled`: the user dismissed Element's own dialog or picker (never an error).
+ */
+export type ActionOutcome = { status: "done"; roomId?: string; eventId?: string } | { status: "cancelled" };
+
+export type ClientViewActionErrorCode =
+    | "unknown_room"
+    | "unknown_event"
+    | "forbidden"
+    | "network"
+    | "unsupported"
+    | "failed";
+
+/** What a rejected action carries: a code a kit maps to its own error, and Element's message. */
+export class ClientViewActionError extends Error {
+    public constructor(
+        public readonly code: ClientViewActionErrorCode,
+        message?: string,
+    ) {
+        super(message ?? code);
+        this.name = "ClientViewActionError";
+    }
+}
+
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 1;
+    readonly version: 2;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -145,6 +175,13 @@ export interface ClientViewBridge {
     views(): { id: string; name: string }[];
     /** "stock" = Element's own UI */
     switchTo(viewId: string): void;
+    /**
+     * Sends a plain-text message (`m.text`, no markdown) and resolves `done` + `eventId` once the server returns it.
+     * `opts.txnId` is the transaction id the sent event carries (`ViewMessage.txnId`); `opts.replyTo` is the event id
+     * of the replied message. In a local (not yet created) room the first send creates the room and `roomId` is the
+     * real one. Interim (D16): Element's own client call, until a composer send view-model ships.
+     */
+    sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome>;
     onChange(cb: (e: { kind: "rooms" | "timeline" | "me" | "connection"; roomId?: string }) => void): () => void;
 }
 

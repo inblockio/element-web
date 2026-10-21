@@ -71,7 +71,9 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
+import { sendText } from "./InterimActions";
 import {
+    type ActionOutcome,
     type ClientViewBridge,
     type ViewConnection,
     type ViewE2e,
@@ -849,7 +851,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 1;
+    public readonly version = 2;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -1124,9 +1126,18 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.media(),
                 row.urlPreviews(),
             );
-            if (message) messages.push(message);
+            if (message) {
+                const txnId = this.ownTxnId(eventItem.event as MatrixEvent);
+                messages.push(txnId ? { ...message, txnId } : message);
+            }
         }
         return messages.sort((a, b) => a.ts - b.ts);
+    }
+
+    /** The transaction id of an own message (its local echo's, else the sync echo's `unsigned.transaction_id`). */
+    private ownTxnId(event: MatrixEvent): string | undefined {
+        if (event.getSender() !== this.client.getUserId()) return undefined;
+        return event.getTxnId() ?? event.getUnsigned().transaction_id;
     }
 
     public markRead(roomId: string): void {
@@ -1146,6 +1157,10 @@ export class ViewModelBridge implements ClientViewBridge {
 
     public switchTo(viewId: string): void {
         void selectClientView(viewId);
+    }
+
+    public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {
+        return sendText(this.client, roomId, text, opts);
     }
 
     public onChange(cb: (e: ChangeEvent) => void): () => void {
