@@ -44,6 +44,16 @@ export interface ViewMessage {
     e2e?: ViewE2e;
     /** The message this one replies to, from the reply tile view-model, once it is loaded. */
     replyTo?: ViewReply;
+    /** Reactions from the reactions row button view-models, in Element's order. Absent for a message without any. */
+    reactions?: ViewReaction[];
+}
+
+/** One reaction key: `count` = distinct senders, `mine` = the user reacted with it (not redacted). */
+export interface ViewReaction {
+    key: string;
+    count: number;
+    mine: boolean;
+    senderIds: string[];
 }
 
 /** A replied-to message: `text` is its plain body without its own reply fallback, empty while it is unreadable. */

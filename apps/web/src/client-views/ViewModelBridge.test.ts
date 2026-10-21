@@ -37,11 +37,12 @@ const h = vi.hoisted(() => {
         public dispose = vi.fn();
     }
     const member = { userId: "@bob:example.org", roomId: "!a" };
+    const timelineSet = { relations: { getChildEventsForEvent: vi.fn((..._args: unknown[]): unknown => undefined) } };
     const room = {
         roomId: "!a",
         getMember: () => member,
         findEventById: vi.fn((_id: string): unknown => undefined),
-        getUnfilteredTimelineSet: () => "unfiltered",
+        getUnfilteredTimelineSet: () => timelineSet,
     };
     const item = new FakeVm({
         id: "!a",
@@ -62,7 +63,25 @@ const h = vi.hoisted(() => {
     const bodies: Array<{ setEventContent: ReturnType<typeof vi.fn> }> = [];
     const replies: Array<{ props: unknown; dispose: ReturnType<typeof vi.fn> }> = [];
     const getEventTimeline = vi.fn(async (..._args: unknown[]) => undefined);
-    return { FakeVm, room, item, timeline, statusBar, member, avatar, padlocks, bodies, replies, getEventTimeline };
+    const reactionButtons: Array<{
+        props: { content: string; disabled?: boolean };
+        dispose: ReturnType<typeof vi.fn>;
+    }> = [];
+    return {
+        FakeVm,
+        room,
+        timelineSet,
+        item,
+        timeline,
+        statusBar,
+        member,
+        avatar,
+        padlocks,
+        bodies,
+        replies,
+        reactionButtons,
+        getEventTimeline,
+    };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -141,6 +160,17 @@ vi.mock("../viewmodels/room/timeline/event-tile/ReplyTileViewModel", () => ({
         }
     },
 }));
+vi.mock("../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel", () => ({
+    ReactionsRowButtonViewModel: class extends h.FakeVm<{ count: number; isSelected: boolean }> {
+        public constructor(public props: { content: string; count: number; myReactionEvent?: unknown }) {
+            super({ count: props.count, isSelected: !!props.myReactionEvent });
+            h.reactionButtons.push(this as never);
+        }
+        public setReactionData = vi.fn();
+        public setCount = (count: number): void => this.set({ count });
+        public setMyReactionEvent = (ev?: unknown): void => this.set({ isSelected: !!ev });
+    },
+}));
 vi.mock("../settings/SettingsStore", () => ({ default: { getValue: () => false } }));
 vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
@@ -194,6 +224,8 @@ describe("ViewModelBridge", () => {
         h.padlocks.length = 0;
         h.bodies.length = 0;
         h.replies.length = 0;
+        h.reactionButtons.length = 0;
+        h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
         h.room.findEventById.mockImplementation(() => undefined);
     });
 
@@ -617,7 +649,7 @@ describe("ViewModelBridge", () => {
             expect(read(reply)[0]).not.toHaveProperty("replyTo");
             read(reply);
             expect(h.getEventTimeline).toHaveBeenCalledTimes(1);
-            expect(h.getEventTimeline).toHaveBeenCalledWith("unfiltered", "$far");
+            expect(h.getEventTimeline).toHaveBeenCalledWith(h.timelineSet, "$far");
             loaded(parent);
             await new Promise((r) => setTimeout(r, 0));
             expect(seen).toContain("timeline");
@@ -630,6 +662,103 @@ describe("ViewModelBridge", () => {
             read(replyTo("$p"));
             bridge.dispose();
             expect(h.replies[0].dispose).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe("reactions", () => {
+        const reaction = (sender: string, key: string, over: Record<string, unknown> = {}) =>
+            fakeEvent(`$r-${sender}-${key}`, { getSender: () => sender, getRelation: () => ({ key }), ...over });
+        const relationsOf = (
+            groups: Array<[string, ReturnType<typeof reaction>[]]>,
+            me: ReturnType<typeof reaction>[] = [],
+        ) => ({
+            getSortedAnnotationsByKey: () => groups.map(([key, events]) => [key, new Set(events)]),
+            getAnnotationsBySender: () => ({ "@me:example.org": new Set(me) }),
+            on: vi.fn(),
+            off: vi.fn(),
+        });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+
+        it("hands over each reaction key with the button view-model's count and selection, one vote per sender", () => {
+            const mine = reaction("@me:example.org", "👍");
+            const relations = relationsOf(
+                [
+                    ["👍", [reaction("@bob:example.org", "👍"), reaction("@bob:example.org", "👍"), mine]],
+                    ["🎉", [reaction("@bob:example.org", "🎉")]],
+                ],
+                [mine],
+            );
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(relations);
+            const [m] = read(fakeEvent("$1"));
+            expect(h.timelineSet.relations.getChildEventsForEvent).toHaveBeenCalledWith(
+                "$1",
+                "m.annotation",
+                "m.reaction",
+            );
+            expect(m.reactions).toEqual([
+                { key: "👍", count: 2, mine: true, senderIds: ["@bob:example.org", "@me:example.org"] },
+                { key: "🎉", count: 1, mine: false, senderIds: ["@bob:example.org"] },
+            ]);
+            // Read-only: the buttons never send (adding or toggling a reaction is N/A in a client view).
+            expect(h.reactionButtons.every((b) => b.props.disabled === true)).toBe(true);
+        });
+
+        it("does not count a redacted own reaction as selected and drops an emptied key", () => {
+            const mine = reaction("@me:example.org", "👍", { isRedacted: () => true });
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(
+                relationsOf(
+                    [
+                        ["👍", [reaction("@bob:example.org", "👍")]],
+                        ["🎉", []],
+                    ],
+                    [mine],
+                ),
+            );
+            expect(read(fakeEvent("$1"))[0].reactions).toEqual([
+                { key: "👍", count: 1, mine: false, senderIds: ["@bob:example.org"] },
+            ]);
+        });
+
+        it("adds no reactions to a message without any", () => {
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
+            expect(read(fakeEvent("$1"))[0]).not.toHaveProperty("reactions");
+        });
+
+        it("follows the reactions: a first reaction (relations created) and later ones change the timeline", () => {
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
+            const ev = fakeEvent("$1");
+            read(ev);
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            const created = ev.on.mock.calls.find(([name]) => name === "Event.relationsCreated");
+            expect(created).toBeDefined();
+            const relations = relationsOf([["👍", [reaction("@bob:example.org", "👍")]]]);
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(relations);
+            created![1]();
+            expect(seen).toContain("timeline");
+            expect(read(ev)[0].reactions).toHaveLength(1);
+            const added = relations.on.mock.calls.find(([name]) => name === "Relations.add");
+            expect(added).toBeDefined();
+            seen.length = 0;
+            added![1]();
+            expect(seen).toContain("timeline");
+        });
+
+        it("releases the relations listeners and button view-models with the row", () => {
+            const relations = relationsOf([["👍", [reaction("@bob:example.org", "👍")]]]);
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(relations);
+            read(fakeEvent("$1"));
+            bridge.dispose();
+            expect(relations.off).toHaveBeenCalledWith("Relations.add", expect.any(Function));
+            expect(relations.off).toHaveBeenCalledWith("Relations.remove", expect.any(Function));
+            expect(relations.off).toHaveBeenCalledWith("Relations.redaction", expect.any(Function));
+            expect(h.reactionButtons[0].dispose).toHaveBeenCalledTimes(1);
         });
     });
 });

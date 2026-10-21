@@ -20,7 +20,7 @@ import {
 
 import { type EventTileViewModelSnapshot } from "../viewmodels/room/timeline/event-tile/EventTileViewModel";
 import { type EventTileE2ePadlockViewState } from "../viewmodels/room/timeline/event-tile/EventTileE2eState";
-import { type ViewE2e, type ViewMessage, type ViewReply, type ViewRoom } from "./types";
+import { type ViewE2e, type ViewMessage, type ViewReaction, type ViewReply, type ViewRoom } from "./types";
 
 /** The shape of `_t` the mappings need: a translation key and optional variables. */
 export type Translate = (key: string, variables?: Record<string, string>) => string;
@@ -143,6 +143,7 @@ export function toViewMessage(
     senderAvatarUrl?: string,
     e2e?: ViewE2e,
     replyTo?: ViewReply,
+    reactions?: ViewReaction[],
 ): ViewMessage | undefined {
     const id = tile.event.eventId;
     if (!id) return undefined;
@@ -161,5 +162,6 @@ export function toViewMessage(
         kind: kindOf(tile.event.msgtype),
         ...(e2e ? { e2e } : {}),
         ...(replyTo ? { replyTo } : {}),
+        ...(reactions?.length ? { reactions } : {}),
     };
 }

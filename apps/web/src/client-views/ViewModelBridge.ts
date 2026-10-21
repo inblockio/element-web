@@ -9,10 +9,13 @@ import {
     type MatrixClient,
     type MatrixEvent,
     type Room,
+    type Relations,
     EventType,
     MatrixEventEvent,
+    RelationsEvent,
     RoomStateEvent,
 } from "matrix-js-sdk/src/matrix";
+import { uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
 import { type TimelineItem, RoomStatusBarState } from "@element-hq/web-shared-components";
 
@@ -31,6 +34,8 @@ import { DecryptionFailureBodyViewModel } from "../viewmodels/room/timeline/even
 import { EventContentBodyViewModel } from "../viewmodels/message-body/EventContentBodyViewModel";
 import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/ReplyTileViewModel";
 import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/Reply";
+import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
+import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
@@ -43,6 +48,7 @@ import {
     type ViewE2e,
     type ViewMe,
     type ViewMessage,
+    type ViewReaction,
     type ViewReply,
     type ViewRoom,
     STOCK_VIEW,
@@ -75,6 +81,8 @@ class EventRow {
     /** The reply tile view-model of the replied event, as ReplyChain builds it, once that event is loaded. */
     private reply?: ReplyTileViewModel;
     private replyLookup = false;
+    private reactionRelations?: Relations;
+    private readonly reactionButtons = new Map<string, ReactionsRowButtonViewModel>();
     private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
 
@@ -152,6 +160,9 @@ class EventRow {
         // (Event.replaced fires only on a new replacement), so the row listens on the replacement itself.
         ev.on(MatrixEventEvent.Replaced, this.onReplaced);
         this.unsubscribe.push(() => ev.off(MatrixEventEvent.Replaced, this.onReplaced));
+        // The first reaction creates the event's relations (EventTile listens the same way).
+        ev.on(MatrixEventEvent.RelationsCreated, changed);
+        this.unsubscribe.push(() => ev.off(MatrixEventEvent.RelationsCreated, changed));
         this.followReplacement();
         this.padlock.start();
     }
@@ -294,8 +305,73 @@ class EventRow {
         return { eventId: parentId, senderId, senderName, text };
     }
 
+    /**
+     * The message's reactions as the reactions row shows them: per key, one vote per sender, the count and selection from
+     * its button view-model. The buttons are disabled: adding or toggling a reaction is a send, N/A in a client view.
+     */
+    public reactions(): ViewReaction[] | undefined {
+        const room = this.client.getRoom(this.ev.getRoomId() ?? "");
+        const relations =
+            (room &&
+                getEventTileReactionRelations({
+                    mxEvent: this.ev,
+                    showReactions: true,
+                    getRelationsForEvent: (id, relationType, eventType) =>
+                        room.getUnfilteredTimelineSet().relations.getChildEventsForEvent(id, relationType, eventType),
+                })) ||
+            undefined;
+        if (relations !== this.reactionRelations) {
+            this.bindReactions(this.reactionRelations, "off");
+            this.reactionRelations = relations;
+            this.bindReactions(relations, "on");
+        }
+        const me = this.client.getUserId();
+        const mine = (me && relations?.getAnnotationsBySender()?.[me]) || new Set<MatrixEvent>();
+        const reactions: ViewReaction[] = [];
+        for (const [key, events] of relations?.getSortedAnnotationsByKey() ?? []) {
+            const senders = uniqBy([...events], (e) => e.getSender());
+            if (!senders.length) continue;
+            const myReactionEvent = [...mine].find((e) => !e.isRedacted() && e.getRelation()?.key === key);
+            let button = this.reactionButtons.get(key);
+            if (!button) {
+                button = new ReactionsRowButtonViewModel({
+                    client: this.client,
+                    mxEvent: this.ev,
+                    content: key,
+                    count: senders.length,
+                    reactionEvents: senders,
+                    myReactionEvent,
+                    disabled: true,
+                });
+                this.reactionButtons.set(key, button);
+            } else {
+                button.setReactionData(key, senders);
+                button.setCount(senders.length);
+                button.setMyReactionEvent(myReactionEvent);
+            }
+            const { count, isSelected } = button.getSnapshot();
+            reactions.push({ key, count, mine: isSelected, senderIds: senders.map((e) => e.getSender() ?? "") });
+        }
+        for (const [key, button] of this.reactionButtons) {
+            if (reactions.some((r) => r.key === key)) continue;
+            button.dispose();
+            this.reactionButtons.delete(key);
+        }
+        return reactions.length ? reactions : undefined;
+    }
+
+    private bindReactions(relations: Relations | undefined, how: "on" | "off"): void {
+        for (const name of [RelationsEvent.Add, RelationsEvent.Remove, RelationsEvent.Redaction]) {
+            relations?.[how](name, this.changed);
+        }
+    }
+
     public dispose(): void {
         this.disposed = true;
+        this.bindReactions(this.reactionRelations, "off");
+        this.reactionRelations = undefined;
+        this.reactionButtons.forEach((b) => b.dispose());
+        this.reactionButtons.clear();
         this.unsubscribe.forEach((u) => u());
         this.unsubscribe.length = 0;
         this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
@@ -573,6 +649,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 senderAvatarUrl,
                 row.e2e(this.localDeviceVerified),
                 row.replyTo(),
+                row.reactions(),
             );
             if (message) messages.push(message);
         }
