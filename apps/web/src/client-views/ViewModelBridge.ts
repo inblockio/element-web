@@ -15,6 +15,7 @@ import {
     MatrixEventEvent,
     RelationsEvent,
     RoomStateEvent,
+    THREAD_RELATION_TYPE,
     ThreadEvent,
 } from "matrix-js-sdk/src/matrix";
 import { uniq, uniqBy } from "lodash";
@@ -96,6 +97,8 @@ class EventRow {
     private readonly reactionButtons = new Map<string, ReactionsRowButtonViewModel>();
     /** Releases the listeners of the thread summary view-model, which the tile owns and disposes with the row. */
     private threadSummaryRelease?: () => void;
+    /** The latest thread reply's edit, followed: the preview listens on the reply, which a bundled edit leaves silent. */
+    private lastReplyEdit: MatrixEvent | null = null;
     private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
 
@@ -437,16 +440,21 @@ class EventRow {
         }
         if (!snapshot.isVisible) return undefined;
         const last = thread.replyToEvent;
+        this.followLastReplyEdit(last?.replacingEvent() ?? null);
         const body = last?.getContent().body;
+        // An edit's body has no reply fallback to strip (as replyTo).
+        const text =
+            !last || unreadable(last) || typeof body !== "string"
+                ? ""
+                : last.replacingEvent()
+                  ? body
+                  : stripPlainReply(body);
         const lastReply =
-            last && last.getId()
-                ? {
-                      eventId: last.getId()!,
-                      senderId: last.getSender() ?? "",
-                      text: unreadable(last) || typeof body !== "string" ? "" : stripPlainReply(body),
-                  }
-                : undefined;
-        const repliers = thread.events.filter((e) => e.getId() !== thread.id).map((e) => e.getSender() ?? "");
+            last && last.getId() ? { eventId: last.getId()!, senderId: last.getSender() ?? "", text } : undefined;
+        // The thread timeline also holds reactions and edits once fetched; only replies count (as Thread.length).
+        const repliers = thread.events
+            .filter((e) => e.getId() !== thread.id && e.isRelation(THREAD_RELATION_TYPE.name))
+            .map((e) => e.getSender() ?? "");
         return {
             replyCount: thread.length,
             lastReplyTs: (last ?? this.ev).getTs(),
@@ -455,7 +463,15 @@ class EventRow {
         };
     }
 
+    private followLastReplyEdit(edit: MatrixEvent | null): void {
+        if (edit === this.lastReplyEdit) return;
+        this.lastReplyEdit?.off(MatrixEventEvent.Decrypted, this.changed);
+        this.lastReplyEdit = edit;
+        this.lastReplyEdit?.on(MatrixEventEvent.Decrypted, this.changed);
+    }
+
     private releaseThreadSummary(): void {
+        this.followLastReplyEdit(null);
         if (!this.threadSummaryRelease) return;
         this.threadSummaryRelease();
         this.threadSummaryRelease = undefined;
@@ -476,6 +492,7 @@ class EventRow {
         this.reactionButtons.clear();
         this.threadSummaryRelease?.();
         this.threadSummaryRelease = undefined;
+        this.followLastReplyEdit(null);
         this.unsubscribe.forEach((u) => u());
         this.unsubscribe.length = 0;
         this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);

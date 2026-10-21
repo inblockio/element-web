@@ -893,6 +893,7 @@ describe("ViewModelBridge", () => {
                 getSender: () => sender,
                 getTs: () => 5000,
                 getContent: () => ({ msgtype: "m.text", body: `text of ${id}` }),
+                isRelation: (type: string) => type === "m.thread",
                 ...over,
             });
         /** A thread rooted at `root` with the given replies (the last one is the latest reply). */
@@ -967,6 +968,39 @@ describe("ViewModelBridge", () => {
             });
             const { root: root2 } = rootWith([edited]);
             expect(read(root2)[0].thread?.lastReply?.text).toBe("");
+        });
+
+        it("reads the latest reply again when its edit decrypts, and stops following it with the row", () => {
+            const edit = fakeEvent("$e", { isEncrypted: () => true, getClearContent: () => null });
+            const { root } = rootWith([reply("$r1", "@bob:example.org", { replacingEvent: () => edit })]);
+            expect(read(root)[0].thread?.lastReply?.text).toBe("");
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            const decrypted = edit.on.mock.calls.find(([name]) => name === "Event.decrypted");
+            expect(decrypted).toBeDefined();
+            decrypted![1]();
+            expect(seen).toContain("timeline");
+            bridge.dispose();
+            expect(edit.off).toHaveBeenCalledWith("Event.decrypted", decrypted![1]);
+        });
+
+        it("lists only repliers: a reaction or an edit in the thread timeline adds no participant", () => {
+            const { root, thread } = rootWith([reply("$r1", "@bob:example.org"), reply("$r2", "@carol:example.org")]);
+            const notThread = { isRelation: (type: string) => type !== "m.thread" };
+            thread.events.push(
+                reply("$re", "@dave:example.org", notThread),
+                reply("$ed", "@erin:example.org", notThread),
+            );
+            expect(read(root)[0].thread?.participantIds).toEqual(["@bob:example.org", "@carol:example.org"]);
+        });
+
+        it("keeps an edited latest reply's leading quote lines: an edit's body has no reply fallback", () => {
+            const edited = reply("$r1", "@bob:example.org", {
+                getContent: () => ({ msgtype: "m.text", body: "> typed quote\n\nmy answer" }),
+                replacingEvent: () => fakeEvent("$e"),
+            });
+            const { root } = rootWith([edited]);
+            expect(read(root)[0].thread?.lastReply?.text).toBe("> typed quote\n\nmy answer");
         });
 
         it("strips a reply fallback from the latest reply's text", () => {
