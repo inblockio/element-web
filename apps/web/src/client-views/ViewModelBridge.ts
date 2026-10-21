@@ -29,6 +29,8 @@ import { EventTileViewModel } from "../viewmodels/room/timeline/event-tile/Event
 import { EventTileE2eViewModel } from "../viewmodels/room/timeline/event-tile/EventTileE2eViewModel";
 import { DecryptionFailureBodyViewModel } from "../viewmodels/room/timeline/event-tile/body/DecryptionFailureBodyViewModel";
 import { EventContentBodyViewModel } from "../viewmodels/message-body/EventContentBodyViewModel";
+import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/ReplyTileViewModel";
+import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/Reply";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
@@ -41,6 +43,7 @@ import {
     type ViewE2e,
     type ViewMe,
     type ViewMessage,
+    type ViewReply,
     type ViewRoom,
     STOCK_VIEW,
 } from "./types";
@@ -48,6 +51,12 @@ import {
 type ChangeEvent = Parameters<Parameters<ClientViewBridge["onChange"]>[0]>[0];
 
 const AVATAR_PX = 64;
+
+/** An event, or the replacement it shows, that is still waiting for its key or failed to decrypt. */
+const unreadable = (ev: MatrixEvent): boolean =>
+    [ev, ev.replacingEvent()].some(
+        (e) => !!e && (e.isDecryptionFailure() || (e.isEncrypted() && e.getClearContent() === null)),
+    );
 
 /**
  * The tile, body and E2E view-models of one timeline event, built the way EventTile builds them. `changed` runs when
@@ -63,6 +72,10 @@ class EventRow {
     private replacement: MatrixEvent | null = null;
     private decryption?: DecryptionFailureBodyViewModel;
     private decryptionCode?: unknown;
+    /** The reply tile view-model of the replied event, as ReplyChain builds it, once that event is loaded. */
+    private reply?: ReplyTileViewModel;
+    private replyLookup = false;
+    private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
 
     public constructor(
@@ -242,7 +255,47 @@ class EventRow {
         });
     }
 
+    /**
+     * The message this row replies to. A replied event outside the loaded timeline is fetched once, as ReplyChain does
+     * (a timeline around it); the row changes when it arrives. Its text is the event's body without its own reply
+     * fallback, and empty while that event or its edit is unreadable (never an edit's cleartext m.new_content).
+     */
+    public replyTo(): ViewReply | undefined {
+        const ev = this.ev;
+        if (!shouldDisplayReply(ev)) return undefined;
+        const parentId = getParentEventId(ev);
+        const room = this.client.getRoom(ev.getRoomId() ?? "");
+        if (!parentId || !room) return undefined;
+        const parent = room.findEventById(parentId);
+        if (!parent) {
+            if (!this.replyLookup) {
+                this.replyLookup = true;
+                this.client.getEventTimeline(room.getUnfilteredTimelineSet(), parentId).then(
+                    () => {
+                        if (!this.disposed && room.findEventById(parentId)) this.changed();
+                    },
+                    () => {},
+                );
+            }
+            return undefined;
+        }
+        if (!this.reply) {
+            this.reply = new ReplyTileViewModel({ mxEvent: parent, cli: this.client });
+            this.unsubscribe.push(this.reply.subscribe(this.changed));
+        }
+        const senderId = parent.getSender() ?? "";
+        // An emote quote has no profile view-model (the name is part of its body).
+        const senderName =
+            this.reply.getSnapshot().sender?.profileViewModel?.getSnapshot().displayName ||
+            parent.sender?.rawDisplayName ||
+            senderId;
+        const body = parent.getContent().body;
+        const text = unreadable(parent) || typeof body !== "string" ? "" : stripPlainReply(body);
+        return { eventId: parentId, senderId, senderName, text };
+    }
+
     public dispose(): void {
+        this.disposed = true;
         this.unsubscribe.forEach((u) => u());
         this.unsubscribe.length = 0;
         this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
@@ -252,6 +305,7 @@ class EventRow {
         this.body.dispose();
         this.padlock.dispose();
         this.decryption?.dispose();
+        this.reply?.dispose();
     }
 }
 
@@ -518,6 +572,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.body.getSnapshot(),
                 senderAvatarUrl,
                 row.e2e(this.localDeviceVerified),
+                row.replyTo(),
             );
             if (message) messages.push(message);
         }

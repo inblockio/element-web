@@ -37,7 +37,12 @@ const h = vi.hoisted(() => {
         public dispose = vi.fn();
     }
     const member = { userId: "@bob:example.org", roomId: "!a" };
-    const room = { roomId: "!a", getMember: () => member };
+    const room = {
+        roomId: "!a",
+        getMember: () => member,
+        findEventById: vi.fn((_id: string): unknown => undefined),
+        getUnfilteredTimelineSet: () => "unfiltered",
+    };
     const item = new FakeVm({
         id: "!a",
         name: "General",
@@ -55,7 +60,9 @@ const h = vi.hoisted(() => {
     const padlocks: Array<InstanceType<typeof FakeVm<{ kind: string }>> & { start: () => void; setProps: () => void }> =
         [];
     const bodies: Array<{ setEventContent: ReturnType<typeof vi.fn> }> = [];
-    return { FakeVm, room, item, timeline, statusBar, member, avatar, padlocks, bodies };
+    const replies: Array<{ props: unknown; dispose: ReturnType<typeof vi.fn> }> = [];
+    const getEventTimeline = vi.fn(async (..._args: unknown[]) => undefined);
+    return { FakeVm, room, item, timeline, statusBar, member, avatar, padlocks, bodies, replies, getEventTimeline };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -122,6 +129,18 @@ vi.mock("../viewmodels/room/timeline/event-tile/EventTileE2eViewModel", () => ({
         return vm;
     }),
 }));
+vi.mock("../viewmodels/room/timeline/event-tile/ReplyTileViewModel", () => ({
+    ReplyTileViewModel: class extends h.FakeVm<object> {
+        public constructor(public props: unknown) {
+            super({
+                href: "",
+                body: null,
+                sender: { profileViewModel: { getSnapshot: () => ({ displayName: "Bob" }) } },
+            });
+            h.replies.push(this as never);
+        }
+    },
+}));
 vi.mock("../settings/SettingsStore", () => ({ default: { getValue: () => false } }));
 vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
@@ -146,6 +165,10 @@ const fakeEvent = (id: string, over: Record<string, unknown> = {}) => {
         decryptionFailureReason: null,
         status: null,
         replacingEvent: () => null,
+        isRedacted: () => false,
+        getWireContent: () => ({}),
+        getRelation: () => null,
+        replyEventId: undefined as string | undefined,
         on: vi.fn(),
         off: vi.fn(),
         ...over,
@@ -164,11 +187,14 @@ describe("ViewModelBridge", () => {
             getUserId: () => "@me:example.org",
             isRoomEncrypted: () => true,
             getCrypto: () => undefined,
+            getEventTimeline: h.getEventTimeline,
             on: vi.fn(),
             off: vi.fn(),
         } as unknown as MatrixClient);
         h.padlocks.length = 0;
         h.bodies.length = 0;
+        h.replies.length = 0;
+        h.room.findEventById.mockImplementation(() => undefined);
     });
 
     it("maps the room list and the user menu snapshots", () => {
@@ -520,6 +546,90 @@ describe("ViewModelBridge", () => {
             bridge.onChange((e) => seen.push(e.kind));
             h.padlocks[0].set({ kind: "none" });
             expect(seen).toContain("timeline");
+        });
+    });
+
+    describe("replies", () => {
+        const replyTo = (parentId: string, body = "Count me in") =>
+            fakeEvent("$reply", {
+                getContent: () => ({ msgtype: "m.text", body }),
+                getWireContent: () => ({ "m.relates_to": { "m.in_reply_to": { event_id: parentId } } }),
+                replyEventId: parentId,
+            });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        const loaded = (parent: ReturnType<typeof fakeEvent>) =>
+            h.room.findEventById.mockImplementation((id: string) => (id === parent.getId() ? parent : undefined));
+
+        it("hands over the replied message from the reply tile view-model: sender and plain text", () => {
+            const parent = fakeEvent("$p", { getContent: () => ({ msgtype: "m.text", body: "Lunch at noon" }) });
+            loaded(parent);
+            const [m] = read(replyTo("$p"));
+            expect(m.replyTo).toEqual({
+                eventId: "$p",
+                senderId: "@bob:example.org",
+                senderName: "Bob",
+                text: "Lunch at noon",
+            });
+            expect(h.replies).toHaveLength(1);
+            expect(h.replies[0].props).toEqual(expect.objectContaining({ mxEvent: parent }));
+            read(replyTo("$p"));
+            expect(h.replies).toHaveLength(1);
+        });
+
+        it("strips the replied message's own reply fallback", () => {
+            loaded(fakeEvent("$p", { getContent: () => ({ msgtype: "m.text", body: "> <@x> earlier\n\nanswer" }) }));
+            expect(read(replyTo("$p"))[0].replyTo?.text).toBe("answer");
+        });
+
+        it("hands over no text of a replied message that, or whose edit, is still unreadable", () => {
+            const pending = fakeEvent("$p", {
+                getType: () => "m.room.encrypted",
+                getContent: () => ({ body: "forged" }),
+                isEncrypted: () => true,
+            });
+            loaded(pending);
+            expect(read(replyTo("$p"))[0].replyTo?.text).toBe("");
+            const edit = fakeEvent("$e", {
+                getContent: () => ({ "m.new_content": { body: "forged" } }),
+                isEncrypted: () => true,
+            });
+            const edited = fakeEvent("$q", {
+                getContent: () => ({ body: "forged" }),
+                isEncrypted: () => true,
+                getClearContent: () => ({ body: "original" }),
+                replacingEvent: () => edit,
+            });
+            loaded(edited);
+            expect(JSON.stringify(read(replyTo("$q"))[0])).not.toContain("forged");
+        });
+
+        it("fetches a replied message outside the loaded timeline once, then hands it over", async () => {
+            const parent = fakeEvent("$far", { getContent: () => ({ msgtype: "m.text", body: "Long ago" }) });
+            const reply = replyTo("$far");
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            expect(read(reply)[0]).not.toHaveProperty("replyTo");
+            read(reply);
+            expect(h.getEventTimeline).toHaveBeenCalledTimes(1);
+            expect(h.getEventTimeline).toHaveBeenCalledWith("unfiltered", "$far");
+            loaded(parent);
+            await new Promise((r) => setTimeout(r, 0));
+            expect(seen).toContain("timeline");
+            expect(read(reply)[0].replyTo?.text).toBe("Long ago");
+        });
+
+        it("adds no reply to a message without one and disposes the reply view-model with the row", () => {
+            expect(read(fakeEvent("$plain"))[0]).not.toHaveProperty("replyTo");
+            loaded(fakeEvent("$p"));
+            read(replyTo("$p"));
+            bridge.dispose();
+            expect(h.replies[0].dispose).toHaveBeenCalledTimes(1);
         });
     });
 });

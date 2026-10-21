@@ -42,6 +42,16 @@ export interface ViewMessage {
      * `decrypted`: the body is readable; `warning` is the padlock text when the padlock marks the message.
      */
     e2e?: ViewE2e;
+    /** The message this one replies to, from the reply tile view-model, once it is loaded. */
+    replyTo?: ViewReply;
+}
+
+/** A replied-to message: `text` is its plain body without its own reply fallback, empty while it is unreadable. */
+export interface ViewReply {
+    eventId: string;
+    senderId: string;
+    senderName: string;
+    text: string;
 }
 
 export type ViewE2e = { state: "pending" | "failed"; text: string } | { state: "decrypted"; warning?: string };
