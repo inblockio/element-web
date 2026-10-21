@@ -36,7 +36,15 @@ export interface ViewMessage {
     /** sanitized HTML if the view-model exposes it */
     formattedBody?: string;
     kind: "text" | "notice" | "emote" | "other";
+    /**
+     * Trust signals from the E2E view-models (REQ-0007). Absent for a message without any.
+     * `pending`/`failed`: the message has no readable body (`body` is empty), `text` is the reason Element shows.
+     * `decrypted`: the body is readable; `warning` is the padlock text when the padlock marks the message.
+     */
+    e2e?: ViewE2e;
 }
+
+export type ViewE2e = { state: "pending" | "failed"; text: string } | { state: "decrypted"; warning?: string };
 
 /** The signed-in user as the user menu view-model shows them. */
 export interface ViewMe {

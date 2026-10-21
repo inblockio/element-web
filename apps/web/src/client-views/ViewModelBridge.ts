@@ -5,7 +5,15 @@
  * Please see LICENSE files in the repository root for full details.
  */
 
-import { type MatrixClient, type MatrixEvent, type Room, EventType } from "matrix-js-sdk/src/matrix";
+import {
+    type IContent,
+    type MatrixClient,
+    type MatrixEvent,
+    type Room,
+    EventType,
+    MatrixEventEvent,
+} from "matrix-js-sdk/src/matrix";
+import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
 import { type TimelineItem, RoomStatusBarState } from "@element-hq/web-shared-components";
 
 import { SDKContextClass } from "../contexts/SDKContextClass";
@@ -18,15 +26,19 @@ import { resolveRoomMemberProfile, roomMemberToMemberInfo } from "../hooks/room/
 import { RoomListViewModel } from "../viewmodels/room-list/RoomListViewModel";
 import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
 import { EventTileViewModel } from "../viewmodels/room/timeline/event-tile/EventTileViewModel";
+import { EventTileE2eViewModel } from "../viewmodels/room/timeline/event-tile/EventTileE2eViewModel";
+import { DecryptionFailureBodyViewModel } from "../viewmodels/room/timeline/event-tile/body/DecryptionFailureBodyViewModel";
 import { EventContentBodyViewModel } from "../viewmodels/message-body/EventContentBodyViewModel";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
+import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
-import { toViewMessage, toViewRoom } from "./mapping";
+import { toViewE2e, toViewMessage, toViewRoom } from "./mapping";
 import {
     type ClientViewBridge,
     type ViewConnection,
+    type ViewE2e,
     type ViewMe,
     type ViewMessage,
     type ViewRoom,
@@ -37,12 +49,26 @@ type ChangeEvent = Parameters<Parameters<ClientViewBridge["onChange"]>[0]>[0];
 
 const AVATAR_PX = 64;
 
-/** The tile and body view-models of one timeline event, built the way EventTile builds them. */
+/**
+ * The tile, body and E2E view-models of one timeline event, built the way EventTile builds them. `changed` runs when
+ * a view-model of the row, or a late decryption of its event, changes what the row shows.
+ */
 class EventRow {
     public readonly tile: EventTileViewModel;
     public readonly body: EventContentBodyViewModel;
+    /** The padlock view-model, as EventTile builds it (EventTile.tsx, e2eViewModel). */
+    public readonly padlock: EventTileE2eViewModel;
+    private decryption?: DecryptionFailureBodyViewModel;
+    private decryptionCode?: unknown;
+    private bodyContent: IContent;
+    private readonly unsubscribe: Array<() => void> = [];
 
-    public constructor(client: MatrixClient, ev: MatrixEvent, continuation: boolean) {
+    public constructor(
+        private readonly client: MatrixClient,
+        private readonly ev: MatrixEvent,
+        continuation: boolean,
+        private readonly changed: () => void,
+    ) {
         // EventTile.createViewModelProps reads only two values from the legacy RoomContext:
         // showHiddenEvents and timelineRenderingType. Everything else is EventTile props or utilities.
         this.tile = new EventTileViewModel(
@@ -96,11 +122,100 @@ class EventRow {
             linkify: false,
             client,
         });
+        this.bodyContent = ev.getContent();
+        this.padlock = new EventTileE2eViewModel({
+            cli: client,
+            mxEvent: ev,
+            isRoomEncrypted: client.isRoomEncrypted(ev.getRoomId() ?? ""),
+            eventSendStatus: ev.status,
+            enableListeners: true,
+        });
+        this.unsubscribe.push(
+            this.tile.subscribe(changed),
+            this.body.subscribe(changed),
+            this.padlock.subscribe(changed),
+        );
+        // A late key turns a decryption failure into a message: the body view-model reads its content once, so it is
+        // told the new content (the stock EventTile re-renders with it).
+        ev.on(MatrixEventEvent.Decrypted, this.onDecrypted);
+        this.unsubscribe.push(() => ev.off(MatrixEventEvent.Decrypted, this.onDecrypted));
+        this.padlock.start();
+    }
+
+    private readonly onDecrypted = (): void => {
+        this.syncContent();
+        this.changed();
+    };
+
+    private syncContent(): void {
+        const content = this.ev.getContent();
+        if (content === this.bodyContent) return;
+        this.bodyContent = content;
+        this.body.setEventContent(this.ev, content);
+    }
+
+    /**
+     * The row's E2E trust signals (REQ-0007): the decryption failure body view-model for an undecryptable event, the
+     * padlock view-model for a decrypted one. `localDeviceVerified` is what the stock UI reads from
+     * LocalDeviceVerificationStateContext.
+     */
+    public e2e(localDeviceVerified: boolean): ViewE2e | undefined {
+        const ev = this.ev;
+        this.syncContent();
+        this.padlock.setProps({
+            isRoomEncrypted: this.client.isRoomEncrypted(ev.getRoomId() ?? ""),
+            eventSendStatus: ev.status,
+        });
+        const padlock = this.padlock.getSnapshot();
+        let sharedByText: string | undefined;
+        if (padlock.kind === "messageShared") {
+            const shared = this.tile.getE2eMessageSharedIconViewModel({
+                client: this.client,
+                roomId: padlock.roomId,
+                keyForwardingUserId: padlock.keyForwardingUserId,
+            });
+            shared.setKeyForwardingUserId(padlock.keyForwardingUserId);
+            const { displayName, userId } = shared.getSnapshot();
+            sharedByText = _t("timeline|message_shared_by", { displayName, userId });
+        }
+        let failure;
+        if (ev.isDecryptionFailure()) {
+            if (!this.decryption) {
+                this.decryption = new DecryptionFailureBodyViewModel({
+                    decryptionFailureCode: ev.decryptionFailureReason,
+                    verificationState: localDeviceVerified,
+                });
+                this.decryptionCode = ev.decryptionFailureReason;
+                this.unsubscribe.push(this.decryption.subscribe(this.changed));
+            }
+            // The setters merge into the snapshot and notify; call them only on a change, or a kit's read would loop.
+            if (this.decryptionCode !== ev.decryptionFailureReason) {
+                this.decryptionCode = ev.decryptionFailureReason;
+                this.decryption.setDecryptionFailureCode(ev.decryptionFailureReason);
+            }
+            if (this.decryption.getSnapshot().isLocalDeviceVerified !== localDeviceVerified) {
+                this.decryption.setVerificationState(localDeviceVerified);
+            }
+            const s = this.decryption.getSnapshot();
+            failure = { reason: s.decryptionFailureReason, isLocalDeviceVerified: s.isLocalDeviceVerified };
+        }
+        return toViewE2e({
+            pending: ev.isEncrypted() && ev.getClearContent() === null,
+            failure,
+            padlock,
+            sharedByText,
+            encrypted: ev.isEncrypted(),
+            t: _t,
+        });
     }
 
     public dispose(): void {
+        this.unsubscribe.forEach((u) => u());
+        this.unsubscribe.length = 0;
         this.tile.dispose();
         this.body.dispose();
+        this.padlock.dispose();
+        this.decryption?.dispose();
     }
 }
 
@@ -124,6 +239,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
     private lastConnection: ViewConnection = "online";
+    /** Whether the signed-in user's cross-signing identity is verified: the stock UI's "local device verified" state. */
+    private localDeviceVerified = false;
     private isUsed = false;
     /** Called when a kit document first reads the bridge, from inside its scripts (before its DOMContentLoaded). */
     public onUse?: () => void;
@@ -153,7 +270,35 @@ export class ViewModelBridge implements ClientViewBridge {
             false,
         );
         this.disposers.push(this.userMenu.subscribe(() => this.emit({ kind: "me" })));
+        this.watchLocalVerification();
         this.syncRooms();
+    }
+
+    /**
+     * What MatrixClientContextProvider feeds the stock UI's LocalDeviceVerificationStateContext (the decryption
+     * failure body reads it): the user's own cross-signing verification, read once and on every trust change.
+     */
+    private watchLocalVerification(): void {
+        const client = this.client;
+        const userId = client.getUserId();
+        if (!userId) return;
+        const set = (verified: boolean): void => {
+            if (verified === this.localDeviceVerified) return;
+            this.localDeviceVerified = verified;
+            this.timelines.forEach((_, roomId) => this.emit({ kind: "timeline", roomId }));
+        };
+        void client
+            .getCrypto()
+            ?.getUserVerificationStatus(userId)
+            .then(
+                (status) => set(status.isCrossSigningVerified()),
+                () => {},
+            );
+        const onTrust = (id: string, status: { isCrossSigningVerified(): boolean }): void => {
+            if (id === userId) set(status.isCrossSigningVerified());
+        };
+        client.on(CryptoEvent.UserTrustStatusChanged, onTrust);
+        this.disposers.push(() => client.off(CryptoEvent.UserTrustStatusChanged, onTrust));
     }
 
     private emit(e: ChangeEvent): void {
@@ -230,10 +375,8 @@ export class ViewModelBridge implements ClientViewBridge {
         const key = ev.getId()!;
         let row = this.rows.get(key);
         if (!row) {
-            row = new EventRow(this.client, ev, item.continuation);
+            row = new EventRow(this.client, ev, item.continuation, () => this.emit({ kind: "timeline", roomId }));
             this.rows.set(key, row);
-            const changed = (): void => this.emit({ kind: "timeline", roomId });
-            this.disposers.push(row.tile.subscribe(changed), row.body.subscribe(changed));
         }
         return row;
     }
@@ -276,11 +419,21 @@ export class ViewModelBridge implements ClientViewBridge {
             if (!id || id.startsWith("~")) continue;
             const row = this.row(eventItem, roomId);
             const tile = row.tile.getSnapshot().snapshot;
-            if (tile.event.eventType !== EventType.RoomMessage || tile.event.isLocalEcho) continue;
+            // An event still waiting for its key keeps the SDK type m.room.encrypted (a failed one is m.room.message).
+            const isMessage =
+                tile.event.eventType === EventType.RoomMessage ||
+                tile.event.eventType === EventType.RoomMessageEncrypted;
+            if (!isMessage || tile.event.isLocalEcho) continue;
             const senderAvatarUrl = tile.sender.senderId
                 ? this.senderAvatarUrl(roomId, tile.sender.senderId)
                 : undefined;
-            const message = toViewMessage(roomId, tile, row.body.getSnapshot(), senderAvatarUrl);
+            const message = toViewMessage(
+                roomId,
+                tile,
+                row.body.getSnapshot(),
+                senderAvatarUrl,
+                row.e2e(this.localDeviceVerified),
+            );
             if (message) messages.push(message);
         }
         return messages.sort((a, b) => a.ts - b.ts);

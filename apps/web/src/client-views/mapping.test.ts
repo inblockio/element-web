@@ -9,10 +9,19 @@
 
 import { describe, it, expect } from "vitest";
 import { MsgType } from "matrix-js-sdk/src/matrix";
-import { type JSX } from "react";
+import { createElement, type JSX } from "react";
+import { render } from "test-utils-rtl";
+import {
+    DecryptionFailureBodyView,
+    DecryptionFailureReason,
+    E2ePadlockIcon,
+    I18nContext,
+} from "@element-hq/web-shared-components";
+import { type I18nApi } from "@element-hq/element-web-module-api";
 
 import { bodyToNode } from "../HtmlUtils";
-import { nodeText, toViewMessage, toViewRoom } from "./mapping";
+import { decryptionFailureText, nodeText, padlockWarning, toViewE2e, toViewMessage, toViewRoom } from "./mapping";
+import { type EventTileE2ePadlockViewState } from "../viewmodels/room/timeline/event-tile/EventTileE2eState";
 
 const tile = (over: { msgtype?: string; eventId?: string; senderId?: string; rawDisplayName?: string } = {}) =>
     ({
@@ -96,5 +105,158 @@ describe("client view mapping", () => {
 
     it("reads text from nested nodes", () => {
         expect(nodeText(["a", 1, null, false, ["b"]])).toBe("a1b");
+    });
+});
+
+/** A translator that shows the key, so a test pins which string a reason maps to. */
+const keyOnly = (key: string): string => key;
+
+describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
+    const reasons = Object.values(DecryptionFailureReason);
+
+    it("covers every DecryptionFailureReason, with and without a verified local device", () => {
+        expect(reasons).toHaveLength(7);
+        for (const reason of reasons) {
+            for (const verified of [undefined, true, false]) {
+                expect(decryptionFailureText(reason, verified, keyOnly)).toMatch(/^timeline\|decryption_failure\|/);
+            }
+        }
+    });
+
+    it("maps each reason to its string", () => {
+        const text = (r: DecryptionFailureReason, v?: boolean) => decryptionFailureText(r, v, keyOnly);
+        expect(text(DecryptionFailureReason.MEGOLM_KEY_WITHHELD_FOR_UNVERIFIED_DEVICE)).toBe(
+            "timeline|decryption_failure|blocked",
+        );
+        expect(text(DecryptionFailureReason.HISTORICAL_MESSAGE_NO_KEY_BACKUP)).toBe(
+            "timeline|decryption_failure|historical_event_no_key_backup",
+        );
+        expect(text(DecryptionFailureReason.HISTORICAL_MESSAGE_USER_NOT_JOINED)).toBe(
+            "timeline|decryption_failure|historical_event_user_not_joined",
+        );
+        expect(text(DecryptionFailureReason.SENDER_IDENTITY_PREVIOUSLY_VERIFIED)).toBe(
+            "timeline|decryption_failure|sender_identity_previously_verified",
+        );
+        expect(text(DecryptionFailureReason.UNSIGNED_SENDER_DEVICE)).toBe(
+            "timeline|decryption_failure|sender_unsigned_device",
+        );
+        expect(text(DecryptionFailureReason.UNABLE_TO_DECRYPT)).toBe("timeline|decryption_failure|unable_to_decrypt");
+        // The unconfigured-backup case depends on the local device: an unverified one is asked to verify.
+        expect(text(DecryptionFailureReason.HISTORICAL_MESSAGE_BACKUP_UNCONFIGURED, false)).toBe(
+            "timeline|decryption_failure|historical_event_unverified_device",
+        );
+        expect(text(DecryptionFailureReason.HISTORICAL_MESSAGE_BACKUP_UNCONFIGURED, true)).toBe(
+            "timeline|decryption_failure|unable_to_decrypt",
+        );
+        expect(text(DecryptionFailureReason.HISTORICAL_MESSAGE_BACKUP_UNCONFIGURED)).toBe(
+            "timeline|decryption_failure|unable_to_decrypt",
+        );
+    });
+
+    it("shows the same text as Element's own decryption failure body view for every reason", () => {
+        const i18n = { translate: keyOnly } as unknown as I18nApi;
+        for (const reason of reasons) {
+            for (const verified of [undefined, true, false]) {
+                const snapshot = { decryptionFailureReason: reason, isLocalDeviceVerified: verified };
+                const vm = {
+                    getSnapshot: () => snapshot,
+                    subscribe: () => () => {},
+                };
+                const { container, unmount } = render(
+                    createElement(
+                        I18nContext.Provider,
+                        { value: i18n },
+                        createElement(DecryptionFailureBodyView, { vm }),
+                    ),
+                );
+                expect(decryptionFailureText(reason, verified, keyOnly), `${reason} ${verified}`).toBe(
+                    container.textContent,
+                );
+                unmount();
+            }
+        }
+    });
+
+    describe("padlock", () => {
+        const warning = (p: EventTileE2ePadlockViewState, shared?: string) => padlockWarning(p, shared);
+
+        it("takes the title of a warning or decryption-failure icon", () => {
+            expect(warning({ kind: "icon", icon: E2ePadlockIcon.Warning, title: "Not encrypted" })).toBe(
+                "Not encrypted",
+            );
+            expect(warning({ kind: "icon", icon: E2ePadlockIcon.DecryptionFailure, title: "Could not decrypt" })).toBe(
+                "Could not decrypt",
+            );
+        });
+
+        it("takes the shared-by text of a forwarded message", () => {
+            expect(warning({ kind: "messageShared", keyForwardingUserId: "@c:x", roomId: "!a" }, "C shared it")).toBe(
+                "C shared it",
+            );
+        });
+
+        it("has no warning for none or the grey info icon", () => {
+            expect(warning({ kind: "none" })).toBeUndefined();
+            expect(warning({ kind: "icon", icon: E2ePadlockIcon.Normal, title: "grey" })).toBeUndefined();
+        });
+    });
+
+    describe("toViewE2e", () => {
+        const none: EventTileE2ePadlockViewState = { kind: "none" };
+        const t = keyOnly;
+
+        it("a failure wins over the padlock and carries the reason text", () => {
+            expect(
+                toViewE2e({
+                    failure: { reason: DecryptionFailureReason.UNSIGNED_SENDER_DEVICE },
+                    padlock: none,
+                    encrypted: true,
+                    t,
+                }),
+            ).toEqual({ state: "failed", text: "timeline|decryption_failure|sender_unsigned_device" });
+        });
+
+        it("pending has the placeholder and no text", () => {
+            expect(toViewE2e({ pending: true, padlock: none, encrypted: true, t })).toEqual({
+                state: "pending",
+                text: "",
+            });
+        });
+
+        it("a decrypted message carries the padlock warning; an unmarked encrypted one carries none", () => {
+            const padlock: EventTileE2ePadlockViewState = {
+                kind: "icon",
+                icon: E2ePadlockIcon.Warning,
+                title: "unverified",
+            };
+            expect(toViewE2e({ padlock, encrypted: true, t })).toEqual({ state: "decrypted", warning: "unverified" });
+            expect(toViewE2e({ padlock: none, encrypted: true, t })).toEqual({ state: "decrypted" });
+        });
+
+        it("a plain message in an unencrypted room has no e2e state; an unencrypted one in an encrypted room warns", () => {
+            expect(toViewE2e({ padlock: none, encrypted: false, t })).toBeUndefined();
+            const padlock: EventTileE2ePadlockViewState = {
+                kind: "icon",
+                icon: E2ePadlockIcon.Warning,
+                title: "Not encrypted",
+            };
+            expect(toViewE2e({ padlock, encrypted: false, t })).toEqual({
+                state: "decrypted",
+                warning: "Not encrypted",
+            });
+        });
+    });
+
+    it("toViewMessage drops the SDK placeholder body of a failed or pending message", () => {
+        const m = toViewMessage(
+            "!a",
+            tile({ msgtype: "m.bad.encrypted" }),
+            { body: "** Unable to decrypt: DecryptionError **" },
+            undefined,
+            { state: "failed", text: "x" },
+        );
+        expect(m?.body).toBe("");
+        expect(m?.formattedBody).toBeUndefined();
+        expect(m?.e2e).toEqual({ state: "failed", text: "x" });
     });
 });
