@@ -12,9 +12,6 @@ import SettingsStore from "../settings/SettingsStore";
 import { SettingLevel } from "../settings/SettingLevel";
 import { type ClientViewDescriptor, STOCK_VIEW } from "./types";
 
-/** Kits registered in code (in-repo kits); config.json `client_views` entries are read on every call. */
-const registered = new Map<string, ClientViewDescriptor>();
-
 const isDescriptor = (v: unknown): v is ClientViewDescriptor => {
     const d = v as Partial<ClientViewDescriptor> | null;
     return (
@@ -26,21 +23,10 @@ const isDescriptor = (v: unknown): v is ClientViewDescriptor => {
     );
 };
 
-/** Registers a kit in code. A later registration with the same id replaces the earlier one. */
-export function registerClientView(view: ClientViewDescriptor): void {
-    if (!isDescriptor(view)) throw new Error(`Invalid client view: ${JSON.stringify(view)}`);
-    registered.set(view.id, { id: view.id, name: view.name, url: view.url });
-}
-
-/** Removes a kit registered in code (tests, or a kit that unloads itself). */
-export function unregisterClientView(id: string): void {
-    registered.delete(id);
-}
-
-/** The kits from config.json (`client_views`) and from code; config entries win on an id clash. */
+/** The kits from config.json `client_views`, in config order. Invalid entries are skipped. */
 export function getClientViews(): ClientViewDescriptor[] {
     const fromConfig = (SdkConfig.get() as { client_views?: unknown }).client_views;
-    const views = new Map(registered);
+    const views = new Map<string, ClientViewDescriptor>();
     if (Array.isArray(fromConfig)) {
         for (const entry of fromConfig) {
             if (isDescriptor(entry)) views.set(entry.id, { id: entry.id, name: entry.name, url: entry.url });

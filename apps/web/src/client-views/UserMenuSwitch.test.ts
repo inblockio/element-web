@@ -19,9 +19,9 @@ import {
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { MatrixDispatcher } from "../dispatcher/dispatcher";
 import { SDKContextClass } from "../contexts/SDKContextClass";
+import SdkConfig from "../SdkConfig";
 import SettingsStore from "../settings/SettingsStore";
 import { type OwnProfileStore } from "../stores/OwnProfileStore";
-import { registerClientView, unregisterClientView } from "./registry";
 
 /** The stock user menu's "Switch to <view>" entries, one per kit, behind the Labs flag. */
 describe("user menu client view entries", () => {
@@ -54,11 +54,13 @@ describe("user menu client view entries", () => {
                 ? labs
                 : (getValue as (...a: unknown[]) => unknown)(name, ...rest)) as never);
         vi.spyOn(SettingsStore, "setValue").mockResolvedValue();
-        registerClientView({ id: "fixture", name: "Fixture", url: "/kits/fixture/index.html" });
+        SdkConfig.put({
+            client_views: [{ id: "fixture", name: "Fixture", url: "/kits/fixture/index.html" }],
+        } as never);
     });
 
     afterEach(() => {
-        unregisterClientView("fixture");
+        SdkConfig.reset();
         vi.restoreAllMocks();
         SDKContextClass.instance.onLoggedOut();
     });

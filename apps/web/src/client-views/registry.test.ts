@@ -17,10 +17,8 @@ import {
     getActiveClientView,
     getClientViews,
     isHandedOver,
-    registerClientView,
     selectClientView,
     setHandedOver,
-    unregisterClientView,
     watchHandOver,
 } from "./registry";
 
@@ -38,36 +36,27 @@ describe("client view registry", () => {
     });
 
     afterEach(() => {
-        unregisterClientView("fixture");
         SdkConfig.reset();
         vi.restoreAllMocks();
     });
 
-    it("lists kits from code and from config.json, ignoring invalid entries", () => {
-        registerClientView(fixture);
+    it("lists the valid kits from config.json and skips invalid entries", () => {
         SdkConfig.put({
             client_views: [
-                { id: "other", name: "Other", url: "/kits/other/" },
+                fixture,
+                { id: "", name: "x", url: "/" },
                 { id: "stock", name: "x", url: "/" },
+                { id: "noname", url: "/" },
+                { id: "nourl", name: "x" },
+                { id: "other", name: "Other", url: "/kits/other/" },
                 7,
             ],
         } as never);
-        expect(getClientViews().map((v) => v.id)).toEqual(["fixture", "other"]);
-    });
-
-    it("rejects an invalid registration and the reserved stock id", () => {
-        expect(() => registerClientView({ id: "", name: "x", url: "/" })).toThrow();
-        expect(() => registerClientView({ id: "stock", name: "x", url: "/" })).toThrow();
-    });
-
-    it("lets config.json override a kit registered in code", () => {
-        registerClientView(fixture);
-        SdkConfig.put({ client_views: [{ ...fixture, url: "/elsewhere/" }] } as never);
-        expect(getClientViews()).toEqual([{ ...fixture, url: "/elsewhere/" }]);
+        expect(getClientViews()).toEqual([fixture, { id: "other", name: "Other", url: "/kits/other/" }]);
     });
 
     it("shows a kit only with the Labs flag on and the kit selected", async () => {
-        registerClientView(fixture);
+        SdkConfig.put({ client_views: [fixture] } as never);
         expect(getActiveClientView()).toBeUndefined();
         await selectClientView("fixture");
         expect(SettingsStore.setValue).toHaveBeenCalledWith("clientView", null, SettingLevel.DEVICE, "fixture");
@@ -86,12 +75,12 @@ describe("client view registry", () => {
 
     it("is available only with the Labs flag and at least one kit", () => {
         expect(clientViewsAvailable()).toBe(false);
-        registerClientView(fixture);
+        SdkConfig.put({ client_views: [fixture] } as never);
         expect(clientViewsAvailable()).toBe(true);
     });
 
     it("ends a hand-over on any switch, the already selected kit included, and tells the watchers", async () => {
-        registerClientView(fixture);
+        SdkConfig.put({ client_views: [fixture] } as never);
         await selectClientView("fixture");
         const watcher = vi.fn();
         const unwatch = watchHandOver(watcher);
