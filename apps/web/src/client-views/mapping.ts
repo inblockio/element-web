@@ -236,6 +236,8 @@ export function toViewMedia(
         case VideoBodyViewState.LOADING:
             return { kind, state: "loading", name: "", ...size };
         default:
+            // A data: src is the placeholder of an encrypted video that is not decrypted yet, not something to play.
+            if (video.src?.startsWith("data:")) return { kind, state: "loading", name: "", ...size };
             return {
                 kind,
                 state: video.src ? "ready" : "loading",

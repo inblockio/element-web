@@ -79,6 +79,7 @@ const h = vi.hoisted(() => {
             props: Record<string, unknown>;
             loadInitialMediaIfVisible: ReturnType<typeof vi.fn>;
             setMediaVisible: ReturnType<typeof vi.fn>;
+            onPlay: ReturnType<typeof vi.fn>;
         }
     > = [];
     const mediaHelpers: Array<{ destroy: ReturnType<typeof vi.fn>; event?: unknown }> = [];
@@ -87,6 +88,7 @@ const h = vi.hoisted(() => {
         class extends FakeVm<Record<string, unknown>> {
             public kind = kind;
             public loadInitialMediaIfVisible = vi.fn();
+            public onPlay = vi.fn(async () => {});
             public setMediaVisible = vi.fn((visible: boolean) => {
                 this.props = { ...this.props, mediaVisible: visible };
             });
@@ -1179,6 +1181,70 @@ describe("ViewModelBridge", () => {
             read(mediaEvent("$img", "m.image"));
             expect(vm.setMediaVisible).toHaveBeenCalledTimes(1);
             expect(vm.setMediaVisible).toHaveBeenCalledWith(true);
+        });
+
+        it("follows the live content: a row built while encrypted gets its media once the event decrypts", () => {
+            let content: Record<string, unknown> = { msgtype: "m.bad.encrypted", body: "** Unable to decrypt **" };
+            const ev = fakeEvent("$late", { getContent: () => content });
+            expect(read(ev)[0]).not.toHaveProperty("media");
+            expect(h.mediaVms).toHaveLength(0);
+            content = { msgtype: "m.image", body: "x", file: { url: "mxc://hs/a" } };
+            expect(read(ev)[0].media).toMatchObject({ kind: "image", state: "loading" });
+            expect(h.mediaVms).toHaveLength(1);
+        });
+
+        it("rebuilds the media view-model when an edit swaps the file, and releases the old one", () => {
+            let content: Record<string, unknown> = { msgtype: "m.image", body: "x", url: "mxc://hs/a" };
+            const ev = fakeEvent("$e", { getContent: () => content });
+            read(ev);
+            read(ev);
+            expect(h.mediaVms).toHaveLength(1);
+            content = { msgtype: "m.image", body: "x", url: "mxc://hs/b" };
+            read(ev);
+            expect(h.mediaVms).toHaveLength(2);
+            expect(h.mediaVms[0].dispose).toHaveBeenCalledTimes(1);
+            expect(h.mediaHelpers[0].destroy).toHaveBeenCalledTimes(1);
+            expect(h.mediaHelpers[1].destroy).not.toHaveBeenCalled();
+        });
+
+        it("drops the media of a redacted message and disposes its view-model", () => {
+            let redacted = false;
+            const ev = fakeEvent("$r", {
+                getContent: () => (redacted ? {} : { msgtype: "m.image", body: "x", url: "mxc://hs/a" }),
+                isRedacted: () => redacted,
+            });
+            expect(read(ev)[0].media).toBeDefined();
+            redacted = true;
+            expect(read(ev)[0]).not.toHaveProperty("media");
+            expect(h.mediaVms[0].dispose).toHaveBeenCalledTimes(1);
+            expect(h.mediaHelpers[0].destroy).toHaveBeenCalledTimes(1);
+        });
+
+        it("plays an encrypted video that waits on its data: placeholder, once, so it decrypts to a blob URL", async () => {
+            const ev = mediaEvent("$enc", "m.video");
+            read(ev);
+            const vm = h.mediaVms[0];
+            vm.onPlay.mockImplementation(async () => vm.set({ src: "blob:decrypted-video" }));
+            vm.set({ src: "data:video/mp4," });
+            expect(read(ev)[0].media).toMatchObject({ state: "loading" });
+            expect(read(ev)[0].media).not.toHaveProperty("url");
+            await Promise.resolve();
+            expect(vm.onPlay).toHaveBeenCalledTimes(1);
+            read(ev);
+            await Promise.resolve();
+            expect(vm.onPlay).toHaveBeenCalledTimes(1);
+            expect(read(ev)[0].media).toMatchObject({ state: "ready", url: "blob:decrypted-video" });
+        });
+
+        it("does not play a video that is disposed before the placeholder is acted on", async () => {
+            const ev = mediaEvent("$enc2", "m.video");
+            read(ev);
+            const vm = h.mediaVms[0];
+            vm.set({ src: "data:video/mp4," });
+            read(ev);
+            bridge.dispose();
+            await Promise.resolve();
+            expect(vm.onPlay).not.toHaveBeenCalled();
         });
 
         it("keeps one view-model per event and disposes it and its helper with the bridge", () => {

@@ -330,6 +330,10 @@ describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
                 height: 270,
             });
             expect(toViewMedia("video", { state: VideoBodyViewState.LOADING })).toMatchObject({ state: "loading" });
+            // An encrypted video with autoplay off carries a data: placeholder until onPlay decrypts it.
+            const waiting = toViewMedia("video", { state: VideoBodyViewState.READY, src: "data:video/mp4," });
+            expect(waiting).toMatchObject({ state: "loading" });
+            expect(waiting).not.toHaveProperty("url");
             expect(
                 toViewMedia("video", { state: VideoBodyViewState.HIDDEN, hiddenButtonLabel: "Show video" }),
             ).toMatchObject({ state: "hidden", label: "Show video" });

@@ -118,7 +118,11 @@ class EventRow {
         kind: ViewMedia["kind"];
         vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
         helper: MediaEventHelper;
+        /** The file the view-model was built for (content `url` / `file.url`): another file, as an edit brings, rebuilds it. */
+        identity: string;
         visible: boolean;
+        /** Whether `onPlay` was asked for: an encrypted video decrypts only on play, and it must not be asked twice. */
+        played: boolean;
         unsubscribe: () => void;
     };
     private disposed = false;
@@ -511,19 +515,26 @@ class EventRow {
      * `changed` when its snapshot gets the URL. Element's media-visibility setting is mirrored: hidden stays hidden.
      */
     public media(): ViewMedia | undefined {
-        const msgtype = this.tile.getSnapshot().snapshot.event.msgtype;
+        // The live content, not the tile snapshot (built once): it is the replacement's after an edit, `{}` once
+        // redacted, and the clear content once decrypted.
+        const content: { msgtype?: string; url?: string; file?: { url?: string } } = this.ev.isRedacted()
+            ? {}
+            : this.ev.getContent();
         const kind =
-            msgtype === MsgType.Image
+            content.msgtype === MsgType.Image
                 ? "image"
-                : msgtype === MsgType.Video
+                : content.msgtype === MsgType.Video
                   ? "video"
-                  : msgtype === MsgType.File
+                  : content.msgtype === MsgType.File
                     ? "file"
                     : undefined;
-        if (this.disposed || kind !== this.mediaBody?.kind) this.releaseMedia();
+        const identity = `${content.url ?? ""}|${content.file?.url ?? ""}`;
+        if (this.disposed || kind !== this.mediaBody?.kind || identity !== this.mediaBody?.identity) {
+            this.releaseMedia();
+        }
         if (this.disposed || !kind) return undefined;
         const visible = getMediaVisibility(this.ev, this.client);
-        if (!this.mediaBody) this.mediaBody = this.newMedia(kind, visible);
+        if (!this.mediaBody) this.mediaBody = this.newMedia(kind, identity, visible);
         const body = this.mediaBody;
         // Called only on a change: the setters notify, and a kit's read must not loop.
         if (body.kind !== "file" && body.visible !== visible) {
@@ -531,6 +542,14 @@ class EventRow {
             (body.vm as ImageBodyViewModel | VideoBodyViewModel).setMediaVisible(visible);
         }
         const snapshot = body.vm.getSnapshot();
+        // An encrypted video with autoplay off carries a data: placeholder until played; nobody clicks play here.
+        if (kind === "video" && !body.played && (snapshot as VideoBodyViewSnapshot).src?.startsWith("data:")) {
+            body.played = true;
+            const player = body.vm as VideoBodyViewModel;
+            queueMicrotask(() => {
+                if (!this.disposed && this.mediaBody?.vm === player) void player.onPlay();
+            });
+        }
         switch (kind) {
             case "image":
                 return toViewMedia("image", snapshot as ImageBodyViewSnapshot);
@@ -541,7 +560,7 @@ class EventRow {
         }
     }
 
-    private newMedia(kind: ViewMedia["kind"], visible: boolean): NonNullable<EventRow["mediaBody"]> {
+    private newMedia(kind: ViewMedia["kind"], identity: string, visible: boolean): NonNullable<EventRow["mediaBody"]> {
         const helper = new MediaEventHelper(this.ev);
         let vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
         if (kind === "image") {
@@ -577,7 +596,7 @@ class EventRow {
                 if (!this.disposed && this.mediaBody?.vm === loader) loader.loadInitialMediaIfVisible();
             });
         }
-        return { kind, vm, helper, visible, unsubscribe };
+        return { kind, vm, helper, identity, visible, played: false, unsubscribe };
     }
 
     private releaseMedia(): void {
