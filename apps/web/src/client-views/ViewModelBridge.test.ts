@@ -42,7 +42,10 @@ const h = vi.hoisted(() => {
         roomId: "!a",
         getMember: () => member,
         findEventById: vi.fn((_id: string): unknown => undefined),
+        findThreadForEvent: () => null,
         getUnfilteredTimelineSet: () => timelineSet,
+        on: vi.fn(),
+        off: vi.fn(),
     };
     const item = new FakeVm({
         id: "!a",
@@ -67,8 +70,13 @@ const h = vi.hoisted(() => {
         props: { content: string; disabled?: boolean };
         dispose: ReturnType<typeof vi.fn>;
     }> = [];
+    const threadSummaries: Array<FakeVm<{ isVisible: boolean; previewVm: FakeVm<object> }> & Record<string, unknown>> =
+        [];
+    const releaseThreadSummary = vi.fn();
     return {
         FakeVm,
+        threadSummaries,
+        releaseThreadSummary,
         room,
         timelineSet,
         item,
@@ -130,6 +138,23 @@ vi.mock("../viewmodels/room/timeline/event-tile/EventTileViewModel", () => ({
                 },
             });
         }
+        /** The tile's lazily created thread summary view-model (one per tile, as the real one). */
+        private threadSummary?: unknown;
+        public getThreadSummaryViewModel = vi.fn((props: unknown) => {
+            if (!this.threadSummary) {
+                const vm = Object.assign(new h.FakeVm({ isVisible: true, previewVm: new h.FakeVm<object>({}) }), {
+                    props,
+                    setThread: vi.fn(),
+                });
+                h.threadSummaries.push(vm as never);
+                this.threadSummary = vm;
+            }
+            return this.threadSummary as (typeof h.threadSummaries)[number];
+        });
+        public releaseThreadSummaryViewModel = (): void => {
+            h.releaseThreadSummary();
+            this.threadSummary = undefined;
+        };
     },
 }));
 vi.mock("../viewmodels/message-body/EventContentBodyViewModel", () => ({
@@ -197,6 +222,8 @@ const fakeEvent = (id: string, over: Record<string, unknown> = {}) => {
         replacingEvent: () => null,
         isRedacted: () => false,
         getWireContent: () => ({}),
+        getTs: () => 1,
+        getThread: () => null,
         getRelation: () => null,
         replyEventId: undefined as string | undefined,
         on: vi.fn(),
@@ -225,6 +252,7 @@ describe("ViewModelBridge", () => {
         h.bodies.length = 0;
         h.replies.length = 0;
         h.reactionButtons.length = 0;
+        h.threadSummaries.length = 0;
         h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
         h.room.findEventById.mockImplementation(() => undefined);
     });
@@ -850,6 +878,145 @@ describe("ViewModelBridge", () => {
             expect(relations.off).toHaveBeenCalledWith("Relations.remove", expect.any(Function));
             expect(relations.off).toHaveBeenCalledWith("Relations.redaction", expect.any(Function));
             expect(h.reactionButtons[0].dispose).toHaveBeenCalledTimes(1);
+        });
+    });
+    describe("thread summary", () => {
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        const reply = (id: string, sender: string, over: Record<string, unknown> = {}) =>
+            fakeEvent(id, {
+                getSender: () => sender,
+                getTs: () => 5000,
+                getContent: () => ({ msgtype: "m.text", body: `text of ${id}` }),
+                ...over,
+            });
+        /** A thread rooted at `root` with the given replies (the last one is the latest reply). */
+        const threadOf = (root: ReturnType<typeof fakeEvent>, replies: ReturnType<typeof reply>[]) => ({
+            id: root.getId(),
+            room: h.room,
+            length: replies.length,
+            events: [root, ...replies],
+            replyToEvent: replies[replies.length - 1] ?? null,
+            on: vi.fn(),
+            off: vi.fn(),
+        });
+        const rootWith = (replies: ReturnType<typeof reply>[], over: Record<string, unknown> = {}) => {
+            const root = fakeEvent("$root", { getTs: () => 1000, ...over });
+            const thread = threadOf(root, replies);
+            Object.assign(root, { getThread: () => thread });
+            return { root, thread };
+        };
+
+        it("hands over the reply count, the latest reply and the repliers from the thread summary view-model", () => {
+            const { root, thread } = rootWith([reply("$r1", "@bob:example.org"), reply("$r2", "@carol:example.org")]);
+            const [m] = read(root);
+            expect(m.thread).toEqual({
+                replyCount: 2,
+                lastReplyTs: 5000,
+                lastReply: { eventId: "$r2", senderId: "@carol:example.org", text: "text of $r2" },
+                participantIds: ["@bob:example.org", "@carol:example.org"],
+            });
+            // The view-model is the tile's own, fed the thread of the row's event.
+            expect(h.threadSummaries).toHaveLength(1);
+            expect(h.threadSummaries[0].props).toMatchObject({ mxEvent: root, thread, isCard: false, narrow: false });
+            // One view-model per row, however often the timeline is read.
+            read(root);
+            expect(h.threadSummaries).toHaveLength(1);
+        });
+
+        it("lists each replier once", () => {
+            const { root } = rootWith([
+                reply("$r1", "@bob:example.org"),
+                reply("$r2", "@bob:example.org"),
+                reply("$r3", "@me:example.org"),
+            ]);
+            expect(read(root)[0].thread?.participantIds).toEqual(["@bob:example.org", "@me:example.org"]);
+        });
+
+        it("adds no thread to a message without replies, a reply inside a thread, or a hidden summary", () => {
+            expect(read(fakeEvent("$1"))[0]).not.toHaveProperty("thread");
+            const other = threadOf(fakeEvent("$elsewhere"), [reply("$r1", "@bob:example.org")]);
+            expect(read(fakeEvent("$2", { getThread: () => other }))[0]).not.toHaveProperty("thread");
+            const { root } = rootWith([reply("$r1", "@bob:example.org")]);
+            read(root);
+            h.threadSummaries[0].set({ isVisible: false });
+            expect(read(root)[0]).not.toHaveProperty("thread");
+        });
+
+        it("blanks the latest reply's text while that event or its edit is unreadable", () => {
+            const undecrypted = reply("$r1", "@bob:example.org", {
+                isEncrypted: () => true,
+                getClearContent: () => null,
+            });
+            const { root } = rootWith([undecrypted]);
+            const [m] = read(root);
+            expect(m.thread?.lastReply).toEqual({ eventId: "$r1", senderId: "@bob:example.org", text: "" });
+            expect(JSON.stringify(m)).not.toContain("text of $r1");
+
+            const edited = reply("$r2", "@bob:example.org", {
+                replacingEvent: () => ({
+                    isDecryptionFailure: () => true,
+                    isEncrypted: () => true,
+                    getClearContent: () => null,
+                }),
+            });
+            const { root: root2 } = rootWith([edited]);
+            expect(read(root2)[0].thread?.lastReply?.text).toBe("");
+        });
+
+        it("strips a reply fallback from the latest reply's text", () => {
+            const fallback = reply("$r1", "@bob:example.org", {
+                getContent: () => ({ msgtype: "m.text", body: "> <@a:x> quoted\n\nthe answer" }),
+            });
+            const { root } = rootWith([fallback]);
+            expect(read(root)[0].thread?.lastReply?.text).toBe("the answer");
+        });
+
+        it("follows the thread: a view-model change, the preview's change, the event's thread update and a new thread", () => {
+            const { root, thread } = rootWith([reply("$r1", "@bob:example.org")]);
+            read(root);
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            h.threadSummaries[0].set({});
+            expect(seen).toContain("timeline");
+            seen.length = 0;
+            h.threadSummaries[0].snapshot.previewVm.set({});
+            expect(seen).toContain("timeline");
+            seen.length = 0;
+            const updated = root.on.mock.calls.find(([name]) => name === "Thread.update");
+            expect(updated).toBeDefined();
+            updated![1]();
+            expect(seen).toContain("timeline");
+
+            // A thread created after the root was read: the room announces it.
+            const late = fakeEvent("$late");
+            read(late);
+            seen.length = 0;
+            const created = h.room.on.mock.calls.filter(([name]) => name === "Thread.new").map(([, cb]) => cb);
+            expect(created.length).toBeGreaterThan(0);
+            created.forEach((cb) => cb({ id: "$other" }));
+            expect(seen).toHaveLength(0);
+            created.forEach((cb) => cb({ id: "$late" }));
+            expect(seen).toContain("timeline");
+            expect(thread.on).not.toHaveBeenCalled();
+        });
+
+        it("releases the summary listeners and view-model with the row", () => {
+            const { root } = rootWith([reply("$r1", "@bob:example.org")]);
+            read(root);
+            const [vm] = h.threadSummaries;
+            expect(vm.listeners.size).toBe(1);
+            expect(vm.snapshot.previewVm.listeners.size).toBe(1);
+            bridge.dispose();
+            expect(vm.listeners.size).toBe(0);
+            expect(vm.snapshot.previewVm.listeners.size).toBe(0);
+            expect(root.off).toHaveBeenCalledWith("Thread.update", expect.any(Function));
+            expect(h.room.off).toHaveBeenCalledWith("Thread.new", expect.any(Function));
         });
     });
 });

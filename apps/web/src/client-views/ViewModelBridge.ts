@@ -10,12 +10,14 @@ import {
     type MatrixEvent,
     type Room,
     type Relations,
+    type Thread,
     EventType,
     MatrixEventEvent,
     RelationsEvent,
     RoomStateEvent,
+    ThreadEvent,
 } from "matrix-js-sdk/src/matrix";
-import { uniqBy } from "lodash";
+import { uniq, uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
 import { type TimelineItem, RoomStatusBarState } from "@element-hq/web-shared-components";
 
@@ -37,6 +39,7 @@ import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { isContentActionable } from "../utils/EventUtils";
+import { getEventTileThread } from "../viewmodels/room/timeline/event-tile/EventTileThreadState";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
@@ -52,6 +55,7 @@ import {
     type ViewReaction,
     type ViewReply,
     type ViewRoom,
+    type ViewThread,
     STOCK_VIEW,
 } from "./types";
 
@@ -90,6 +94,8 @@ class EventRow {
     private replyEdit: MatrixEvent | null = null;
     private reactionRelations?: Relations;
     private readonly reactionButtons = new Map<string, ReactionsRowButtonViewModel>();
+    /** Releases the listeners of the thread summary view-model, which the tile owns and disposes with the row. */
+    private threadSummaryRelease?: () => void;
     private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
 
@@ -170,6 +176,13 @@ class EventRow {
         // The first reaction creates the event's relations (EventTile listens the same way).
         ev.on(MatrixEventEvent.RelationsCreated, changed);
         this.unsubscribe.push(() => ev.off(MatrixEventEvent.RelationsCreated, changed));
+        // The root of a thread learns its thread from the event, or from the room when the thread is created later
+        // (EventTile listens the same way).
+        ev.on(ThreadEvent.Update, changed);
+        this.unsubscribe.push(() => ev.off(ThreadEvent.Update, changed));
+        const room = client.getRoom(ev.getRoomId() ?? "");
+        room?.on(ThreadEvent.New, this.onNewThread);
+        this.unsubscribe.push(() => room?.off(ThreadEvent.New, this.onNewThread));
         this.followReplacement();
         this.padlock.start();
     }
@@ -191,6 +204,10 @@ class EventRow {
         this.replacement = next;
         this.replacement?.on(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
     }
+
+    private readonly onNewThread = (thread: Thread): void => {
+        if (thread.id === this.ev.getId()) this.changed();
+    };
 
     private readonly onDecrypted = (): void => {
         this.body.setEventContent(this.ev, this.ev.getContent());
@@ -386,6 +403,65 @@ class EventRow {
         return reactions.length ? reactions : undefined;
     }
 
+    /**
+     * The thread this message roots, as the thread summary under it shows it: the reply count the summary view-model
+     * counts (it is visible only for a thread with replies), the latest reply and the repliers. The view-model is the
+     * tile's own; opening the thread is the summary's click action, N/A in a client view. The latest reply's text is
+     * blank while that event or its edit is unreadable (the summary view-model shows its own placeholder instead).
+     */
+    public threadSummary(): ViewThread | undefined {
+        const thread = getEventTileThread(this.ev, this.client.getRoom(this.ev.getRoomId() ?? ""));
+        if (!thread || thread.id !== this.ev.getId()) {
+            this.releaseThreadSummary();
+            return undefined;
+        }
+        const first = !this.threadSummaryRelease;
+        const vm = this.tile.getThreadSummaryViewModel({
+            cli: this.client,
+            mxEvent: this.ev,
+            thread,
+            narrow: false,
+            isCard: false,
+            room: thread.room,
+            timelineRenderingType: TimelineRenderingType.Room,
+            lowBandwidth: SettingsStore.getValue("lowBandwidth"),
+            useOnlyCurrentProfiles: SettingsStore.getValue("useOnlyCurrentProfiles"),
+        });
+        vm.setThread(thread);
+        const snapshot = vm.getSnapshot();
+        if (first) {
+            // The preview view-model follows the latest reply's decryption and edits; the summary's own snapshot
+            // follows the thread (count) and its notifications.
+            const unsubscribes = [vm.subscribe(this.changed), snapshot.previewVm.subscribe(this.changed)];
+            this.threadSummaryRelease = () => unsubscribes.forEach((u) => u());
+        }
+        if (!snapshot.isVisible) return undefined;
+        const last = thread.replyToEvent;
+        const body = last?.getContent().body;
+        const lastReply =
+            last && last.getId()
+                ? {
+                      eventId: last.getId()!,
+                      senderId: last.getSender() ?? "",
+                      text: unreadable(last) || typeof body !== "string" ? "" : stripPlainReply(body),
+                  }
+                : undefined;
+        const repliers = thread.events.filter((e) => e.getId() !== thread.id).map((e) => e.getSender() ?? "");
+        return {
+            replyCount: thread.length,
+            lastReplyTs: (last ?? this.ev).getTs(),
+            ...(lastReply ? { lastReply } : {}),
+            participantIds: uniq([...repliers, ...(lastReply ? [lastReply.senderId] : [])].filter(Boolean)),
+        };
+    }
+
+    private releaseThreadSummary(): void {
+        if (!this.threadSummaryRelease) return;
+        this.threadSummaryRelease();
+        this.threadSummaryRelease = undefined;
+        this.tile.releaseThreadSummaryViewModel();
+    }
+
     private bindReactions(relations: Relations | undefined, how: "on" | "off"): void {
         for (const name of [RelationsEvent.Add, RelationsEvent.Remove, RelationsEvent.Redaction]) {
             relations?.[how](name, this.changed);
@@ -398,6 +474,8 @@ class EventRow {
         this.reactionRelations = undefined;
         this.reactionButtons.forEach((b) => b.dispose());
         this.reactionButtons.clear();
+        this.threadSummaryRelease?.();
+        this.threadSummaryRelease = undefined;
         this.unsubscribe.forEach((u) => u());
         this.unsubscribe.length = 0;
         this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
@@ -678,6 +756,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.e2e(this.localDeviceVerified),
                 row.replyTo(),
                 row.reactions(),
+                row.threadSummary(),
             );
             if (message) messages.push(message);
         }

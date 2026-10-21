@@ -46,6 +46,20 @@ export interface ViewMessage {
     replyTo?: ViewReply;
     /** Reactions from the reactions row button view-models, in Element's order. Absent for a message without any. */
     reactions?: ViewReaction[];
+    /** The thread this message roots, from the thread summary view-model. Absent for a message without replies. */
+    thread?: ViewThread;
+}
+
+/**
+ * A thread summary: `replyCount` as the summary view-model counts it, `lastReplyTs` in ms (the root's own time when the
+ * latest reply is not loaded), `participantIds` = distinct senders of the replies, `lastReply.text` empty while that
+ * event or its edit is unreadable.
+ */
+export interface ViewThread {
+    replyCount: number;
+    lastReplyTs: number;
+    lastReply?: { eventId: string; senderId: string; text: string };
+    participantIds: string[];
 }
 
 /** One reaction key: `count` = distinct senders, `mine` = the user reacted with it (not redacted). */
