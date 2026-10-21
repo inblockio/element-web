@@ -60,6 +60,9 @@ const h = vi.hoisted(() => {
         start: vi.fn(),
         onMarkAllAsRead: vi.fn(),
         onJumpToLive: vi.fn(),
+        onStartReached: vi.fn(),
+        onAnchorReached: vi.fn(),
+        loading: false,
     });
     const statusBar = new FakeVm<{ state: string | null }>({ state: null });
     const avatar = new FakeVm<{ url?: string }>({ url: "http://avatar/bob" });
@@ -2041,6 +2044,90 @@ describe("ViewModelBridge", () => {
             expect(vm.dispose).toHaveBeenCalledTimes(1);
             expect(vm.listeners.size).toBe(0);
             expect(h.watchers.size).toBe(0);
+        });
+    });
+    describe("loadOlder", () => {
+        const eventItem = (id: string, type = "m.room.message") => ({
+            kind: "event" as const,
+            key: id,
+            event: { getId: () => id, getType: () => type },
+        });
+        const loadingItem = { kind: "loading" as const, key: "backward-loading" };
+        const window = (n: number, from = 0) => Array.from({ length: n }, (_, i) => eventItem(`$e${from + i}`));
+        beforeEach(() => {
+            h.timeline.loading = false;
+            h.timeline.set({ items: window(20, 100), pendingAnchor: { targetKey: "$e119", align: "end" } } as never);
+            h.timeline.onStartReached.mockReset();
+            h.timeline.onAnchorReached.mockReset();
+        });
+
+        it("clears the anchor, asks for the page, and resolves with the new events once the spinner is gone", async () => {
+            const seen: string[] = [];
+            h.timeline.onAnchorReached.mockImplementation(() => seen.push("anchor"));
+            h.timeline.onStartReached.mockImplementationOnce(() => {
+                seen.push("start");
+                h.timeline.set({ items: [loadingItem, ...window(20, 100)] } as never);
+                setTimeout(() => h.timeline.set({ items: [...window(20, 80), ...window(20, 100)] } as never), 60);
+            });
+            const result = await bridge.loadOlder("!a");
+            expect(seen).toEqual(["anchor", "start"]);
+            expect(result).toEqual({ added: 20, atStart: false, atLimit: false });
+        });
+
+        it("waits for the first window to finish loading before it paginates", async () => {
+            h.timeline.loading = true;
+            const done = vi.fn();
+            const p = bridge.loadOlder("!a").then(done);
+            await new Promise((r) => setTimeout(r, 80));
+            expect(h.timeline.onStartReached).not.toHaveBeenCalled();
+            expect(done).not.toHaveBeenCalled();
+            h.timeline.loading = false;
+            await p;
+            expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
+        });
+
+        it("resolves with nothing added when the view-model skips the page", async () => {
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: false, atLimit: false });
+        });
+
+        it("reports atStart, without a page, when the room's creation event is in the window", async () => {
+            h.timeline.set({ items: [eventItem("$create", "m.room.create"), ...window(5)] } as never);
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: true, atLimit: false });
+            expect(h.timeline.onStartReached).not.toHaveBeenCalled();
+        });
+
+        it("reports atStart after a page that brings in the creation event", async () => {
+            h.timeline.onStartReached.mockImplementation(() =>
+                h.timeline.set({ items: [eventItem("$create", "m.room.create"), ...window(20, 100)] } as never),
+            );
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 1, atStart: true, atLimit: false });
+        });
+
+        it("reports atLimit within one page of the window limit and asks for no page (it would drop the live end)", async () => {
+            h.timeline.set({ items: window(900) } as never);
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: false, atLimit: true });
+            expect(h.timeline.onStartReached).not.toHaveBeenCalled();
+            h.timeline.set({ items: window(899) } as never);
+            h.timeline.onStartReached.mockImplementation(() => h.timeline.set({ items: window(920, 0) } as never));
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 21, atStart: false, atLimit: true });
+        });
+
+        it("gives concurrent calls one page and one answer", async () => {
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [loadingItem, ...window(20, 100)] } as never);
+                setTimeout(() => h.timeline.set({ items: [...window(10, 90), ...window(20, 100)] } as never), 60);
+            });
+            const [a, b] = await Promise.all([bridge.loadOlder("!a"), bridge.loadOlder("!a")]);
+            expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
+            expect(a).toEqual({ added: 10, atStart: false, atLimit: false });
+            expect(b).toEqual(a);
+            // A call after it has settled asks again.
+            await bridge.loadOlder("!a");
+            expect(h.timeline.onStartReached).toHaveBeenCalledTimes(2);
+        });
+
+        it("rejects unknown_room for a room the bridge does not know", async () => {
+            await expect(bridge.loadOlder("!nope")).rejects.toMatchObject({ code: "unknown_room" });
         });
     });
 });

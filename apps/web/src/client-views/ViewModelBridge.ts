@@ -76,6 +76,8 @@ import { sendText } from "./InterimActions";
 import {
     type ActionOutcome,
     type ClientViewBridge,
+    ClientViewActionError,
+    type LoadOlderResult,
     type ViewAnchor,
     type ViewConnection,
     type ViewE2e,
@@ -94,6 +96,15 @@ import {
 type ChangeEvent = Parameters<Parameters<ClientViewBridge["onChange"]>[0]>[0];
 
 const AVATAR_PX = 64;
+/**
+ * The timeline view-model's window size and page size (`WINDOW_LIMIT` and `PAGINATE_SIZE`, not exported). A window
+ * within one page of its limit cannot take another page without dropping events at the live end.
+ */
+const WINDOW_LIMIT = 1000;
+const PAGE_SIZE = 100;
+/** How often `loadOlder` looks at the view-model while it waits for it, and how long it waits at most. */
+const LOAD_OLDER_POLL_MS = 25;
+const LOAD_OLDER_TIMEOUT_MS = 30_000;
 /** The pause before a failed fetch of a replied event outside the timeline is tried again. */
 const REPLY_RETRY_MS = 30_000;
 /** How long a reaction press waits for the snapshot to show it before it is reported failed. */
@@ -953,6 +964,9 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly userMenu: UserMenuViewModel;
     private readonly watchedItems = new Set<string>();
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
+    /** A `loadOlder` in flight per room: a concurrent call gets the same answer. */
+    private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
+    private disposed = false;
     private readonly rows = new Map<string, EventRow>();
     private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
     /** Per room: encrypted once either the room state or the crypto store said so (never back to false). */
@@ -1394,6 +1408,63 @@ export class ViewModelBridge implements ClientViewBridge {
         void selectClientView(viewId);
     }
 
+    public loadOlder(roomId: string): Promise<LoadOlderResult> {
+        this.used = true;
+        const running = this.olderLoads.get(roomId);
+        if (running) return running;
+        const vm = this.ensureTimeline(roomId);
+        if (!vm) return Promise.reject(new ClientViewActionError("unknown_room", roomId));
+        const load = this.loadOlderPage(vm).finally(() => this.olderLoads.delete(roomId));
+        this.olderLoads.set(roomId, load);
+        return load;
+    }
+
+    /** Waits until `done()` holds, looking every {@link LOAD_OLDER_POLL_MS} (the view-model's loading flag is not published). */
+    private async waitFor(done: () => boolean, what: string): Promise<void> {
+        const deadline = Date.now() + LOAD_OLDER_TIMEOUT_MS;
+        while (!done()) {
+            if (this.disposed) throw new ClientViewActionError("failed", "bridge disposed");
+            if (Date.now() > deadline) throw new ClientViewActionError("failed", `timed out waiting for ${what}`);
+            await new Promise((resolve) => setTimeout(resolve, LOAD_OLDER_POLL_MS));
+        }
+    }
+
+    private async loadOlderPage(vm: RoomTimelineViewModel): Promise<LoadOlderResult> {
+        const events = (): MatrixEvent[] =>
+            vm
+                .getSnapshot()
+                .items.filter((i): i is EventItem => i.kind === "event")
+                .map((i) => i.event as MatrixEvent);
+        const state = (n: number): Pick<LoadOlderResult, "atStart" | "atLimit"> => ({
+            atStart: events().some((e) => e.getType() === EventType.RoomCreate),
+            atLimit: n >= WINDOW_LIMIT - PAGE_SIZE,
+        });
+        // The first window is still loading (or the room has no showable event yet): a page asked now would race it.
+        // `loading` is the view-model's own flag for that; it is private and published nowhere.
+        await this.waitFor(
+            () =>
+                !(vm as unknown as { loading?: boolean }).loading &&
+                vm.getSnapshot().items.some((i) => i.kind === "event"),
+            "the first window",
+        );
+        // The first window is held in place by `pendingAnchor` until a list view reports it settled, and paginating
+        // waits for that. The kit has no list view, so it reports it here (a no-op without an anchor: safe for read
+        // markers and jump to live).
+        vm.onAnchorReached();
+        const before = new Set(events().map((e) => e.getId()));
+        const start = state(before.size);
+        if (start.atStart || start.atLimit) return { added: 0, ...start };
+        vm.onStartReached();
+        // The paginate chain shows a backward-loading item while it runs; no item (nothing to load, or the chain was
+        // skipped) means it is already over.
+        await this.waitFor(
+            () => !vm.getSnapshot().items.some((i) => i.kind === "loading" && i.key === "backward-loading"),
+            "older messages",
+        );
+        const after = events();
+        return { added: after.filter((e) => !before.has(e.getId())).length, ...state(after.length) };
+    }
+
     public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {
         return sendText(this.client, roomId, text, opts);
     }
@@ -1405,6 +1476,7 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public dispose(): void {
+        this.disposed = true;
         this.closeReactionPicker();
         [...this.reactionWaits].forEach((cancel) => cancel());
         this.disposers.forEach((d) => d());

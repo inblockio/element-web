@@ -170,6 +170,16 @@ export interface ViewAnchor {
     height: number;
 }
 
+/** What `loadOlder` reports: the messages it brought in, and why no further page can follow. */
+export interface LoadOlderResult {
+    /** Events that newly entered the loaded window. */
+    added: number;
+    /** The room's creation event is in the window: there is nothing older. */
+    atStart: boolean;
+    /** The window is within one page of its size limit: older history is out of reach (loading it would drop the live end). */
+    atLimit: boolean;
+}
+
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
     readonly version: 2;
@@ -190,6 +200,13 @@ export interface ClientViewBridge {
      * real one. Interim (D16): Element's own client call, until a composer send view-model ships.
      */
     sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome>;
+    /**
+     * Loads the next page of older messages of a room and resolves when the page is in (the room's `timeline` has
+     * changed by then). Concurrent calls for a room share one load. Backed by the timeline view-model's
+     * `onStartReached`. Rejects `unknown_room` for a room the bridge does not know, `failed` if the room's first window
+     * never loads.
+     */
+    loadOlder(roomId: string): Promise<LoadOlderResult>;
     onChange(cb: (e: { kind: "rooms" | "timeline" | "me" | "connection"; roomId?: string }) => void): () => void;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
