@@ -14,7 +14,6 @@ import { isValidElement, type ReactNode } from "react";
 import { MsgType } from "matrix-js-sdk/src/matrix";
 import {
     DecryptionFailureReason,
-    E2ePadlockIcon,
     type RoomListItemViewSnapshot,
     type EventContentBodyViewSnapshot,
 } from "@element-hq/web-shared-components";
@@ -99,15 +98,14 @@ export function decryptionFailureText(
 }
 
 /**
- * The warning a padlock state stands for, if any: the title of a warning or decryption-failure icon, or the "shared by"
- * text of a forwarded message. A grey info icon (authenticity not guaranteed) and `none` carry no warning.
+ * The warning a padlock state stands for, if any: the title of any icon, or the "shared by" text of a forwarded
+ * message. The grey icon warns too: its only case is a key from an insecure source (authenticity not guaranteed), i.e.
+ * a sending device not established for that message ("unknown" in REQ-0007). Only `none` carries no warning.
  */
 export function padlockWarning(padlock: EventTileE2ePadlockViewState, sharedByText?: string): string | undefined {
     switch (padlock.kind) {
         case "icon":
-            return padlock.icon === E2ePadlockIcon.Warning || padlock.icon === E2ePadlockIcon.DecryptionFailure
-                ? padlock.title
-                : undefined;
+            return padlock.title;
         case "messageShared":
             return sharedByText;
         case "none":

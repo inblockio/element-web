@@ -195,9 +195,13 @@ describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
             );
         });
 
-        it("has no warning for none or the grey info icon", () => {
+        it("has no warning for none", () => {
             expect(warning({ kind: "none" })).toBeUndefined();
-            expect(warning({ kind: "icon", icon: E2ePadlockIcon.Normal, title: "grey" })).toBeUndefined();
+        });
+
+        it("warns with the grey icon's title: the sending device is not established for that message (A3)", () => {
+            const title = "The authenticity of this encrypted message can't be guaranteed on this device.";
+            expect(warning({ kind: "icon", icon: E2ePadlockIcon.Normal, title })).toBe(title);
         });
     });
 

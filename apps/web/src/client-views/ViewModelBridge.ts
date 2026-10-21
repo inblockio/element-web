@@ -6,12 +6,12 @@
  */
 
 import {
-    type IContent,
     type MatrixClient,
     type MatrixEvent,
     type Room,
     EventType,
     MatrixEventEvent,
+    RoomStateEvent,
 } from "matrix-js-sdk/src/matrix";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
 import { type TimelineItem, RoomStatusBarState } from "@element-hq/web-shared-components";
@@ -60,7 +60,6 @@ class EventRow {
     public readonly padlock: EventTileE2eViewModel;
     private decryption?: DecryptionFailureBodyViewModel;
     private decryptionCode?: unknown;
-    private bodyContent: IContent;
     private readonly unsubscribe: Array<() => void> = [];
 
     public constructor(
@@ -68,6 +67,8 @@ class EventRow {
         private readonly ev: MatrixEvent,
         continuation: boolean,
         private readonly changed: () => void,
+        /** The room's downgrade-proof encryption flag (what RoomView feeds EventTile as isRoomEncrypted). */
+        private readonly isRoomEncrypted: () => boolean,
     ) {
         // EventTile.createViewModelProps reads only two values from the legacy RoomContext:
         // showHiddenEvents and timelineRenderingType. Everything else is EventTile props or utilities.
@@ -122,11 +123,10 @@ class EventRow {
             linkify: false,
             client,
         });
-        this.bodyContent = ev.getContent();
         this.padlock = new EventTileE2eViewModel({
             cli: client,
             mxEvent: ev,
-            isRoomEncrypted: client.isRoomEncrypted(ev.getRoomId() ?? ""),
+            isRoomEncrypted: isRoomEncrypted(),
             eventSendStatus: ev.status,
             enableListeners: true,
         });
@@ -136,23 +136,18 @@ class EventRow {
             this.padlock.subscribe(changed),
         );
         // A late key turns a decryption failure into a message: the body view-model reads its content once, so it is
-        // told the new content (the stock EventTile re-renders with it).
+        // told the new content (the stock EventTile re-renders with it). Edits it follows itself (Event.replaced).
+        // Only this event tells it: getContent() of an unreadable replacement is a new {} on every read, so a content
+        // check on each read would re-render forever.
         ev.on(MatrixEventEvent.Decrypted, this.onDecrypted);
         this.unsubscribe.push(() => ev.off(MatrixEventEvent.Decrypted, this.onDecrypted));
         this.padlock.start();
     }
 
     private readonly onDecrypted = (): void => {
-        this.syncContent();
+        this.body.setEventContent(this.ev, this.ev.getContent());
         this.changed();
     };
-
-    private syncContent(): void {
-        const content = this.ev.getContent();
-        if (content === this.bodyContent) return;
-        this.bodyContent = content;
-        this.body.setEventContent(this.ev, content);
-    }
 
     /**
      * The row's E2E trust signals (REQ-0007): the decryption failure body view-model for an undecryptable event, the
@@ -161,9 +156,8 @@ class EventRow {
      */
     public e2e(localDeviceVerified: boolean): ViewE2e | undefined {
         const ev = this.ev;
-        this.syncContent();
         this.padlock.setProps({
-            isRoomEncrypted: this.client.isRoomEncrypted(ev.getRoomId() ?? ""),
+            isRoomEncrypted: this.isRoomEncrypted(),
             eventSendStatus: ev.status,
         });
         const padlock = this.padlock.getSnapshot();
@@ -236,6 +230,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
     private readonly rows = new Map<string, EventRow>();
     private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
+    /** Per room: encrypted once either the room state or the crypto store said so (never back to false). */
+    private readonly encrypted = new Map<string, boolean>();
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
     private lastConnection: ViewConnection = "online";
@@ -271,7 +267,48 @@ export class ViewModelBridge implements ClientViewBridge {
         );
         this.disposers.push(this.userMenu.subscribe(() => this.emit({ kind: "me" })));
         this.watchLocalVerification();
+        this.watchEncryption();
         this.syncRooms();
+    }
+
+    /**
+     * Whether a room is encrypted, as RoomView's useIsEncrypted feeds EventTile: the crypto store's flag, which stays
+     * true when a server removes m.room.encryption from the room state (downgrade guard). It is async, so the state
+     * flag answers until it arrives; either one saying "encrypted" sticks.
+     */
+    private isRoomEncrypted(roomId: string): boolean {
+        let known = this.encrypted.get(roomId);
+        if (known === undefined) {
+            known = this.client.isRoomEncrypted(roomId);
+            this.encrypted.set(roomId, known);
+            this.readEncryption(roomId);
+        }
+        return known;
+    }
+
+    private readEncryption(roomId: string): void {
+        void this.client
+            .getCrypto()
+            ?.isEncryptionEnabledInRoom(roomId)
+            .then(
+                (enabled) => {
+                    if (!enabled || this.encrypted.get(roomId)) return;
+                    this.encrypted.set(roomId, true);
+                    this.emit({ kind: "timeline", roomId });
+                },
+                () => {},
+            );
+    }
+
+    /** useIsEncrypted re-reads the flag on every m.room.encryption state event. */
+    private watchEncryption(): void {
+        const onState = (ev: MatrixEvent): void => {
+            const roomId = ev.getRoomId();
+            if (ev.getType() !== EventType.RoomEncryption || !roomId || !this.encrypted.has(roomId)) return;
+            this.readEncryption(roomId);
+        };
+        this.client.on(RoomStateEvent.Events, onState);
+        this.disposers.push(() => this.client.off(RoomStateEvent.Events, onState));
     }
 
     /**
@@ -375,7 +412,13 @@ export class ViewModelBridge implements ClientViewBridge {
         const key = ev.getId()!;
         let row = this.rows.get(key);
         if (!row) {
-            row = new EventRow(this.client, ev, item.continuation, () => this.emit({ kind: "timeline", roomId }));
+            row = new EventRow(
+                this.client,
+                ev,
+                item.continuation,
+                () => this.emit({ kind: "timeline", roomId }),
+                () => this.isRoomEncrypted(roomId),
+            );
             this.rows.set(key, row);
         }
         return row;

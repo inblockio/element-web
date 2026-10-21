@@ -54,7 +54,8 @@ const h = vi.hoisted(() => {
     const avatar = new FakeVm<{ url?: string }>({ url: "http://avatar/bob" });
     const padlocks: Array<InstanceType<typeof FakeVm<{ kind: string }>> & { start: () => void; setProps: () => void }> =
         [];
-    return { FakeVm, room, item, timeline, statusBar, member, avatar, padlocks };
+    const bodies: Array<{ setEventContent: ReturnType<typeof vi.fn> }> = [];
+    return { FakeVm, room, item, timeline, statusBar, member, avatar, padlocks, bodies };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -110,6 +111,7 @@ vi.mock("../viewmodels/message-body/EventContentBodyViewModel", () => ({
         public setEventContent = vi.fn();
         public constructor() {
             super({ body: "hi" });
+            h.bodies.push(this);
         }
     },
 }));
@@ -165,6 +167,7 @@ describe("ViewModelBridge", () => {
             off: vi.fn(),
         } as unknown as MatrixClient);
         h.padlocks.length = 0;
+        h.bodies.length = 0;
     });
 
     it("maps the room list and the user menu snapshots", () => {
@@ -360,6 +363,53 @@ describe("ViewModelBridge", () => {
             const [m, n] = timelineOf(marked, plain);
             expect(m.e2e).toEqual({ state: "decrypted", warning: "Encrypted by a device not verified by its owner." });
             expect(n.e2e).toEqual({ state: "decrypted" });
+        });
+
+        it("never re-sets the body of an edit whose content is a fresh object per read (UTD edit, no m.new_content)", () => {
+            // The SDK returns a new {} from getContent() for a replacement it cannot read: an undecryptable edit or one
+            // without m.new_content. Reading such a row again and again must not tell the body view-model anything.
+            const ev = fakeEvent("$edit", { getContent: () => ({}) });
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            for (let i = 0; i < 5; i++) timelineOf(ev);
+            expect(h.bodies[0].setEventContent).not.toHaveBeenCalled();
+            expect(seen).toEqual([]);
+        });
+
+        it("feeds the padlock the crypto store's room flag, which a removed m.room.encryption state cannot clear", async () => {
+            // A server that drops m.room.encryption from the live state makes the deprecated state flag false; the
+            // crypto API keeps the room encrypted (downgrade guard), as RoomView's useIsEncrypted reads it.
+            const on = vi.fn();
+            const isEncryptionEnabledInRoom = vi.fn(async () => true);
+            const downgraded = new ViewModelBridge({
+                getRoom: (id: string) => (id === "!a" ? h.room : null),
+                getUserId: () => "@me:example.org",
+                isRoomEncrypted: () => false,
+                getCrypto: () => ({
+                    isEncryptionEnabledInRoom,
+                    getUserVerificationStatus: async () => ({ isCrossSigningVerified: () => false }),
+                }),
+                on,
+                off: vi.fn(),
+            } as unknown as MatrixClient);
+            h.timeline.snapshot = {
+                items: [{ kind: "event", event: fakeEvent("$x"), continuation: false }],
+                atLiveEnd: true,
+            };
+            const seen: string[] = [];
+            downgraded.onChange((e) => seen.push(e.kind));
+            downgraded.timeline("!a");
+            await new Promise((r) => setTimeout(r, 0));
+            expect(isEncryptionEnabledInRoom).toHaveBeenCalledWith("!a");
+            expect(seen).toContain("timeline");
+            downgraded.timeline("!a");
+            const setProps = h.padlocks[0].setProps as unknown as ReturnType<typeof vi.fn>;
+            expect(setProps).toHaveBeenLastCalledWith(expect.objectContaining({ isRoomEncrypted: true }));
+            // An m.room.encryption state change re-reads the flag.
+            const onState = on.mock.calls.find(([name]) => name === "RoomState.events")?.[1] as (e: unknown) => void;
+            onState({ getType: () => "m.room.encryption", getRoomId: () => "!a" });
+            expect(isEncryptionEnabledInRoom).toHaveBeenCalledTimes(2);
+            downgraded.dispose();
         });
 
         it("leaves a plain message in an unencrypted room without an e2e field", () => {
