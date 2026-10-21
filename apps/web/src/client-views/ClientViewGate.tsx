@@ -16,6 +16,7 @@ import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { type ActionPayload } from "../dispatcher/payloads";
 import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
+import { UPDATE_EVENT } from "../stores/AsyncStore";
 import { _t } from "../languageHandler";
 import AccessibleButton from "../components/views/elements/AccessibleButton";
 import ToastContainer from "../components/structures/ToastContainer";
@@ -58,6 +59,18 @@ function useActiveLegacyCalls(): MatrixCall[] {
         return () => void legacyCallHandler.removeListener(LegacyCallHandlerEvent.CallState, update);
     }, [legacyCallHandler]);
     return calls;
+}
+
+/** The room RoomViewStore shows, where Element draws a legacy call in RoomView instead of picture-in-picture. */
+function useViewedRoomId(): string | null {
+    const { roomViewStore } = useContext(SDKContext);
+    const [roomId, setRoomId] = useState(() => roomViewStore.getRoomId());
+    useEffect(() => {
+        const update = (): void => setRoomId(roomViewStore.getRoomId());
+        roomViewStore.on(UPDATE_EVENT, update);
+        return () => void roomViewStore.off(UPDATE_EVENT, update);
+    }, [roomViewStore]);
+    return roomId;
 }
 
 /** The host's own overlays (toasts, incoming calls, picture-in-picture, call audio), drawn above the kit. */
@@ -155,7 +168,8 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
 
 /**
  * Renders the selected client view instead of its children (Element's UI) while one is selected. A host room view
- * that needs Element's UI (see needsStockUi) shows the children for that room until the next view switch.
+ * that needs Element's UI (see needsStockUi) shows the children for that room until the next view switch, and so
+ * does a live legacy call in the viewed room.
  */
 export function ClientViewGate({ client, children }: { client: MatrixClient; children: ReactNode }): JSX.Element {
     const [view, setView] = useState(getActiveClientView);
@@ -188,6 +202,11 @@ export function ClientViewGate({ client, children }: { client: MatrixClient; chi
         ];
         return () => refs.forEach((r) => SettingsStore.unwatchSetting(r));
     }, []);
-    if (!view || handedOver) return <>{children}</>;
+    // Picture-in-picture leaves out a live legacy call in the viewed room (its controls are in RoomView), so a kit
+    // never covers it: Element's UI stays until the call ends or the user views another room.
+    const calls = useActiveLegacyCalls();
+    const viewedRoomId = useViewedRoomId();
+    const callInView = calls.some((call) => call.roomId === viewedRoomId);
+    if (!view || handedOver || callInView) return <>{children}</>;
     return <ClientViewHost key={view.id} client={client} view={view} />;
 }

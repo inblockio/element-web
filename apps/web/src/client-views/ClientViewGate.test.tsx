@@ -16,6 +16,7 @@ import { TypedEventEmitter } from "matrix-js-sdk/src/matrix";
 import { SDKContext } from "../contexts/SDKContext";
 import { type SDKContextClass } from "../contexts/SDKContextClass";
 import ToastStore from "../stores/ToastStore";
+import { UPDATE_EVENT } from "../stores/AsyncStore";
 import { LegacyCallHandlerEvent } from "../LegacyCallHandler";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
@@ -60,9 +61,10 @@ vi.mock("../components/structures/MatrixClientContextProvider", () => ({
 
 describe("ClientViewGate", () => {
     const calls = Object.assign(new TypedEventEmitter<string, any>(), {
-        getAllActiveCalls: vi.fn(() => [] as { callId: string }[]),
+        getAllActiveCalls: vi.fn(() => [] as { callId: string; roomId?: string }[]),
     });
-    const sdk = { legacyCallHandler: calls } as unknown as SDKContextClass;
+    const roomViewStore = Object.assign(new TypedEventEmitter<string, any>(), { getRoomId: vi.fn(() => null as string | null) });
+    const sdk = { legacyCallHandler: calls, roomViewStore } as unknown as SDKContextClass;
     const client = {} as MatrixClient;
 
     const renderGate = () =>
@@ -80,6 +82,7 @@ describe("ClientViewGate", () => {
         h.used = false;
         h.handedOver = false;
         calls.getAllActiveCalls.mockReturnValue([]);
+        roomViewStore.getRoomId.mockReturnValue(null);
         vi.mocked(selectClientView).mockClear();
     });
 
@@ -183,5 +186,21 @@ describe("ClientViewGate", () => {
         expect(h.handedOver).toBe(true);
         unmount();
         expect(h.handedOver).toBe(false);
+    });
+
+    it("keeps Element's UI while a live legacy call is in the viewed room (picture-in-picture leaves it out)", () => {
+        renderGate();
+        // A PiP double-click or a consultative transfer views the call's room without a hand-over trigger.
+        calls.getAllActiveCalls.mockReturnValue([{ callId: "c1", roomId: "!call:x" }]);
+        act(() => void calls.emit(LegacyCallHandlerEvent.CallState));
+        expect(screen.getByTitle("Fixture")).toBeTruthy();
+        roomViewStore.getRoomId.mockReturnValue("!call:x");
+        act(() => void roomViewStore.emit(UPDATE_EVENT));
+        expect(screen.getByText("stock UI")).toBeTruthy();
+        expect(screen.queryByTitle("Fixture")).toBeNull();
+
+        calls.getAllActiveCalls.mockReturnValue([]);
+        act(() => void calls.emit(LegacyCallHandlerEvent.CallState));
+        expect(screen.getByTitle("Fixture")).toBeTruthy();
     });
 });
