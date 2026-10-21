@@ -57,6 +57,8 @@ import {
 type ChangeEvent = Parameters<Parameters<ClientViewBridge["onChange"]>[0]>[0];
 
 const AVATAR_PX = 64;
+/** The pause before a failed fetch of a replied event outside the timeline is tried again. */
+const REPLY_RETRY_MS = 30_000;
 
 /** An event, or the replacement it shows, that is still waiting for its key or failed to decrypt. */
 const unreadable = (ev: MatrixEvent): boolean =>
@@ -80,7 +82,11 @@ class EventRow {
     private decryptionCode?: unknown;
     /** The reply tile view-model of the replied event, as ReplyChain builds it, once that event is loaded. */
     private reply?: ReplyTileViewModel;
-    private replyLookup = false;
+    /** When the replied event may be fetched (again): a failed fetch waits REPLY_RETRY_MS before the next read tries. */
+    private replyFetchAt = 0;
+    private replyFetching = false;
+    /** The replied event's edit, followed: a bundled edit emits nothing on the replied event when it decrypts. */
+    private replyEdit: MatrixEvent | null = null;
     private reactionRelations?: Relations;
     private readonly reactionButtons = new Map<string, ReactionsRowButtonViewModel>();
     private disposed = false;
@@ -282,16 +288,27 @@ class EventRow {
         if (!parentId || !room) return undefined;
         const parent = room.findEventById(parentId);
         if (!parent) {
-            if (!this.replyLookup) {
-                this.replyLookup = true;
+            if (!this.replyFetching && Date.now() >= this.replyFetchAt) {
+                this.replyFetching = true;
+                this.replyFetchAt = Infinity;
                 this.client.getEventTimeline(room.getUnfilteredTimelineSet(), parentId).then(
                     () => {
+                        this.replyFetching = false;
                         if (!this.disposed && room.findEventById(parentId)) this.changed();
                     },
-                    () => {},
+                    () => {
+                        this.replyFetching = false;
+                        this.replyFetchAt = Date.now() + REPLY_RETRY_MS;
+                    },
                 );
             }
             return undefined;
+        }
+        const edit = parent.replacingEvent();
+        if (edit !== this.replyEdit) {
+            this.replyEdit?.off(MatrixEventEvent.Decrypted, this.changed);
+            this.replyEdit = edit;
+            this.replyEdit?.on(MatrixEventEvent.Decrypted, this.changed);
         }
         if (!this.reply) {
             this.reply = new ReplyTileViewModel({ mxEvent: parent, cli: this.client });
@@ -304,7 +321,9 @@ class EventRow {
             parent.sender?.rawDisplayName ||
             senderId;
         const body = parent.getContent().body;
-        const text = unreadable(parent) || typeof body !== "string" ? "" : stripPlainReply(body);
+        // As the stock body: only a reply's own fallback is stripped, and an edit's body has none.
+        const isReply = !parent.replacingEvent() && !!getParentEventId(parent);
+        const text = unreadable(parent) || typeof body !== "string" ? "" : isReply ? stripPlainReply(body) : body;
         return { eventId: parentId, senderId, senderName, text };
     }
 
@@ -379,6 +398,8 @@ class EventRow {
         this.unsubscribe.length = 0;
         this.replacement?.off(MatrixEventEvent.Decrypted, this.onReplacementDecrypted);
         this.replacement = null;
+        this.replyEdit?.off(MatrixEventEvent.Decrypted, this.changed);
+        this.replyEdit = null;
         this.padlockUnsubscribe();
         this.tile.dispose();
         this.body.dispose();

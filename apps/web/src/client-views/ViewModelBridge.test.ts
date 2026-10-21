@@ -644,8 +644,57 @@ describe("ViewModelBridge", () => {
         });
 
         it("strips the replied message's own reply fallback", () => {
-            loaded(fakeEvent("$p", { getContent: () => ({ msgtype: "m.text", body: "> <@x> earlier\n\nanswer" }) }));
+            loaded(
+                fakeEvent("$p", {
+                    getContent: () => ({ msgtype: "m.text", body: "> <@x> earlier\n\nanswer" }),
+                    getWireContent: () => ({ "m.relates_to": { "m.in_reply_to": { event_id: "$x" } } }),
+                    replyEventId: "$x",
+                }),
+            );
             expect(read(replyTo("$p"))[0].replyTo?.text).toBe("answer");
+        });
+
+        // grok inc1 host F3: as the stock body, only a reply's own fallback is stripped, never a quote someone wrote.
+        it("keeps leading '> ' lines of a replied message that is not itself a reply", () => {
+            loaded(fakeEvent("$p", { getContent: () => ({ msgtype: "m.text", body: "> ship it" }) }));
+            expect(read(replyTo("$p"))[0].replyTo?.text).toBe("> ship it");
+        });
+
+        // grok inc1 host F1: a bundled edit of the replied message emits nothing on it when it decrypts.
+        it("re-reads the quote when the replied message's pending edit decrypts", () => {
+            const edit = fakeEvent("$e", { isEncrypted: () => true, getClearContent: () => null });
+            loaded(
+                fakeEvent("$q", {
+                    getContent: () => ({ body: "edited" }),
+                    isEncrypted: () => true,
+                    getClearContent: () => ({ body: "original" }),
+                    replacingEvent: () => edit,
+                }),
+            );
+            expect(read(replyTo("$q"))[0].replyTo?.text).toBe("");
+            const seen: string[] = [];
+            bridge.onChange((e) => seen.push(e.kind));
+            const decrypted = edit.on.mock.calls.find(([n]) => n === "Event.decrypted")?.[1] as () => void;
+            expect(decrypted).toBeInstanceOf(Function);
+            decrypted();
+            expect(seen).toContain("timeline");
+            bridge.dispose();
+            expect(edit.off).toHaveBeenCalledWith("Event.decrypted", decrypted);
+        });
+
+        // grok inc1 host F2: a failed fetch of the replied message is tried again on a later read (not on every read).
+        it("tries a failed fetch of the replied message again after a pause", async () => {
+            h.getEventTimeline.mockRejectedValueOnce(new Error("offline"));
+            const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+            const reply = replyTo("$far");
+            read(reply);
+            await new Promise((r) => setTimeout(r, 0));
+            read(reply);
+            expect(h.getEventTimeline).toHaveBeenCalledTimes(1);
+            now.mockReturnValue(1_000_000 + 60_000);
+            read(reply);
+            expect(h.getEventTimeline).toHaveBeenCalledTimes(2);
+            now.mockRestore();
         });
 
         it("hands over no text of a replied message that, or whose edit, is still unreadable", () => {
