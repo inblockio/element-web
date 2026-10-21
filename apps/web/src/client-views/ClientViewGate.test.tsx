@@ -63,7 +63,9 @@ describe("ClientViewGate", () => {
     const calls = Object.assign(new TypedEventEmitter<string, any>(), {
         getAllActiveCalls: vi.fn(() => [] as { callId: string; roomId?: string }[]),
     });
-    const roomViewStore = Object.assign(new TypedEventEmitter<string, any>(), { getRoomId: vi.fn(() => null as string | null) });
+    const roomViewStore = Object.assign(new TypedEventEmitter<string, any>(), {
+        getRoomId: vi.fn(() => null as string | null),
+    });
     const sdk = { legacyCallHandler: calls, roomViewStore } as unknown as SDKContextClass;
     const client = {} as MatrixClient;
 
