@@ -48,6 +48,27 @@ export interface ViewMessage {
     reactions?: ViewReaction[];
     /** The thread this message roots, from the thread summary view-model. Absent for a message without replies. */
     thread?: ViewThread;
+    /** The image, file or video of a media message, from its body view-model. Absent for any other message. */
+    media?: ViewMedia;
+}
+
+/**
+ * A media body as the image, file or video body view-model shows it. URLs are plain strings the kit's frame can load
+ * (authenticated media goes through Element's service worker, encrypted media is the view-model's decrypted blob URL).
+ * `state` "hidden" = Element's media-visibility setting hides it (`label` = the reveal text Element shows),
+ * "error" = Element shows its error (`label` = that text), "loading" = no URL yet.
+ * `name` is the label Element shows: the image alt, the video title, or the file label (which already carries the size).
+ * `width` and `height` are the frame size the view-model suggests for an image or video.
+ */
+export interface ViewMedia {
+    kind: "image" | "file" | "video";
+    state: "ready" | "loading" | "hidden" | "error";
+    url?: string;
+    thumbnailUrl?: string;
+    name: string;
+    width?: number;
+    height?: number;
+    label?: string;
 }
 
 /**

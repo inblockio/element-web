@@ -15,12 +15,23 @@ import {
     DecryptionFailureBodyView,
     DecryptionFailureReason,
     E2ePadlockIcon,
+    FileBodyViewState,
+    ImageBodyViewState,
+    VideoBodyViewState,
     I18nContext,
 } from "@element-hq/web-shared-components";
 import { type I18nApi } from "@element-hq/element-web-module-api";
 
 import { bodyToNode } from "../HtmlUtils";
-import { decryptionFailureText, nodeText, padlockWarning, toViewE2e, toViewMessage, toViewRoom } from "./mapping";
+import {
+    decryptionFailureText,
+    nodeText,
+    padlockWarning,
+    toViewE2e,
+    toViewMedia,
+    toViewMessage,
+    toViewRoom,
+} from "./mapping";
 import { type EventTileE2ePadlockViewState } from "../viewmodels/room/timeline/event-tile/EventTileE2eState";
 
 const tile = (over: { msgtype?: string; eventId?: string; senderId?: string; rawDisplayName?: string } = {}) =>
@@ -262,5 +273,107 @@ describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
         expect(m?.body).toBe("");
         expect(m?.formattedBody).toBeUndefined();
         expect(m?.e2e).toEqual({ state: "failed", text: "x" });
+    });
+
+    describe("toViewMedia", () => {
+        it("an image with its URL is ready, with the thumbnail and the suggested frame size", () => {
+            expect(
+                toViewMedia("image", {
+                    state: ImageBodyViewState.READY,
+                    alt: "cat.png",
+                    src: "blob:full",
+                    thumbnailSrc: "http://hs/thumb",
+                    maxWidth: 320,
+                    maxHeight: 240,
+                }),
+            ).toEqual({
+                kind: "image",
+                state: "ready",
+                url: "blob:full",
+                thumbnailUrl: "http://hs/thumb",
+                name: "cat.png",
+                width: 320,
+                height: 240,
+            });
+        });
+
+        it("an image without a URL yet is loading; hidden and error carry Element's own text", () => {
+            expect(toViewMedia("image", { state: ImageBodyViewState.READY, alt: "a" })).toMatchObject({
+                state: "loading",
+                url: undefined,
+            });
+            expect(toViewMedia("image", { state: ImageBodyViewState.HIDDEN, hiddenButtonLabel: "Show image" })).toEqual(
+                { kind: "image", state: "hidden", name: "", label: "Show image" },
+            );
+            expect(
+                toViewMedia("image", { state: ImageBodyViewState.ERROR, errorLabel: "Error decrypting image" }),
+            ).toEqual({ kind: "image", state: "error", name: "", label: "Error decrypting image" });
+        });
+
+        it("a video maps src and poster; loading, hidden and error follow the view-model state", () => {
+            expect(
+                toViewMedia("video", {
+                    state: VideoBodyViewState.READY,
+                    videoTitle: "clip.webm",
+                    src: "blob:v",
+                    poster: "blob:p",
+                    maxWidth: 480,
+                    maxHeight: 270,
+                }),
+            ).toEqual({
+                kind: "video",
+                state: "ready",
+                url: "blob:v",
+                thumbnailUrl: "blob:p",
+                name: "clip.webm",
+                width: 480,
+                height: 270,
+            });
+            expect(toViewMedia("video", { state: VideoBodyViewState.LOADING })).toMatchObject({ state: "loading" });
+            expect(
+                toViewMedia("video", { state: VideoBodyViewState.HIDDEN, hiddenButtonLabel: "Show video" }),
+            ).toMatchObject({ state: "hidden", label: "Show video" });
+            expect(
+                toViewMedia("video", { state: VideoBodyViewState.ERROR, errorLabel: "Error decrypting video" }),
+            ).toMatchObject({ state: "error", label: "Error decrypting video" });
+        });
+
+        it("an unencrypted file links to the download href and names itself by the full label (name and size)", () => {
+            expect(
+                toViewMedia("file", {
+                    state: FileBodyViewState.UNENCRYPTED,
+                    infoLabel: "notes.txt (12 bytes)",
+                    infoTooltip: "notes.txt (12 bytes)",
+                    downloadHref: "http://hs/download/notes",
+                }),
+            ).toEqual({ kind: "file", state: "ready", url: "http://hs/download/notes", name: "notes.txt (12 bytes)" });
+        });
+
+        it("an encrypted file has no URL (the view-model keeps the blob private); an invalid one is an error", () => {
+            const enc = toViewMedia("file", { state: FileBodyViewState.DECRYPTION_PENDING, infoLabel: "s.bin" });
+            expect(enc).toEqual({ kind: "file", state: "ready", name: "s.bin" });
+            expect(toViewMedia("file", { state: FileBodyViewState.INVALID })).toEqual({
+                kind: "file",
+                state: "error",
+                name: "",
+            });
+        });
+
+        it("toViewMessage carries the media when given", () => {
+            const media = { kind: "image", state: "ready", name: "a" } as const;
+            const m = toViewMessage(
+                "!a",
+                tile({}),
+                { body: "a" },
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                media,
+            );
+            expect(m?.media).toEqual(media);
+            expect(toViewMessage("!a", tile({}), { body: "a" })).not.toHaveProperty("media");
+        });
     });
 });

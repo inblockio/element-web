@@ -73,8 +73,34 @@ const h = vi.hoisted(() => {
     const threadSummaries: Array<FakeVm<{ isVisible: boolean; previewVm: FakeVm<object> }> & Record<string, unknown>> =
         [];
     const releaseThreadSummary = vi.fn();
+    const mediaVms: Array<
+        InstanceType<typeof FakeVm<Record<string, unknown>>> & {
+            kind: string;
+            props: Record<string, unknown>;
+            loadInitialMediaIfVisible: ReturnType<typeof vi.fn>;
+            setMediaVisible: ReturnType<typeof vi.fn>;
+        }
+    > = [];
+    const mediaHelpers: Array<{ destroy: ReturnType<typeof vi.fn>; event?: unknown }> = [];
+    const mediaVisible = { value: true };
+    const mediaVm = (kind: "image" | "video" | "file", state: Record<string, unknown>) =>
+        class extends FakeVm<Record<string, unknown>> {
+            public kind = kind;
+            public loadInitialMediaIfVisible = vi.fn();
+            public setMediaVisible = vi.fn((visible: boolean) => {
+                this.props = { ...this.props, mediaVisible: visible };
+            });
+            public constructor(public props: Record<string, unknown>) {
+                super(state);
+                mediaVms.push(this as never);
+            }
+        };
     return {
+        mediaVm,
         FakeVm,
+        mediaVms,
+        mediaHelpers,
+        mediaVisible,
         threadSummaries,
         releaseThreadSummary,
         room,
@@ -125,13 +151,17 @@ vi.mock("../components/viewmodels/avatars/MemberAvatarViewModel", () => ({
 }));
 vi.mock("../viewmodels/room/timeline/event-tile/EventTileViewModel", () => ({
     EventTileViewModel: class extends h.FakeVm<object> {
-        public constructor({ mxEvent }: { mxEvent: { getId: () => string; getType?: () => string } }) {
+        public constructor({
+            mxEvent,
+        }: {
+            mxEvent: { getId: () => string; getType?: () => string; getContent?: () => { msgtype?: string } };
+        }) {
             super({
                 snapshot: {
                     event: {
                         eventId: mxEvent.getId(),
                         eventType: mxEvent.getType?.() ?? "m.room.message",
-                        msgtype: "m.text",
+                        msgtype: mxEvent.getContent?.().msgtype ?? "m.text",
                     },
                     sender: { senderId: "@bob:example.org" },
                     timestamp: { value: 1 },
@@ -196,6 +226,28 @@ vi.mock("../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonView
         public setMyReactionEvent = (ev?: unknown): void => this.set({ isSelected: !!ev });
     },
 }));
+vi.mock("../viewmodels/message-body/ImageBodyViewModel", () => ({
+    ImageBodyViewModel: h.mediaVm("image", { state: "READY", alt: "cat.png" }),
+}));
+vi.mock("../viewmodels/message-body/VideoBodyViewModel", () => ({
+    VideoBodyViewModel: h.mediaVm("video", { state: "READY", videoTitle: "clip.webm", src: "http://hs/clip" }),
+}));
+vi.mock("../viewmodels/message-body/FileBodyViewModel", () => ({
+    FileBodyViewModel: h.mediaVm("file", {
+        state: "UNENCRYPTED",
+        infoTooltip: "notes.txt (12 bytes)",
+        downloadHref: "http://hs/notes",
+    }),
+}));
+vi.mock("../utils/MediaEventHelper", () => ({
+    MediaEventHelper: class {
+        public destroy = vi.fn();
+        public constructor(public event: unknown) {
+            h.mediaHelpers.push(this);
+        }
+    },
+}));
+vi.mock("../utils/media/mediaVisibility", () => ({ getMediaVisibility: () => h.mediaVisible.value }));
 vi.mock("../settings/SettingsStore", () => ({ default: { getValue: () => false } }));
 vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
@@ -253,6 +305,9 @@ describe("ViewModelBridge", () => {
         h.replies.length = 0;
         h.reactionButtons.length = 0;
         h.threadSummaries.length = 0;
+        h.mediaVms.length = 0;
+        h.mediaHelpers.length = 0;
+        h.mediaVisible.value = true;
         h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
         h.room.findEventById.mockImplementation(() => undefined);
     });
@@ -1051,6 +1106,88 @@ describe("ViewModelBridge", () => {
             expect(vm.snapshot.previewVm.listeners.size).toBe(0);
             expect(root.off).toHaveBeenCalledWith("Thread.update", expect.any(Function));
             expect(h.room.off).toHaveBeenCalledWith("Thread.new", expect.any(Function));
+        });
+    });
+
+    describe("media bodies", () => {
+        const mediaEvent = (id: string, msgtype: string, over: Record<string, unknown> = {}) =>
+            fakeEvent(id, { getContent: () => ({ msgtype, body: "x" }), ...over });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+
+        it("hands over no media for a text message and builds no media view-model", () => {
+            const [m] = read(fakeEvent("$1"));
+            expect(m).not.toHaveProperty("media");
+            expect(h.mediaVms).toHaveLength(0);
+        });
+
+        it("builds the image view-model with the event, a media helper and the visibility, then maps its snapshot", () => {
+            const ev = mediaEvent("$img", "m.image");
+            const [m] = read(ev);
+            expect(h.mediaVms).toHaveLength(1);
+            const vm = h.mediaVms[0];
+            expect(vm.kind).toBe("image");
+            expect(vm.props).toMatchObject({ mxEvent: ev, mediaVisible: true });
+            expect(vm.props.mediaEventHelper).toBe(h.mediaHelpers[0]);
+            expect(h.mediaHelpers[0].event).toBe(ev);
+            expect(m.media).toEqual({ kind: "image", state: "loading", name: "cat.png" });
+        });
+
+        it("starts the download once, after the read, and emits timeline when the snapshot gets its URL", async () => {
+            read(mediaEvent("$img", "m.image"));
+            const vm = h.mediaVms[0];
+            await Promise.resolve();
+            expect(vm.loadInitialMediaIfVisible).toHaveBeenCalledTimes(1);
+            read(mediaEvent("$img", "m.image"));
+            await Promise.resolve();
+            expect(vm.loadInitialMediaIfVisible).toHaveBeenCalledTimes(1);
+            const seen: Array<{ kind: string; roomId?: string }> = [];
+            bridge.onChange((e) => seen.push(e));
+            vm.set({ src: "blob:decrypted", thumbnailSrc: "blob:thumb" });
+            expect(seen).toContainEqual({ kind: "timeline", roomId: "!a" });
+            expect(bridge.timeline("!a")[0].media).toMatchObject({
+                state: "ready",
+                url: "blob:decrypted",
+                thumbnailUrl: "blob:thumb",
+            });
+        });
+
+        it("maps a video and an unencrypted file from their own view-models", () => {
+            const [video, file] = read(mediaEvent("$v", "m.video"), mediaEvent("$f", "m.file", { getTs: () => 2 }));
+            expect(h.mediaVms.map((v) => v.kind)).toEqual(["video", "file"]);
+            expect(video.media).toEqual({ kind: "video", state: "ready", url: "http://hs/clip", name: "clip.webm" });
+            expect(file.media).toEqual({
+                kind: "file",
+                state: "ready",
+                url: "http://hs/notes",
+                name: "notes.txt (12 bytes)",
+            });
+        });
+
+        it("mirrors Element's media visibility: hidden media is passed to the view-model, and a change is applied once", () => {
+            h.mediaVisible.value = false;
+            read(mediaEvent("$img", "m.image"));
+            const vm = h.mediaVms[0];
+            expect(vm.props.mediaVisible).toBe(false);
+            h.mediaVisible.value = true;
+            read(mediaEvent("$img", "m.image"));
+            read(mediaEvent("$img", "m.image"));
+            expect(vm.setMediaVisible).toHaveBeenCalledTimes(1);
+            expect(vm.setMediaVisible).toHaveBeenCalledWith(true);
+        });
+
+        it("keeps one view-model per event and disposes it and its helper with the bridge", () => {
+            read(mediaEvent("$img", "m.image"));
+            read(mediaEvent("$img", "m.image"));
+            expect(h.mediaVms).toHaveLength(1);
+            bridge.dispose();
+            expect(h.mediaVms[0].dispose).toHaveBeenCalledTimes(1);
+            expect(h.mediaHelpers[0].destroy).toHaveBeenCalledTimes(1);
         });
     });
 });

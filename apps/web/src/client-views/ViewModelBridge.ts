@@ -13,6 +13,7 @@ import {
     type Thread,
     EventType,
     MatrixEventEvent,
+    MsgType,
     RelationsEvent,
     RoomStateEvent,
     THREAD_RELATION_TYPE,
@@ -20,7 +21,14 @@ import {
 } from "matrix-js-sdk/src/matrix";
 import { uniq, uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
-import { type TimelineItem, RoomStatusBarState } from "@element-hq/web-shared-components";
+import type { RefObject } from "react";
+import {
+    type FileBodyViewSnapshot,
+    type ImageBodyViewSnapshot,
+    type TimelineItem,
+    type VideoBodyViewSnapshot,
+    RoomStatusBarState,
+} from "@element-hq/web-shared-components";
 
 import { SDKContextClass } from "../contexts/SDKContextClass";
 import { TimelineRenderingType } from "../contexts/RoomContext";
@@ -35,6 +43,11 @@ import { EventTileViewModel } from "../viewmodels/room/timeline/event-tile/Event
 import { EventTileE2eViewModel } from "../viewmodels/room/timeline/event-tile/EventTileE2eViewModel";
 import { DecryptionFailureBodyViewModel } from "../viewmodels/room/timeline/event-tile/body/DecryptionFailureBodyViewModel";
 import { EventContentBodyViewModel } from "../viewmodels/message-body/EventContentBodyViewModel";
+import { ImageBodyViewModel } from "../viewmodels/message-body/ImageBodyViewModel";
+import { VideoBodyViewModel } from "../viewmodels/message-body/VideoBodyViewModel";
+import { FileBodyViewModel } from "../viewmodels/message-body/FileBodyViewModel";
+import { MediaEventHelper } from "../utils/MediaEventHelper";
+import { getMediaVisibility } from "../utils/media/mediaVisibility";
 import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/ReplyTileViewModel";
 import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/Reply";
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
@@ -46,12 +59,13 @@ import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
-import { toViewE2e, toViewMessage, toViewRoom } from "./mapping";
+import { toViewE2e, toViewMedia, toViewMessage, toViewRoom } from "./mapping";
 import {
     type ClientViewBridge,
     type ViewConnection,
     type ViewE2e,
     type ViewMe,
+    type ViewMedia,
     type ViewMessage,
     type ViewReaction,
     type ViewReply,
@@ -99,6 +113,14 @@ class EventRow {
     private threadSummaryRelease?: () => void;
     /** The latest thread reply's edit, followed: the preview listens on the reply, which a bundled edit leaves silent. */
     private lastReplyEdit: MatrixEvent | null = null;
+    /** The image, video or file body view-model of a media message, as MBodyFactory builds it, built on first read. */
+    private mediaBody?: {
+        kind: ViewMedia["kind"];
+        vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
+        helper: MediaEventHelper;
+        visible: boolean;
+        unsubscribe: () => void;
+    };
     private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
 
@@ -484,8 +506,92 @@ class EventRow {
         }
     }
 
+    /**
+     * The media body of an image, video or file message. The view-model decrypts or fetches on its own and notifies
+     * `changed` when its snapshot gets the URL. Element's media-visibility setting is mirrored: hidden stays hidden.
+     */
+    public media(): ViewMedia | undefined {
+        const msgtype = this.tile.getSnapshot().snapshot.event.msgtype;
+        const kind =
+            msgtype === MsgType.Image
+                ? "image"
+                : msgtype === MsgType.Video
+                  ? "video"
+                  : msgtype === MsgType.File
+                    ? "file"
+                    : undefined;
+        if (this.disposed || kind !== this.mediaBody?.kind) this.releaseMedia();
+        if (this.disposed || !kind) return undefined;
+        const visible = getMediaVisibility(this.ev, this.client);
+        if (!this.mediaBody) this.mediaBody = this.newMedia(kind, visible);
+        const body = this.mediaBody;
+        // Called only on a change: the setters notify, and a kit's read must not loop.
+        if (body.kind !== "file" && body.visible !== visible) {
+            body.visible = visible;
+            (body.vm as ImageBodyViewModel | VideoBodyViewModel).setMediaVisible(visible);
+        }
+        const snapshot = body.vm.getSnapshot();
+        switch (kind) {
+            case "image":
+                return toViewMedia("image", snapshot as ImageBodyViewSnapshot);
+            case "video":
+                return toViewMedia("video", snapshot as VideoBodyViewSnapshot);
+            default:
+                return toViewMedia("file", snapshot as FileBodyViewSnapshot);
+        }
+    }
+
+    private newMedia(kind: ViewMedia["kind"], visible: boolean): NonNullable<EventRow["mediaBody"]> {
+        const helper = new MediaEventHelper(this.ev);
+        let vm: ImageBodyViewModel | VideoBodyViewModel | FileBodyViewModel;
+        if (kind === "image") {
+            vm = new ImageBodyViewModel({
+                mxEvent: this.ev,
+                mediaEventHelper: helper,
+                mediaVisible: visible,
+                timelineRenderingType: TimelineRenderingType.Room,
+                imageRef: { current: null },
+            });
+        } else if (kind === "video") {
+            vm = new VideoBodyViewModel({
+                mxEvent: this.ev,
+                mediaEventHelper: helper,
+                mediaVisible: visible,
+                videoRef: { current: null },
+            });
+        } else {
+            vm = new FileBodyViewModel({
+                mxEvent: this.ev,
+                mediaEventHelper: helper,
+                timelineRenderingType: TimelineRenderingType.Room,
+                refIFrame: { current: null } as unknown as RefObject<HTMLIFrameElement>,
+                refLink: { current: null } as unknown as RefObject<HTMLAnchorElement>,
+                documentPreviewsEnabled: false,
+            });
+        }
+        const unsubscribe = vm.subscribe(this.changed);
+        if (kind !== "file") {
+            // Start after the read that built it: the first snapshot may land synchronously.
+            const loader = vm as ImageBodyViewModel | VideoBodyViewModel;
+            queueMicrotask(() => {
+                if (!this.disposed && this.mediaBody?.vm === loader) loader.loadInitialMediaIfVisible();
+            });
+        }
+        return { kind, vm, helper, visible, unsubscribe };
+    }
+
+    private releaseMedia(): void {
+        const body = this.mediaBody;
+        if (!body) return;
+        this.mediaBody = undefined;
+        body.unsubscribe();
+        body.vm.dispose();
+        body.helper.destroy();
+    }
+
     public dispose(): void {
         this.disposed = true;
+        this.releaseMedia();
         this.bindReactions(this.reactionRelations, "off");
         this.reactionRelations = undefined;
         this.reactionButtons.forEach((b) => b.dispose());
@@ -774,6 +880,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.replyTo(),
                 row.reactions(),
                 row.threadSummary(),
+                row.media(),
             );
             if (message) messages.push(message);
         }

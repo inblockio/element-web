@@ -14,14 +14,21 @@ import { isValidElement, type ReactNode } from "react";
 import { MsgType } from "matrix-js-sdk/src/matrix";
 import {
     DecryptionFailureReason,
+    FileBodyViewState,
+    ImageBodyViewState,
+    VideoBodyViewState,
+    type FileBodyViewSnapshot,
+    type ImageBodyViewSnapshot,
     type RoomListItemViewSnapshot,
     type EventContentBodyViewSnapshot,
+    type VideoBodyViewSnapshot,
 } from "@element-hq/web-shared-components";
 
 import { type EventTileViewModelSnapshot } from "../viewmodels/room/timeline/event-tile/EventTileViewModel";
 import { type EventTileE2ePadlockViewState } from "../viewmodels/room/timeline/event-tile/EventTileE2eState";
 import {
     type ViewE2e,
+    type ViewMedia,
     type ViewMessage,
     type ViewReaction,
     type ViewReply,
@@ -152,6 +159,7 @@ export function toViewMessage(
     replyTo?: ViewReply,
     reactions?: ViewReaction[],
     thread?: ViewThread,
+    media?: ViewMedia,
 ): ViewMessage | undefined {
     const id = tile.event.eventId;
     if (!id) return undefined;
@@ -172,5 +180,69 @@ export function toViewMessage(
         ...(replyTo ? { replyTo } : {}),
         ...(reactions?.length ? { reactions } : {}),
         ...(thread ? { thread } : {}),
+        ...(media ? { media } : {}),
     };
+}
+
+/**
+ * An image, video or file body snapshot as a ViewMedia. Fields the snapshot does not carry stay out: a file's size
+ * and name come only as the one label Element shows, and an encrypted file's decrypted blob is private to its
+ * view-model (no URL).
+ */
+export function toViewMedia(kind: "image", snapshot: ImageBodyViewSnapshot): ViewMedia;
+export function toViewMedia(kind: "video", snapshot: VideoBodyViewSnapshot): ViewMedia;
+export function toViewMedia(kind: "file", snapshot: FileBodyViewSnapshot): ViewMedia;
+export function toViewMedia(
+    kind: ViewMedia["kind"],
+    snapshot: ImageBodyViewSnapshot | VideoBodyViewSnapshot | FileBodyViewSnapshot,
+): ViewMedia {
+    if (kind === "file") {
+        const file = snapshot as FileBodyViewSnapshot;
+        const name = file.infoTooltip ?? file.infoLabel ?? "";
+        if (file.state === FileBodyViewState.INVALID) return { kind, state: "error", name };
+        return { kind, state: "ready", name, ...(file.downloadHref ? { url: file.downloadHref } : {}) };
+    }
+    if (kind === "image") {
+        const image = snapshot as ImageBodyViewSnapshot;
+        const size = {
+            ...(image.maxWidth !== undefined ? { width: image.maxWidth } : {}),
+            ...(image.maxHeight !== undefined ? { height: image.maxHeight } : {}),
+        };
+        if (image.state === ImageBodyViewState.HIDDEN) {
+            return { kind, state: "hidden", name: "", label: image.hiddenButtonLabel, ...size };
+        }
+        if (image.state === ImageBodyViewState.ERROR) {
+            return { kind, state: "error", name: "", label: image.errorLabel, ...size };
+        }
+        return {
+            kind,
+            state: image.src ? "ready" : "loading",
+            url: image.src,
+            thumbnailUrl: image.thumbnailSrc,
+            name: image.alt ?? "",
+            ...size,
+        };
+    }
+    const video = snapshot as VideoBodyViewSnapshot;
+    const size = {
+        ...(video.maxWidth !== undefined ? { width: video.maxWidth } : {}),
+        ...(video.maxHeight !== undefined ? { height: video.maxHeight } : {}),
+    };
+    switch (video.state) {
+        case VideoBodyViewState.HIDDEN:
+            return { kind, state: "hidden", name: "", label: video.hiddenButtonLabel, ...size };
+        case VideoBodyViewState.ERROR:
+            return { kind, state: "error", name: "", label: video.errorLabel, ...size };
+        case VideoBodyViewState.LOADING:
+            return { kind, state: "loading", name: "", ...size };
+        default:
+            return {
+                kind,
+                state: video.src ? "ready" : "loading",
+                url: video.src,
+                thumbnailUrl: video.poster,
+                name: video.videoTitle ?? "",
+                ...size,
+            };
+    }
 }
