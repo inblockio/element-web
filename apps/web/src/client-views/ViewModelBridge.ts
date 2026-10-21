@@ -1270,6 +1270,8 @@ export class ViewModelBridge implements ClientViewBridge {
         if (!pressed) {
             return Promise.reject(new ClientViewActionError("forbidden", "reacting is not allowed on this message"));
         }
+        // A press the snapshot shows at once (the SDK's local echo) ends inside the executor, before `call` exists.
+        let ended = false;
         const call = new Promise<ActionOutcome>((resolve, reject) => {
             const timer = setTimeout(() => {
                 end();
@@ -1291,6 +1293,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 this.listeners.delete(onChange);
                 this.reactionWaits.delete(cancel);
                 this.reacting.delete(flight);
+                ended = true;
             };
             const check = (): void => {
                 if (row.isMine(key) === pressed.wasMine) return;
@@ -1301,7 +1304,7 @@ export class ViewModelBridge implements ClientViewBridge {
             this.reactionWaits.add(cancel);
             check();
         });
-        this.reacting.set(flight, call);
+        if (!ended) this.reacting.set(flight, call);
         return call;
     }
 

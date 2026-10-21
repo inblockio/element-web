@@ -1095,6 +1095,26 @@ describe("ViewModelBridge", () => {
                 expect(bridge.react("!a", "$1", "👍")).not.toBe(first);
             });
 
+            it("a press the snapshot shows at once (local echo) is done, and the next press is a new call", async () => {
+                h.buttonClick.run = (content) => {
+                    const mine = reaction("@me:example.org", content);
+                    groups = [[content, [...groups[0][1], mine]]];
+                    mineList = [mine];
+                    present();
+                };
+                const first = bridge.react("!a", "$1", "👍");
+                await expect(first).resolves.toMatchObject({ status: "done" });
+                h.buttonClick.run = () => {
+                    groups = [["👍", [reaction("@bob:example.org", "👍")]]];
+                    mineList = [];
+                    present();
+                };
+                const second = bridge.react("!a", "$1", "👍");
+                expect(second).not.toBe(first);
+                expect(h.reactionButtons[0].onClick).toHaveBeenCalledTimes(2);
+                await expect(second).resolves.toMatchObject({ status: "done" });
+            });
+
             it("gives a key without a chip a fresh button view-model, clicks it and releases it", async () => {
                 h.buttonClick.run = (content) => {
                     const mine = reaction("@me:example.org", content);
