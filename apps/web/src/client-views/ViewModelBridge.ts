@@ -166,6 +166,8 @@ class EventRow {
         private readonly changed: () => void,
         /** The room's downgrade-proof encryption flag (what RoomView feeds EventTile as isRoomEncrypted). */
         private readonly isRoomEncrypted: () => boolean,
+        /** Whether the crypto answer for the room has settled (RoomView awaits it before it computes showUrlPreview). */
+        private readonly isEncryptionSettled: () => boolean,
     ) {
         // EventTile.createViewModelProps reads only two values from the legacy RoomContext:
         // showHiddenEvents and timelineRenderingType. Everything else is EventTile props or utilities.
@@ -720,6 +722,9 @@ class EventRow {
             return undefined;
         }
         const encrypted = this.isRoomEncrypted();
+        // Until the crypto answer is in, the state flag may be a downgrade's: no view-model, no fetch (the bridge
+        // re-emits the timeline when the answer settles).
+        if (!this.isEncryptionSettled()) return undefined;
         const visible = !!SettingsStore.getValue(encrypted ? "urlPreviewsEnabled_e2ee" : "urlPreviewsEnabled");
         const kind: UrlPreviewKind = SettingsStore.getValue("feature_msc4095_url_preview_bundle")
             ? encrypted && SettingsStore.getValue("urlPreviewsEnabled_e2ee_bundled_only")
@@ -856,6 +861,10 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
     /** Per room: encrypted once either the room state or the crypto store said so (never back to false). */
     private readonly encrypted = new Map<string, boolean>();
+    /** Rooms whose crypto answer (or its failure, or the lack of crypto) is in; the URL previews wait for it. */
+    private readonly encryptionSettled = new Set<string>();
+    /** Rooms where a row was held back for that answer: the timeline is re-emitted when it settles. */
+    private readonly heldForEncryption = new Set<string>();
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
     private lastConnection: ViewConnection = "online";
@@ -910,18 +919,26 @@ export class ViewModelBridge implements ClientViewBridge {
         return known;
     }
 
+    private isEncryptionSettled(roomId: string): boolean {
+        if (this.encryptionSettled.has(roomId)) return true;
+        this.heldForEncryption.add(roomId);
+        return false;
+    }
+
     private readEncryption(roomId: string): void {
-        void this.client
-            .getCrypto()
-            ?.isEncryptionEnabledInRoom(roomId)
-            .then(
-                (enabled) => {
-                    if (!enabled || this.encrypted.get(roomId)) return;
-                    this.encrypted.set(roomId, true);
-                    this.emit({ kind: "timeline", roomId });
-                },
-                () => {},
-            );
+        const pending = this.client.getCrypto()?.isEncryptionEnabledInRoom(roomId);
+        // Without crypto the state flag stands.
+        if (!pending) {
+            this.encryptionSettled.add(roomId);
+            return;
+        }
+        const settle = (enabled: boolean): void => {
+            this.encryptionSettled.add(roomId);
+            const flipped = enabled && !this.encrypted.get(roomId);
+            if (flipped) this.encrypted.set(roomId, true);
+            if (flipped || this.heldForEncryption.delete(roomId)) this.emit({ kind: "timeline", roomId });
+        };
+        void pending.then(settle, () => settle(false));
     }
 
     /** useIsEncrypted re-reads the flag on every m.room.encryption state event. */
@@ -1042,6 +1059,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 item.continuation,
                 () => this.emit({ kind: "timeline", roomId }),
                 () => this.isRoomEncrypted(roomId),
+                () => this.isEncryptionSettled(roomId),
             );
             this.rows.set(key, row);
         }
