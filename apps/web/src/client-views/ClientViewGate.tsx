@@ -174,19 +174,27 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
     );
     // Every load of the kit document (first boot, a reload inside the frame) gets its own boot deadline.
     const [loads, setLoads] = useState(0);
+    const deadline = useRef<number | undefined>(undefined);
     useEffect(() => {
         setFailed(false);
         if (!bridge || loads === 0) return;
         const timer = window.setTimeout(() => setFailed(!bridge.used), BOOT_TIMEOUT_MS);
+        deadline.current = timer;
         return () => window.clearTimeout(timer);
     }, [bridge, loads]);
     const onLoad = useCallback(
         (e: React.SyntheticEvent<HTMLIFrameElement>) => {
             // A reload inside the frame must start the kit again: the bridge counts as unused from the old document's
-            // unload, so the next load's deadline checks the new document, not the first boot.
-            e.currentTarget.contentWindow?.addEventListener("pagehide", () => bridge && (bridge.used = false), {
-                once: true,
-            });
+            // unload, so the next load's deadline checks the new document, not the first boot. The old document's
+            // deadline goes with it, or it would judge the new document before that one has loaded.
+            e.currentTarget.contentWindow?.addEventListener(
+                "pagehide",
+                () => {
+                    window.clearTimeout(deadline.current);
+                    if (bridge) bridge.used = false;
+                },
+                { once: true },
+            );
             setLoads((n) => n + 1);
         },
         [bridge],
@@ -249,7 +257,7 @@ export function ClientViewGate({ client, children }: { client: MatrixClient; chi
     }, []);
     // Picture-in-picture leaves out a live legacy call in the viewed room (its controls are in RoomView), so a kit
     // never covers it: Element's UI stays until the call ends or the user views another room. A live call widget
-    // keeps Element's UI until it ends, since a fresh PipContainer would not show it (G1).
+    // keeps Element's UI until it ends: a running call stays in the tree it started in, never moved under a kit (G1).
     const calls = useActiveLegacyCalls();
     const viewedRoomId = useViewedRoomId();
     const widgetLive = usePersistentWidgetLive();

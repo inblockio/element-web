@@ -152,7 +152,23 @@ describe("ClientViewGate", () => {
         expect(screen.getByText("Fixture did not start.")).toBeTruthy();
     });
 
-    it("keeps Element's UI while a call widget is live, since a fresh picture-in-picture would hide it (G1)", () => {
+    it("drops the old document's deadline when the frame reloads, so a slow reload is not taken as failed", () => {
+        renderGate();
+        h.used = true;
+        loadKit();
+        act(() => void vi.advanceTimersByTime(BOOT_TIMEOUT_MS - 5000));
+
+        const frame = screen.getByTitle("Fixture") as HTMLIFrameElement;
+        act(() => void frame.contentWindow!.dispatchEvent(new Event("pagehide")));
+        act(() => void vi.advanceTimersByTime(5000));
+        expect(screen.queryByText("Fixture did not start.")).toBeNull();
+
+        loadKit();
+        act(() => void vi.advanceTimersByTime(BOOT_TIMEOUT_MS));
+        expect(screen.getByText("Fixture did not start.")).toBeTruthy();
+    });
+
+    it("keeps Element's UI while a call widget is live (G1)", () => {
         const persistent = vi.spyOn(ActiveWidgetStore.instance, "getPersistentWidgetId").mockReturnValue("ec");
         try {
             renderGate();

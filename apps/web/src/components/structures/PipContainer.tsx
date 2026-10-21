@@ -92,6 +92,8 @@ class PipContainerInner extends React.Component<IProps, IState> {
         ActiveWidgetStore.instance.on(ActiveWidgetStoreEvent.Persistence, this.onWidgetPersistence);
         ActiveWidgetStore.instance.on(ActiveWidgetStoreEvent.Dock, this.onWidgetDockChanges);
         ActiveWidgetStore.instance.on(ActiveWidgetStoreEvent.Undock, this.onWidgetDockChanges);
+        // A widget can already be persistent when this mounts (a remount while a call runs), with no event to come.
+        this.updateShowWidgetInPip();
     }
 
     public componentWillUnmount(): void {

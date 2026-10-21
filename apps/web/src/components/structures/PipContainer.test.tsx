@@ -268,4 +268,14 @@ describe("PipContainer", () => {
 
         WidgetStore.instance.removeVirtualWidget("1", room.roomId);
     });
+
+    it("shows a widget that was already persistent when it mounted", async () => {
+        setUpRoomViewStore();
+        viewRoom(room2.roomId);
+
+        await withWidget(async () => {
+            renderPip();
+            expect(screen.getByRole("complementary")).toBeInTheDocument();
+        });
+    });
 });
