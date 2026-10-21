@@ -308,8 +308,7 @@ vi.mock("../viewmodels/message-body/UrlPreviewGroupViewModel", () => ({
 vi.mock("../HtmlUtils", () => ({
     bodyToNode: (content: { body: string; formatted_body?: string }) => ({
         strippedBody: content.body,
-        formattedBody:
-            content.formatted_body ?? content.body.replace(/(https?:\/\/\S+)/g, '<a href="$1">$1</a>'),
+        formattedBody: content.formatted_body ?? content.body.replace(/(https?:\/\/\S+)/g, '<a href="$1">$1</a>'),
     }),
 }));
 vi.mock("../modules/Api", () => ({ ModuleApi: { instance: { urlPreviews: { module: "url-preview-api" } } } }));
@@ -1374,7 +1373,7 @@ describe("ViewModelBridge", () => {
         });
 
         it("a voice message is the same audio body", async () => {
-            const ev = audioEvent("$v", {}, { body: "Voice message", "org.matrix.msc3245.voice": {} });
+            const ev = audioEvent("$v", {}, { "body": "Voice message", "org.matrix.msc3245.voice": {} });
             read(ev);
             h.mediaHelpers[0].resolveUrl("blob:voice");
             await settle();
@@ -1502,7 +1501,12 @@ describe("ViewModelBridge", () => {
             title: "A post",
             siteName: "Example",
             description: "About a post",
-            image: { imageThumb: "http://hs/thumb", imageFull: "http://hs/full", mxcImageFull: "mxc://hs/f", playable: false },
+            image: {
+                imageThumb: "http://hs/thumb",
+                imageFull: "http://hs/full",
+                mxcImageFull: "mxc://hs/f",
+                playable: false,
+            },
         };
         const linkText = { msgtype: "m.text", body: "see https://example.org/post now" };
 
@@ -1734,7 +1738,11 @@ describe("ViewModelBridge", () => {
 
         it("drops the previews of a redacted message and releases the view-model and its watchers", () => {
             let redacted = false;
-            const ev = textEvent("$rd", {}, { getContent: () => (redacted ? {} : linkText), isRedacted: () => redacted });
+            const ev = textEvent(
+                "$rd",
+                {},
+                { getContent: () => (redacted ? {} : linkText), isRedacted: () => redacted },
+            );
             read(ev);
             const vm = h.urlPreviewVms[0];
             vm.set({ previews: [preview] });

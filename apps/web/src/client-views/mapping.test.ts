@@ -446,7 +446,9 @@ describe("E2EE trust signals mapping (REQ-0007 V3, host half)", () => {
         });
 
         it("leaves out what the preview does not have", () => {
-            const [p] = toViewUrlPreviews([{ link: "https://e.org", showTooltipOnLink: false, title: "T", siteName: "" }])!;
+            const [p] = toViewUrlPreviews([
+                { link: "https://e.org", showTooltipOnLink: false, title: "T", siteName: "" },
+            ])!;
             expect(p).toEqual({ link: "https://e.org", title: "T", siteName: "" });
         });
 
