@@ -483,7 +483,7 @@ describe("ViewModelBridge", () => {
                 const ev = fakeEvent("$o", {
                     isEncrypted: () => true,
                     getClearContent: () => ({ msgtype: "m.text", body: "original" }),
-                    getContent: () => (replacement.getContent() as Record<string, unknown>)["m.new_content"],
+                    getContent: () => (replacement.getContent() as Record<string, unknown>)["m.new_content"] ?? {},
                     replacingEvent: () => replacement,
                 });
                 return { ev, replacement };
@@ -801,6 +801,19 @@ describe("ViewModelBridge", () => {
             expect(read(fakeEvent("$1"))[0].reactions).toEqual([
                 { key: "👍", count: 1, mine: false, senderIds: ["@bob:example.org"] },
             ]);
+        });
+
+        it("hands over no reactions where the stock row shows none: redacted, undecryptable, edit not yet decrypted", () => {
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(
+                relationsOf([["👍", [reaction("@bob:example.org", "👍")]]]),
+            );
+            const bad = { msgtype: "m.bad.encrypted", body: "** Unable to decrypt **" };
+            const items = read(
+                fakeEvent("$redacted", { isRedacted: () => true }),
+                fakeEvent("$utd", { getContent: () => bad, isDecryptionFailure: () => true }),
+                fakeEvent("$edit", { getContent: () => ({}) }),
+            );
+            expect(items.map((m) => m.reactions)).toEqual([undefined, undefined, undefined]);
         });
 
         it("adds no reactions to a message without any", () => {

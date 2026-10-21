@@ -36,6 +36,7 @@ import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/Reply
 import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/Reply";
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
+import { isContentActionable } from "../utils/EventUtils";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
@@ -347,6 +348,9 @@ class EventRow {
             this.reactionRelations = relations;
             this.bindReactions(relations, "on");
         }
+        // The stock row shows no chips where the content is not actionable (redacted, undecryptable, an edit not yet
+        // decrypted): neither does the view. The listeners stay bound, so a later decryption re-reads them.
+        if (!isContentActionable(this.ev)) return undefined;
         const me = this.client.getUserId();
         const mine = (me && relations?.getAnnotationsBySender()?.[me]) || new Set<MatrixEvent>();
         const reactions: ViewReaction[] = [];
