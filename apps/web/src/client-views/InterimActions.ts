@@ -30,10 +30,6 @@ import { type ActionOutcome, ClientViewActionError } from "./types";
 export const AWAITS_SEND_TEXT =
     "a composer send view-model (vm/composer ships only MessageComposerUrlPreviewViewModel)";
 
-/**
- * Cancels the pending (NOT_SENT) event a failed `client.sendMessage` leaves behind: it would block every later send in
- * that room ("Event blocked by other events not yet sent") and is persisted across a reload.
- */
 function pendingEventsOf(client: MatrixClient, roomId: string): MatrixEvent[] {
     try {
         return client.getRoom(roomId)?.getPendingEvents() ?? [];
@@ -42,18 +38,15 @@ function pendingEventsOf(client: MatrixClient, roomId: string): MatrixEvent[] {
     }
 }
 
-function cancelFailedPendingEvents(
-    client: MatrixClient,
-    roomId: string,
-    before: Set<MatrixEvent>,
-    text: string,
-    txnId?: string,
-): void {
+/**
+ * Cancels the pending (NOT_SENT) event a failed `client.sendMessage` leaves behind: it would block every later send in
+ * that room ("Event blocked by other events not yet sent") and is persisted across a reload.
+ */
+function cancelFailedPendingEvents(client: MatrixClient, roomId: string, txnId: string): void {
     try {
+        // By transaction id only: a pending event restored from a reload is never ours.
         for (const ev of pendingEventsOf(client, roomId)) {
-            if (before.has(ev) || ev.status !== EventStatus.NOT_SENT) continue;
-            if (txnId ? ev.getTxnId() !== txnId : ev.getContent().body !== text) continue;
-            client.cancelPendingEvent(ev);
+            if (ev.status === EventStatus.NOT_SENT && ev.getTxnId() === txnId) client.cancelPendingEvent(ev);
         }
     } catch {
         // best effort: the send error is what the caller needs to see
@@ -108,6 +101,8 @@ export async function sendText(
     if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
     if (!text.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
     const content: RoomMessageEventContent = { msgtype: MsgType.Text, body: text };
+    // Always our own transaction id: the cancel of a failed send finds exactly this pending event.
+    const txnId = opts.txnId ?? client.makeTxnId();
 
     let queued: ((roomId: string) => void) | undefined;
     let stopWatching = (): void => {};
@@ -121,11 +116,10 @@ export async function sendText(
             roomId,
             async (actualRoomId: string) => {
                 sentRoomId = actualRoomId;
-                const before = new Set(pendingEventsOf(client, actualRoomId));
                 try {
-                    return await client.sendMessage(actualRoomId, null, content, opts.txnId);
+                    return await client.sendMessage(actualRoomId, null, content, txnId);
                 } catch (e) {
-                    cancelFailedPendingEvents(client, actualRoomId, before, text, opts.txnId);
+                    cancelFailedPendingEvents(client, actualRoomId, txnId);
                     throw e;
                 }
             },
@@ -141,12 +135,21 @@ export async function sendText(
             // (a no-op while another caller's creation is running: it acts on a new local room only).
             const { failed, stop } = localRoomCreationFailure(client, local);
             stopWatching = stop;
-            const creation = Promise.resolve(createRoomFromLocalRoom(client, local)).then(() => {
-                if (local.state === LocalRoomState.ERROR) {
-                    throw new ClientViewActionError("failed", "the direct message could not be created");
-                }
-                return new Promise<never>(() => {}); // creation done: the callback sends, `sent` settles the race
-            });
+            const startsCreation = local.isNew; // only the caller that starts it may declare it failed
+            const creation = Promise.resolve(createRoomFromLocalRoom(client, local))
+                .catch(() => {})
+                .then(() => {
+                    // A creation that settles without CREATED (a guest `createRoom` gives no room id, and the stock
+                    // handler throws past its own rejection handler) must not leave the room in CREATING for every waiter.
+                    if (startsCreation && local.state === LocalRoomState.CREATING) {
+                        local.state = LocalRoomState.ERROR;
+                        client.emit(ClientEvent.Room, local);
+                    }
+                    if (local.state === LocalRoomState.ERROR) {
+                        throw new ClientViewActionError("failed", "the direct message could not be created");
+                    }
+                    return new Promise<never>(() => {}); // creation done: the callback sends, `sent` settles the race
+                });
             creation.catch(() => {});
             response = await Promise.race([sent, failed, creation]);
         } else {

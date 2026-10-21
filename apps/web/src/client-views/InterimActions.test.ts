@@ -143,6 +143,25 @@ describe("sendText (interim action, D16)", () => {
             };
         };
 
+        it("F1: a creation that settles without CREATED or ERROR is a failure for every waiter, and the room can be retried", async () => {
+            // The stock handler throws past its own rejection handler: the room stays CREATING, the promise rejects.
+            let rejectCreation: (e: Error) => void = () => {};
+            vi.mocked(createRoomFromLocalRoom).mockImplementation(async (c, local) => {
+                if (!local.isNew) return;
+                local.state = LocalRoomState.CREATING;
+                c.emit(ClientEvent.Room, local);
+                await new Promise<void>((_, rej) => (rejectCreation = rej));
+            });
+            const first = codeOf(sendText(client, localRoom.roomId, "one"));
+            const second = codeOf(sendText(client, localRoom.roomId, "two"));
+            rejectCreation(new Error("startDm for local room did not return a room id"));
+            expect(await first).toBe("failed");
+            expect(await second).toBe("failed");
+            expect(localRoom.state).toBe(LocalRoomState.ERROR);
+            expect(localRoom.afterCreateCallbacks).toHaveLength(0);
+            expect(client.sendMessage).not.toHaveBeenCalled();
+        });
+
         it("H1: a second send while the room is being created rejects too when the creation fails", async () => {
             const creation = fakeCreation();
             const first = codeOf(sendText(client, localRoom.roomId, "one"));
@@ -195,5 +214,32 @@ describe("sendText (interim action, D16)", () => {
         expect(await codeOf(sendText(client, detached.roomId, "hi", { txnId: "rc-1" }))).toBe("failed");
         const cancelled = vi.mocked(client.cancelPendingEvent).mock.calls.map(([ev]) => ev.getTxnId());
         expect(cancelled).toEqual(["rc-1"]);
+    });
+
+    it("F2: sends with its own transaction id when none is given, and cancels only that pending event", async () => {
+        const detached = new Room("!d:example.org", client, "@me:example.org", {
+            pendingEventOrdering: PendingEventOrdering.Detached,
+        });
+        vi.mocked(client.getRoom).mockImplementation((id?: string) => (id === detached.roomId ? detached : null));
+        // A restored pending event with the same body, and one a rehydration adds while the send is in flight.
+        const restored = new MatrixEvent({ type: "m.room.message", content: { msgtype: "m.text", body: "hi" } });
+        restored.setTxnId("restored");
+        restored.setStatus(EventStatus.NOT_SENT);
+        detached.addPendingEvent(restored, "restored");
+        vi.mocked(client.sendMessage).mockImplementationOnce(async (_room, _thread, content, txn) => {
+            const ev = new MatrixEvent({ type: "m.room.message", content });
+            ev.setTxnId(txn as string);
+            ev.setStatus(EventStatus.NOT_SENT);
+            detached.addPendingEvent(ev, txn as string);
+            const late = new MatrixEvent({ type: "m.room.message", content });
+            late.setTxnId("late");
+            late.setStatus(EventStatus.NOT_SENT);
+            detached.addPendingEvent(late, "late");
+            throw new HTTPError("boom", 500);
+        });
+        expect(await codeOf(sendText(client, detached.roomId, "hi"))).toBe("failed");
+        const sentTxn = vi.mocked(client.sendMessage).mock.calls[0][3];
+        expect(sentTxn).toEqual(expect.any(String));
+        expect(vi.mocked(client.cancelPendingEvent).mock.calls.map(([ev]) => ev.getTxnId())).toEqual([sentTxn]);
     });
 });
