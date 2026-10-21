@@ -175,29 +175,35 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
     // Every load of the kit document (first boot, a reload inside the frame) gets its own boot deadline.
     const [loads, setLoads] = useState(0);
     const deadline = useRef<number | undefined>(undefined);
+    const arm = useCallback(() => {
+        window.clearTimeout(deadline.current);
+        if (bridge) deadline.current = window.setTimeout(() => setFailed(!bridge.used), BOOT_TIMEOUT_MS);
+    }, [bridge]);
     useEffect(() => {
         setFailed(false);
         if (!bridge || loads === 0) return;
-        const timer = window.setTimeout(() => setFailed(!bridge.used), BOOT_TIMEOUT_MS);
-        deadline.current = timer;
-        return () => window.clearTimeout(timer);
-    }, [bridge, loads]);
+        arm();
+        return () => window.clearTimeout(deadline.current);
+    }, [bridge, loads, arm]);
     const onLoad = useCallback(
         (e: React.SyntheticEvent<HTMLIFrameElement>) => {
             // A reload inside the frame must start the kit again: the bridge counts as unused from the old document's
             // unload, so the next load's deadline checks the new document, not the first boot. The old document's
-            // deadline goes with it, or it would judge the new document before that one has loaded.
+            // deadline is replaced by a fresh one from the unload: it must not judge the new document before that one
+            // loads, and a reload that never loads still gets the way back. A frame being removed (ref detached
+            // first) needs none.
             e.currentTarget.contentWindow?.addEventListener(
                 "pagehide",
                 () => {
-                    window.clearTimeout(deadline.current);
                     if (bridge) bridge.used = false;
+                    if (frameRef.current) arm();
+                    else window.clearTimeout(deadline.current);
                 },
                 { once: true },
             );
             setLoads((n) => n + 1);
         },
-        [bridge],
+        [bridge, arm],
     );
     if (!bridge) return <div />;
     return (

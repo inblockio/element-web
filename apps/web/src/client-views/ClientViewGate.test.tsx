@@ -168,6 +168,16 @@ describe("ClientViewGate", () => {
         expect(screen.getByText("Fixture did not start.")).toBeTruthy();
     });
 
+    it("offers the way back when a reload inside the frame never loads (grok re-review F1)", () => {
+        renderGate();
+        h.used = true;
+        loadKit();
+        const frame = screen.getByTitle("Fixture") as HTMLIFrameElement;
+        act(() => void frame.contentWindow!.dispatchEvent(new Event("pagehide")));
+        act(() => void vi.advanceTimersByTime(BOOT_TIMEOUT_MS));
+        expect(screen.getByText("Fixture did not start.")).toBeTruthy();
+    });
+
     it("keeps Element's UI while a call widget is live (G1)", () => {
         const persistent = vi.spyOn(ActiveWidgetStore.instance, "getPersistentWidgetId").mockReturnValue("ec");
         try {
