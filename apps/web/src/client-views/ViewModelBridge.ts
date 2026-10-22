@@ -1445,19 +1445,25 @@ export class ViewModelBridge implements ClientViewBridge {
             vm as unknown as {
                 timelineWindow: {
                     getEvents(): MatrixEvent[];
-                    canPaginate(direction: Direction): boolean;
+                    canPaginate: (direction: Direction) => boolean;
                     paginate: (...args: unknown[]) => Promise<boolean>;
                 };
             }
         ).timelineWindow;
+        // The room's real creation event (its id in the room state): an event that merely decrypts to an `m.room.create`
+        // is not the start (crafted input), and a type test would take it for one.
+        const createId = (): string | undefined =>
+            this.client.getRoom(roomId)?.currentState.getStateEvents(EventType.RoomCreate, "")?.getId();
         const state = (): Pick<LoadOlderResult, "atStart" | "atLimit"> => {
             const windowEvents = timelineWindow.getEvents();
+            const create = createId();
             return {
                 atStart:
-                    windowEvents.some((e) => e.getType() === EventType.RoomCreate) ||
+                    (create !== undefined && windowEvents.some((e) => e.getId() === create)) ||
                     !timelineWindow.canPaginate(Direction.Backward),
-                // The cap is on the window's events, hidden reactions and edits included, not on the rendered rows.
-                atLimit: windowEvents.length >= WINDOW_LIMIT - PAGE_SIZE,
+                // The cap is on the window's events, hidden reactions and edits included, not on the rendered rows. A window of
+                // exactly WINDOW_LIMIT - PAGE_SIZE still takes one more page without a trim.
+                atLimit: windowEvents.length > WINDOW_LIMIT - PAGE_SIZE,
             };
         };
         // The first window is still loading (or the room has no showable event yet): a page asked now would race it.
@@ -1474,12 +1480,25 @@ export class ViewModelBridge implements ClientViewBridge {
         vm.onAnchorReached();
         const before = new Set(events().map((e) => e.getId()));
         const start = state();
-        if (start.atStart || start.atLimit) return { added: 0, ...start };
+        if (start.atStart || start.atLimit) return { added: 0, ids: [], ...start };
         // The view-model's paginate chain catches a failed `/messages` page and publishes nothing that tells it from an
         // empty page, so the window's own paginate is watched for the length of this page (instance wrap, restored below).
+        // The chain also loops over up to 10 batches that show nothing (hidden events only) and, before each batch, trims
+        // the live end when the window is past the limit: the wrap refuses a backward batch that would take the window past
+        // WINDOW_LIMIT (`false`, no request: the chain ends), and `canPaginate(Backward)` says no for the same window so
+        // the chain ends before that pre-trim. A page never trims the live end.
         let failure: unknown;
         const paginate = timelineWindow.paginate;
+        const canPaginate = timelineWindow.canPaginate;
+        const full = (): boolean => timelineWindow.getEvents().length > WINDOW_LIMIT - PAGE_SIZE;
+        timelineWindow.canPaginate = (direction: Direction) =>
+            !(direction === Direction.Backward && full()) && canPaginate.call(timelineWindow, direction);
         timelineWindow.paginate = async (...args: unknown[]) => {
+            if (
+                args[0] === Direction.Backward &&
+                timelineWindow.getEvents().length + Number(args[1] ?? PAGE_SIZE) > WINDOW_LIMIT
+            )
+                return false;
             try {
                 return await paginate.apply(timelineWindow, args);
             } catch (e) {
@@ -1497,10 +1516,13 @@ export class ViewModelBridge implements ClientViewBridge {
             );
         } finally {
             timelineWindow.paginate = paginate;
+            timelineWindow.canPaginate = canPaginate;
         }
         if (failure !== undefined) throw toActionError(failure);
-        const after = events();
-        return { added: after.filter((e) => !before.has(e.getId())).length, ...state() };
+        const ids = events()
+            .map((e) => e.getId())
+            .filter((id): id is string => !!id && !before.has(id));
+        return { added: ids.length, ids, ...state() };
     }
 
     public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {

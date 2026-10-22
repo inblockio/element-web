@@ -2074,6 +2074,7 @@ describe("ViewModelBridge", () => {
             h.timeline.timelineWindow.getEvents.mockReset().mockReturnValue([]);
             h.timeline.timelineWindow.canPaginate.mockReset().mockReturnValue(true);
             h.timeline.timelineWindow.paginate.mockReset().mockResolvedValue(true);
+            h.room.currentState.getStateEvents.mockReset().mockReturnValue(undefined);
             h.timeline.set({ items: window(20, 100), pendingAnchor: { targetKey: "$e119", align: "end" } } as never);
             h.timeline.onStartReached.mockReset();
             h.timeline.onAnchorReached.mockReset();
@@ -2089,7 +2090,7 @@ describe("ViewModelBridge", () => {
             });
             const result = await bridge.loadOlder("!a");
             expect(seen).toEqual(["anchor", "start"]);
-            expect(result).toEqual({ added: 20, atStart: false, atLimit: false });
+            expect(result).toMatchObject({ added: 20, atStart: false, atLimit: false });
         });
 
         it("waits for the first window to finish loading before it paginates", async () => {
@@ -2105,12 +2106,13 @@ describe("ViewModelBridge", () => {
         });
 
         it("resolves with nothing added when the view-model skips the page", async () => {
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: false, atLimit: false });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 0, atStart: false, atLimit: false });
         });
 
         it("reports atStart, without a page, when the room's creation event is in the window (a hidden event, not among the items)", async () => {
+            h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$create" });
             windowHolds([eventItem("$create", "m.room.create"), ...window(5)]);
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: true, atLimit: false });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 0, atStart: true, atLimit: false });
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
         });
 
@@ -2125,44 +2127,123 @@ describe("ViewModelBridge", () => {
             });
             const result = await bridge.loadOlder("!a");
             expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
-            expect(result).toEqual({ added: 50, atStart: false, atLimit: false });
+            expect(result).toMatchObject({ added: 50, atStart: false, atLimit: false });
         });
 
         it("is at the start when the window cannot paginate backward and no creation event came (history visibility, grok F2)", async () => {
             windowHolds(window(20, 100));
             h.timeline.timelineWindow.canPaginate.mockImplementation((d: string) => d !== "b");
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: true, atLimit: false });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 0, atStart: true, atLimit: false });
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
         });
 
         it("is at the start after a page that leaves the window unable to paginate backward", async () => {
             windowHolds(window(20, 100));
+            // The window's own canPaginate (the bridge wraps it for the length of a page).
+            const canPaginate = h.timeline.timelineWindow.canPaginate;
             h.timeline.onStartReached.mockImplementation(() => {
                 h.timeline.set({ items: [...window(5, 90), ...window(20, 100)] } as never);
-                h.timeline.timelineWindow.canPaginate.mockImplementation((d: string) => d !== "b");
+                canPaginate.mockImplementation((d: string) => d !== "b");
             });
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 5, atStart: true, atLimit: false });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 5, atStart: true, atLimit: false });
         });
 
         it("reports atStart after a page that brings in the creation event", async () => {
+            h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$create" });
             h.timeline.onStartReached.mockImplementation(() => {
                 h.timeline.set({ items: [eventItem("$create", "m.room.create"), ...window(20, 100)] } as never);
                 windowHolds([eventItem("$create", "m.room.create"), ...window(20, 100)]);
             });
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 1, atStart: true, atLimit: false });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 1, atStart: true, atLimit: false });
         });
 
         it("counts the limit on the window's events, hidden reactions and edits included (grok F2)", async () => {
-            // 900 events in the window, only 20 rendered: a page would pre-trim the live end.
-            windowHolds([...window(20, 100), ...hidden(880)]);
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: false, atLimit: true });
+            // 901 events in the window, only 20 rendered: a page would pre-trim the live end.
+            windowHolds([...window(20, 100), ...hidden(881)]);
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 0, atStart: false, atLimit: true });
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
-            windowHolds([...window(20, 100), ...hidden(879)]);
+            windowHolds([...window(20, 100), ...hidden(880)]);
             h.timeline.onStartReached.mockImplementation(() => {
                 h.timeline.set({ items: [...window(1, 99), ...window(20, 100)] } as never);
-                windowHolds([...window(21, 99), ...hidden(879)]);
+                windowHolds([...window(21, 99), ...hidden(880)]);
             });
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 1, atStart: false, atLimit: true });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 1, atStart: false, atLimit: true });
+        });
+
+        it("takes one more page at exactly 900 events in the window (no trim then, grok F3)", async () => {
+            windowHolds([...window(20, 100), ...hidden(880)]);
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [...window(1, 99), ...window(20, 100)] } as never);
+                windowHolds([...window(21, 99), ...hidden(880)]);
+            });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 1, atStart: false, atLimit: true });
+            expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
+        });
+
+        it("a chain of hidden-only pages from 899 events never trims the live end (grok F1)", async () => {
+            const tw = h.timeline.timelineWindow as typeof h.timeline.timelineWindow & {
+                unpaginate: (n: number, startOfTimeline: boolean) => void;
+            };
+            const unpaginate = vi.fn((_n: number, _startOfTimeline: boolean) => {});
+            tw.unpaginate = unpaginate;
+            let held: unknown[] = [...window(20, 100).map((i) => i.event), ...hidden(879).map((i) => i.event)];
+            let requests = 0;
+            tw.getEvents.mockImplementation(() => held);
+            tw.paginate.mockImplementation(async () => {
+                requests++;
+                held = [...held, ...hidden(100).map((i, n) => ({ ...i.event, id: `$x${requests}-${n}` }))];
+                return true;
+            });
+            // The view-model's chain: up to 10 batches, a pre-trim of the far end whenever the next page overflows 1000.
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [loadingItem, ...window(20, 100)] } as never);
+                void (async () => {
+                    for (let empty = 0; empty <= 10 && tw.canPaginate("b"); empty++) {
+                        const toTrim = tw.getEvents().length + 100 - 1000;
+                        if (toTrim > 0) unpaginate(toTrim, false);
+                        await tw.paginate("b", 100);
+                    }
+                    h.timeline.set({ items: window(20, 100) } as never);
+                })();
+            });
+            const result = await bridge.loadOlder("!a");
+            expect(unpaginate).not.toHaveBeenCalled();
+            expect(requests).toBe(1);
+            expect(result).toMatchObject({ added: 0, ids: [], atStart: false, atLimit: true });
+        });
+
+        it("the wrapped paginate refuses a backward page that would overflow the window, without a request (grok F1)", async () => {
+            const held = [...window(20, 100).map((i) => i.event), ...hidden(880).map((i) => i.event)];
+            h.timeline.timelineWindow.getEvents.mockReturnValue(held);
+            let answer: boolean | undefined;
+            h.timeline.onStartReached.mockImplementation(() => {
+                held.push(...hidden(50).map((i) => i.event));
+                void h.timeline.timelineWindow.paginate("b", 100).then((r) => (answer = r));
+            });
+            const original = h.timeline.timelineWindow.paginate;
+            await bridge.loadOlder("!a");
+            await new Promise((r) => setTimeout(r, 10));
+            expect(answer).toBe(false);
+            expect(original).not.toHaveBeenCalled();
+        });
+
+        it("ids lists the events the page added", async () => {
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [...window(3, 97), ...window(20, 100)] } as never);
+            });
+            expect(await bridge.loadOlder("!a")).toMatchObject({ added: 3, ids: ["$e97", "$e98", "$e99"] });
+        });
+
+        it("is not the start for an event that only decrypts to m.room.create (crafted input, grok F2)", async () => {
+            h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$real" });
+            const fake = { getId: () => "$fake", getType: () => "m.room.create", getClearContent: () => ({}) };
+            windowHolds([{ event: fake }, ...window(5)]);
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [...window(2, 98), ...window(20, 100)] } as never);
+            });
+            const result = await bridge.loadOlder("!a");
+            expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
+            expect(result).toMatchObject({ atStart: false });
         });
 
         it("rejects when the page's /messages failed, with the existing error mapping (grok F2)", async () => {
@@ -2184,8 +2265,10 @@ describe("ViewModelBridge", () => {
         it("restores the window's paginate after the page", async () => {
             windowHolds(window(20, 100));
             const original = h.timeline.timelineWindow.paginate;
+            const canPaginate = h.timeline.timelineWindow.canPaginate;
             await bridge.loadOlder("!a");
             expect(h.timeline.timelineWindow.paginate).toBe(original);
+            expect(h.timeline.timelineWindow.canPaginate).toBe(canPaginate);
         });
 
         it("gives concurrent calls one page and one answer", async () => {
@@ -2195,7 +2278,7 @@ describe("ViewModelBridge", () => {
             });
             const [a, b] = await Promise.all([bridge.loadOlder("!a"), bridge.loadOlder("!a")]);
             expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
-            expect(a).toEqual({ added: 10, atStart: false, atLimit: false });
+            expect(a).toMatchObject({ added: 10, atStart: false, atLimit: false });
             expect(b).toEqual(a);
             // A call after it has settled asks again.
             await bridge.loadOlder("!a");

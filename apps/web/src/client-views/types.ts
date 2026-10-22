@@ -178,6 +178,8 @@ export interface LoadOlderResult {
     atStart: boolean;
     /** The window is within one page of its size limit: older history is out of reach (loading it would drop the live end). */
     atLimit: boolean;
+    /** The event ids this page added to the loaded window (a kit tells history from a live arrival by them, not by position or time). */
+    ids?: string[];
 }
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
