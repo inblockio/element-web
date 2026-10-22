@@ -46,7 +46,8 @@ const h = vi.hoisted(() => {
         notification: { hasUnreadCount: false, count: 0, isMention: false, invited: true },
     });
     const list = { createRoom: vi.fn(), createChatRoom: vi.fn() };
-    return { FakeVm, item, invited, list, ids: ["!a:example.org", "!inv:example.org"] };
+    const current = { a: item as unknown as { getSnapshot: () => object; subscribe: (cb: () => void) => () => void } };
+    return { FakeVm, item, invited, list, current, ids: ["!a:example.org", "!inv:example.org"] };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -58,7 +59,7 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
         public createRoom = h.list.createRoom;
         public createChatRoom = h.list.createChatRoom;
         public getRoomItemViewModel = (id: string) =>
-            id === "!a:example.org" ? h.item : id === "!inv:example.org" ? h.invited : undefined;
+            id === "!a:example.org" ? h.current.a : id === "!inv:example.org" ? h.invited : undefined;
     },
 }));
 vi.mock("../viewmodels/menus/UserMenuViewModel", () => ({
@@ -113,6 +114,18 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
             ["!a:example.org", "join"],
             ["!inv:example.org", "invite"],
         ]);
+    });
+
+    it("follows the room's new item view-model when the list builds another one (a rename re-sorts the room)", () => {
+        const replacement = new h.FakeVm({ ...h.item.getSnapshot(), name: "Renamed" });
+        h.current.a = replacement as never;
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        h.invited.set({}); // any change makes the bridge look at the list again, and see the new view-model
+        replacement.set({ name: "Renamed again" });
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.name).toBe("Renamed again");
+        expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
+        h.current.a = h.item as never;
     });
 
     it("creates a room through the room list view-model's createRoom (Element's dialog)", async () => {

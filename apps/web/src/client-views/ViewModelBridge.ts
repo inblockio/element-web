@@ -1002,7 +1002,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly disposers: Array<() => void> = [];
     private readonly roomList: RoomListViewModel;
     private readonly userMenu: UserMenuViewModel;
-    private readonly watchedItems = new Set<string>();
+    /** The item view-model each room's subscription follows: the list may build a new one for a room (a rename re-sorts it). */
+    private readonly watchedItems = new Map<string, { item: object; off: () => void }>();
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
     /** A `loadOlder` in flight per room: a concurrent call gets the same answer. */
     private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
@@ -1156,9 +1157,10 @@ export class ViewModelBridge implements ClientViewBridge {
         for (const id of ids) {
             const item = this.roomList.getRoomItemViewModel(id);
             if (!item) continue;
-            if (!this.watchedItems.has(id)) {
-                this.watchedItems.add(id);
-                this.disposers.push(item.subscribe(() => this.syncRooms()));
+            const watched = this.watchedItems.get(id);
+            if (watched?.item !== item) {
+                watched?.off();
+                this.watchedItems.set(id, { item, off: item.subscribe(() => this.syncRooms()) });
             }
             const s = item.getSnapshot();
             const room = this.client.getRoom(id);
@@ -1703,6 +1705,8 @@ export class ViewModelBridge implements ClientViewBridge {
         this.disposed = true;
         this.closeReactionPicker();
         [...this.reactionWaits].forEach((cancel) => cancel());
+        this.watchedItems.forEach((w) => w.off());
+        this.watchedItems.clear();
         this.disposers.forEach((d) => d());
         this.rows.forEach((r) => r.dispose());
         this.senderAvatars.forEach((a) => a.dispose());
