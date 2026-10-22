@@ -15,14 +15,23 @@
 import {
     ClientEvent,
     EventStatus,
+    EventType,
     type MatrixClient,
-    type MatrixEvent,
     MatrixError,
+    type MatrixEvent,
     MsgType,
+    RelationType,
+    type Room,
+    RoomMember,
 } from "matrix-js-sdk/src/matrix";
 import { type RoomMessageEventContent } from "matrix-js-sdk/src/types";
 
 import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
+import { canEditContent } from "../utils/EventUtils";
+import { addReplyToMessageContent } from "../utils/Reply";
+import { attachMentions, attachRelation } from "../utils/messages";
+import { TimelineRenderingType } from "../contexts/RoomContext";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { createRoomFromLocalRoom } from "../utils/direct-messages";
@@ -37,6 +46,14 @@ import { type ActionOutcome, ClientViewActionError } from "./types";
 export const AWAITS_SEND_TEXT =
     "a composer send view-model (vm/composer ships only MessageComposerUrlPreviewViewModel)";
 
+/** The message types editText replaces as plain text (the types `canEditContent` allows besides a poll). */
+const EDITABLE_TEXT_MSGTYPES = new Set<string>([MsgType.Text, MsgType.Emote]);
+
+/** A11 edit: an edit/composer view-model. Entry goes through the event tile's `onEditClick`; the send is Element's. */
+export const AWAITS_EDIT_TEXT = "an edit/composer view-model (EventTileActionBarViewModel only opens the edit state)";
+/** A12 delete: the event tile action bar's `onRemoveClick` (absent in v1.12.32; only EditHistoryActionBarViewModel forwards one). */
+export const AWAITS_REDACT = "EventTileActionBarViewModel.onRemoveClick (not implemented in v1.12.32)";
+
 function pendingEventsOf(client: MatrixClient, roomId: string): MatrixEvent[] {
     try {
         return client.getRoom(roomId)?.getPendingEvents() ?? [];
@@ -46,8 +63,11 @@ function pendingEventsOf(client: MatrixClient, roomId: string): MatrixEvent[] {
 }
 
 /**
- * Cancels the pending (NOT_SENT) event a failed `client.sendMessage` leaves behind: it would block every later send in
- * that room ("Event blocked by other events not yet sent") and is persisted across a reload.
+ * Cancels the pending (NOT_SENT) event a failed `client.sendMessage` left behind: it would block every later send in
+ * that room ("Event blocked by other events not yet sent") and is persisted across a reload. Also frees its transaction
+ * id: the SDK keeps `Room.txnToEvent[txnId]` after a cancel (no public way to drop it), and a later send with the same
+ * id would throw before any request. Called only for a transaction id that had no local echo before the send, so the
+ * event found is this call's own and an echo that existed before is never touched.
  */
 function cancelFailedPendingEvents(client: MatrixClient, roomId: string, txnId: string): void {
     try {
@@ -58,6 +78,37 @@ function cancelFailedPendingEvents(client: MatrixClient, roomId: string, txnId: 
     } catch {
         // best effort: the send error is what the caller needs to see
     }
+    try {
+        (client.getRoom(roomId) as unknown as { txnToEvent?: Map<string, MatrixEvent> } | null)?.txnToEvent?.delete(
+            txnId,
+        );
+    } catch {
+        // best effort
+    }
+}
+
+/**
+ * The event a message action targets: the loaded one of the room, else fetched from the homeserver. `unknown_event`
+ * when it cannot be loaded (the action's client call is then not made).
+ */
+export async function loadEvent(client: MatrixClient, room: Room, eventId: string): Promise<MatrixEvent> {
+    const loaded = room.findEventById(eventId);
+    if (loaded) return loaded;
+    try {
+        const ev = client.getEventMapper()(await client.fetchRoomEvent(room.roomId, eventId));
+        if (ev.getId() !== eventId || (ev.getRoomId() && ev.getRoomId() !== room.roomId))
+            throw new Error("wrong event");
+        return ev;
+    } catch (e) {
+        throw new ClientViewActionError("unknown_event", `event ${eventId} cannot be loaded: ${(e as Error).message}`);
+    }
+}
+
+/** The event's sender as a member, so Element's mention rules (`replyToEvent.sender`) work on a fetched event. */
+function withSender(room: Room, ev: MatrixEvent): MatrixEvent {
+    const senderId = ev.getSender();
+    if (!ev.sender && senderId) ev.sender = room.getMember(senderId) ?? new RoomMember(room.roomId, senderId);
+    return ev;
 }
 
 // H4: every DM-creation failure maps to `failed`. `createRoomFromLocalRoom` swallows the cause (it only sets ERROR),
@@ -101,13 +152,21 @@ export async function sendText(
     roomId: string,
     text: string,
     opts: { txnId?: string; replyTo?: string } = {},
+    hooks: { onReplyTarget?: (target: MatrixEvent) => void } = {},
 ): Promise<ActionOutcome> {
-    // AWAITS: see AWAITS_SEND_TEXT. Replies (A3) are not implemented in this path yet.
-    if (opts.replyTo) throw new ClientViewActionError("unsupported", "replying is not supported yet");
+    // AWAITS: see AWAITS_SEND_TEXT.
     const room = client.getRoom(roomId);
     if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
     if (!text.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
+    // A3: the replied event is loaded first (`unknown_event` before anything is sent), the view-model entry follows.
+    const replyTo = opts.replyTo ? withSender(room, await loadEvent(client, room, opts.replyTo)) : undefined;
     const content: RoomMessageEventContent = { msgtype: MsgType.Text, body: text };
+    if (replyTo) {
+        // As `createMessageContent` (SendMessageComposer): the mentions (the replied sender), then the reply relation.
+        attachMentions(client.getSafeUserId(), content, null, replyTo);
+        addReplyToMessageContent(content, replyTo);
+        hooks.onReplyTarget?.(replyTo);
+    }
     // Always our own transaction id: the cancel of a failed send finds exactly this pending event.
     const txnId = opts.txnId ?? client.makeTxnId();
 
@@ -123,6 +182,14 @@ export async function sendText(
             roomId,
             async (actualRoomId: string) => {
                 sentRoomId = actualRoomId;
+                // A transaction id with a local echo already (a pending send, or a failed one restored from a reload) is
+                // not ours to send over or cancel: refused before any request or echo of this call.
+                if (client.getRoom(actualRoomId)?.getEventForTxnId(txnId)) {
+                    throw new ClientViewActionError(
+                        "failed",
+                        `a message with transaction id ${txnId} is already pending`,
+                    );
+                }
                 try {
                     return await client.sendMessage(actualRoomId, null, content, txnId);
                 } catch (e) {
@@ -136,6 +203,10 @@ export async function sendText(
         queued = local?.afterCreateCallbacks.find((cb) => !known.has(cb));
         // As Element's composer: the event is queued, then `message_sent` goes out; the response is awaited below.
         defaultDispatcher.dispatch({ action: "message_sent" });
+        if (replyTo) {
+            // The reply state goes with the queued message (SendMessageComposer clears it the same way).
+            defaultDispatcher.dispatch({ action: "reply_to_event", event: null, context: TimelineRenderingType.Room });
+        }
         let response;
         if (local && queued) {
             // The dispatched `local_room_event` has no listener without a mounted RoomView; the creation runs here
@@ -168,6 +239,145 @@ export async function sendText(
     } finally {
         stopWatching();
         if (local && queued) local.afterCreateCallbacks = local.afterCreateCallbacks.filter((cb) => cb !== queued);
+    }
+}
+
+/**
+ * The own event of a message action, loaded (room timeline, else `fetchRoomEvent`). Only the user's own event:
+ * `forbidden` for anyone else's, also for a user with redact power (bridge v2, addendum rule 2).
+ */
+async function loadOwnEvent(
+    client: MatrixClient,
+    roomId: string,
+    eventId: string,
+): Promise<{ room: Room; ev: MatrixEvent }> {
+    const room = client.getRoom(roomId);
+    if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+    const ev = await loadEvent(client, room, eventId);
+    if (ev.getSender() !== client.getUserId()) {
+        throw new ClientViewActionError("forbidden", "only the user's own message can be changed");
+    }
+    return { room, ev };
+}
+
+/** The link preview bundle entries whose URL (`matched_url`, else `og:url`) occurs in `text`; undefined when none. */
+function keepPreviewsIn(bundle: unknown, text: string): unknown[] | undefined {
+    if (!Array.isArray(bundle)) return undefined;
+    const kept = bundle.filter((p: unknown) => {
+        const entry = (p ?? {}) as Record<string, unknown>;
+        const url = typeof entry["matched_url"] === "string" ? entry["matched_url"] : entry["og:url"];
+        return typeof url === "string" && url !== "" && text.includes(url);
+    });
+    return kept.length ? kept : undefined;
+}
+
+/**
+ * A11 edit: the replacement event as Element's plain-text edit composer builds it (`createEditContent`, rules 3-6 of the
+ * D20 addendum): `* text` as the outer body, `m.new_content` with the plain text and the ORIGINAL msgtype, `m.mentions`
+ * through `attachMentions` (outer lists only new mentions), an existing link preview bundle copied onto
+ * `m.new_content`, the `m.replace` relation. Own event only and only when `canEditContent` allows (else `forbidden`);
+ * a blank text is `failed` and sends nothing; an earlier queued or unsent replacement of the event is cancelled first.
+ * `onEnter` is the action bar view-model's `onEditClick` (the edit state), called once the edit is allowed. Resolves
+ * with the ORIGINAL event id (the replacement's id is never a message id), once the homeserver has the replacement.
+ */
+export async function editText(
+    client: MatrixClient,
+    roomId: string,
+    eventId: string,
+    text: string,
+    hooks: { onEnter?: (ev: MatrixEvent) => boolean | void } = {},
+): Promise<ActionOutcome> {
+    const { room, ev } = await loadOwnEvent(client, roomId, eventId);
+    if (!canEditContent(client, ev)) throw new ClientViewActionError("forbidden", "this message cannot be edited");
+    // Only a plain text message: canEditContent also allows an own poll, whose edit is Element's poll dialog, not a
+    // text replacement (the replacement would turn the poll into text).
+    if (ev.getType() !== EventType.RoomMessage || !EDITABLE_TEXT_MSGTYPES.has(ev.getOriginalContent().msgtype ?? "")) {
+        throw new ClientViewActionError("forbidden", "only a text message can be edited");
+    }
+    if (!text.trim()) throw new ClientViewActionError("failed", "an empty edit is not sent");
+    const original = ev.getOriginalContent();
+    const newContent: Record<string, unknown> = { msgtype: original.msgtype, body: text };
+    // The bundle on screen (a replacement's `m.new_content` once edited), as the edit composer restores it.
+    // Only the previews of URLs the new text still has (the composer keeps just those); none left, no key.
+    const kept = keepPreviewsIn(ev.getContent()["com.beeper.linkpreviews"], text);
+    if (kept !== undefined) newContent["com.beeper.linkpreviews"] = kept;
+    const content: Record<string, unknown> = {
+        "msgtype": original.msgtype,
+        "body": `* ${text}`,
+        "m.new_content": newContent,
+    };
+    const repliedTo = ev.replyEventId ? room.findEventById(ev.replyEventId) : undefined;
+    attachMentions(
+        client.getSafeUserId(),
+        content,
+        null,
+        repliedTo ? withSender(room, repliedTo) : undefined,
+        ev.getContent(),
+    );
+    attachRelation(content, { rel_type: RelationType.Replace, event_id: eventId });
+
+    const previous = ev.replacingEvent();
+    if (previous && (previous.status === EventStatus.QUEUED || previous.status === EventStatus.NOT_SENT)) {
+        client.cancelPendingEvent(previous);
+    }
+    const txnId = client.makeTxnId();
+    // Element's edit state ends with the send, but only an edit state this call entered: an entry the hook skipped (the
+    // room is not the one on screen) must not clear the composer or search of the room that is.
+    let entered = false;
+    try {
+        if (hooks.onEnter) {
+            entered = true;
+            if (hooks.onEnter(ev) === false) entered = false;
+        }
+        await client.sendMessage(roomId, ev.threadRootId ?? null, content as unknown as RoomMessageEventContent, txnId);
+        defaultDispatcher.dispatch({ action: "message_sent" });
+        return { status: "done", roomId, eventId };
+    } catch (e) {
+        cancelFailedPendingEvents(client, roomId, txnId);
+        throw toActionError(e);
+    } finally {
+        // (EditMessageComposer.endEdit)
+        if (entered) {
+            defaultDispatcher.dispatch({
+                action: Action.EditEvent,
+                event: null,
+                timelineRenderingType: TimelineRenderingType.Room,
+            });
+        }
+    }
+}
+
+/**
+ * A12 delete: redacts the user's own event with `client.redactEvent`, as Element's redact dialog does after its
+ * confirmation (D20 addendum rule 6: no dialog here, the kit's own confirm came first). `done` when the call resolves;
+ * a failed redaction cancels the local redaction it left, so the message does not look deleted.
+ */
+export async function redact(client: MatrixClient, roomId: string, eventId: string): Promise<ActionOutcome> {
+    // AWAITS: see AWAITS_REDACT.
+    const { ev } = await loadOwnEvent(client, roomId, eventId);
+    // An already deleted event is not redacted again: a failure would unmark its tombstone below.
+    if (ev.isRedacted()) throw new ClientViewActionError("forbidden", "this message is already deleted");
+    // Our own transaction id, as editText: the failed redaction is found by it, whichever event object the SDK marked
+    // (a fetched target is not in the room; an overlapping second redact is not the target's local redaction).
+    const txnId = client.makeTxnId();
+    try {
+        await client.redactEvent(roomId, eventId, txnId);
+        return { status: "done", roomId, eventId };
+    } catch (e) {
+        cancelFailedPendingEvents(client, roomId, txnId);
+        try {
+            // The SDK undoes the local redaction only on the unfiltered timeline set, not on a thread's: unmark the
+            // target if the failed redaction of this call is still what marks it.
+            const local = ev.localRedactionEvent();
+            if (local && local.getTxnId() === txnId) {
+                // a room that keeps no detached pending list: the redaction is still pending
+                if (local.status === EventStatus.NOT_SENT) client.cancelPendingEvent(local);
+                ev.unmarkLocallyRedacted();
+            }
+        } catch {
+            // best effort: the redaction error is what the caller needs to see
+        }
+        throw toActionError(e);
     }
 }
 

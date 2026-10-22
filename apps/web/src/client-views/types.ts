@@ -58,6 +58,20 @@ export interface ViewMessage {
      * `unsigned.transaction_id`). A kit that sent it with a txnId of its own recognises its optimistic copy by it.
      */
     txnId?: string;
+    /**
+     * Own message that Element's edit rule allows editing (`canEditContent`: sent, not redacted, not an edit itself, own,
+     * `m.text` or `m.emote` with a body). A kit offers its edit control only when this is true. Absent = not editable.
+     */
+    canEdit?: boolean;
+    /** The message has been edited (the edited marker's rule: a replacement event exists). */
+    edited?: true;
+    /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
+    editedTs?: number;
+    /**
+     * The message was deleted (redacted). Its `body` is then Element's own redacted text ("Message deleted"); a kit may
+     * drop or tombstone the row.
+     */
+    redacted?: true;
     /** The image, file, video or audio of a media message, from its body view-model. Absent for any other message. */
     media?: ViewMedia;
     /**
@@ -240,6 +254,20 @@ export interface ClientViewBridge {
      * `cancelled` when the confirm says no, `unsupported` for an archived room, `failed` when the leave did not happen.
      */
     leave(roomId: string): Promise<ActionOutcome>;
+    /**
+     * A11: edits the user's own message `eventId` (the Matrix event id) to the plain text `text`. Resolves `done` with
+     * the ORIGINAL event id once the homeserver holds the replacement. `forbidden` for another user's message or one
+     * Element does not let the user edit (`ViewMessage.canEdit`), `unknown_event` when it cannot be loaded, `failed`
+     * for a blank text (nothing is sent). Interim (D16/D20): entry through the action bar view-model's `onEditClick`,
+     * the replacement send is Element's own client call.
+     */
+    editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome>;
+    /**
+     * A12: deletes (redacts) the user's own message `eventId`. `done` once the homeserver accepted the redaction;
+     * `forbidden` for another user's message (also for a user with redact power), `unknown_event` when it cannot be
+     * loaded. The kit asks for the confirmation. Interim (D16/D20): Element's own client call.
+     */
+    redact(roomId: string, eventId: string): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
