@@ -156,6 +156,20 @@ describe("A6 start chat (RoomListViewModel.createChatRoom -> Element's invite di
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!local_abc:example.org" });
     });
 
+    it("waits for the chat's ViewRoom when Element dispatches it after the dialog's answer (its dispatch is async)", async () => {
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = startChatViaDialog(d.start);
+            d.finish(true);
+            await vi.advanceTimersByTimeAsync(0);
+            viewRoom("local+dm", undefined);
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+dm" });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("is cancelled when the dialog closes without success", async () => {
         const d = openDialogOnStart();
         const outcome = startChatViaDialog(d.start);
@@ -163,11 +177,18 @@ describe("A6 start chat (RoomListViewModel.createChatRoom -> Element's invite di
         await expect(outcome).resolves.toEqual({ status: "cancelled" });
     });
 
-    it("fails when the dialog reports success but showed no room", async () => {
-        const d = openDialogOnStart();
-        const outcome = startChatViaDialog(d.start);
-        d.finish(true);
-        expect(await codeOf(outcome)).toBe("failed");
+    it("fails when the dialog reports success but no room is shown", async () => {
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = startChatViaDialog(d.start);
+            d.finish(true);
+            const code = codeOf(outcome);
+            await vi.advanceTimersByTimeAsync(6000);
+            expect(await code).toBe("failed");
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
 

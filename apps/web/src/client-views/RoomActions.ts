@@ -29,6 +29,8 @@ import { type ActionOutcome, ClientViewActionError } from "./types";
 export const ROOM_ACTION_TIMEOUT_MS = 15_000;
 /** After Element reports the leave done, how long the membership may take to show it (an error leaves it as it was). */
 export const LEAVE_SETTLE_MS = 3_000;
+/** How long Element may take to show the chat once its dialog reported success. */
+const CHAT_SHOWN_MS = 5_000;
 /** How long Element's dialog may take to open after the view-model action. */
 const DIALOG_OPEN_MS = 5_000;
 
@@ -160,7 +162,7 @@ export function createRoomViaDialog(start: () => void): Promise<ActionOutcome> {
  * A6 start chat: Element's start-chat dialog (`InviteDialog`). Its "Go" has already dispatched the `ViewRoom` of the
  * chat when the dialog reports success: an existing DM (trigger `MessageUser`) or the local room of a new one
  * (`direct-messages.ts`; the first `sendText` turns it into the real room). `done` + that room id, `cancelled` when the
- * dialog closes without success, `failed` when it reports success but no room was shown.
+ * dialog closes without success, `failed` when it reports success but no room is shown within 5 s.
  */
 export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
     return dialogAction(async () => {
@@ -169,9 +171,9 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
             const dialog = await openedDialog(start);
             const [success] = await dialog.finished;
             if (!success) return { status: "cancelled" };
-            const shown = [...seen.payloads].reverse().find(isViewRoom);
-            if (!shown?.room_id) throw new ClientViewActionError("failed", "Element did not open the chat");
-            return { status: "done", roomId: shown.room_id };
+            // Element dispatches asynchronously, so the chat's `ViewRoom` may follow the dialog's answer by a tick.
+            const roomId = await seen.wait<string>((p) => (isViewRoom(p) ? p.room_id : undefined), CHAT_SHOWN_MS);
+            return { status: "done", roomId };
         } finally {
             seen.stop();
         }
