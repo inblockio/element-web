@@ -55,7 +55,7 @@ const h = vi.hoisted(() => {
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
-    RoomListViewModel: class extends h.FakeVm<{ sections: { roomIds: string[] }[] }> {
+    RoomListViewModel: class extends h.FakeVm<{ sections: { id: string; roomIds: string[] }[] }> {
         public constructor() {
             super({ sections: [{ id: "recent", roomIds: h.ids }] });
             h.lists.push(this);
