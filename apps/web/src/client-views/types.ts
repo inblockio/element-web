@@ -60,6 +60,8 @@ export interface ViewMessage {
     canEdit?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
+    /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
+    editedTs?: number;
     /**
      * The message was deleted (redacted). Its `body` is then Element's own redacted text ("Message deleted"); a kit may
      * drop or tombstone the row.

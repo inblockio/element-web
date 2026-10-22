@@ -369,6 +369,11 @@ class EventRow {
         return !!this.ev.replacingEventId();
     }
 
+    /** When the latest replacement was sent (its `origin_server_ts`), else undefined. */
+    public editedTs(): number | undefined {
+        return this.ev.replacingEvent()?.getTs();
+    }
+
     /**
      * The row's E2E trust signals (REQ-0007): the decryption failure body view-model for an undecryptable event, the
      * padlock view-model for a decrypted one. `localDeviceVerified` is what the stock UI reads from
@@ -1296,7 +1301,12 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.threadSummary(),
                 row.media(),
                 row.urlPreviews(),
-                { canEdit: row.canEdit(), edited: row.edited(), redactedText: row.redactedText() },
+                {
+                    canEdit: row.canEdit(),
+                    edited: row.edited(),
+                    editedTs: row.editedTs(),
+                    redactedText: row.redactedText(),
+                },
             );
             if (message) {
                 const txnId = this.ownTxnId(eventItem.event as MatrixEvent);
@@ -1570,7 +1580,7 @@ export class ViewModelBridge implements ClientViewBridge {
     public editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome> {
         this.used = true;
         return editText(this.client, roomId, eventId, text, {
-            onEnter: (ev) => this.actionBar(ev, (vm) => vm.onEditClick(null), false),
+            onEnter: (ev) => this.actionBar(ev, (vm) => vm.onEditClick(null), true),
         });
     }
 

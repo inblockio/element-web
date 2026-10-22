@@ -433,6 +433,51 @@ describe("A11 editText and A12 redact (interim)", () => {
             expect(content["m.new_content"]["com.beeper.linkpreviews"]).toEqual([{ matched_url: "https://x.y" }]);
         });
 
+        it("takes the link preview bundle from the content on screen (a replacement's), not the original wire content", async () => {
+            const ev = own({
+                "msgtype": "m.text",
+                "body": "see https://a.b",
+                "com.beeper.linkpreviews": [{ matched_url: "https://old" }],
+            });
+            const replacement = new MatrixEvent({
+                type: "m.room.message",
+                room_id: room.roomId,
+                event_id: "$edit1",
+                sender: "@me:example.org",
+                content: {
+                    "msgtype": "m.text",
+                    "body": "* see https://a.b",
+                    "m.new_content": {
+                        "msgtype": "m.text",
+                        "body": "see https://a.b",
+                        "com.beeper.linkpreviews": [{ matched_url: "https://a.b" }],
+                    },
+                    "m.relates_to": { rel_type: "m.replace", event_id: "$mine" },
+                },
+            });
+            ev.makeReplaced(replacement);
+            vi.spyOn(room, "findEventById").mockReturnValue(ev);
+            await editText(client, room.roomId, "$mine", "see https://a.b now");
+            const content = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(content["m.new_content"]["com.beeper.linkpreviews"]).toEqual([{ matched_url: "https://a.b" }]);
+        });
+
+        it("is forbidden for an own poll: it is not a text message (Element's poll dialog edits it)", async () => {
+            const onEnter = vi.fn();
+            vi.spyOn(room, "findEventById").mockReturnValue(
+                new MatrixEvent({
+                    type: "org.matrix.msc3381.poll.start",
+                    room_id: room.roomId,
+                    event_id: "$poll",
+                    sender: "@me:example.org",
+                    content: {},
+                }),
+            );
+            expect(await codeOf(editText(client, room.roomId, "$poll", "hello", { onEnter }))).toBe("forbidden");
+            expect(onEnter).not.toHaveBeenCalled();
+            expect(client.sendMessage).not.toHaveBeenCalled();
+        });
+
         it("is forbidden for another user's message and for one canEditContent refuses; blank is failed; nothing is sent", async () => {
             vi.spyOn(room, "findEventById").mockReturnValue(
                 new MatrixEvent({
@@ -481,7 +526,7 @@ describe("A11 editText and A12 redact (interim)", () => {
                 roomId: room.roomId,
                 eventId: "$mine",
             });
-            expect(client.redactEvent).toHaveBeenCalledWith(room.roomId, "$mine");
+            expect(client.redactEvent).toHaveBeenCalledWith(room.roomId, "$mine", expect.any(String));
         });
 
         it("is forbidden for another user's event even with redact power, and does not call the client", async () => {
@@ -508,11 +553,84 @@ describe("A11 editText and A12 redact (interim)", () => {
             const ev = own();
             const local = new MatrixEvent({ type: "m.room.redaction", content: {} });
             local.setStatus(EventStatus.NOT_SENT);
+            local.setTxnId("t-own");
+            vi.mocked(client.makeTxnId).mockReturnValueOnce("t-own");
             vi.spyOn(ev, "localRedactionEvent").mockReturnValue(local);
             vi.spyOn(room, "findEventById").mockReturnValue(ev);
             vi.mocked(client.redactEvent).mockRejectedValueOnce(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));
             expect(await codeOf(redact(client, room.roomId, "$mine"))).toBe("forbidden");
             expect(client.cancelPendingEvent).toHaveBeenCalledWith(local);
+        });
+
+        describe("a failed redaction leaves nothing pending (own transaction id)", () => {
+            const detachedRoom = () => {
+                const detached = new Room("!a:example.org", client, "@me:example.org", {
+                    pendingEventOrdering: PendingEventOrdering.Detached,
+                });
+                vi.mocked(client.getRoom).mockImplementation((id?: string) =>
+                    id === detached.roomId ? detached : null,
+                );
+                return detached;
+            };
+            const redaction = (txnId: string) => {
+                const r = new MatrixEvent({ type: "m.room.redaction", content: {}, redacts: "$mine" });
+                r.setTxnId(txnId);
+                r.setStatus(EventStatus.NOT_SENT);
+                return r;
+            };
+
+            it("cancels the NOT_SENT redaction by txn id when the target was fetched, not in the room", async () => {
+                const detached = detachedRoom();
+                vi.spyOn(detached, "findEventById").mockReturnValue(undefined);
+                vi.mocked(client.fetchRoomEvent).mockResolvedValue({
+                    type: "m.room.message",
+                    room_id: detached.roomId,
+                    event_id: "$mine",
+                    sender: "@me:example.org",
+                    content: { msgtype: "m.text", body: "x" },
+                } as any);
+                vi.mocked(client.redactEvent).mockImplementationOnce(async (_r: any, _e: any, txnId: any) => {
+                    detached.addPendingEvent(redaction(txnId), txnId);
+                    throw new MatrixError({ errcode: "M_FORBIDDEN" }, 403);
+                });
+                expect(await codeOf(redact(client, detached.roomId, "$mine"))).toBe("forbidden");
+                const cancelled = vi.mocked(client.cancelPendingEvent).mock.calls.map(([ev]) => ev.getTxnId());
+                expect(cancelled).toHaveLength(1);
+                expect(cancelled[0]).toBe(vi.mocked(client.redactEvent).mock.calls[0][2]);
+            });
+
+            it("cancels its own failed redaction, not the other in-flight redaction the target is marked with", async () => {
+                const detached = detachedRoom();
+                const ev = own();
+                vi.spyOn(detached, "findEventById").mockReturnValue(ev);
+                const inflight = redaction("other-call");
+                inflight.setStatus(EventStatus.SENDING);
+                ev.markLocallyRedacted(inflight);
+                vi.mocked(client.redactEvent).mockImplementationOnce(async (_r: any, _e: any, txnId: any) => {
+                    detached.addPendingEvent(redaction(txnId), txnId);
+                    throw new HTTPError("boom", 500);
+                });
+                await codeOf(redact(client, detached.roomId, "$mine"));
+                const cancelled = vi.mocked(client.cancelPendingEvent).mock.calls.map(([e]) => e.getTxnId());
+                expect(cancelled).toEqual([vi.mocked(client.redactEvent).mock.calls[0][2]]);
+                // the other call's local redaction is still its own
+                expect(ev.localRedactionEvent()).toBe(inflight);
+            });
+
+            it("unmarks the target's local redaction when the SDK's cancel did not (a thread reply)", async () => {
+                const detached = detachedRoom();
+                const ev = own();
+                vi.spyOn(detached, "findEventById").mockReturnValue(ev);
+                vi.mocked(client.redactEvent).mockImplementationOnce(async (_r: any, _e: any, txnId: any) => {
+                    const r = redaction(txnId);
+                    detached.addPendingEvent(r, txnId);
+                    ev.markLocallyRedacted(r);
+                    throw new MatrixError({ errcode: "M_FORBIDDEN" }, 403);
+                });
+                expect(await codeOf(redact(client, detached.roomId, "$mine"))).toBe("forbidden");
+                expect(ev.localRedactionEvent()).toBeNull();
+                expect(ev.isRedacted()).toBe(false);
+            });
         });
     });
 });

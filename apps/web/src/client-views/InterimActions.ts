@@ -15,6 +15,7 @@
 import {
     ClientEvent,
     EventStatus,
+    EventType,
     type MatrixClient,
     type MatrixEvent,
     MsgType,
@@ -43,6 +44,9 @@ import { type ActionOutcome, ClientViewActionError } from "./types";
  */
 export const AWAITS_SEND_TEXT =
     "a composer send view-model (vm/composer ships only MessageComposerUrlPreviewViewModel)";
+
+/** The message types editText replaces as plain text (the types `canEditContent` allows besides a poll). */
+const EDITABLE_TEXT_MSGTYPES = new Set<string>([MsgType.Text, MsgType.Emote]);
 
 /** A11 edit: an edit/composer view-model. Entry goes through the event tile's `onEditClick`; the send is Element's. */
 export const AWAITS_EDIT_TEXT = "an edit/composer view-model (EventTileActionBarViewModel only opens the edit state)";
@@ -273,10 +277,16 @@ export async function editText(
 ): Promise<ActionOutcome> {
     const { room, ev } = await loadOwnEvent(client, roomId, eventId);
     if (!canEditContent(client, ev)) throw new ClientViewActionError("forbidden", "this message cannot be edited");
+    // Only a plain text message: canEditContent also allows an own poll, whose edit is Element's poll dialog, not a
+    // text replacement (the replacement would turn the poll into text).
+    if (ev.getType() !== EventType.RoomMessage || !EDITABLE_TEXT_MSGTYPES.has(ev.getOriginalContent().msgtype ?? "")) {
+        throw new ClientViewActionError("forbidden", "only a text message can be edited");
+    }
     if (!text.trim()) throw new ClientViewActionError("failed", "an empty edit is not sent");
     const original = ev.getOriginalContent();
     const newContent: Record<string, unknown> = { msgtype: original.msgtype, body: text };
-    const previews = original["com.beeper.linkpreviews"];
+    // The bundle on screen (a replacement's `m.new_content` once edited), as the edit composer restores it.
+    const previews = ev.getContent()["com.beeper.linkpreviews"];
     if (previews !== undefined) newContent["com.beeper.linkpreviews"] = previews;
     const content: Record<string, unknown> = {
         "msgtype": original.msgtype,
@@ -324,13 +334,23 @@ export async function editText(
 export async function redact(client: MatrixClient, roomId: string, eventId: string): Promise<ActionOutcome> {
     // AWAITS: see AWAITS_REDACT.
     const { ev } = await loadOwnEvent(client, roomId, eventId);
+    // Our own transaction id, as editText: the failed redaction is found by it, whichever event object the SDK marked
+    // (a fetched target is not in the room; an overlapping second redact is not the target's local redaction).
+    const txnId = client.makeTxnId();
     try {
-        await client.redactEvent(roomId, eventId);
+        await client.redactEvent(roomId, eventId, txnId);
         return { status: "done", roomId, eventId };
     } catch (e) {
+        cancelFailedPendingEvents(client, roomId, txnId);
         try {
+            // The SDK undoes the local redaction only on the unfiltered timeline set, not on a thread's: unmark the
+            // target if the failed redaction of this call is still what marks it.
             const local = ev.localRedactionEvent();
-            if (local && local.status === EventStatus.NOT_SENT) client.cancelPendingEvent(local);
+            if (local && local.getTxnId() === txnId) {
+                // a room that keeps no detached pending list: the redaction is still pending
+                if (local.status === EventStatus.NOT_SENT) client.cancelPendingEvent(local);
+                ev.unmarkLocallyRedacted();
+            }
         } catch {
             // best effort: the redaction error is what the caller needs to see
         }

@@ -566,6 +566,7 @@ describe("ViewModelBridge", () => {
         });
 
         it("editText hands over to the interim edit and enters the edit state through onEditClick", async () => {
+            h.sdkContext.roomViewStore = { getRoomId: () => "!a" };
             h.editText.mockResolvedValueOnce({ status: "done", roomId: "!a", eventId: "$mine" });
             await expect(bridge.editText("!a", "$mine", "new")).resolves.toEqual({
                 status: "done",
@@ -578,6 +579,19 @@ describe("ViewModelBridge", () => {
             expect(h.actionBars[0].onEditClick).toHaveBeenCalledTimes(1);
             expect(h.actionBars[0].onReplyClick).not.toHaveBeenCalled();
             expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+        });
+
+        it("enters the edit state only for the room RoomViewStore already shows: it would navigate Element's UI otherwise", async () => {
+            h.editText.mockResolvedValue({ status: "done", roomId: "!a", eventId: "$mine" });
+            await bridge.editText("!a", "$mine", "new");
+            const hooks = h.editText.mock.calls[0][4] as { onEnter: (ev: unknown) => void };
+            h.sdkContext.roomViewStore = { getRoomId: () => "!other" };
+            hooks.onEnter(target("$mine"));
+            expect(h.actionBars).toHaveLength(0);
+            h.sdkContext.roomViewStore = { getRoomId: () => "!a" };
+            hooks.onEnter(target("$mine"));
+            expect(h.actionBars).toHaveLength(1);
+            expect(h.actionBars[0].onEditClick).toHaveBeenCalledTimes(1);
         });
 
         it("redact hands over to the interim redaction", async () => {
@@ -612,6 +626,19 @@ describe("ViewModelBridge", () => {
             (ev as { replacingEventId: () => string | undefined }).replacingEventId = () => "$edit";
             expect(message().canEdit).toBeUndefined();
             expect(message().edited).toBe(true);
+            expect(message().editedTs).toBeUndefined();
+        });
+
+        it("hands over editedTs: the replacement's timestamp, only with edited", () => {
+            const { ev, message } = readFirst();
+            const e = ev as { replacingEventId: () => string | undefined; replacingEvent: () => unknown };
+            e.replacingEventId = () => "$edit";
+            e.replacingEvent = () => fakeEvent("$edit", { getTs: () => 7777 });
+            expect(message()).toMatchObject({ edited: true, editedTs: 7777 });
+            expect(message().ts).not.toBe(7777);
+            e.replacingEventId = () => undefined;
+            e.replacingEvent = () => undefined;
+            expect(message().editedTs).toBeUndefined();
         });
 
         it("reads a redacted event as Element's redacted body with redacted: true and nothing of its content", () => {
