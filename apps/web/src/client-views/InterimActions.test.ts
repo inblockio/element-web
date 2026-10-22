@@ -227,9 +227,9 @@ describe("sendText (interim action, D16)", () => {
         detached.addPendingEvent(restored, "restored");
         vi.mocked(client.sendMessage).mockImplementationOnce(async (_room, _thread, content, txn) => {
             const ev = new MatrixEvent({ type: "m.room.message", content });
-            ev.setTxnId(txn as string);
+            ev.setTxnId(txn!);
             ev.setStatus(EventStatus.NOT_SENT);
-            detached.addPendingEvent(ev, txn as string);
+            detached.addPendingEvent(ev, txn!);
             const late = new MatrixEvent({ type: "m.room.message", content });
             late.setTxnId("late");
             late.setStatus(EventStatus.NOT_SENT);
@@ -250,9 +250,9 @@ describe("sendText (interim action, D16)", () => {
         // A client whose failed send leaves the NOT_SENT echo, and whose cancel keeps `txnToEvent` (as the SDK does).
         vi.mocked(client.sendMessage).mockImplementationOnce(async (_r, _t, content, txn) => {
             const ev = new MatrixEvent({ type: "m.room.message", content });
-            ev.setTxnId(txn as string);
+            ev.setTxnId(txn!);
             ev.setStatus(EventStatus.NOT_SENT);
-            detached.addPendingEvent(ev, txn as string);
+            detached.addPendingEvent(ev, txn!);
             throw new ConnectionError("offline");
         });
         expect(await codeOf(sendText(client, detached.roomId, "hi", { txnId: "rc-9" }))).toBe("network");
@@ -260,9 +260,9 @@ describe("sendText (interim action, D16)", () => {
         // The retry reaches the client (the real SDK would otherwise throw "known txnId" from addPendingEvent).
         vi.mocked(client.sendMessage).mockImplementationOnce(async (_r, _t, content, txn) => {
             const ev = new MatrixEvent({ type: "m.room.message", content });
-            ev.setTxnId(txn as string);
+            ev.setTxnId(txn!);
             ev.setStatus(EventStatus.SENDING);
-            detached.addPendingEvent(ev, txn as string);
+            detached.addPendingEvent(ev, txn!);
             return { event_id: "$retried" };
         });
         expect(await sendText(client, detached.roomId, "hi", { txnId: "rc-9" })).toEqual({
