@@ -139,7 +139,7 @@ const h = vi.hoisted(() => {
         [];
     const eventUtils = { canEdit: true };
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
-    const videoRooms = { video: false, activeCall: null as unknown };
+
     return {
         sendText: vi.fn(),
         editText: vi.fn(),
@@ -147,7 +147,6 @@ const h = vi.hoisted(() => {
         actionBars,
         eventUtils,
         sdkContext,
-        videoRooms,
         mediaVm,
         FakeVm,
         mediaVms,
@@ -392,8 +391,6 @@ vi.mock("../viewmodels/message-body/RedactedBodyViewModel", () => ({
 vi.mock("../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState", () => ({
     getRedactedBodyViewModelProps: () => ({ text: "Message deleted" }),
 }));
-vi.mock("../utils/video-rooms", () => ({ isVideoRoom: () => h.videoRooms.video }));
-vi.mock("../stores/CallStore", () => ({ CallStore: { instance: { getActiveCall: () => h.videoRooms.activeCall } } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => "http://avatar/room" }));
 vi.mock("./InterimActions", () => ({
@@ -472,8 +469,6 @@ describe("ViewModelBridge", () => {
         h.actionBars.length = 0;
         h.eventUtils.canEdit = true;
         h.sdkContext.roomViewStore = { getRoomId: () => null };
-        h.videoRooms.video = false;
-        h.videoRooms.activeCall = null;
     });
 
     it("maps the room list and the user menu snapshots", () => {
@@ -546,6 +541,7 @@ describe("ViewModelBridge", () => {
         const target = (id = "$t") => fakeEvent(id, { getSender: () => "@bob:example.org" });
 
         it("starts a reply through the replied event's action bar view-model, then disposes it", () => {
+            h.sdkContext.roomViewStore = { getRoomId: () => "!a" };
             h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
             void bridge.sendText("!a", "answer", { txnId: "t", replyTo: "$t" });
             const hooks = h.sendText.mock.calls[0][4] as { onReplyTarget: (ev: unknown) => void };
@@ -557,20 +553,16 @@ describe("ViewModelBridge", () => {
             expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
         });
 
-        it("skips the reply entry in a video room or a room with an active call (it would start the call)", () => {
+        it("starts the reply entry only for the room RoomViewStore already shows: it would navigate Element's UI otherwise", () => {
             h.sendText.mockResolvedValue({ status: "done" });
             void bridge.sendText("!a", "x", { replyTo: "$t" });
             const hooks = h.sendText.mock.calls[0][4] as { onReplyTarget: (ev: unknown) => void };
-            h.videoRooms.video = true;
-            hooks.onReplyTarget(target());
-            h.videoRooms.video = false;
-            h.videoRooms.activeCall = {};
             hooks.onReplyTarget(target());
             expect(h.actionBars).toHaveLength(0);
-            // the room RoomViewStore already shows is never navigated to: the entry runs
             h.sdkContext.roomViewStore = { getRoomId: () => "!a" };
             hooks.onReplyTarget(target());
             expect(h.actionBars).toHaveLength(1);
+            expect(h.actionBars[0].onReplyClick).toHaveBeenCalledTimes(1);
         });
 
         it("editText hands over to the interim edit and enters the edit state through onEditClick", async () => {
@@ -603,6 +595,14 @@ describe("ViewModelBridge", () => {
             h.timeline.snapshot = { items: [{ kind: "event", event: ev, continuation: false }], atLiveEnd: true };
             return { ev, message: () => bridge.timeline("!a")[0] };
         };
+
+        it("lists an own message once its remote echo arrived, also when its row was built while the send was only SENT", () => {
+            const ev = fakeEvent("$m1", { getSender: () => "@me:example.org", status: "sent" as string | null });
+            h.timeline.snapshot = { items: [{ kind: "event", event: ev, continuation: false }], atLiveEnd: true };
+            expect(bridge.timeline("!a")).toEqual([]);
+            ev.status = null;
+            expect(bridge.timeline("!a").map((m) => m.id)).toEqual(["$m1"]);
+        });
 
         it("hands over canEdit by Element's rule, and edited when a replacement exists", () => {
             const { ev, message } = readFirst();

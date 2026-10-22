@@ -69,8 +69,6 @@ import { canEditContent, isContentActionable } from "../utils/EventUtils";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
 import { RedactedBodyViewModel } from "../viewmodels/message-body/RedactedBodyViewModel";
 import { getRedactedBodyViewModelProps } from "../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState";
-import { isVideoRoom } from "../utils/video-rooms";
-import { CallStore } from "../stores/CallStore";
 import { getEventTileThread } from "../viewmodels/room/timeline/event-tile/EventTileThreadState";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
@@ -1280,7 +1278,10 @@ export class ViewModelBridge implements ClientViewBridge {
             const isMessage =
                 tile.event.eventType === EventType.RoomMessage ||
                 tile.event.eventType === EventType.RoomMessageEncrypted;
-            if (!isMessage || tile.event.isLocalEcho) continue;
+            // The tile snapshot's `isLocalEcho` is fixed when the row is built: a row built in the window between the send
+            // response (real event id, status SENT) and the remote echo kept it for good and hid the own message forever.
+            // The event's status is read live.
+            if (!isMessage || (eventItem.event as MatrixEvent).status != null) continue;
             const senderAvatarUrl = tile.sender.senderId
                 ? this.senderAvatarUrl(roomId, tile.sender.senderId)
                 : undefined;
@@ -1559,16 +1560,15 @@ export class ViewModelBridge implements ClientViewBridge {
 
     /**
      * Runs one action of an event's action bar view-model (the stock one, built for this call and disposed after).
-     * `reply_to_event` makes `RoomViewStore` view a room it does not show yet, and for a video room or a room with an
-     * active call that would start the call (principle 4): the reply entry is skipped there, the reply content does
-     * not depend on it.
+     * `reply_to_event` makes `RoomViewStore` dispatch `ViewRoom` for a room it does not show (RoomViewStore.tsx, case
+     * "reply_to_event"), which navigates Element's own UI under the kit (principle 4; observed in the reply e2e: the
+     * kit's timeline stops updating) and starts a call in a video room. So the reply entry runs only for the room the
+     * store already shows; for any other the reply content is still sent with the relation (it does not depend on the
+     * reply state), and the view-model entry is skipped. A contract mismatch, reported with A3.
      */
     private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): void {
         const roomId = ev.getRoomId() ?? "";
-        const room = this.client.getRoom(roomId);
-        if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) {
-            if (!room || isVideoRoom(room) || CallStore.instance.getActiveCall(roomId) !== null) return;
-        }
+        if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) return;
         const vm = new EventTileActionBarViewModel({
             mxEvent: ev,
             timelineRenderingType: TimelineRenderingType.Room,
