@@ -14,6 +14,7 @@ import {
     type Thread,
     EventType,
     KnownMembership,
+    ClientEvent,
     MatrixEventEvent,
     MsgType,
     RelationsEvent,
@@ -73,7 +74,11 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
-import { sendText } from "./InterimActions";
+import { acceptInvite, declineInvite, joinRoom, sendText } from "./InterimActions";
+import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
+import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
+import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
 import { toActionError } from "./actions";
 import {
     type ActionOutcome,
@@ -978,6 +983,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly heldForEncryption = new Set<string>();
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
+    /** Local rooms of the chats started here (A6) that Element has not created yet; listed until they are. */
+    private readonly localChats = new Set<string>();
     private lastConnection: ViewConnection = "online";
     /** Whether the signed-in user's cross-signing identity is verified: the stock UI's "local device verified" state. */
     private localDeviceVerified = false;
@@ -1019,6 +1026,12 @@ export class ViewModelBridge implements ClientViewBridge {
         this.disposers.push(this.userMenu.subscribe(() => this.emit({ kind: "me" })));
         this.watchLocalVerification();
         this.watchEncryption();
+        // A local chat room changes state (creating, created, error) through client room events.
+        const onLocalRoom = (room: Room): void => {
+            if (this.localChats.has(room.roomId)) this.syncRooms();
+        };
+        client.on(ClientEvent.Room, onLocalRoom);
+        this.disposers.push(() => client.off(ClientEvent.Room, onLocalRoom));
         this.syncRooms();
     }
 
@@ -1105,7 +1118,7 @@ export class ViewModelBridge implements ClientViewBridge {
         const ids = this.roomList.getSnapshot().sections.flatMap((s) => s.roomIds);
         // Item view-models exist only for rooms the list was told are visible.
         this.roomList.updateVisibleRooms(0, ids.length);
-        const rooms: ViewRoom[] = [];
+        const rooms: ViewRoom[] = this.localChatRooms();
         for (const id of ids) {
             const item = this.roomList.getRoomItemViewModel(id);
             if (!item) continue;
@@ -1122,6 +1135,32 @@ export class ViewModelBridge implements ClientViewBridge {
         if (JSON.stringify(rooms) === JSON.stringify(this.roomCache)) return;
         this.roomCache = rooms;
         this.emit({ kind: "rooms" });
+    }
+
+    /**
+     * The chats started from the kit (A6) that have no real room yet, from the client's local rooms (`createDmLocalRoom`),
+     * first in the list. A chat whose room has been created (or whose local room is gone) is dropped: the real room is in
+     * the room list view-model's own list.
+     */
+    private localChatRooms(): ViewRoom[] {
+        const out: ViewRoom[] = [];
+        for (const id of this.localChats) {
+            const room = this.client.getRoom(id) as LocalRoom | null;
+            if (!room || !isLocalRoom(id) || room.state === LocalRoomState.CREATED) {
+                this.localChats.delete(id);
+                continue;
+            }
+            out.push({
+                id,
+                name: room.name,
+                unreadCount: 0,
+                mentionCount: 0,
+                isDirect: true,
+                order: out.length,
+                membership: "join",
+            });
+        }
+        return out;
     }
 
     /** The sync state is global; the room status bar view-model exposes it for whichever room it is given. */
@@ -1527,6 +1566,44 @@ export class ViewModelBridge implements ClientViewBridge {
 
     public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {
         return sendText(this.client, roomId, text, opts);
+    }
+
+    public join(roomIdOrAlias: string): Promise<ActionOutcome> {
+        return joinRoom(this.client, roomIdOrAlias);
+    }
+
+    public acceptInvite(roomId: string): Promise<ActionOutcome> {
+        return acceptInvite(this.client, roomId);
+    }
+
+    public declineInvite(roomId: string): Promise<ActionOutcome> {
+        return declineInvite(this.client, roomId);
+    }
+
+    public async createRoom(): Promise<ActionOutcome> {
+        return createRoomViaDialog(() => this.roomList.createRoom());
+    }
+
+    public async createChat(): Promise<ActionOutcome> {
+        const outcome = await startChatViaDialog(() => this.roomList.createChatRoom());
+        // The local room of a new chat is listed (and opened) by the kit like any room until the first send creates it.
+        if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
+            this.localChats.add(outcome.roomId);
+            this.syncRooms();
+        }
+        return outcome;
+    }
+
+    public async leave(roomId: string): Promise<ActionOutcome> {
+        const room = this.client.getRoom(roomId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        const item = this.roomList.getRoomItemViewModel(roomId);
+        if (!item || !("onLeaveRoom" in item))
+            throw new ClientViewActionError("unknown_room", `${roomId} is not in the room list`);
+        // The view-model would `forget_room` an archived room without any confirm: not a leave.
+        if (room.tags?.[DefaultTagID.Archived])
+            throw new ClientViewActionError("unsupported", "an archived room is not left");
+        return leaveViaDialog(this.client, roomId, () => item.onLeaveRoom());
     }
 
     public onChange(cb: (e: ChangeEvent) => void): () => void {

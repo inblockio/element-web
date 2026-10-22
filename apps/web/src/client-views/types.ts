@@ -21,6 +21,11 @@ export interface ViewRoom {
     isDirect: boolean;
     /** position in the room list snapshot, 0 = top */
     order: number;
+    /**
+     * `invite` = the room list item's snapshot flags the room as invited (`notification.invited`); absent or `join` =
+     * joined. An invite has no inviter field (no view-model source).
+     */
+    membership?: "join" | "invite";
 }
 
 /** A message as the timeline, event tile and body view-models show it. */
@@ -210,6 +215,31 @@ export interface ClientViewBridge {
      */
     loadOlder(roomId: string): Promise<LoadOlderResult>;
     onChange(cb: (e: { kind: "rooms" | "timeline" | "me" | "connection"; roomId?: string }) => void): () => void;
+    /**
+     * A5: joins a room by id or `#alias:server` (no `ViewRoom`); `done` + the joined room's id. `unknown_room` for an
+     * address that does not exist, `forbidden` when the server refuses. Interim (D16).
+     */
+    join(roomIdOrAlias: string): Promise<ActionOutcome>;
+    /** A5: accepts an invite (the join of that room). Interim (D16). */
+    acceptInvite(roomId: string): Promise<ActionOutcome>;
+    /** A5: declines an invite (`client.leave`). Interim (D16). */
+    declineInvite(roomId: string): Promise<ActionOutcome>;
+    /**
+     * A6: Element's create-room dialog (`RoomListViewModel.createRoom`). `done` + the new room's id once Element has
+     * created it, `cancelled` when the dialog closes without creating, `failed` on Element's error dialog or after 15 s.
+     */
+    createRoom(): Promise<ActionOutcome>;
+    /**
+     * A6: Element's start-chat dialog (`RoomListViewModel.createChatRoom`). `done` + the chat's room id: an existing DM,
+     * or the local room of a new one (listed in `rooms()` until its first `sendText` creates the real room).
+     * `cancelled` when the dialog closes without a chat.
+     */
+    createChat(): Promise<ActionOutcome>;
+    /**
+     * A7: Element's leave confirm (`RoomListItemViewModel.onLeaveRoom`). `done` once the user is no longer in the room,
+     * `cancelled` when the confirm says no, `unsupported` for an archived room, `failed` when the leave did not happen.
+     */
+    leave(roomId: string): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */

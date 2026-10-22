@@ -69,6 +69,7 @@ export function toViewRoom(
         mentionCount: n.isMention ? unreadCount : 0,
         isDirect: snapshot.isDm,
         order,
+        membership: n.invited ? "invite" : "join",
     };
 }
 

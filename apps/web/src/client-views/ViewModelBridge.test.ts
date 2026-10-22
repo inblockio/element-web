@@ -441,6 +441,7 @@ describe("ViewModelBridge", () => {
                 mentionCount: 0,
                 isDirect: false,
                 order: 0,
+                membership: "join",
             },
         ]);
         expect(bridge.me()).toEqual({ userId: "@me:example.org", displayName: "Me", avatarUrl: "http://avatar/me" });

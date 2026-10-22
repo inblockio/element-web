@@ -111,9 +111,16 @@ describe("client view mapping", () => {
             mentionCount: 3,
             isDirect: false,
             order: 2,
+            membership: "join",
         });
         const quiet = toViewRoom(item({ hasUnreadCount: false, count: 5, isMention: false }), 0);
         expect([quiet.unreadCount, quiet.mentionCount]).toEqual([0, 0]);
+        // A5: an invited room (the item snapshot's `notification.invited`) is an invite.
+        const invited = toViewRoom(
+            item({ hasUnreadCount: false, count: 0, isMention: false, invited: true } as never),
+            0,
+        );
+        expect(invited.membership).toBe("invite");
     });
 
     it("reads text from nested nodes", () => {

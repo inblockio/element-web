@@ -12,7 +12,14 @@
  * No view-model of our own is shaped here: these are plain functions over the client.
  */
 
-import { ClientEvent, EventStatus, type MatrixClient, type MatrixEvent, MsgType } from "matrix-js-sdk/src/matrix";
+import {
+    ClientEvent,
+    EventStatus,
+    type MatrixClient,
+    type MatrixEvent,
+    MatrixError,
+    MsgType,
+} from "matrix-js-sdk/src/matrix";
 import { type RoomMessageEventContent } from "matrix-js-sdk/src/types";
 
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -161,5 +168,57 @@ export async function sendText(
     } finally {
         stopWatching();
         if (local && queued) local.afterCreateCallbacks = local.afterCreateCallbacks.filter((cb) => cb !== queued);
+    }
+}
+
+/**
+ * A5 join / invite: a room preview and join view-model, and an invite view-model. Today the room list item snapshot only
+ * flags `notification.invited`, and joining lives in `RoomView` (not mounted under a kit).
+ */
+export const AWAITS_JOIN =
+    "a room preview and join view-model (the room view joins through RoomViewStore, not a view-model)";
+export const AWAITS_INVITE = "an invite view-model (the room list item snapshot only flags notification.invited)";
+
+/**
+ * Joins a room by id or by `#alias:server` the way Element does (`client.joinRoom`), without `ViewRoom` (bridge
+ * principle 4). An alias is resolved first (`getRoomIdForAlias`, whose servers become the join's `viaServers`). `done`
+ * carries the joined room's id; M_NOT_FOUND and a malformed address are `unknown_room`, M_FORBIDDEN `forbidden`.
+ */
+export async function joinRoom(client: MatrixClient, roomIdOrAlias: string): Promise<ActionOutcome> {
+    const target = roomIdOrAlias.trim();
+    if (!target.startsWith("#") && !target.startsWith("!")) {
+        throw new ClientViewActionError("unknown_room", `${target || "(empty)"} is not a room id or alias`);
+    }
+    try {
+        let roomId = target;
+        let viaServers: string[] | undefined;
+        if (target.startsWith("#")) {
+            const resolved = await client.getRoomIdForAlias(target);
+            roomId = resolved.room_id;
+            viaServers = resolved.servers?.slice(0, 3);
+        }
+        const room = await client.joinRoom(roomId, viaServers?.length ? { viaServers } : undefined);
+        return { status: "done", roomId: room.roomId };
+    } catch (e) {
+        if (e instanceof MatrixError && (e.errcode === "M_NOT_FOUND" || e.errcode === "M_UNKNOWN_ROOM")) {
+            throw new ClientViewActionError("unknown_room", e.message);
+        }
+        throw toActionError(e);
+    }
+}
+
+/** Accepts an invite: the join of the invited room (AWAITS: see `AWAITS_INVITE`). */
+export function acceptInvite(client: MatrixClient, roomId: string): Promise<ActionOutcome> {
+    return joinRoom(client, roomId);
+}
+
+/** Declines an invite: `client.leave` on the invited room, as `RoomView` does (AWAITS: see `AWAITS_INVITE`). */
+export async function declineInvite(client: MatrixClient, roomId: string): Promise<ActionOutcome> {
+    if (!client.getRoom(roomId)) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+    try {
+        await client.leave(roomId);
+        return { status: "done", roomId };
+    } catch (e) {
+        throw toActionError(e);
     }
 }

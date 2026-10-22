@@ -21,7 +21,7 @@ import {
 } from "matrix-js-sdk/src/matrix";
 import { createTestClient } from "test-utils";
 
-import { sendText } from "./InterimActions";
+import { acceptInvite, declineInvite, joinRoom, sendText } from "./InterimActions";
 import { ClientViewActionError } from "./types";
 import { LocalRoom, LocalRoomState, LOCAL_ROOM_ID_PREFIX } from "../models/LocalRoom";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -241,5 +241,74 @@ describe("sendText (interim action, D16)", () => {
         const sentTxn = vi.mocked(client.sendMessage).mock.calls[0][3];
         expect(sentTxn).toEqual(expect.any(String));
         expect(vi.mocked(client.cancelPendingEvent).mock.calls.map(([ev]) => ev.getTxnId())).toEqual([sentTxn]);
+    });
+});
+
+describe("join, accept and decline (interim actions, D16)", () => {
+    let client: MatrixClient;
+
+    beforeEach(() => {
+        client = createTestClient();
+        vi.mocked(client.joinRoom).mockImplementation(async (id: string) => ({ roomId: id }) as unknown as Room);
+        vi.mocked(client.getRoomIdForAlias).mockResolvedValue({ room_id: "!r:example.org", servers: ["example.org"] });
+        vi.mocked(client.getRoom).mockImplementation((id?: string) =>
+            id === "!inv:example.org" ? ({ roomId: id } as unknown as Room) : null,
+        );
+        vi.mocked(client.leave).mockResolvedValue({});
+    });
+
+    it("joins a room id, done with the joined room's id", async () => {
+        await expect(joinRoom(client, "!r:example.org")).resolves.toEqual({ status: "done", roomId: "!r:example.org" });
+        expect(client.joinRoom).toHaveBeenCalledWith("!r:example.org", undefined);
+        expect(client.getRoomIdForAlias).not.toHaveBeenCalled();
+    });
+
+    it("resolves an alias first and joins through the servers that came with it, without a ViewRoom", async () => {
+        const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
+        await expect(joinRoom(client, " #lobby:example.org ")).resolves.toEqual({
+            status: "done",
+            roomId: "!r:example.org",
+        });
+        expect(client.getRoomIdForAlias).toHaveBeenCalledWith("#lobby:example.org");
+        expect(client.joinRoom).toHaveBeenCalledWith("!r:example.org", { viaServers: ["example.org"] });
+        expect(dispatch).not.toHaveBeenCalled();
+    });
+
+    it("maps a missing alias or room to unknown_room, a refusal to forbidden, a lost connection to network", async () => {
+        vi.mocked(client.getRoomIdForAlias).mockRejectedValue(
+            new MatrixError({ errcode: "M_NOT_FOUND", error: "no" }, 404),
+        );
+        expect(await codeOf(joinRoom(client, "#nope:example.org"))).toBe("unknown_room");
+        vi.mocked(client.joinRoom).mockRejectedValue(new MatrixError({ errcode: "M_NOT_FOUND", error: "no" }, 404));
+        expect(await codeOf(joinRoom(client, "!gone:example.org"))).toBe("unknown_room");
+        vi.mocked(client.joinRoom).mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403));
+        expect(await codeOf(joinRoom(client, "!priv:example.org"))).toBe("forbidden");
+        vi.mocked(client.joinRoom).mockRejectedValue(new ConnectionError("offline"));
+        expect(await codeOf(joinRoom(client, "!r:example.org"))).toBe("network");
+    });
+
+    it("refuses an address that is neither a room id nor an alias, without calling the client", async () => {
+        expect(await codeOf(joinRoom(client, "lobby"))).toBe("unknown_room");
+        expect(await codeOf(joinRoom(client, "   "))).toBe("unknown_room");
+        expect(client.joinRoom).not.toHaveBeenCalled();
+    });
+
+    it("accepts an invite as the join of that room", async () => {
+        await expect(acceptInvite(client, "!inv:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "!inv:example.org",
+        });
+        expect(client.joinRoom).toHaveBeenCalledWith("!inv:example.org", undefined);
+    });
+
+    it("declines an invite by leaving the room, unknown_room for a room the client does not have", async () => {
+        await expect(declineInvite(client, "!inv:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "!inv:example.org",
+        });
+        expect(client.leave).toHaveBeenCalledWith("!inv:example.org");
+        expect(await codeOf(declineInvite(client, "!none:example.org"))).toBe("unknown_room");
+        vi.mocked(client.leave).mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403));
+        expect(await codeOf(declineInvite(client, "!inv:example.org"))).toBe("forbidden");
     });
 });
