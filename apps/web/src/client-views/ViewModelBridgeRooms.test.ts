@@ -161,6 +161,14 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         dispatch.mockRestore();
     });
 
+    it("tells the kit to read a room's timeline again when its invite became a join", () => {
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        h.invited.set({ notification: { hasUnreadCount: false, count: 0, isMention: false, invited: false } });
+        expect(onChange.mock.calls.map((c) => c[0])).toContainEqual({ kind: "timeline", roomId: "!inv:example.org" });
+        h.invited.set({ notification: { hasUnreadCount: false, count: 0, isMention: false, invited: true } });
+    });
+
     it("creates a room through the room list view-model's createRoom (Element's dialog)", async () => {
         actions.createRoomViaDialog.mockImplementation(async (start: () => void) => {
             start();

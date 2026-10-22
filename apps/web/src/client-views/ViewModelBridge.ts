@@ -1019,6 +1019,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly heldForEncryption = new Set<string>();
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
+    /** The rooms that were invites at the last look. */
+    private invitedRooms = new Set<string>();
     /** Local rooms of the chats started here (A6) that Element has not created yet; listed until they are. */
     private readonly localChats = new Set<string>();
     private lastConnection: ViewConnection = "online";
@@ -1177,9 +1179,13 @@ export class ViewModelBridge implements ClientViewBridge {
             rooms.push(toViewRoom(s, rooms.length, avatarUrl));
             if (!this.statusBar && room) this.watchConnection(room);
         }
+        // An invite that became a join: the kit asks for the room's timeline again (none was built while it was invited).
+        const joined = rooms.filter((r) => r.membership !== "invite" && this.invitedRooms.has(r.id));
+        this.invitedRooms = new Set(rooms.filter((r) => r.membership === "invite").map((r) => r.id));
         if (JSON.stringify(rooms) === JSON.stringify(this.roomCache)) return;
         this.roomCache = rooms;
         this.emit({ kind: "rooms" });
+        for (const r of joined) this.emit({ kind: "timeline", roomId: r.id });
     }
 
     /**
@@ -1230,6 +1236,8 @@ export class ViewModelBridge implements ClientViewBridge {
         if (!this.roomList.getRoomItemViewModel(roomId)) return undefined;
         const room = this.client.getRoom(roomId);
         if (!room) return undefined;
+        // An invited room has no timeline to load, and a view-model built now would stay empty after the join (see `syncRooms`).
+        if (room.getMyMembership() !== KnownMembership.Join) return undefined;
         const vm = new RoomTimelineViewModel({ client: this.client, room });
         this.timelines.set(roomId, vm);
         // start() opens on the reader's saved scroll position in the stock UI, which may be a window without the
