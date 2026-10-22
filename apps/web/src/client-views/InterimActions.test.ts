@@ -426,7 +426,7 @@ describe("A11 editText and A12 redact (interim)", () => {
                     "com.beeper.linkpreviews": [{ matched_url: "https://x.y" }],
                 }),
             );
-            await editText(client, room.roomId, "$mine", "waves hard");
+            await editText(client, room.roomId, "$mine", "waves https://x.y hard");
             const content = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
             expect(content.msgtype).toBe("m.emote");
             expect(content["m.new_content"].msgtype).toBe("m.emote");
@@ -460,6 +460,30 @@ describe("A11 editText and A12 redact (interim)", () => {
             await editText(client, room.roomId, "$mine", "see https://a.b now");
             const content = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
             expect(content["m.new_content"]["com.beeper.linkpreviews"]).toEqual([{ matched_url: "https://a.b" }]);
+        });
+
+        it("keeps only the previews of URLs the new text still has, and no key when none remain", async () => {
+            vi.spyOn(room, "findEventById").mockReturnValue(
+                own({
+                    "msgtype": "m.text",
+                    "body": "see https://a.b and https://c.d",
+                    "com.beeper.linkpreviews": [{ matched_url: "https://a.b" }, { "og:url": "https://c.d" }],
+                }),
+            );
+            await editText(client, room.roomId, "$mine", "only https://c.d now");
+            let content = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(content["m.new_content"]["com.beeper.linkpreviews"]).toEqual([{ "og:url": "https://c.d" }]);
+            await editText(client, room.roomId, "$mine", "no link at all");
+            content = vi.mocked(client.sendMessage).mock.calls[1][2] as Record<string, any>;
+            expect("com.beeper.linkpreviews" in content["m.new_content"]).toBe(false);
+        });
+
+        it("ends the edit state only when the entry ran: a skipped entry (another room) leaves the shown room's composer alone", async () => {
+            vi.spyOn(room, "findEventById").mockReturnValue(own());
+            await editText(client, room.roomId, "$mine", "a", { onEnter: () => false });
+            expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ action: "edit_event" }));
+            await editText(client, room.roomId, "$mine", "b", { onEnter: () => true });
+            expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ action: "edit_event", event: null }));
         });
 
         it("is forbidden for an own poll: it is not a text message (Element's poll dialog edits it)", async () => {
@@ -511,7 +535,9 @@ describe("A11 editText and A12 redact (interim)", () => {
             vi.spyOn(ev, "replacingEvent").mockReturnValue(queued);
             vi.spyOn(room, "findEventById").mockReturnValue(ev);
             vi.mocked(client.sendMessage).mockRejectedValueOnce(new MatrixError({ errcode: "M_FORBIDDEN" }, 403));
-            expect(await codeOf(editText(client, room.roomId, "$mine", "again"))).toBe("forbidden");
+            expect(await codeOf(editText(client, room.roomId, "$mine", "again", { onEnter: () => true }))).toBe(
+                "forbidden",
+            );
             expect(client.cancelPendingEvent).toHaveBeenCalledWith(queued);
             // the edit state is ended either way
             expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ action: "edit_event", event: null }));
@@ -539,6 +565,14 @@ describe("A11 editText and A12 redact (interim)", () => {
             });
             vi.spyOn(room, "findEventById").mockReturnValue(theirs);
             expect(await codeOf(redact(client, room.roomId, "$theirs"))).toBe("forbidden");
+            expect(client.redactEvent).not.toHaveBeenCalled();
+        });
+
+        it("refuses an already deleted event up front: a failed second redact would clear its tombstone", async () => {
+            const ev = own();
+            vi.spyOn(ev, "isRedacted").mockReturnValue(true);
+            vi.spyOn(room, "findEventById").mockReturnValue(ev);
+            expect(await codeOf(redact(client, room.roomId, "$mine"))).toBe("forbidden");
             expect(client.redactEvent).not.toHaveBeenCalled();
         });
 
@@ -605,7 +639,7 @@ describe("A11 editText and A12 redact (interim)", () => {
                 vi.spyOn(detached, "findEventById").mockReturnValue(ev);
                 const inflight = redaction("other-call");
                 inflight.setStatus(EventStatus.SENDING);
-                ev.markLocallyRedacted(inflight);
+                vi.spyOn(ev, "localRedactionEvent").mockReturnValue(inflight);
                 vi.mocked(client.redactEvent).mockImplementationOnce(async (_r: any, _e: any, txnId: any) => {
                     detached.addPendingEvent(redaction(txnId), txnId);
                     throw new HTTPError("boom", 500);

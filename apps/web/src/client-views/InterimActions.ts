@@ -259,6 +259,17 @@ async function loadOwnEvent(
     return { room, ev };
 }
 
+/** The link preview bundle entries whose URL (`matched_url`, else `og:url`) occurs in `text`; undefined when none. */
+function keepPreviewsIn(bundle: unknown, text: string): unknown[] | undefined {
+    if (!Array.isArray(bundle)) return undefined;
+    const kept = bundle.filter((p: unknown) => {
+        const entry = (p ?? {}) as Record<string, unknown>;
+        const url = typeof entry["matched_url"] === "string" ? entry["matched_url"] : entry["og:url"];
+        return typeof url === "string" && url !== "" && text.includes(url);
+    });
+    return kept.length ? kept : undefined;
+}
+
 /**
  * A11 edit: the replacement event as Element's plain-text edit composer builds it (`createEditContent`, rules 3-6 of the
  * D20 addendum): `* text` as the outer body, `m.new_content` with the plain text and the ORIGINAL msgtype, `m.mentions`
@@ -273,7 +284,7 @@ export async function editText(
     roomId: string,
     eventId: string,
     text: string,
-    hooks: { onEnter?: (ev: MatrixEvent) => void } = {},
+    hooks: { onEnter?: (ev: MatrixEvent) => boolean | void } = {},
 ): Promise<ActionOutcome> {
     const { room, ev } = await loadOwnEvent(client, roomId, eventId);
     if (!canEditContent(client, ev)) throw new ClientViewActionError("forbidden", "this message cannot be edited");
@@ -286,8 +297,9 @@ export async function editText(
     const original = ev.getOriginalContent();
     const newContent: Record<string, unknown> = { msgtype: original.msgtype, body: text };
     // The bundle on screen (a replacement's `m.new_content` once edited), as the edit composer restores it.
-    const previews = ev.getContent()["com.beeper.linkpreviews"];
-    if (previews !== undefined) newContent["com.beeper.linkpreviews"] = previews;
+    // Only the previews of URLs the new text still has (the composer keeps just those); none left, no key.
+    const kept = keepPreviewsIn(ev.getContent()["com.beeper.linkpreviews"], text);
+    if (kept !== undefined) newContent["com.beeper.linkpreviews"] = kept;
     const content: Record<string, unknown> = {
         "msgtype": original.msgtype,
         "body": `* ${text}`,
@@ -308,8 +320,14 @@ export async function editText(
         client.cancelPendingEvent(previous);
     }
     const txnId = client.makeTxnId();
+    // Element's edit state ends with the send, but only an edit state this call entered: an entry the hook skipped (the
+    // room is not the one on screen) must not clear the composer or search of the room that is.
+    let entered = false;
     try {
-        hooks.onEnter?.(ev);
+        if (hooks.onEnter) {
+            entered = true;
+            if (hooks.onEnter(ev) === false) entered = false;
+        }
         await client.sendMessage(roomId, ev.threadRootId ?? null, content as unknown as RoomMessageEventContent, txnId);
         defaultDispatcher.dispatch({ action: "message_sent" });
         return { status: "done", roomId, eventId };
@@ -317,12 +335,14 @@ export async function editText(
         cancelFailedPendingEvents(client, roomId, txnId);
         throw toActionError(e);
     } finally {
-        // Element's edit state ends with the send (EditMessageComposer.endEdit).
-        defaultDispatcher.dispatch({
-            action: Action.EditEvent,
-            event: null,
-            timelineRenderingType: TimelineRenderingType.Room,
-        });
+        // (EditMessageComposer.endEdit)
+        if (entered) {
+            defaultDispatcher.dispatch({
+                action: Action.EditEvent,
+                event: null,
+                timelineRenderingType: TimelineRenderingType.Room,
+            });
+        }
     }
 }
 
@@ -334,6 +354,8 @@ export async function editText(
 export async function redact(client: MatrixClient, roomId: string, eventId: string): Promise<ActionOutcome> {
     // AWAITS: see AWAITS_REDACT.
     const { ev } = await loadOwnEvent(client, roomId, eventId);
+    // An already deleted event is not redacted again: a failure would unmark its tombstone below.
+    if (ev.isRedacted()) throw new ClientViewActionError("forbidden", "this message is already deleted");
     // Our own transaction id, as editText: the failed redaction is found by it, whichever event object the SDK marked
     // (a fetched target is not in the room; an overlapping second redact is not the target's local redaction).
     const txnId = client.makeTxnId();

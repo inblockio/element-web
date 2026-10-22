@@ -418,6 +418,7 @@ const fakeEvent = (id: string, over: Record<string, unknown> = {}) => {
         decryptionFailureReason: null,
         status: null,
         replacingEvent: () => null,
+        replacingEventDate: () => undefined as Date | undefined,
         replacingEventId: () => undefined as string | undefined,
         isRedacted: () => false,
         getWireContent: () => ({}),
@@ -636,6 +637,14 @@ describe("ViewModelBridge", () => {
             e.replacingEvent = () => fakeEvent("$edit", { getTs: () => 7777 });
             expect(message()).toMatchObject({ edited: true, editedTs: 7777 });
             expect(message().ts).not.toBe(7777);
+            // the server aggregation (no replacement in memory) names the time too, and wins
+            e.replacingEvent = () => undefined;
+            (ev as { replacingEventDate: () => Date }).replacingEventDate = () => new Date(8888);
+            e.replacingEventId = () => "$edit";
+            expect(message()).toMatchObject({ edited: true, editedTs: 8888 });
+            (ev as { replacingEventDate: () => Date | undefined }).replacingEventDate = () => undefined;
+            e.replacingEvent = () => fakeEvent("$edit", { getTs: () => 7777 });
+            expect(message().editedTs).toBe(7777);
             e.replacingEventId = () => undefined;
             e.replacingEvent = () => undefined;
             expect(message().editedTs).toBeUndefined();

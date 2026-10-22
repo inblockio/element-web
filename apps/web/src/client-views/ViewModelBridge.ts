@@ -371,7 +371,8 @@ class EventRow {
 
     /** When the latest replacement was sent (its `origin_server_ts`), else undefined. */
     public editedTs(): number | undefined {
-        return this.ev.replacingEvent()?.getTs();
+        // The server aggregation the edited marker uses, else the replacement held in memory.
+        return this.ev.replacingEventDate()?.getTime() ?? this.ev.replacingEvent()?.getTs();
     }
 
     /**
@@ -1598,9 +1599,9 @@ export class ViewModelBridge implements ClientViewBridge {
      * store already shows; for any other the reply content is still sent with the relation (it does not depend on the
      * reply state), and the view-model entry is skipped. A contract mismatch, reported with A3.
      */
-    private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): void {
+    private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): boolean {
         const roomId = ev.getRoomId() ?? "";
-        if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) return;
+        if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) return false;
         const vm = new EventTileActionBarViewModel({
             mxEvent: ev,
             timelineRenderingType: TimelineRenderingType.Room,
@@ -1609,6 +1610,7 @@ export class ViewModelBridge implements ClientViewBridge {
         });
         try {
             run(vm);
+            return true;
         } finally {
             vm.dispose();
         }
