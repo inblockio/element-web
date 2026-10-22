@@ -9,6 +9,7 @@ import {
     type MatrixClient,
     type MatrixEvent,
     type Room,
+    Direction,
     type Relations,
     type Thread,
     EventType,
@@ -73,6 +74,7 @@ import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { sendText } from "./InterimActions";
+import { toActionError } from "./actions";
 import {
     type ActionOutcome,
     type ClientViewBridge,
@@ -1434,18 +1436,30 @@ export class ViewModelBridge implements ClientViewBridge {
                 .getSnapshot()
                 .items.filter((i): i is EventItem => i.kind === "event")
                 .map((i) => i.event as MatrixEvent);
-        // The start of the room is loaded: its creation event is in the loaded timeline. The creation event is a hidden
-        // event in most rooms, so it is not among the window's items, and the timeline's own backward token is not
-        // cleared by the server's last page: the event itself is the evidence.
-        const atRoomStart = (): boolean => {
-            const room = this.client.getRoom(roomId);
-            const create = room?.currentState.getStateEvents(EventType.RoomCreate, "")?.getId();
-            return !!create && !!room?.getUnfilteredTimelineSet().getTimelineForEvent(create);
+        // The view-model's own `TimelineWindow` (private, read like `loading`): the start of the room is in view when the
+        // creation event is among the window's events (hidden in most rooms, so not among the items), or when the window
+        // cannot paginate backward any more (no token left and the index at the oldest event: the history visibility
+        // stops it before the creation event). The timeline SET is not the window: a reopened view windows only the last
+        // events of a set that may already hold the creation event further back.
+        const timelineWindow = (
+            vm as unknown as {
+                timelineWindow: {
+                    getEvents(): MatrixEvent[];
+                    canPaginate(direction: Direction): boolean;
+                    paginate: (...args: unknown[]) => Promise<boolean>;
+                };
+            }
+        ).timelineWindow;
+        const state = (): Pick<LoadOlderResult, "atStart" | "atLimit"> => {
+            const windowEvents = timelineWindow.getEvents();
+            return {
+                atStart:
+                    windowEvents.some((e) => e.getType() === EventType.RoomCreate) ||
+                    !timelineWindow.canPaginate(Direction.Backward),
+                // The cap is on the window's events, hidden reactions and edits included, not on the rendered rows.
+                atLimit: windowEvents.length >= WINDOW_LIMIT - PAGE_SIZE,
+            };
         };
-        const state = (n: number): Pick<LoadOlderResult, "atStart" | "atLimit"> => ({
-            atStart: events().some((e) => e.getType() === EventType.RoomCreate) || atRoomStart(),
-            atLimit: n >= WINDOW_LIMIT - PAGE_SIZE,
-        });
         // The first window is still loading (or the room has no showable event yet): a page asked now would race it.
         // `loading` is the view-model's own flag for that; it is private and published nowhere.
         await this.waitFor(
@@ -1459,17 +1473,34 @@ export class ViewModelBridge implements ClientViewBridge {
         // markers and jump to live).
         vm.onAnchorReached();
         const before = new Set(events().map((e) => e.getId()));
-        const start = state(before.size);
+        const start = state();
         if (start.atStart || start.atLimit) return { added: 0, ...start };
-        vm.onStartReached();
-        // The paginate chain shows a backward-loading item while it runs; no item (nothing to load, or the chain was
-        // skipped) means it is already over.
-        await this.waitFor(
-            () => !vm.getSnapshot().items.some((i) => i.kind === "loading" && i.key === "backward-loading"),
-            "older messages",
-        );
+        // The view-model's paginate chain catches a failed `/messages` page and publishes nothing that tells it from an
+        // empty page, so the window's own paginate is watched for the length of this page (instance wrap, restored below).
+        let failure: unknown;
+        const paginate = timelineWindow.paginate;
+        timelineWindow.paginate = async (...args: unknown[]) => {
+            try {
+                return await paginate.apply(timelineWindow, args);
+            } catch (e) {
+                if (args[0] === Direction.Backward) failure = e;
+                throw e;
+            }
+        };
+        try {
+            vm.onStartReached();
+            // The paginate chain shows a backward-loading item while it runs; no item (nothing to load, or the chain was
+            // skipped) means it is already over.
+            await this.waitFor(
+                () => !vm.getSnapshot().items.some((i) => i.kind === "loading" && i.key === "backward-loading"),
+                "older messages",
+            );
+        } finally {
+            timelineWindow.paginate = paginate;
+        }
+        if (failure !== undefined) throw toActionError(failure);
         const after = events();
-        return { added: after.filter((e) => !before.has(e.getId())).length, ...state(after.length) };
+        return { added: after.filter((e) => !before.has(e.getId())).length, ...state() };
     }
 
     public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {

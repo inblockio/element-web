@@ -8,7 +8,7 @@
 // @vitest-environment happy-dom
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { ConnectionError, type MatrixClient } from "matrix-js-sdk/src/matrix";
 import { DecryptionFailureCode } from "matrix-js-sdk/src/crypto-api";
 
 import { ViewModelBridge } from "./ViewModelBridge";
@@ -69,6 +69,11 @@ const h = vi.hoisted(() => {
         onStartReached: vi.fn(),
         onAnchorReached: vi.fn(),
         loading: false,
+        timelineWindow: {
+            getEvents: vi.fn((): unknown[] => []),
+            canPaginate: vi.fn((_direction: string) => true),
+            paginate: vi.fn(async (..._args: unknown[]) => true),
+        },
     });
     const statusBar = new FakeVm<{ state: string | null }>({ state: null });
     const avatar = new FakeVm<{ url?: string }>({ url: "http://avatar/bob" });
@@ -2060,10 +2065,15 @@ describe("ViewModelBridge", () => {
         });
         const loadingItem = { kind: "loading" as const, key: "backward-loading" };
         const window = (n: number, from = 0) => Array.from({ length: n }, (_, i) => eventItem(`$e${from + i}`));
+        /** The view-model's TimelineWindow holds these events (hidden ones included). */
+        const windowHolds = (events: { event: unknown }[]) =>
+            h.timeline.timelineWindow.getEvents.mockReturnValue(events.map((i) => i.event));
+        const hidden = (n: number) => Array.from({ length: n }, (_, i) => eventItem(`$h${i}`, "m.reaction"));
         beforeEach(() => {
             h.timeline.loading = false;
-            h.timelineSet.getTimelineForEvent.mockReturnValue(null);
-            h.room.currentState.getStateEvents.mockReturnValue(undefined);
+            h.timeline.timelineWindow.getEvents.mockReset().mockReturnValue([]);
+            h.timeline.timelineWindow.canPaginate.mockReset().mockReturnValue(true);
+            h.timeline.timelineWindow.paginate.mockReset().mockResolvedValue(true);
             h.timeline.set({ items: window(20, 100), pendingAnchor: { targetKey: "$e119", align: "end" } } as never);
             h.timeline.onStartReached.mockReset();
             h.timeline.onAnchorReached.mockReset();
@@ -2098,39 +2108,84 @@ describe("ViewModelBridge", () => {
             expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: false, atLimit: false });
         });
 
-        it("reports atStart, without a page, when the room's creation event is in the window", async () => {
-            h.timeline.set({ items: [eventItem("$create", "m.room.create"), ...window(5)] } as never);
+        it("reports atStart, without a page, when the room's creation event is in the window (a hidden event, not among the items)", async () => {
+            windowHolds([eventItem("$create", "m.room.create"), ...window(5)]);
             expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: true, atLimit: false });
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
         });
 
-        it("reports atStart when the room's creation event is in a loaded timeline (a hidden event, not among the items)", async () => {
+        it("is not at the start for a reopened window whose timeline set holds the creation event further back (grok F1)", async () => {
+            // The set knows the creation event, the view-model's window (the last events) does not, and it can still paginate.
             h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$create" });
             h.timelineSet.getTimelineForEvent.mockImplementation((id: string) => (id === "$create" ? {} : null));
+            windowHolds(window(100, 100));
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [...window(50, 50), ...window(20, 100)] } as never);
+                windowHolds(window(150, 50));
+            });
+            const result = await bridge.loadOlder("!a");
+            expect(h.timeline.onStartReached).toHaveBeenCalledTimes(1);
+            expect(result).toEqual({ added: 50, atStart: false, atLimit: false });
+        });
+
+        it("is at the start when the window cannot paginate backward and no creation event came (history visibility, grok F2)", async () => {
+            windowHolds(window(20, 100));
+            h.timeline.timelineWindow.canPaginate.mockImplementation((d: string) => d !== "b");
             expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: true, atLimit: false });
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
         });
 
-        it("is not at the start while the creation event is not loaded", async () => {
-            h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$create" });
-            h.timelineSet.getTimelineForEvent.mockReturnValue(null);
-            expect((await bridge.loadOlder("!a")).atStart).toBe(false);
+        it("is at the start after a page that leaves the window unable to paginate backward", async () => {
+            windowHolds(window(20, 100));
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [...window(5, 90), ...window(20, 100)] } as never);
+                h.timeline.timelineWindow.canPaginate.mockImplementation((d: string) => d !== "b");
+            });
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 5, atStart: true, atLimit: false });
         });
 
         it("reports atStart after a page that brings in the creation event", async () => {
-            h.timeline.onStartReached.mockImplementation(() =>
-                h.timeline.set({ items: [eventItem("$create", "m.room.create"), ...window(20, 100)] } as never),
-            );
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [eventItem("$create", "m.room.create"), ...window(20, 100)] } as never);
+                windowHolds([eventItem("$create", "m.room.create"), ...window(20, 100)]);
+            });
             expect(await bridge.loadOlder("!a")).toEqual({ added: 1, atStart: true, atLimit: false });
         });
 
-        it("reports atLimit within one page of the window limit and asks for no page (it would drop the live end)", async () => {
-            h.timeline.set({ items: window(900) } as never);
+        it("counts the limit on the window's events, hidden reactions and edits included (grok F2)", async () => {
+            // 900 events in the window, only 20 rendered: a page would pre-trim the live end.
+            windowHolds([...window(20, 100), ...hidden(880)]);
             expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: false, atLimit: true });
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
-            h.timeline.set({ items: window(899) } as never);
-            h.timeline.onStartReached.mockImplementation(() => h.timeline.set({ items: window(920, 0) } as never));
-            expect(await bridge.loadOlder("!a")).toEqual({ added: 21, atStart: false, atLimit: true });
+            windowHolds([...window(20, 100), ...hidden(879)]);
+            h.timeline.onStartReached.mockImplementation(() => {
+                h.timeline.set({ items: [...window(1, 99), ...window(20, 100)] } as never);
+                windowHolds([...window(21, 99), ...hidden(879)]);
+            });
+            expect(await bridge.loadOlder("!a")).toEqual({ added: 1, atStart: false, atLimit: true });
+        });
+
+        it("rejects when the page's /messages failed, with the existing error mapping (grok F2)", async () => {
+            windowHolds(window(20, 100));
+            h.timeline.onStartReached.mockImplementation(() => {
+                // The view-model catches the failure itself; only the window's paginate saw it.
+                h.timeline.set({ items: [loadingItem, ...window(20, 100)] } as never);
+                void h.timeline.timelineWindow
+                    .paginate("b", 100)
+                    .catch(() => undefined)
+                    .then(() => h.timeline.set({ items: window(20, 100) } as never));
+            });
+            h.timeline.timelineWindow.paginate.mockRejectedValue(new ConnectionError("offline"));
+            await expect(bridge.loadOlder("!a")).rejects.toMatchObject({ code: "network" });
+            h.timeline.timelineWindow.paginate.mockRejectedValue(new Error("boom"));
+            await expect(bridge.loadOlder("!a")).rejects.toMatchObject({ code: "failed" });
+        });
+
+        it("restores the window's paginate after the page", async () => {
+            windowHolds(window(20, 100));
+            const original = h.timeline.timelineWindow.paginate;
+            await bridge.loadOlder("!a");
+            expect(h.timeline.timelineWindow.paginate).toBe(original);
         });
 
         it("gives concurrent calls one page and one answer", async () => {
