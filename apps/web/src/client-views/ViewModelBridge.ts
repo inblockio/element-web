@@ -40,6 +40,7 @@ import { TimelineRenderingType } from "../contexts/RoomContext";
 import SettingsStore from "../settings/SettingsStore";
 import { OwnProfileStore } from "../stores/OwnProfileStore";
 import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
 import { avatarUrlForRoom } from "../Avatar";
 import { resolveRoomMemberProfile, roomMemberToMemberInfo } from "../hooks/room/useRoomMemberProfile";
 import { RoomListViewModel } from "../viewmodels/room-list/RoomListViewModel";
@@ -1149,8 +1150,18 @@ export class ViewModelBridge implements ClientViewBridge {
         this.listeners.forEach((cb) => cb(e));
     }
 
+    /** The sections the room list showed at the last look: a section that appears is expanded (see `syncRooms`). */
+    private knownSections = new Set<string>();
+
     private syncRooms(): void {
-        const ids = this.roomList.getSnapshot().sections.flatMap((s) => s.roomIds);
+        const sections = this.roomList.getSnapshot().sections;
+        // The Invites section appears collapsed every time (Element keeps its rooms out of the snapshot then), and a kit
+        // lists every room: the room list view-model's own "expand all" is asked for once per section that appears.
+        const current = new Set(sections.map((s) => s.id));
+        const appeared = [...current].some((id) => !this.knownSections.has(id));
+        this.knownSections = current;
+        if (appeared) defaultDispatcher.dispatch({ action: Action.RoomListExpandAllSections });
+        const ids = sections.flatMap((s) => s.roomIds);
         // Item view-models exist only for rooms the list was told are visible.
         this.roomList.updateVisibleRooms(0, ids.length);
         const rooms: ViewRoom[] = this.localChatRooms();

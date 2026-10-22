@@ -13,6 +13,8 @@ import { ClientEvent, type MatrixClient, type Room } from "matrix-js-sdk/src/mat
 import { ViewModelBridge } from "./ViewModelBridge";
 import { ClientViewActionError } from "./types";
 import { LOCAL_ROOM_ID_PREFIX, LocalRoomState } from "../models/LocalRoom";
+import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
 
 /* A6 / A7 / A5 on the bridge: which view-model action each method calls and what the room list shows around it. */
 const h = vi.hoisted(() => {
@@ -47,13 +49,15 @@ const h = vi.hoisted(() => {
     });
     const list = { createRoom: vi.fn(), createChatRoom: vi.fn() };
     const current = { a: item as unknown as { getSnapshot: () => object; subscribe: (cb: () => void) => () => void } };
-    return { FakeVm, item, invited, list, current, ids: ["!a:example.org", "!inv:example.org"] };
+    const lists: Array<{ set: (s: object) => void }> = [];
+    return { FakeVm, item, invited, list, current, lists, ids: ["!a:example.org", "!inv:example.org"] };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
     RoomListViewModel: class extends h.FakeVm<{ sections: { roomIds: string[] }[] }> {
         public constructor() {
-            super({ sections: [{ roomIds: h.ids }] });
+            super({ sections: [{ id: "recent", roomIds: h.ids }] });
+            h.lists.push(this);
         }
         public updateVisibleRooms = vi.fn();
         public createRoom = h.list.createRoom;
@@ -126,6 +130,39 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.name).toBe("Renamed again");
         expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
         h.current.a = h.item as never;
+    });
+
+    it("asks the room list view-model to expand all sections once per section that appears (the Invites section starts collapsed)", () => {
+        const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
+        const list = h.lists[h.lists.length - 1];
+        dispatch.mockClear();
+        list.set({ sections: [{ id: "recent", roomIds: h.ids }] });
+        expect(dispatch).not.toHaveBeenCalled();
+        list.set({
+            sections: [
+                { id: "invites", roomIds: [] },
+                { id: "recent", roomIds: h.ids },
+            ],
+        });
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(dispatch).toHaveBeenCalledWith({ action: Action.RoomListExpandAllSections });
+        list.set({
+            sections: [
+                { id: "invites", roomIds: ["!inv:example.org"] },
+                { id: "recent", roomIds: h.ids },
+            ],
+        });
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        // The section goes and comes back: collapsed again by Element, expanded again here.
+        list.set({ sections: [{ id: "recent", roomIds: h.ids }] });
+        list.set({
+            sections: [
+                { id: "invites", roomIds: [] },
+                { id: "recent", roomIds: h.ids },
+            ],
+        });
+        expect(dispatch).toHaveBeenCalledTimes(2);
+        dispatch.mockRestore();
     });
 
     it("creates a room through the room list view-model's createRoom (Element's dialog)", async () => {
