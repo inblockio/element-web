@@ -50,7 +50,8 @@ const h = vi.hoisted(() => {
     const list = { createRoom: vi.fn(), createChatRoom: vi.fn() };
     const current = { a: item as unknown as { getSnapshot: () => object; subscribe: (cb: () => void) => () => void } };
     const lists: Array<{ set: (s: object) => void }> = [];
-    return { FakeVm, item, invited, list, current, lists, ids: ["!a:example.org", "!inv:example.org"] };
+    const headers: Record<string, { isExpanded: boolean }> = {};
+    return { FakeVm, item, invited, list, current, lists, headers, ids: ["!a:example.org", "!inv:example.org"] };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -60,6 +61,7 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
             h.lists.push(this);
         }
         public updateVisibleRooms = vi.fn();
+        public getSectionHeaderViewModel = (id: string) => (h.headers[id] ??= { isExpanded: true });
         public createRoom = h.list.createRoom;
         public createChatRoom = h.list.createChatRoom;
         public getRoomItemViewModel = (id: string) =>
@@ -132,36 +134,30 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         h.current.a = h.item as never;
     });
 
-    it("asks the room list view-model to expand all sections once per section that appears (the Invites section starts collapsed)", () => {
+    it("expands a collapsed section (the Invites section appears collapsed and hides its rooms) through the list's expand all", () => {
         const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
         const list = h.lists[h.lists.length - 1];
         dispatch.mockClear();
         list.set({ sections: [{ id: "recent", roomIds: h.ids }] });
         expect(dispatch).not.toHaveBeenCalled();
+        h.headers.invites = { isExpanded: false };
         list.set({
             sections: [
                 { id: "invites", roomIds: [] },
                 { id: "recent", roomIds: h.ids },
             ],
         });
-        expect(dispatch).toHaveBeenCalledTimes(1);
         expect(dispatch).toHaveBeenCalledWith({ action: Action.RoomListExpandAllSections });
-        list.set({
-            sections: [
-                { id: "invites", roomIds: ["!inv:example.org"] },
-                { id: "recent", roomIds: h.ids },
-            ],
-        });
-        expect(dispatch).toHaveBeenCalledTimes(1);
-        // The section goes and comes back: collapsed again by Element, expanded again here.
-        list.set({ sections: [{ id: "recent", roomIds: h.ids }] });
+        // Expanded (or an empty section that is expanded): nothing to ask.
+        dispatch.mockClear();
+        h.headers.invites = { isExpanded: true };
         list.set({
             sections: [
                 { id: "invites", roomIds: [] },
                 { id: "recent", roomIds: h.ids },
             ],
         });
-        expect(dispatch).toHaveBeenCalledTimes(2);
+        expect(dispatch).not.toHaveBeenCalled();
         dispatch.mockRestore();
     });
 

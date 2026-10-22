@@ -1150,17 +1150,15 @@ export class ViewModelBridge implements ClientViewBridge {
         this.listeners.forEach((cb) => cb(e));
     }
 
-    /** The sections the room list showed at the last look: a section that appears is expanded (see `syncRooms`). */
-    private knownSections = new Set<string>();
-
     private syncRooms(): void {
         const sections = this.roomList.getSnapshot().sections;
-        // The Invites section appears collapsed every time (Element keeps its rooms out of the snapshot then), and a kit
-        // lists every room: the room list view-model's own "expand all" is asked for once per section that appears.
-        const current = new Set(sections.map((s) => s.id));
-        const appeared = [...current].some((id) => !this.knownSections.has(id));
-        this.knownSections = current;
-        if (appeared) defaultDispatcher.dispatch({ action: Action.RoomListExpandAllSections });
+        // A collapsed section has no rooms in the snapshot (the Invites section appears collapsed every time), and a kit
+        // lists every room: the section's header view-model is asked (it is built on first ask, collapsed or not), and when
+        // one is collapsed the room list view-model's own "expand all" runs.
+        const collapsed = sections.filter(
+            (s) => s.roomIds.length === 0 && !this.roomList.getSectionHeaderViewModel(s.id).isExpanded,
+        );
+        if (collapsed.length > 0) defaultDispatcher.dispatch({ action: Action.RoomListExpandAllSections });
         const ids = sections.flatMap((s) => s.roomIds);
         // Item view-models exist only for rooms the list was told are visible.
         this.roomList.updateVisibleRooms(0, ids.length);
