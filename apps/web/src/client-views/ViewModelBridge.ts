@@ -65,7 +65,12 @@ import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/Reply
 import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/Reply";
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
-import { isContentActionable } from "../utils/EventUtils";
+import { canEditContent, isContentActionable } from "../utils/EventUtils";
+import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
+import { RedactedBodyViewModel } from "../viewmodels/message-body/RedactedBodyViewModel";
+import { getRedactedBodyViewModelProps } from "../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState";
+import { isVideoRoom } from "../utils/video-rooms";
+import { CallStore } from "../stores/CallStore";
 import { getEventTileThread } from "../viewmodels/room/timeline/event-tile/EventTileThreadState";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
@@ -73,7 +78,7 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
-import { sendText } from "./InterimActions";
+import { editText, redact, sendText } from "./InterimActions";
 import { toActionError } from "./actions";
 import {
     type ActionOutcome,
@@ -200,6 +205,8 @@ class EventRow {
         unsubscribe?: () => void;
         unwatch: () => void;
     };
+    /** Element's redacted body view-model, built on the first read of a redacted event. */
+    private redactedBody?: RedactedBodyViewModel;
     private disposed = false;
     private readonly unsubscribe: Array<() => void> = [];
 
@@ -341,6 +348,28 @@ class EventRow {
         this.padlock.start();
         this.changed();
     };
+
+    /**
+     * Element's redacted body text ("Message deleted", `getRedactedBodyViewModelProps` through the redacted body
+     * view-model) when the event is redacted, else undefined.
+     */
+    public redactedText(): string | undefined {
+        if (!this.ev.isRedacted()) return undefined;
+        const props = getRedactedBodyViewModelProps(this.ev, SettingsStore.getValue("showTwelveHourTimestamps"));
+        if (!this.redactedBody) this.redactedBody = new RedactedBodyViewModel(props);
+        else if (this.redactedBody.getSnapshot().text !== props.text) this.redactedBody.setProps(props);
+        return this.redactedBody.getSnapshot().text;
+    }
+
+    /** Element's edit rule for this event (`canEditContent`), the rule the edit action bar button follows. */
+    public canEdit(): boolean {
+        return canEditContent(this.client, this.ev);
+    }
+
+    /** The edited marker's rule (`TextualBodyViewModel`): a replacement event exists. */
+    public edited(): boolean {
+        return !!this.ev.replacingEventId();
+    }
 
     /**
      * The row's E2E trust signals (REQ-0007): the decryption failure body view-model for an undecryptable event, the
@@ -947,6 +976,7 @@ class EventRow {
         this.padlock.dispose();
         this.decryption?.dispose();
         this.reply?.dispose();
+        this.redactedBody?.dispose();
     }
 }
 
@@ -1265,6 +1295,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.threadSummary(),
                 row.media(),
                 row.urlPreviews(),
+                { canEdit: row.canEdit(), edited: row.edited(), redactedText: row.redactedText() },
             );
             if (message) {
                 const txnId = this.ownTxnId(eventItem.event as MatrixEvent);
@@ -1504,7 +1535,51 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {
-        return sendText(this.client, roomId, text, opts);
+        this.used = true;
+        // A3: the replied event is started through its action bar view-model's `onReplyClick` (the reply state Element's
+        // composer reads); the content send is the interim path with the reply relation.
+        return sendText(this.client, roomId, text, opts, {
+            onReplyTarget: (target) => this.actionBar(target, (vm) => vm.onReplyClick(null), true),
+        });
+    }
+
+    /** A11: the replacement send is interim; the edit state is entered through the row's `onEditClick`. */
+    public editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome> {
+        this.used = true;
+        return editText(this.client, roomId, eventId, text, {
+            onEnter: (ev) => this.actionBar(ev, (vm) => vm.onEditClick(null), false),
+        });
+    }
+
+    /** A12: interim until the event tile's action bar implements `onRemoveClick`. */
+    public redact(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        return redact(this.client, roomId, eventId);
+    }
+
+    /**
+     * Runs one action of an event's action bar view-model (the stock one, built for this call and disposed after).
+     * `reply_to_event` makes `RoomViewStore` view a room it does not show yet, and for a video room or a room with an
+     * active call that would start the call (principle 4): the reply entry is skipped there, the reply content does
+     * not depend on it.
+     */
+    private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): void {
+        const roomId = ev.getRoomId() ?? "";
+        const room = this.client.getRoom(roomId);
+        if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) {
+            if (!room || isVideoRoom(room) || CallStore.instance.getActiveCall(roomId) !== null) return;
+        }
+        const vm = new EventTileActionBarViewModel({
+            mxEvent: ev,
+            timelineRenderingType: TimelineRenderingType.Room,
+            canSendMessages: true,
+            canReact: false,
+        });
+        try {
+            run(vm);
+        } finally {
+            vm.dispose();
+        }
     }
 
     public onChange(cb: (e: ChangeEvent) => void): () => void {

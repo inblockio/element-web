@@ -7,7 +7,7 @@
 
 // @vitest-environment happy-dom
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
 import { ConnectionError, type MatrixClient } from "matrix-js-sdk/src/matrix";
 import { DecryptionFailureCode } from "matrix-js-sdk/src/crypto-api";
 
@@ -135,8 +135,19 @@ const h = vi.hoisted(() => {
                 mediaVms.push(this as never);
             }
         };
+    const actionBars: Array<{ props: Record<string, unknown>; onReplyClick: Mock; onEditClick: Mock; dispose: Mock }> =
+        [];
+    const eventUtils = { canEdit: true };
+    const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
+    const videoRooms = { video: false, activeCall: null as unknown };
     return {
         sendText: vi.fn(),
+        editText: vi.fn(),
+        redact: vi.fn(),
+        actionBars,
+        eventUtils,
+        sdkContext,
+        videoRooms,
         mediaVm,
         FakeVm,
         mediaVms,
@@ -358,10 +369,38 @@ vi.mock("../settings/SettingsStore", () => ({
         }),
     },
 }));
-vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: {} } }));
+vi.mock("../contexts/SDKContextClass", () => ({ SDKContextClass: { instance: h.sdkContext } }));
+vi.mock("../utils/EventUtils", async (orig) => ({
+    ...(await orig<typeof import("../utils/EventUtils")>()),
+    canEditContent: () => h.eventUtils.canEdit,
+}));
+vi.mock("../viewmodels/room/EventTileActionBarViewModel", () => ({
+    EventTileActionBarViewModel: class {
+        public onReplyClick = vi.fn();
+        public onEditClick = vi.fn();
+        public dispose = vi.fn();
+        public constructor(public props: Record<string, unknown>) {
+            h.actionBars.push(this as never);
+        }
+    },
+}));
+vi.mock("../viewmodels/message-body/RedactedBodyViewModel", () => ({
+    RedactedBodyViewModel: class extends h.FakeVm<{ text: string }> {
+        public setProps = (p: { text: string }): void => this.set(p);
+    },
+}));
+vi.mock("../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState", () => ({
+    getRedactedBodyViewModelProps: () => ({ text: "Message deleted" }),
+}));
+vi.mock("../utils/video-rooms", () => ({ isVideoRoom: () => h.videoRooms.video }));
+vi.mock("../stores/CallStore", () => ({ CallStore: { instance: { getActiveCall: () => h.videoRooms.activeCall } } }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => "http://avatar/room" }));
-vi.mock("./InterimActions", () => ({ sendText: (...args: unknown[]) => h.sendText(...args) }));
+vi.mock("./InterimActions", () => ({
+    sendText: (...args: unknown[]) => h.sendText(...args),
+    editText: (...args: unknown[]) => h.editText(...args),
+    redact: (...args: unknown[]) => h.redact(...args),
+}));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
     selectClientView: vi.fn(async () => {}),
@@ -382,6 +421,7 @@ const fakeEvent = (id: string, over: Record<string, unknown> = {}) => {
         decryptionFailureReason: null,
         status: null,
         replacingEvent: () => null,
+        replacingEventId: () => undefined as string | undefined,
         isRedacted: () => false,
         getWireContent: () => ({}),
         getTs: () => 1,
@@ -429,6 +469,11 @@ describe("ViewModelBridge", () => {
         h.room.findEventById.mockImplementation(() => undefined);
         h.room.currentState.maySendEvent.mockImplementation(() => true);
         h.buttonClick.run = () => {};
+        h.actionBars.length = 0;
+        h.eventUtils.canEdit = true;
+        h.sdkContext.roomViewStore = { getRoomId: () => null };
+        h.videoRooms.video = false;
+        h.videoRooms.activeCall = null;
     });
 
     it("maps the room list and the user menu snapshots", () => {
@@ -494,7 +539,88 @@ describe("ViewModelBridge", () => {
         expect(bridge.version).toBe(2);
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
-        expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" });
+        expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));
+    });
+
+    describe("action bar (A3 reply, A11 edit) and delete (A12)", () => {
+        const target = (id = "$t") => fakeEvent(id, { getSender: () => "@bob:example.org" });
+
+        it("starts a reply through the replied event's action bar view-model, then disposes it", () => {
+            h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
+            void bridge.sendText("!a", "answer", { txnId: "t", replyTo: "$t" });
+            const hooks = h.sendText.mock.calls[0][4] as { onReplyTarget: (ev: unknown) => void };
+            const ev = target();
+            hooks.onReplyTarget(ev);
+            expect(h.actionBars).toHaveLength(1);
+            expect(h.actionBars[0].props).toMatchObject({ mxEvent: ev, canSendMessages: true });
+            expect(h.actionBars[0].onReplyClick).toHaveBeenCalledTimes(1);
+            expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+        });
+
+        it("skips the reply entry in a video room or a room with an active call (it would start the call)", () => {
+            h.sendText.mockResolvedValue({ status: "done" });
+            void bridge.sendText("!a", "x", { replyTo: "$t" });
+            const hooks = h.sendText.mock.calls[0][4] as { onReplyTarget: (ev: unknown) => void };
+            h.videoRooms.video = true;
+            hooks.onReplyTarget(target());
+            h.videoRooms.video = false;
+            h.videoRooms.activeCall = {};
+            hooks.onReplyTarget(target());
+            expect(h.actionBars).toHaveLength(0);
+            // the room RoomViewStore already shows is never navigated to: the entry runs
+            h.sdkContext.roomViewStore = { getRoomId: () => "!a" };
+            hooks.onReplyTarget(target());
+            expect(h.actionBars).toHaveLength(1);
+        });
+
+        it("editText hands over to the interim edit and enters the edit state through onEditClick", async () => {
+            h.editText.mockResolvedValueOnce({ status: "done", roomId: "!a", eventId: "$mine" });
+            await expect(bridge.editText("!a", "$mine", "new")).resolves.toEqual({
+                status: "done",
+                roomId: "!a",
+                eventId: "$mine",
+            });
+            expect(h.editText).toHaveBeenCalledWith(expect.anything(), "!a", "$mine", "new", expect.any(Object));
+            const hooks = h.editText.mock.calls[0][4] as { onEnter: (ev: unknown) => void };
+            hooks.onEnter(target("$mine"));
+            expect(h.actionBars[0].onEditClick).toHaveBeenCalledTimes(1);
+            expect(h.actionBars[0].onReplyClick).not.toHaveBeenCalled();
+            expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+        });
+
+        it("redact hands over to the interim redaction", async () => {
+            h.redact.mockResolvedValueOnce({ status: "done", roomId: "!a", eventId: "$mine" });
+            await expect(bridge.redact("!a", "$mine")).resolves.toEqual({
+                status: "done",
+                roomId: "!a",
+                eventId: "$mine",
+            });
+            expect(h.redact).toHaveBeenCalledWith(expect.anything(), "!a", "$mine");
+        });
+
+        const readFirst = () => {
+            const ev = fakeEvent("$m1", { getSender: () => "@me:example.org" });
+            h.timeline.snapshot = { items: [{ kind: "event", event: ev, continuation: false }], atLiveEnd: true };
+            return { ev, message: () => bridge.timeline("!a")[0] };
+        };
+
+        it("hands over canEdit by Element's rule, and edited when a replacement exists", () => {
+            const { ev, message } = readFirst();
+            expect(message().canEdit).toBe(true);
+            expect(message().edited).toBeUndefined();
+            h.eventUtils.canEdit = false;
+            (ev as { replacingEventId: () => string | undefined }).replacingEventId = () => "$edit";
+            expect(message().canEdit).toBeUndefined();
+            expect(message().edited).toBe(true);
+        });
+
+        it("reads a redacted event as Element's redacted body with redacted: true and nothing of its content", () => {
+            const { ev, message } = readFirst();
+            (ev as { isRedacted: () => boolean }).isRedacted = () => true;
+            expect(message()).toMatchObject({ id: "$m1", body: "Message deleted", redacted: true, kind: "other" });
+            expect(message().canEdit).toBeUndefined();
+            expect(message().formattedBody).toBeUndefined();
+        });
     });
 
     it("hands over the transaction id of an own message, from the local echo or the sync echo, not of others", () => {

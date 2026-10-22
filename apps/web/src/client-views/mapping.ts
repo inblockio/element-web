@@ -163,11 +163,26 @@ export function toViewMessage(
     thread?: ViewThread,
     media?: ViewMedia,
     urlPreviews?: ViewUrlPreview[],
+    flags: { canEdit?: boolean; edited?: boolean; redactedText?: string } = {},
 ): ViewMessage | undefined {
     const id = tile.event.eventId;
     if (!id) return undefined;
     const senderId = tile.sender.senderId ?? "";
     const failed = e2e?.state === "failed" || e2e?.state === "pending";
+    if (flags.redactedText !== undefined) {
+        // A deleted message reads as Element's redacted body, with nothing of its former content.
+        return {
+            id,
+            roomId,
+            senderId,
+            senderName: tile.sender.member?.rawDisplayName || senderId,
+            senderAvatarUrl,
+            ts: tile.timestamp.value,
+            body: flags.redactedText,
+            kind: "other",
+            redacted: true,
+        };
+    }
     return {
         id,
         roomId,
@@ -185,6 +200,8 @@ export function toViewMessage(
         ...(thread ? { thread } : {}),
         ...(media ? { media } : {}),
         ...(urlPreviews?.length ? { urlPreviews } : {}),
+        ...(flags.canEdit ? { canEdit: true } : {}),
+        ...(flags.edited ? { edited: true as const } : {}),
     };
 }
 
