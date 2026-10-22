@@ -11,7 +11,6 @@ import {
     type Room,
     type Relations,
     type Thread,
-    Direction,
     EventType,
     KnownMembership,
     MatrixEventEvent,
@@ -1435,23 +1434,16 @@ export class ViewModelBridge implements ClientViewBridge {
                 .getSnapshot()
                 .items.filter((i): i is EventItem => i.kind === "event")
                 .map((i) => i.event as MatrixEvent);
-        // The start of the room is loaded: its creation event is in the window, or (the creation event is a hidden
-        // event in most rooms, so it is not among the window's items) the oldest loaded timeline has no earlier page.
+        // The start of the room is loaded: its creation event is in the loaded timeline. The creation event is a hidden
+        // event in most rooms, so it is not among the window's items, and the timeline's own backward token is not
+        // cleared by the server's last page: the event itself is the evidence.
         const atRoomStart = (): boolean => {
-            const all = events();
-            if (all.some((e) => e.getType() === EventType.RoomCreate)) return true;
-            const set = this.client.getRoom(roomId)?.getUnfilteredTimelineSet();
-            const first = all[0]?.getId();
-            let timeline = first ? set?.getTimelineForEvent(first) : null;
-            if (!timeline) return false;
-            for (let earlier = timeline.getNeighbouringTimeline(Direction.Backward); earlier;) {
-                timeline = earlier;
-                earlier = timeline.getNeighbouringTimeline(Direction.Backward);
-            }
-            return timeline.getPaginationToken(Direction.Backward) === null;
+            const room = this.client.getRoom(roomId);
+            const create = room?.currentState.getStateEvents(EventType.RoomCreate, "")?.getId();
+            return !!create && !!room?.getUnfilteredTimelineSet().getTimelineForEvent(create);
         };
         const state = (n: number): Pick<LoadOlderResult, "atStart" | "atLimit"> => ({
-            atStart: atRoomStart(),
+            atStart: events().some((e) => e.getType() === EventType.RoomCreate) || atRoomStart(),
             atLimit: n >= WINDOW_LIMIT - PAGE_SIZE,
         });
         // The first window is still loading (or the room has no showable event yet): a page asked now would race it.

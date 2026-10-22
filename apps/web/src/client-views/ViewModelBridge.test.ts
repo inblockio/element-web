@@ -48,7 +48,10 @@ const h = vi.hoisted(() => {
         findThreadForEvent: () => null,
         getUnfilteredTimelineSet: () => timelineSet,
         getMyMembership: () => "join",
-        currentState: { maySendEvent: vi.fn((_type: string, _user: string): boolean => true) },
+        currentState: {
+            maySendEvent: vi.fn((_type: string, _user: string): boolean => true),
+            getStateEvents: vi.fn((..._args: unknown[]): unknown => undefined),
+        },
         on: vi.fn(),
         off: vi.fn(),
     };
@@ -2060,6 +2063,7 @@ describe("ViewModelBridge", () => {
         beforeEach(() => {
             h.timeline.loading = false;
             h.timelineSet.getTimelineForEvent.mockReturnValue(null);
+            h.room.currentState.getStateEvents.mockReturnValue(undefined);
             h.timeline.set({ items: window(20, 100), pendingAnchor: { targetKey: "$e119", align: "end" } } as never);
             h.timeline.onStartReached.mockReset();
             h.timeline.onAnchorReached.mockReset();
@@ -2100,20 +2104,16 @@ describe("ViewModelBridge", () => {
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
         });
 
-        it("reports atStart when the oldest loaded timeline has no earlier page (the creation event is a hidden event)", async () => {
-            const start = { getNeighbouringTimeline: () => null, getPaginationToken: () => null };
-            h.timelineSet.getTimelineForEvent.mockReturnValue(start);
+        it("reports atStart when the room's creation event is in a loaded timeline (a hidden event, not among the items)", async () => {
+            h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$create" });
+            h.timelineSet.getTimelineForEvent.mockImplementation((id: string) => (id === "$create" ? {} : null));
             expect(await bridge.loadOlder("!a")).toEqual({ added: 0, atStart: true, atLimit: false });
-            expect(h.timelineSet.getTimelineForEvent).toHaveBeenCalledWith("$e100");
             expect(h.timeline.onStartReached).not.toHaveBeenCalled();
         });
 
-        it("asks the earliest linked timeline for the start, and a pagination token there means more history", async () => {
-            const earlier = { getNeighbouringTimeline: () => null, getPaginationToken: () => "t1" };
-            h.timelineSet.getTimelineForEvent.mockReturnValue({
-                getNeighbouringTimeline: () => earlier,
-                getPaginationToken: () => null,
-            });
+        it("is not at the start while the creation event is not loaded", async () => {
+            h.room.currentState.getStateEvents.mockReturnValue({ getId: () => "$create" });
+            h.timelineSet.getTimelineForEvent.mockReturnValue(null);
             expect((await bridge.loadOlder("!a")).atStart).toBe(false);
         });
 
