@@ -40,7 +40,6 @@ import { TimelineRenderingType } from "../contexts/RoomContext";
 import SettingsStore from "../settings/SettingsStore";
 import { OwnProfileStore } from "../stores/OwnProfileStore";
 import defaultDispatcher from "../dispatcher/dispatcher";
-import { Action } from "../dispatcher/actions";
 import { avatarUrlForRoom } from "../Avatar";
 import { resolveRoomMemberProfile, roomMemberToMemberInfo } from "../hooks/room/useRoomMemberProfile";
 import { RoomListViewModel } from "../viewmodels/room-list/RoomListViewModel";
@@ -83,6 +82,7 @@ import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomA
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
+import RoomListStoreV3, { RoomListStoreV3Event } from "../stores/room-list-v3/RoomListStoreV3";
 import { toActionError } from "./actions";
 import {
     type ActionOutcome,
@@ -1055,6 +1055,11 @@ export class ViewModelBridge implements ClientViewBridge {
             spaceStore: SDKContextClass.instance.spaceStore,
         });
         this.disposers.push(this.roomList.subscribe(() => this.syncRooms()));
+        // A room joining or leaving a collapsed section changes no snapshot (collapsed sections hold no room ids there);
+        // the list's own listener ran first on this event, so its room ids are current.
+        const onListsUpdate = (): void => this.syncRooms();
+        RoomListStoreV3.instance.on(RoomListStoreV3Event.ListsUpdate, onListsUpdate);
+        this.disposers.push(() => RoomListStoreV3.instance.off(RoomListStoreV3Event.ListsUpdate, onListsUpdate));
         this.userMenu = new UserMenuViewModel(
             { ownProfileStore: OwnProfileStore.instance },
             defaultDispatcher,
@@ -1153,15 +1158,10 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     private syncRooms(): void {
-        const sections = this.roomList.getSnapshot().sections;
-        // A collapsed section has no rooms in the snapshot (the Invites section appears collapsed every time), and a kit
-        // lists every room: the section's header view-model is asked (it is built on first ask, collapsed or not), and when
-        // one is collapsed the room list view-model's own "expand all" runs.
-        const collapsed = sections.filter(
-            (s) => s.roomIds.length === 0 && !this.roomList.getSectionHeaderViewModel(s.id).isExpanded,
-        );
-        if (collapsed.length > 0) defaultDispatcher.dispatch({ action: Action.RoomListExpandAllSections });
-        const ids = sections.flatMap((s) => s.roomIds);
+        // A kit lists every room, collapsed section or not: the snapshot's sections hold no rooms for a collapsed one (the
+        // Invites section is always collapsed), so the list's own full, ordered room ids are read. Nothing is expanded,
+        // so the user's stored section expansion (`RoomList.SectionExpansionState`) is never written.
+        const ids = this.roomList.roomIds;
         // Item view-models exist only for rooms the list was told are visible.
         this.roomList.updateVisibleRooms(0, ids.length);
         const rooms: ViewRoom[] = this.localChatRooms();

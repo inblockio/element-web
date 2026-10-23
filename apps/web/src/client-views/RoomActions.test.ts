@@ -49,8 +49,8 @@ const codeOf = async (p: Promise<unknown>): Promise<string | undefined> => {
     return undefined;
 };
 
-const viewRoom = (room_id: string, metricsTrigger?: string): void =>
-    defaultDispatcher.dispatch({ action: Action.ViewRoom, room_id, metricsTrigger }, true);
+const viewRoom = (room_id: string, metricsTrigger?: string, targets?: unknown[]): void =>
+    defaultDispatcher.dispatch({ action: Action.ViewRoom, room_id, metricsTrigger, targets }, true);
 
 describe("A6 create room (RoomListViewModel.createRoom -> Element's dialog)", () => {
     beforeEach(() => {
@@ -75,6 +75,18 @@ describe("A6 create room (RoomListViewModel.createRoom -> Element's dialog)", ()
         d.finish(true, {});
         await vi.advanceTimersByTimeAsync(0);
         viewRoom("!other:example.org", "RoomList");
+        viewRoom("!new:example.org", "Created");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
+    });
+
+    it("ignores a ViewRoom and a JoinRoomError that came before the confirmation (other rooms, not this create)", async () => {
+        const d = openDialogOnStart();
+        const outcome = createRoomViaDialog(d.start);
+        viewRoom("!notified:example.org", "Created");
+        defaultDispatcher.dispatch({ action: Action.JoinRoomError, room_id: "!other:example.org" }, true);
+        await vi.advanceTimersByTimeAsync(0);
+        d.finish(true, {});
+        await vi.advanceTimersByTimeAsync(0);
         viewRoom("!new:example.org", "Created");
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
     });
@@ -150,10 +162,10 @@ describe("A6 start chat (RoomListViewModel.createChatRoom -> Element's invite di
         const d = openDialogOnStart();
         const outcome = startChatViaDialog(() => {
             d.start();
-            viewRoom("!local_abc:example.org");
+            viewRoom("local+abc:example.org", undefined, [{}]);
         });
         d.finish(true);
-        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!local_abc:example.org" });
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+abc:example.org" });
     });
 
     it("waits for the chat's ViewRoom when Element dispatches it after the dialog's answer (its dispatch is async)", async () => {
@@ -163,11 +175,26 @@ describe("A6 start chat (RoomListViewModel.createChatRoom -> Element's invite di
             const outcome = startChatViaDialog(d.start);
             d.finish(true);
             await vi.advanceTimersByTimeAsync(0);
-            viewRoom("local+dm", undefined);
+            viewRoom("local+dm", undefined, [{}]);
             await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+dm" });
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it("takes the chat's own ViewRoom, not a notification click or an answered call before Go", async () => {
+        const d = openDialogOnStart();
+        const outcome = startChatViaDialog(() => {
+            d.start();
+            viewRoom("!notified:example.org", "Notification");
+            defaultDispatcher.dispatch(
+                { action: Action.ViewRoom, room_id: "!call:example.org", view_call: true },
+                true,
+            );
+            viewRoom("local+new:example.org", undefined, [{}]);
+        });
+        d.finish(true);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+new:example.org" });
     });
 
     it("is cancelled when the dialog closes without success", async () => {
@@ -232,6 +259,35 @@ describe("A7 leave (RoomListItemViewModel.onLeaveRoom -> Element's confirm)", ()
         const code = codeOf(outcome);
         await vi.advanceTimersByTimeAsync(LEAVE_SETTLE_MS + 200);
         expect(await code).toBe("failed");
+    });
+
+    it("fails for an invite whose leave failed: it is still an invite, not left", async () => {
+        membership = "invite";
+        const d = openDialogOnStart();
+        const outcome = leaveViaDialog(client, "!a:example.org", d.start);
+        d.finish(true);
+        await vi.advanceTimersByTimeAsync(0);
+        afterLeave("!a:example.org");
+        const code = codeOf(outcome);
+        await vi.advanceTimersByTimeAsync(LEAVE_SETTLE_MS + 200);
+        expect(await code).toBe("failed");
+    });
+
+    it("is done for an invite that went to leave, and for a room that is gone", async () => {
+        for (const after of ["leave", "ban", undefined]) {
+            membership = "invite";
+            const gone = after === undefined;
+            const c = {
+                getRoom: () => (gone && membership === "gone" ? null : { getMyMembership: () => membership }),
+            } as unknown as MatrixClient;
+            const d = openDialogOnStart();
+            const outcome = leaveViaDialog(c, "!a:example.org", d.start);
+            d.finish(true);
+            await vi.advanceTimersByTimeAsync(0);
+            membership = after ?? "gone";
+            afterLeave("!a:example.org");
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org" });
+        }
     });
 
     it("ignores another room's AfterLeaveRoom and fails after 15 s", async () => {

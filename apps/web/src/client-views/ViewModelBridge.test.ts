@@ -180,8 +180,15 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
             super({ sections: [{ roomIds: ["!a"] }] });
         }
         public updateVisibleRooms = vi.fn();
+        public get roomIds(): string[] {
+            return this.snapshot.sections.flatMap((s) => s.roomIds);
+        }
         public getRoomItemViewModel = (id: string) => (id === "!a" ? h.item : undefined);
     },
+}));
+vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({
+    RoomListStoreV3Event: { ListsUpdate: "ListsUpdate" },
+    default: { instance: { on: vi.fn(), off: vi.fn() } },
 }));
 vi.mock("../viewmodels/menus/UserMenuViewModel", () => ({
     UserMenuViewModel: class extends h.FakeVm<object> {

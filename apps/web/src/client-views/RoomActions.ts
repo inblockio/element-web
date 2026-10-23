@@ -22,6 +22,7 @@ import { Action } from "../dispatcher/actions";
 import { type ActionPayload } from "../dispatcher/payloads";
 import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
 import { type AfterLeaveRoomPayload } from "../dispatcher/payloads/AfterLeaveRoomPayload";
+import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { toActionError } from "./actions";
 import { type ActionOutcome, ClientViewActionError } from "./types";
 
@@ -44,7 +45,7 @@ let dialogActionRunning = false;
 function recordPayloads(): {
     payloads: ActionPayload[];
     stop: () => void;
-    wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number) => Promise<T>;
+    wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since?: number) => Promise<T>;
 } {
     const payloads: ActionPayload[] = [];
     const waiters = new Set<(p: ActionPayload) => void>();
@@ -55,7 +56,7 @@ function recordPayloads(): {
     return {
         payloads,
         stop: () => defaultDispatcher.unregister(token),
-        wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number): Promise<T> =>
+        wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since = 0): Promise<T> =>
             new Promise<T>((resolve, reject) => {
                 const timer = setTimeout(() => {
                     waiters.delete(check);
@@ -70,8 +71,8 @@ function recordPayloads(): {
                     else resolve(hit);
                 };
                 waiters.add(check);
-                // Payloads that arrived since the recording began count too.
-                for (const p of payloads) check(p);
+                // Payloads that arrived since `since` (default: since the recording began) count too.
+                for (const p of payloads.slice(since)) check(p);
             }),
     };
 }
@@ -80,7 +81,7 @@ function recordPayloads(): {
  * Runs `start` (a view-model action that makes `MatrixChat` open a dialog) and resolves with the handle of the first
  * dialog that opens, so the dialog's own result can be read. Only one such action runs at a time.
  */
-function openedDialog(start: () => void): Promise<DialogHandle> {
+function openedDialog(start: () => void, onFinished?: () => void): Promise<DialogHandle> {
     return new Promise<DialogHandle>((resolve, reject) => {
         // oxlint-disable-next-line typescript/unbound-method -- put back as it was; called with `Modal` as `this` below
         const original = Modal.createDialog;
@@ -100,6 +101,9 @@ function openedDialog(start: () => void): Promise<DialogHandle> {
         Modal.createDialog = function (this: unknown, ...args: Parameters<typeof original>) {
             const handle = original.apply(Modal, args);
             if (!settled) {
+                // Registered before the caller of `createDialog` can await the result, so it runs before whatever Element
+                // does after the answer: the mark it takes separates what came before the answer from what follows.
+                if (onFinished) void Promise.resolve(handle.finished).then(onFinished, () => {});
                 settled = true;
                 clearTimeout(timer);
                 restore();
@@ -135,6 +139,16 @@ async function dialogAction(run: () => Promise<ActionOutcome>): Promise<ActionOu
 const isViewRoom = (p: ActionPayload): p is ViewRoomPayload => p.action === Action.ViewRoom;
 
 /**
+ * The `ViewRoom` that the start-chat dialog's Go dispatches (`startDmOnFirstMessage`, `startDm`): an existing DM
+ * (trigger `MessageUser`) or the new chat's local room, which carries the `targets`. Any other `ViewRoom` (a notification
+ * click, an answered call) is not the chat.
+ */
+const isChatViewRoom = (p: ActionPayload): p is ViewRoomPayload =>
+    isViewRoom(p) &&
+    (p.metricsTrigger === "MessageUser" ||
+        (isLocalRoom(p.room_id) && (p as { targets?: unknown }).targets !== undefined));
+
+/**
  * A6 create room: Element's create-room dialog. Confirmed, Element creates the room and dispatches `ViewRoom` with trigger
  * `Created` (`createRoom.ts`); its failure is an error dialog plus `JoinRoomError`. `done` + the new room's id on the
  * first, `failed` on the second or after 15 s, `cancelled` when the dialog closes without a create.
@@ -142,15 +156,22 @@ const isViewRoom = (p: ActionPayload): p is ViewRoomPayload => p.action === Acti
 export function createRoomViaDialog(start: () => void): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
+        // Only what follows the confirmation belongs to the create: an earlier ViewRoom or a failed join of another room
+        // (a notification click, an answered call) is not its result.
+        let confirmedAt = 0;
         try {
-            const dialog = await openedDialog(start);
+            const dialog = await openedDialog(start, () => (confirmedAt = seen.payloads.length));
             const [confirmed] = await dialog.finished;
             if (!confirmed) return { status: "cancelled" };
-            const roomId = await seen.wait<string>((p) => {
-                if (p.action === Action.JoinRoomError)
-                    return new ClientViewActionError("failed", "Element could not create the room");
-                return isViewRoom(p) && p.metricsTrigger === "Created" ? p.room_id : undefined;
-            }, ROOM_ACTION_TIMEOUT_MS);
+            const roomId = await seen.wait<string>(
+                (p) => {
+                    if (p.action === Action.JoinRoomError)
+                        return new ClientViewActionError("failed", "Element could not create the room");
+                    return isViewRoom(p) && p.metricsTrigger === "Created" ? p.room_id : undefined;
+                },
+                ROOM_ACTION_TIMEOUT_MS,
+                confirmedAt,
+            );
             return { status: "done", roomId };
         } finally {
             seen.stop();
@@ -172,7 +193,7 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
             const [success] = await dialog.finished;
             if (!success) return { status: "cancelled" };
             // Element dispatches asynchronously, so the chat's `ViewRoom` may follow the dialog's answer by a tick.
-            const roomId = await seen.wait<string>((p) => (isViewRoom(p) ? p.room_id : undefined), CHAT_SHOWN_MS);
+            const roomId = await seen.wait<string>((p) => (isChatViewRoom(p) ? p.room_id : undefined), CHAT_SHOWN_MS);
             return { status: "done", roomId };
         } finally {
             seen.stop();
@@ -182,13 +203,14 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
 
 /**
  * A7 leave: Element's leave confirm (`MatrixChat.leaveRoom`). Confirmed, it leaves and dispatches `AfterLeaveRoom` (also
- * when the leave failed, after an error dialog), so the membership decides: `done` once it is no longer `join`,
- * `failed` if it still is a moment after, `cancelled` when the confirm says no.
+ * when the leave failed, after an error dialog), so the membership decides: `done` once it went from what it was (join,
+ * invite, knock) to leave or ban, or the room is gone; `failed` if it still is what it was a moment after, `cancelled` when the confirm says no.
  */
 export function leaveViaDialog(client: MatrixClient, roomId: string, start: () => void): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
         try {
+            const before = client.getRoom(roomId)?.getMyMembership();
             const dialog = await openedDialog(start);
             const [confirmed] = await dialog.finished;
             if (!confirmed) return { status: "cancelled" };
@@ -199,7 +221,13 @@ export function leaveViaDialog(client: MatrixClient, roomId: string, start: () =
                         : undefined,
                 ROOM_ACTION_TIMEOUT_MS,
             );
-            const left = (): boolean => client.getRoom(roomId)?.getMyMembership() !== "join";
+            // Left means the membership went from what it was (join, invite, knock) to leave or ban, or the room is gone: an
+            // invite or a knock whose leave failed is still that, not "not join".
+            const left = (): boolean => {
+                const now = client.getRoom(roomId)?.getMyMembership();
+                if (now === undefined) return true;
+                return before !== now && (now === "leave" || now === "ban");
+            };
             const until = Date.now() + LEAVE_SETTLE_MS;
             while (!left() && Date.now() < until) await new Promise((r) => setTimeout(r, 100));
             if (!left()) throw new ClientViewActionError("failed", "the room could not be left");

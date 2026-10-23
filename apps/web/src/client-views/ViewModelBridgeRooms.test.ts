@@ -51,7 +51,8 @@ const h = vi.hoisted(() => {
     const current = { a: item as unknown as { getSnapshot: () => object; subscribe: (cb: () => void) => () => void } };
     const lists: Array<{ set: (s: object) => void }> = [];
     const headers: Record<string, { isExpanded: boolean }> = {};
-    return { FakeVm, item, invited, list, current, lists, headers, ids: ["!a:example.org", "!inv:example.org"] };
+    const store = { listeners: new Set<() => void>() };
+    return { FakeVm, item, invited, list, current, lists, headers, store, ids: ["!a:example.org", "!inv:example.org"] };
 });
 
 vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
@@ -61,11 +62,24 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
             h.lists.push(this);
         }
         public updateVisibleRooms = vi.fn();
+        // The list's own full room ids: a collapsed section's rooms are in it, not in the snapshot's sections.
+        public get roomIds(): string[] {
+            return h.ids;
+        }
         public getSectionHeaderViewModel = (id: string) => (h.headers[id] ??= { isExpanded: true });
         public createRoom = h.list.createRoom;
         public createChatRoom = h.list.createChatRoom;
         public getRoomItemViewModel = (id: string) =>
             id === "!a:example.org" ? h.current.a : id === "!inv:example.org" ? h.invited : undefined;
+    },
+}));
+vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({
+    RoomListStoreV3Event: { ListsUpdate: "ListsUpdate" },
+    default: {
+        instance: {
+            on: (_e: string, cb: () => void) => h.store.listeners.add(cb),
+            off: (_e: string, cb: () => void) => h.store.listeners.delete(cb),
+        },
     },
 }));
 vi.mock("../viewmodels/menus/UserMenuViewModel", () => ({
@@ -134,31 +148,35 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         h.current.a = h.item as never;
     });
 
-    it("expands a collapsed section (the Invites section appears collapsed and hides its rooms) through the list's expand all", () => {
+    it("lists the rooms of a collapsed section (Invites) without expanding anything or writing the user's section state", () => {
         const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
         const list = h.lists[h.lists.length - 1];
-        dispatch.mockClear();
-        list.set({ sections: [{ id: "recent", roomIds: h.ids }] });
-        expect(dispatch).not.toHaveBeenCalled();
         h.headers.invites = { isExpanded: false };
+        // The snapshot holds no room ids for the collapsed Invites section; the room is still listed, from the list's ids.
         list.set({
             sections: [
                 { id: "invites", roomIds: [] },
-                { id: "recent", roomIds: h.ids },
+                { id: "recent", roomIds: ["!a:example.org"] },
             ],
         });
-        expect(dispatch).toHaveBeenCalledWith({ action: Action.RoomListExpandAllSections });
-        // Expanded (or an empty section that is expanded): nothing to ask.
-        dispatch.mockClear();
-        h.headers.invites = { isExpanded: true };
-        list.set({
-            sections: [
-                { id: "invites", roomIds: [] },
-                { id: "recent", roomIds: h.ids },
-            ],
-        });
-        expect(dispatch).not.toHaveBeenCalled();
+        expect(bridge.rooms().map((r) => r.id)).toContain("!inv:example.org");
+        expect(dispatch).not.toHaveBeenCalledWith({ action: Action.RoomListExpandAllSections });
+        expect(h.headers.invites.isExpanded).toBe(false);
         dispatch.mockRestore();
+    });
+
+    it("lists a room that joined a collapsed section on the store's list update, though no snapshot changed", () => {
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        const before = h.ids;
+        h.ids = ["!a:example.org"];
+        h.store.listeners.forEach((cb) => cb());
+        expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org"]);
+        onChange.mockClear();
+        h.ids = before;
+        h.store.listeners.forEach((cb) => cb());
+        expect(bridge.rooms().map((r) => r.id)).toContain("!inv:example.org");
+        expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
     });
 
     it("tells the kit to read a room's timeline again when its invite became a join", () => {
