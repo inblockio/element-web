@@ -121,6 +121,19 @@ describe("client view mapping", () => {
             0,
         );
         expect(invited.membership).toBe("invite");
+        // H6: Element shows the room unread only by the item's canMarkAsRead (count, activity or marked unread).
+        const shown = (canMarkAsRead: boolean, invited = false) =>
+            toViewRoom(
+                {
+                    id: "!r",
+                    name: "General",
+                    isDm: false,
+                    notification: { hasUnreadCount: false, count: 0, isMention: false, invited },
+                    canMarkAsRead,
+                } as never,
+                0,
+            ).showsUnread;
+        expect([shown(true), shown(false), shown(true, true)]).toEqual([true, false, false]);
     });
 
     it("reads text from nested nodes", () => {

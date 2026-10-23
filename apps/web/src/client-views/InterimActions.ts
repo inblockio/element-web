@@ -35,6 +35,7 @@ import { addReplyToMessageContent } from "../utils/Reply";
 import { attachMentions, attachRelation } from "../utils/messages";
 import { TimelineRenderingType } from "../contexts/RoomContext";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
+import { isLoggingOut } from "../Lifecycle";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { createRoomFromLocalRoom } from "../utils/direct-messages";
 import { doMaybeLocalRoomAction } from "../utils/local-room";
@@ -138,6 +139,48 @@ function localRoomCreationFailure(
     });
     failed.catch(() => {});
     return { failed, stop };
+}
+
+/**
+ * The real room behind `roomId`: the id itself for a real room, else the local room (a new DM) turned into the real one
+ * by `createRoomFromLocalRoom`, as `sendText` does and `RoomView.onLocalRoomEvent` would (not mounted under a kit).
+ * `failed` when the creation fails; a local room in ERROR retries it. Used by actions whose Element flow queues its work
+ * on a local room and returns before the room exists (A8 upload).
+ */
+export async function ensureRealRoom(client: MatrixClient, roomId: string): Promise<string> {
+    const room = client.getRoom(roomId);
+    if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+    if (!isLocalRoom(roomId)) return roomId;
+    const local = room as LocalRoom;
+    if (local.isError) local.state = LocalRoomState.NEW;
+    const known = new Set(local.afterCreateCallbacks);
+    const resolved = doMaybeLocalRoomAction(roomId, async (actualRoomId: string) => actualRoomId, client);
+    resolved.catch(() => {});
+    const queued = local.afterCreateCallbacks.find((cb) => !known.has(cb));
+    if (!queued) return resolved; // already created
+    const { failed, stop } = localRoomCreationFailure(client, local);
+    try {
+        const startsCreation = local.isNew; // only the caller that starts it may declare it failed
+        const creation = Promise.resolve(createRoomFromLocalRoom(client, local))
+            .catch(() => {})
+            .then(() => {
+                if (startsCreation && local.state === LocalRoomState.CREATING) {
+                    local.state = LocalRoomState.ERROR;
+                    client.emit(ClientEvent.Room, local);
+                }
+                if (local.state === LocalRoomState.ERROR) {
+                    throw new ClientViewActionError("failed", "the direct message could not be created");
+                }
+                return new Promise<never>(() => {}); // creation done: the callback resolves `resolved`
+            });
+        creation.catch(() => {});
+        return await Promise.race([resolved, failed, creation]);
+    } catch (e) {
+        throw toActionError(e);
+    } finally {
+        stop();
+        local.afterCreateCallbacks = local.afterCreateCallbacks.filter((cb) => cb !== queued);
+    }
 }
 
 /**
@@ -458,7 +501,9 @@ let logoutRunning = false;
  * then leaves the session and unmounts the kit, so the caller normally never sees the `done` that follows `on_logged_out`.
  */
 export async function logout(client: MatrixClient): Promise<ActionOutcome> {
-    if (logoutRunning) throw new ClientViewActionError("failed", "a sign-out is already running");
+    // Also while Element's own sign-out runs on (`Lifecycle.logout()` after the 30 s timeout cleared `logoutRunning`): a
+    // retry must not start a second one.
+    if (logoutRunning || isLoggingOut()) throw new ClientViewActionError("failed", "a sign-out is already running");
     logoutRunning = true;
     try {
         // Listen before anything dispatches `logout`, so the announcement cannot be missed.

@@ -40,6 +40,7 @@ const h = vi.hoisted(() => {
             notification: { hasUnreadCount: false, count: 0, isMention: false, invited: false },
             isFavourite: true,
             canMarkAsUnread: false,
+            canMarkAsRead: true,
             roomNotifState: "mentions_only",
         }),
         { onLeaveRoom: vi.fn(), onMarkAsUnread: vi.fn(), onToggleFavorite: vi.fn(), onSetRoomNotifState: vi.fn() },
@@ -275,7 +276,12 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
 
     it("A10: rooms() carries the favourite flag, the unread offer and the notification level of the item's snapshot", () => {
         const room = bridge.rooms().find((r) => r.id === "!a:example.org");
-        expect(room).toMatchObject({ isFavourite: true, canMarkAsUnread: false, notificationLevel: "mentions_only" });
+        expect(room).toMatchObject({
+            isFavourite: true,
+            canMarkAsUnread: false,
+            showsUnread: true,
+            notificationLevel: "mentions_only",
+        });
     });
 
     it("A10: markUnread, setFavourite and setNotificationLevel run the room item's view-model actions", async () => {

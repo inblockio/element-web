@@ -21,7 +21,7 @@ import {
 } from "matrix-js-sdk/src/matrix";
 import { createTestClient } from "test-utils";
 
-import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
+import { acceptInvite, declineInvite, editText, ensureRealRoom, joinRoom, redact, sendText } from "./InterimActions";
 import { ClientViewActionError } from "./types";
 import { LocalRoom, LocalRoomState, LOCAL_ROOM_ID_PREFIX } from "../models/LocalRoom";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -735,5 +735,60 @@ describe("join, accept and decline (interim actions, D16)", () => {
         expect(await codeOf(declineInvite(client, "!none:example.org"))).toBe("unknown_room");
         vi.mocked(client.leave).mockRejectedValue(new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403));
         expect(await codeOf(declineInvite(client, "!inv:example.org"))).toBe("forbidden");
+    });
+});
+
+describe("ensureRealRoom (A8 upload into a new DM)", () => {
+    let client: MatrixClient;
+    let room: Room;
+    let localRoom: LocalRoom;
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        client = createTestClient();
+        room = new Room("!a:example.org", client, "@me:example.org");
+        localRoom = new LocalRoom(LOCAL_ROOM_ID_PREFIX + "dm", client, "@me:example.org");
+        vi.mocked(client.getRoom).mockImplementation((id?: string) =>
+            id === room.roomId ? room : id === localRoom.roomId ? localRoom : null,
+        );
+        vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
+    });
+
+    it("returns a real room's id as it is and rejects an unknown room", async () => {
+        expect(await ensureRealRoom(client, "!a:example.org")).toBe("!a:example.org");
+        expect(await codeOf(ensureRealRoom(client, "!nope:example.org"))).toBe("unknown_room");
+        expect(createRoomFromLocalRoom).not.toHaveBeenCalled();
+    });
+
+    it("creates the real room from a new local room and resolves with its id", async () => {
+        vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, local) => {
+            local.state = LocalRoomState.CREATED;
+            local.actualRoomId = "!real:example.org";
+            local.afterCreateCallbacks.forEach((cb) => cb("!real:example.org"));
+        });
+        expect(await ensureRealRoom(client, localRoom.roomId)).toBe("!real:example.org");
+        expect(createRoomFromLocalRoom).toHaveBeenCalledWith(client, localRoom);
+        expect(localRoom.afterCreateCallbacks).toHaveLength(0);
+    });
+
+    it("is failed when the creation fails, leaves no callback queued, and retries from ERROR", async () => {
+        vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, local) => {
+            local.state = LocalRoomState.ERROR;
+        });
+        expect(await codeOf(ensureRealRoom(client, localRoom.roomId))).toBe("failed");
+        expect(localRoom.afterCreateCallbacks).toHaveLength(0);
+        vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, local) => {
+            local.state = LocalRoomState.CREATED;
+            local.actualRoomId = "!real:example.org";
+            local.afterCreateCallbacks.forEach((cb) => cb("!real:example.org"));
+        });
+        expect(await ensureRealRoom(client, localRoom.roomId)).toBe("!real:example.org");
+    });
+
+    it("returns the actual id of an already created local room without creating again", async () => {
+        localRoom.state = LocalRoomState.CREATED;
+        localRoom.actualRoomId = "!real:example.org";
+        expect(await ensureRealRoom(client, localRoom.roomId)).toBe("!real:example.org");
+        expect(createRoomFromLocalRoom).not.toHaveBeenCalled();
     });
 });

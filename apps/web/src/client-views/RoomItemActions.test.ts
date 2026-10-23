@@ -17,6 +17,8 @@ import { markUnread, setFavourite, setNotificationLevel, type RoomItemActionsVm 
 import { ClientViewActionError, type ViewNotificationLevel } from "./types";
 
 vi.mock("../stores/local-echo/EchoChamber", () => ({ EchoChamber: { forRoom: vi.fn() } }));
+const notifs = vi.hoisted(() => ({ state: vi.fn() }));
+vi.mock("../RoomNotifs", () => ({ getRoomNotifsState: notifs.state }));
 
 /* A10: the outcome of each room item action is read where the view-model leaves it (promise, tag result, echo transaction). */
 type Snap = ReturnType<RoomItemActionsVm["getSnapshot"]>;
@@ -93,32 +95,59 @@ describe("A10 mark unread (onMarkAsUnread)", () => {
     });
 });
 
-describe("A10 favourite (onToggleFavorite, RoomListActions.tagRoom result)", () => {
-    const answer = (action: string): void => {
-        setTimeout(() => defaultDispatcher.dispatch({ action }, true), 0);
+describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () => {
+    const answer = (action: string, extra: object = {}): void => {
+        setTimeout(() => defaultDispatcher.dispatch({ action, ...extra }, true), 0);
+    };
+    const tagged = (r: Room, on: boolean): void => {
+        (r as unknown as { tags: Record<string, unknown> }).tags = on ? { "m.favourite": { order: 0.5 } } : {};
     };
 
-    it("is done when the tag write succeeded and the room's tags show it", async () => {
+    it("is done when the room's tag shows it", async () => {
+        const r = room();
         const item = makeItem(snap());
         item.onToggleFavorite.mockImplementation(() => {
             answer("RoomListActions.tagRoom.success");
-            setTimeout(() => item.set({ isFavourite: true }), 5);
+            setTimeout(() => tagged(r, true), 120);
         });
-        expect(await setFavourite(item, room(), true)).toEqual({ status: "done", roomId: "!a:example.org" });
+        expect(await setFavourite(item, r, true)).toEqual({ status: "done", roomId: "!a:example.org" });
         expect(item.onToggleFavorite).toHaveBeenCalledOnce();
     });
 
-    it("calls nothing when the state already is the asked one", async () => {
+    it("calls nothing when the room's tag already is the asked state", async () => {
+        const r = room({ "m.favourite": { order: 0.5 } });
         const item = makeItem(snap({ isFavourite: true }));
-        expect((await setFavourite(item, room(), true)).status).toBe("done");
+        expect((await setFavourite(item, r, true)).status).toBe("done");
         expect(item.onToggleFavorite).not.toHaveBeenCalled();
     });
 
-    it("fails when the tag write failed, and when the tags never show it", async () => {
+    it("fails at once when Element's write for this room was refused and no other tag write was pending", async () => {
         const refused = makeItem(snap());
-        refused.onToggleFavorite.mockImplementation(() => answer("RoomListActions.tagRoom.failure"));
+        refused.onToggleFavorite.mockImplementation(() => {
+            defaultDispatcher.dispatch(
+                { action: "RoomListActions.tagRoom.pending", request: { room: { roomId: "!a:example.org" } } },
+                true,
+            );
+            answer("RoomListActions.tagRoom.failure", { err: new Error("403") });
+        });
         expect(await codeOf(setFavourite(refused, room(), true))).toBe("failed");
+    });
 
+    it("is not failed by another room's tagRoom.failure in the window while this room's tag arrives", async () => {
+        const r = room();
+        const item = makeItem(snap());
+        item.onToggleFavorite.mockImplementation(() => {
+            defaultDispatcher.dispatch(
+                { action: "RoomListActions.tagRoom.pending", request: { room: { roomId: "!other:example.org" } } },
+                true,
+            );
+            answer("RoomListActions.tagRoom.failure", { err: new Error("other room") });
+            setTimeout(() => tagged(r, true), 300);
+        });
+        expect((await setFavourite(item, r, true)).status).toBe("done");
+    });
+
+    it("fails when the tags never show it after Element answered", async () => {
         vi.useFakeTimers();
         try {
             const silent = makeItem(snap());
@@ -154,9 +183,11 @@ describe("A10 notification level (onSetRoomNotifState, echo transaction)", () =>
             setClient: vi.fn(),
         };
         vi.mocked(EchoChamber.forRoom).mockReturnValue(chamber as never);
+        notifs.state.mockReset();
     });
 
-    it("is done when the echo transaction succeeded", async () => {
+    it("is done when the echo transaction succeeded and the homeserver's computed level is the asked one", async () => {
+        notifs.state.mockReturnValue("mute");
         const item = makeItem(snap());
         item.onSetRoomNotifState.mockImplementation(() => {
             const txn = { status: TransactionStatus.Pending };
@@ -182,7 +213,27 @@ describe("A10 notification level (onSetRoomNotifState, echo transaction)", () =>
         expect(chamber.setClient).toHaveBeenCalledWith(client);
     });
 
+    it("fails and drops the echo when Success was a cancelled transaction and the computed level is another", async () => {
+        vi.useFakeTimers();
+        try {
+            notifs.state.mockReturnValue("mentions_only");
+            const item = makeItem(snap());
+            item.onSetRoomNotifState.mockImplementation(() => {
+                const txn = { status: TransactionStatus.Pending };
+                transactions.push(txn);
+                setTimeout(() => (txn.status = TransactionStatus.Success), 20);
+            });
+            const result = codeOf(setNotificationLevel(item, room(), client, "mute"));
+            await vi.advanceTimersByTimeAsync(9_000);
+            expect(await result).toBe("failed");
+            expect(chamber.setClient).toHaveBeenCalledWith(client);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("compares with the echo's level, not the item's stale snapshot", async () => {
+        notifs.state.mockReturnValue("all_messages");
         // The snapshot still says all messages after a change to mentions only: asking for all messages must write.
         chamber.notificationVolume = "mentions_only";
         const item = makeItem(snap({ roomNotifState: "all_messages" }));

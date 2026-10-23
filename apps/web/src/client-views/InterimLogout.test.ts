@@ -17,6 +17,8 @@ import { logout, LOGOUT_TIMEOUT_MS } from "./InterimActions";
 import { ClientViewActionError } from "./types";
 
 const logoutDialog = vi.hoisted(() => ({ shouldShow: vi.fn() }));
+const lifecycle = vi.hoisted(() => ({ isLoggingOut: vi.fn(() => false) }));
+vi.mock("../Lifecycle", () => lifecycle);
 vi.mock("../Modal", () => ({ default: { createDialog: vi.fn() } }));
 vi.mock("../components/views/dialogs/LogoutDialog", () => ({
     default: class LogoutDialog {},
@@ -103,5 +105,18 @@ describe("A9 log out (InterimActions.logout)", () => {
         await vi.advanceTimersByTimeAsync(0);
         dialog.answer(false);
         expect(await next).toEqual({ status: "cancelled" });
+    });
+
+    it("refuses a retry while Element's own sign-out still runs (after the timeout cleared the guard)", async () => {
+        logoutDialog.shouldShow.mockResolvedValue(false);
+        lifecycle.isLoggingOut.mockReturnValue(true);
+        try {
+            vi.mocked(Modal.createDialog).mockClear();
+            await expect(logout(client)).rejects.toBeInstanceOf(ClientViewActionError);
+            expect(dispatched).not.toContain("logout");
+            expect(Modal.createDialog).not.toHaveBeenCalled();
+        } finally {
+            lifecycle.isLoggingOut.mockReturnValue(false);
+        }
     });
 });

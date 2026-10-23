@@ -77,7 +77,16 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
-import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
+import {
+    acceptInvite,
+    declineInvite,
+    editText,
+    ensureRealRoom,
+    joinRoom,
+    logout,
+    redact,
+    sendText,
+} from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
@@ -1254,6 +1263,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 membership: "join",
                 isFavourite: false,
                 canMarkAsUnread: false,
+                showsUnread: false,
                 notificationLevel: "all_messages",
             });
         }
@@ -1766,8 +1776,25 @@ export class ViewModelBridge implements ClientViewBridge {
     /** A8: the files come from Element's picker unless the caller has them. */
     public async upload(roomId: string, files?: File[]): Promise<ActionOutcome> {
         this.used = true;
-        const room = this.client.getRoom(roomId);
-        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        if (!this.client.getRoom(roomId)) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        let chosen: File[] | null;
+        if (files) chosen = await rewrapFiles(files);
+        else {
+            this.filePicker?.cancel();
+            const picker = openFilePicker(document);
+            this.filePicker = picker;
+            try {
+                chosen = await picker.files;
+            } finally {
+                if (this.filePicker === picker) this.filePicker = undefined;
+            }
+        }
+        if (!chosen?.length) return { status: "cancelled" };
+        // A new DM is still a local room: Element would queue the upload on it and answer before it is sent. The real room
+        // is created first (as the text send does), the upload runs against it.
+        const realId = await ensureRealRoom(this.client, roomId);
+        const room = this.client.getRoom(realId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${realId}`);
         const vm = new RoomUploadViewModel(
             room,
             this.client,
@@ -1778,19 +1805,6 @@ export class ViewModelBridge implements ClientViewBridge {
             () => {},
         );
         try {
-            let chosen: File[] | null;
-            if (files) chosen = await rewrapFiles(files);
-            else {
-                this.filePicker?.cancel();
-                const picker = openFilePicker(document);
-                this.filePicker = picker;
-                try {
-                    chosen = await picker.files;
-                } finally {
-                    if (this.filePicker === picker) this.filePicker = undefined;
-                }
-            }
-            if (!chosen?.length) return { status: "cancelled" };
             return await uploadFiles(vm, room, chosen);
         } finally {
             vm.dispose();

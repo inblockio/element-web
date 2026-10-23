@@ -33,6 +33,13 @@ export interface ViewRoom {
      * archived. For a joined room, false means it already shows unread, by a count, an activity or a mark.
      */
     canMarkAsUnread: boolean;
+    /**
+     * Element shows the room as unread (the item's `canMarkAsRead`: a count, an activity or a "marked unread" mark; the
+     * room's notification level is above none). False for a joined room that shows nothing unread, for a local room (a
+     * new DM before its first message) and for the preview of a left room: those have no unread state. The kit's unread
+     * look (bold row) reads this, not `canMarkAsUnread`.
+     */
+    showsUnread: boolean;
     /** The room's notification level (the item's `roomNotifState`). */
     notificationLevel: ViewNotificationLevel;
 }

@@ -16,9 +16,11 @@
 
 import { type Room } from "matrix-js-sdk/src/matrix";
 
+import ContentMessages from "../ContentMessages";
 import { Action } from "../dispatcher/actions";
 import { type ActionPayload } from "../dispatcher/payloads";
 import { type UploadPayload } from "../dispatcher/payloads/UploadPayload";
+import { type RoomUpload } from "../models/RoomUpload";
 import { toActionError } from "./actions";
 import { recordPayloads } from "./RoomActions";
 import { type ActionOutcome, ClientViewActionError } from "./types";
@@ -27,6 +29,11 @@ import { type ActionOutcome, ClientViewActionError } from "./types";
 const STARTED_SETTLE_MS = 150;
 /** How long an upload may go without any progress or result before it counts as failed (contract principle 6). */
 export const UPLOAD_IDLE_MS = 60_000;
+/**
+ * The phase between `upload_started` and the first progress: Element thumbnails, reads and encrypts the file there and
+ * dispatches nothing, so it gets a longer bound than the idle limit (a big encrypted file takes minutes).
+ */
+export const UPLOAD_PROCESSING_MS = 600_000;
 
 /** The part of `RoomUploadViewModel` the action uses. */
 export interface UploadVm {
@@ -74,13 +81,18 @@ let uploadRunning = false;
 
 /**
  * Runs `vm.initiateViaInputFiles(files)` and reads the outcome from Element's upload actions. `cancelled` when no upload
- * started (the confirm was dismissed, or there was nothing to send), `done` once every started upload finished, `failed`
- * when one failed (Element's error dialog shows too) or none reported anything for a minute.
+ * started (the confirm was dismissed, or there was nothing to send) or when nothing finished and nothing failed (Element's
+ * own UI cancelled them), `done` once every started upload ended and at least one finished (its message is in the room),
+ * `failed` when none finished and one failed (Element's error dialog shows too), or when an upload reported nothing for
+ * the idle limit (the processing phase before the first progress has a longer bound). On that limit Element's own
+ * uploads are cancelled first, so no message appears after `failed`.
  */
 export async function uploadFiles(vm: UploadVm, room: Room, files: File[]): Promise<ActionOutcome> {
     if (uploadRunning) throw new ClientViewActionError("failed", "another upload is running");
     uploadRunning = true;
     const seen = recordPayloads();
+    const started = new Set<RoomUpload>();
+    const ended = new Set<RoomUpload>();
     try {
         if (!room.maySendMessage()) throw new ClientViewActionError("forbidden", "the user may not send here");
         const names = new Set(files.map((f) => f.name || "Attachment"));
@@ -91,44 +103,56 @@ export async function uploadFiles(vm: UploadVm, room: Room, files: File[]): Prom
                 Action.UploadFinished,
                 Action.UploadFailed,
                 Action.UploadCanceled,
-            ].includes(p.action as Action) && names.has((p as UploadPayload).upload?.fileName);
+            ].includes(p.action as Action) &&
+            names.has((p as UploadPayload).upload?.fileName) &&
+            (p as UploadPayload).upload?.roomId === room.roomId;
         await vm.initiateViaInputFiles(files);
         // Element's dispatcher delivers asynchronously: the uploads the answered dialogs started are announced a tick later.
         await new Promise((r) => setTimeout(r, STARTED_SETTLE_MS));
-        const started = new Set<unknown>();
-        const ended = new Set<unknown>();
+        const progressed = new Set<RoomUpload>();
+        let finished = 0;
         let failed = false;
-        let canceled = false;
         const settle = (p: ActionPayload): void => {
             if (!isMine(p)) return;
             if (p.action === Action.UploadStarted) started.add(p.upload);
             if (!started.has(p.upload)) return;
-            if (p.action === Action.UploadFinished) ended.add(p.upload);
+            if (p.action === Action.UploadProgress) progressed.add(p.upload);
+            if (ended.has(p.upload)) return;
+            if (p.action === Action.UploadFinished) {
+                ended.add(p.upload);
+                finished++;
+            }
             if (p.action === Action.UploadFailed) {
                 ended.add(p.upload);
                 failed = true;
             }
-            if (p.action === Action.UploadCanceled) {
-                ended.add(p.upload);
-                canceled = true;
-            }
+            if (p.action === Action.UploadCanceled) ended.add(p.upload);
         };
         seen.payloads.forEach(settle);
         if (started.size === 0) return { status: "cancelled" };
-        // Any action of these uploads (progress included) restarts the idle limit.
+        // Any action of these uploads (progress included) restarts the limit.
         while (ended.size < started.size) {
             seen.payloads.forEach(settle);
             if (ended.size >= started.size) break;
             const since = seen.payloads.length;
+            const processing = [...started].some((u) => !ended.has(u) && !progressed.has(u));
             try {
-                await seen.wait<true>((p) => (isMine(p) ? true : undefined), UPLOAD_IDLE_MS, since);
+                await seen.wait<true>(
+                    (p) => (isMine(p) ? true : undefined),
+                    processing ? UPLOAD_PROCESSING_MS : UPLOAD_IDLE_MS,
+                    since,
+                );
             } catch {
+                // Stop Element's own uploads (it would still post the message) before telling the caller it failed.
+                for (const u of started) {
+                    if (!ended.has(u)) ContentMessages.sharedInstance().cancelUpload(u);
+                }
                 throw new ClientViewActionError("failed", "the upload did not finish");
             }
         }
+        if (finished > 0) return { status: "done", roomId: room.roomId };
         if (failed) throw new ClientViewActionError("failed", "the upload failed");
-        if (canceled) return { status: "cancelled" };
-        return { status: "done", roomId: room.roomId };
+        return { status: "cancelled" };
     } catch (e) {
         throw toActionError(e);
     } finally {
