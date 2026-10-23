@@ -8,7 +8,7 @@
 // @vitest-environment happy-dom
 
 import { describe, it, expect, vi } from "vitest";
-import { type EventTimeline, EventType, RoomEvent } from "matrix-js-sdk/src/matrix";
+import { type EventTimeline, EventType, MatrixEvent, type MatrixClient, RoomEvent } from "matrix-js-sdk/src/matrix";
 import { EventEmitter } from "node:events";
 import { mkEvent, mkRoom, mkRoomMember, stubClient } from "test-utils";
 
@@ -16,8 +16,10 @@ import { CallStoreEvent, type CallStore } from "./CallStore";
 import { LatestRtcNotificationEventStore } from "./LatestRtcNotificationEventStore";
 import { type ElementCall, type Call } from "../models/Call";
 
+type CryptoBackend = Parameters<MatrixEvent["attemptDecryption"]>[0];
+
 describe("LatestRtcNotificationEventStore", () => {
-    it("should populate map from timeline on start", () => {
+    it("should populate map from timeline on start", async () => {
         const cli = stubClient();
 
         const event1 = mkEvent({
@@ -65,13 +67,13 @@ describe("LatestRtcNotificationEventStore", () => {
         const store = new LatestRtcNotificationEventStore(callStore);
         vi.spyOn(store, "matrixClient", "get").mockReturnValue(cli);
         store.start();
-        vi.waitFor(() => {
+        await vi.waitFor(() => {
             expect(store.getLatestEventId("!my-room1:m.org")).toStrictEqual("event-1");
             expect(store.getLatestEventId("!my-room2:m.org")).toStrictEqual("event-2");
         });
     });
 
-    it("should wait for rtc notification event when a call begins", () => {
+    it("should wait for rtc notification event when a call begins", async () => {
         const cli = stubClient();
 
         // This is the last notification event in the timeline
@@ -147,7 +149,7 @@ describe("LatestRtcNotificationEventStore", () => {
         expect(store.getLatestEventId("!my-room1:m.org")).toBeUndefined();
 
         // Let's say a new call starts
-        callStore.emit(CallStoreEvent.Call, call, room);
+        callStore.emit(CallStoreEvent.Call, call, "!my-room1:m.org");
 
         // The correct notification event hasn't come in yet, so still undefined.
         expect(store.getLatestEventId("!my-room1:m.org")).toBeUndefined();
@@ -156,8 +158,107 @@ describe("LatestRtcNotificationEventStore", () => {
         room.emit(RoomEvent.Timeline, newNotificationEvent);
 
         // Should update the event id in store
-        vi.waitFor(() => {
+        await vi.waitFor(() => {
             expect(store.getLatestEventId("!my-room1:m.org")).toStrictEqual("event-2");
+        });
+    });
+
+    describe("encrypted rooms", () => {
+        const roomId = "!my-room1:m.org";
+
+        /** A notification as it arrives from sync in an encrypted room: still m.room.encrypted, decrypts later. */
+        function mkEncryptedNotification(): { event: MatrixEvent; crypto: CryptoBackend } {
+            const event = new MatrixEvent({
+                type: EventType.RoomMessageEncrypted,
+                sender: "@bob:m.org",
+                room_id: roomId,
+                event_id: "event-2",
+                content: {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "AwgA",
+                    "m.relates_to": { event_id: "call-membership-1", rel_type: "m.reference" },
+                },
+            });
+            const crypto = {
+                decryptEvent: async () => {
+                    await new Promise((resolve) => setTimeout(resolve, 40));
+                    return {
+                        clearEvent: {
+                            type: EventType.RTCNotification,
+                            content: { "m.relates_to": { event_id: "call-membership-1", rel_type: "m.reference" } },
+                        },
+                    };
+                },
+            } as unknown as CryptoBackend;
+            return { event, crypto };
+        }
+
+        function setup(cli: MatrixClient): { store: LatestRtcNotificationEventStore; room: ReturnType<typeof mkRoom> } {
+            const room = mkRoom(cli, roomId);
+            vi.spyOn(cli, "getRoom").mockImplementation(() => room);
+            vi.spyOn(room, "getLiveTimeline").mockImplementation(
+                () => ({ getEvents: () => [] }) as unknown as EventTimeline,
+            );
+
+            const call = new EventEmitter();
+            // @ts-ignore
+            call.participants = new Map([[mkRoomMember(roomId, "@bob:m.org"), new Set()]]);
+            // @ts-ignore
+            call.session = { memberships: [{ eventId: "call-membership-1" }] };
+
+            const callStore = new EventEmitter() as unknown as CallStore;
+            callStore.getAllCalls = () => new Map([]) as unknown as Map<string, Call>;
+            callStore.getCall = () => call as unknown as ElementCall;
+
+            const store = new LatestRtcNotificationEventStore(callStore);
+            vi.spyOn(store, "matrixClient", "get").mockReturnValue(cli);
+            store.start();
+            callStore.emit(CallStoreEvent.Call, call, roomId);
+            return { store, room };
+        }
+
+        it("should match an encrypted notification that is decrypted after the timeline event", async () => {
+            const cli = stubClient();
+            const { event, crypto } = mkEncryptedNotification();
+            // What MatrixClient.decryptEventIfNeeded does, with the fake crypto backend.
+            vi.spyOn(cli, "decryptEventIfNeeded").mockImplementation(async (e) => {
+                if (e.shouldAttemptDecryption()) void e.attemptDecryption(crypto);
+                await e.getDecryptionPromise();
+            });
+            const { store, room } = setup(cli);
+
+            // The timeline fires while the event is still encrypted and decryption has not started; the SDK's own
+            // pipeline decrypts it a moment later.
+            room.emit(RoomEvent.Timeline, event);
+            setTimeout(() => {
+                if (event.shouldAttemptDecryption()) void event.attemptDecryption(crypto);
+            }, 20);
+
+            await vi.waitFor(() => expect(store.getLatestEventId(roomId)).toStrictEqual("event-2"), { timeout: 1000 });
+        });
+
+        it("should match once the event is decrypted when the client could not start decryption", async () => {
+            const cli = stubClient();
+            const { event, crypto } = mkEncryptedNotification();
+            vi.spyOn(cli, "decryptEventIfNeeded").mockResolvedValue(undefined);
+            const { store, room } = setup(cli);
+
+            room.emit(RoomEvent.Timeline, event);
+            setTimeout(() => void event.attemptDecryption(crypto), 20);
+
+            await vi.waitFor(() => expect(store.getLatestEventId(roomId)).toStrictEqual("event-2"), { timeout: 1000 });
+        });
+
+        it("should not leave an unhandled rejection when no notification arrives", async () => {
+            vi.useFakeTimers();
+            try {
+                const cli = stubClient();
+                const { store } = setup(cli);
+                await vi.advanceTimersByTimeAsync(10_001);
+                expect(store.getLatestEventId(roomId)).toBeUndefined();
+            } finally {
+                vi.useRealTimers();
+            }
         });
     });
 });
