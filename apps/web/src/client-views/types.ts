@@ -82,6 +82,11 @@ export interface ViewMessage {
      * `m.text` or `m.emote` with a body). A kit offers its edit control only when this is true. Absent = not editable.
      */
     canEdit?: boolean;
+    /**
+     * Element's permalink for this event, as its own "Copy link" / Share gives it (`RoomPermalinkCreator.forEvent`:
+     * matrix.to or the configured permalink prefix, with `via` servers). Absent for a deleted message.
+     */
+    permalink?: string;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */

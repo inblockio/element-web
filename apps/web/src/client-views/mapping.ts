@@ -174,7 +174,7 @@ export function toViewMessage(
     thread?: ViewThread,
     media?: ViewMedia,
     urlPreviews?: ViewUrlPreview[],
-    flags: { canEdit?: boolean; edited?: boolean; editedTs?: number; redactedText?: string } = {},
+    flags: { canEdit?: boolean; edited?: boolean; editedTs?: number; redactedText?: string; permalink?: string } = {},
 ): ViewMessage | undefined {
     const id = tile.event.eventId;
     if (!id) return undefined;
@@ -212,6 +212,7 @@ export function toViewMessage(
         ...(media ? { media } : {}),
         ...(urlPreviews?.length ? { urlPreviews } : {}),
         ...(flags.canEdit ? { canEdit: true } : {}),
+        ...(flags.permalink ? { permalink: flags.permalink } : {}),
         ...(flags.edited ? { edited: true as const } : {}),
         ...(flags.edited && flags.editedTs !== undefined ? { editedTs: flags.editedTs } : {}),
     };

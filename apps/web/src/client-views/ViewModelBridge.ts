@@ -67,6 +67,7 @@ import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { canEditContent, isContentActionable } from "../utils/EventUtils";
+import { RoomPermalinkCreator } from "../utils/permalinks/Permalinks";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
 import { RedactedBodyViewModel } from "../viewmodels/message-body/RedactedBodyViewModel";
 import { getRedactedBodyViewModelProps } from "../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState";
@@ -1014,6 +1015,8 @@ export class ViewModelBridge implements ClientViewBridge {
     /** The item view-model each room's subscription follows: the list may build a new one for a room (a rename re-sorts it). */
     private readonly watchedItems = new Map<string, { item: object; off: () => void }>();
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
+    /** One started permalink creator per room (its `via` servers follow the room state); stopped when the room leaves the bridge. */
+    private readonly permalinkCreators = new Map<string, RoomPermalinkCreator>();
     /** A `loadOlder` in flight per room: a concurrent call gets the same answer. */
     private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
     private disposed = false;
@@ -1198,6 +1201,13 @@ export class ViewModelBridge implements ClientViewBridge {
         // An invite that became a join: the kit asks for the room's timeline again (none was built while it was invited).
         const joined = rooms.filter((r) => r.membership !== "invite" && this.invitedRooms.has(r.id));
         this.invitedRooms = new Set(rooms.filter((r) => r.membership === "invite").map((r) => r.id));
+        // A room that left the list takes its permalink creator (a started one listens to the room state) with it.
+        const listed = new Set(ids);
+        for (const [roomId, creator] of this.permalinkCreators) {
+            if (listed.has(roomId)) continue;
+            creator.stop();
+            this.permalinkCreators.delete(roomId);
+        }
         if (JSON.stringify(rooms) === JSON.stringify(this.roomCache)) return;
         this.roomCache = rooms;
         this.emit({ kind: "rooms" });
@@ -1412,6 +1422,7 @@ export class ViewModelBridge implements ClientViewBridge {
                     edited: row.edited(),
                     editedTs: row.editedTs(),
                     redactedText: row.redactedText(),
+                    permalink: this.permalinkOf(roomId, id),
                 },
             );
             if (message) {
@@ -1420,6 +1431,19 @@ export class ViewModelBridge implements ClientViewBridge {
             }
         }
         return messages.sort((a, b) => a.ts - b.ts);
+    }
+
+    /** Element's permalink of an event (`RoomPermalinkCreator.forEvent`, `via` included), undefined for a room the client does not know. */
+    private permalinkOf(roomId: string, eventId: string): string | undefined {
+        let creator = this.permalinkCreators.get(roomId);
+        if (!creator) {
+            const room = this.client.getRoom(roomId);
+            if (!room) return undefined;
+            creator = new RoomPermalinkCreator(room);
+            creator.start();
+            this.permalinkCreators.set(roomId, creator);
+        }
+        return creator.forEvent(eventId);
     }
 
     /** The transaction id of an own message (its local echo's, else the sync echo's `unsigned.transaction_id`). */
@@ -1846,6 +1870,8 @@ export class ViewModelBridge implements ClientViewBridge {
         this.rows.forEach((r) => r.dispose());
         this.senderAvatars.forEach((a) => a.dispose());
         this.timelines.forEach((t) => t.dispose());
+        this.permalinkCreators.forEach((c) => c.stop());
+        this.permalinkCreators.clear();
         this.statusBar?.dispose();
         this.userMenu.dispose();
         this.roomList.dispose();

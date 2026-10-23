@@ -44,6 +44,7 @@ const h = vi.hoisted(() => {
     const room = {
         roomId: "!a",
         getMember: () => member,
+        getJoinedMembers: vi.fn((): Array<{ userId: string }> => []),
         findEventById: vi.fn((_id: string): unknown => undefined),
         findThreadForEvent: () => null,
         getUnfilteredTimelineSet: () => timelineSet,
@@ -51,6 +52,8 @@ const h = vi.hoisted(() => {
         currentState: {
             maySendEvent: vi.fn((_type: string, _user: string): boolean => true),
             getStateEvents: vi.fn((..._args: unknown[]): unknown => undefined),
+            on: vi.fn(),
+            removeListener: vi.fn(),
         },
         on: vi.fn(),
         off: vi.fn(),
@@ -138,6 +141,7 @@ const h = vi.hoisted(() => {
     const actionBars: Array<{ props: Record<string, unknown>; onReplyClick: Mock; onEditClick: Mock; dispose: Mock }> =
         [];
     const eventUtils = { canEdit: true };
+    const roomLists: Array<InstanceType<typeof FakeVm<{ sections: { roomIds: string[] }[] }>>> = [];
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
 
     return {
@@ -147,6 +151,7 @@ const h = vi.hoisted(() => {
         actionBars,
         eventUtils,
         sdkContext,
+        roomLists,
         mediaVm,
         FakeVm,
         mediaVms,
@@ -178,6 +183,7 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
     RoomListViewModel: class extends h.FakeVm<{ sections: { roomIds: string[] }[] }> {
         public constructor() {
             super({ sections: [{ roomIds: ["!a"] }] });
+            h.roomLists.push(this);
         }
         public updateVisibleRooms = vi.fn();
         public get roomIds(): string[] {
@@ -446,6 +452,7 @@ describe("ViewModelBridge", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        h.roomLists.length = 0;
         // The fakes outlive each test's bridge; drop the previous bridge's subscriptions.
         h.timeline.listeners.clear();
         bridge = new ViewModelBridge({
@@ -625,6 +632,30 @@ describe("ViewModelBridge", () => {
             expect(bridge.timeline("!a")).toEqual([]);
             ev.status = null;
             expect(bridge.timeline("!a").map((m) => m.id)).toEqual(["$m1"]);
+        });
+
+        it("hands over Element's permalink with the via servers, one started creator per room, stopped when the room leaves", () => {
+            h.room.getJoinedMembers.mockReturnValue([
+                { userId: "@bob:one.example.org" },
+                { userId: "@carol:one.example.org" },
+                { userId: "@dave:two.example.org" },
+            ]);
+            const { message } = readFirst();
+            expect(message().permalink).toBe("https://matrix.to/#/!a/$m1?via=one.example.org&via=two.example.org");
+            // Read again: the same creator (one start, one state listener), not a new one per read.
+            message();
+            expect(h.room.currentState.on).toHaveBeenCalledTimes(1);
+            expect(h.room.currentState.removeListener).not.toHaveBeenCalled();
+            // The room drops out of the bridge's list: the creator is stopped.
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            expect(h.room.currentState.removeListener).toHaveBeenCalledTimes(1);
+        });
+
+        it("hands over no permalink for a deleted message", () => {
+            const { ev, message } = readFirst();
+            (ev as { isRedacted: () => boolean }).isRedacted = () => true;
+            expect(message().redacted).toBe(true);
+            expect(message().permalink).toBeUndefined();
         });
 
         it("hands over canEdit by Element's rule, and edited when a replacement exists", () => {
