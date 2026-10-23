@@ -135,15 +135,22 @@ const h = vi.hoisted(() => {
                 mediaVms.push(this as never);
             }
         };
-    const actionBars: Array<{ props: Record<string, unknown>; onReplyClick: Mock; onEditClick: Mock; dispose: Mock }> =
-        [];
-    const eventUtils = { canEdit: true };
+    const actionBars: Array<{
+        props: Record<string, unknown>;
+        onReplyClick: Mock;
+        onEditClick: Mock;
+        onDownloadClick: Mock;
+        showDownload: boolean;
+        dispose: Mock;
+    }> = [];
+    const eventUtils = { canEdit: true, canDownload: true };
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
 
     return {
         sendText: vi.fn(),
         editText: vi.fn(),
         redact: vi.fn(),
+        downloadMedia: vi.fn(),
         actionBars,
         eventUtils,
         sdkContext,
@@ -384,6 +391,9 @@ vi.mock("../viewmodels/room/EventTileActionBarViewModel", () => ({
     EventTileActionBarViewModel: class {
         public onReplyClick = vi.fn();
         public onEditClick = vi.fn();
+        public onDownloadClick = vi.fn(async () => {});
+        public showDownload = true;
+        public getSnapshot = (): { actions: string[] } => ({ actions: this.showDownload ? ["download"] : [] });
         public dispose = vi.fn();
         public constructor(public props: Record<string, unknown>) {
             h.actionBars.push(this as never);
@@ -404,6 +414,10 @@ vi.mock("./InterimActions", () => ({
     sendText: (...args: unknown[]) => h.sendText(...args),
     editText: (...args: unknown[]) => h.editText(...args),
     redact: (...args: unknown[]) => h.redact(...args),
+}));
+vi.mock("./DownloadAction", () => ({
+    canDownloadMedia: () => h.eventUtils.canDownload,
+    downloadMedia: (...args: unknown[]) => h.downloadMedia(...args),
 }));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
@@ -476,6 +490,8 @@ describe("ViewModelBridge", () => {
         h.buttonClick.run = () => {};
         h.actionBars.length = 0;
         h.eventUtils.canEdit = true;
+        h.eventUtils.canDownload = true;
+        h.downloadMedia.mockReset();
         h.sdkContext.roomViewStore = { getRoomId: () => null };
     });
 
@@ -613,6 +629,90 @@ describe("ViewModelBridge", () => {
             expect(h.redact).toHaveBeenCalledWith(expect.anything(), "!a", "$mine");
         });
 
+        describe("B7 download", () => {
+            const run = (
+                use: (bar: { offered(): boolean; click(): Promise<void> }) => Promise<void>,
+                ev: unknown = target("$file"),
+            ) => {
+                h.downloadMedia.mockImplementationOnce(
+                    async (
+                        _client: unknown,
+                        roomId: string,
+                        eventId: string,
+                        hooks: {
+                            withActionBar(ev: unknown, use: (bar: never) => Promise<void>): Promise<void>;
+                            disposed(): boolean;
+                        },
+                    ) => {
+                        await hooks.withActionBar(ev, use as never);
+                        return { status: "done", roomId, eventId };
+                    },
+                );
+            };
+
+            it("hands the click of the stock action bar view-model over and disposes it after the click settled", async () => {
+                let finish: () => void = () => {};
+                run(async (bar) => {
+                    const click = h.actionBars[0].onDownloadClick;
+                    click.mockImplementationOnce(
+                        () =>
+                            new Promise<void>((resolve) => {
+                                finish = resolve;
+                            }),
+                    );
+                    await bar.click();
+                });
+                const p = bridge.download("!a", "$file");
+                await Promise.resolve();
+                await Promise.resolve();
+                expect(h.actionBars).toHaveLength(1);
+                expect(h.actionBars[0].props).toMatchObject({ canSendMessages: true });
+                expect(h.actionBars[0].dispose).not.toHaveBeenCalled();
+                finish();
+                await expect(p).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$file" });
+                expect(h.actionBars[0].onDownloadClick).toHaveBeenCalledWith(null);
+                expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+            });
+
+            it("reads the offer from the view-model's showDownload", async () => {
+                let seen: boolean[] = [];
+                run(async (bar) => {
+                    seen = [bar.offered()];
+                    h.actionBars[0].showDownload = false;
+                    seen.push(bar.offered());
+                });
+                await bridge.download("!a", "$file");
+                expect(seen).toEqual([true, false]);
+            });
+
+            it("maps a failure to the contract's error and disposes the view-model", async () => {
+                run(async () => {
+                    throw new Error("boom");
+                });
+                await expect(bridge.download("!a", "$file")).rejects.toMatchObject({ code: "failed", message: "boom" });
+                expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+            });
+
+            it("gives a repeat the pending download, and a later one its own", async () => {
+                let finish: () => void = () => {};
+                h.downloadMedia.mockImplementationOnce(
+                    () =>
+                        new Promise((resolve) => {
+                            finish = () => resolve({ status: "done" });
+                        }),
+                );
+                const first = bridge.download("!a", "$file");
+                const second = bridge.download("!a", "$file");
+                expect(second).toBe(first);
+                expect(h.downloadMedia).toHaveBeenCalledTimes(1);
+                finish();
+                await first;
+                h.downloadMedia.mockResolvedValueOnce({ status: "done" });
+                await bridge.download("!a", "$file");
+                expect(h.downloadMedia).toHaveBeenCalledTimes(2);
+            });
+        });
+
         const readFirst = () => {
             const ev = fakeEvent("$m1", { getSender: () => "@me:example.org" });
             h.timeline.snapshot = { items: [{ kind: "event", event: ev, continuation: false }], atLiveEnd: true };
@@ -636,6 +736,13 @@ describe("ViewModelBridge", () => {
             expect(message().canEdit).toBeUndefined();
             expect(message().edited).toBe(true);
             expect(message().editedTs).toBeUndefined();
+        });
+
+        it("hands over canDownload by Element's Download button rule", () => {
+            const { message } = readFirst();
+            expect(message().canDownload).toBe(true);
+            h.eventUtils.canDownload = false;
+            expect(message().canDownload).toBeUndefined();
         });
 
         it("hands over editedTs: the replacement's timestamp, only with edited", () => {

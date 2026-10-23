@@ -32,6 +32,7 @@ import {
     type ImageBodyViewSnapshot,
     type TimelineItem,
     type VideoBodyViewSnapshot,
+    ActionBarAction,
     RoomStatusBarState,
 } from "@element-hq/web-shared-components";
 
@@ -77,6 +78,7 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
+import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
@@ -374,6 +376,11 @@ class EventRow {
     /** Element's edit rule for this event (`canEditContent`), the rule the edit action bar button follows. */
     public canEdit(): boolean {
         return canEditContent(this.client, this.ev);
+    }
+
+    /** Element's rule for the Download action bar button (no view-model per row), see {@link canDownloadMedia}. */
+    public canDownload(): boolean {
+        return canDownloadMedia(this.ev);
     }
 
     /** The edited marker's rule (`TextualBodyViewModel`): a replacement event exists. */
@@ -1036,6 +1043,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private localDeviceVerified = false;
     /** Reaction presses waiting for their snapshot change, per (event, key): a repeat joins the pending one. */
     private readonly reacting = new Map<string, Promise<ActionOutcome>>();
+    /** B7: the downloads in flight, by room and event. */
+    private readonly downloading = new Map<string, Promise<ActionOutcome>>();
     private readonly reactionWaits = new Set<() => void>();
     /** The reaction picker the host shows over the kit, with the call that waits for its close. */
     private pickerCount = 0;
@@ -1409,6 +1418,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.urlPreviews(),
                 {
                     canEdit: row.canEdit(),
+                    canDownload: row.canDownload(),
                     edited: row.edited(),
                     editedTs: row.editedTs(),
                     redactedText: row.redactedText(),
@@ -1707,18 +1717,62 @@ export class ViewModelBridge implements ClientViewBridge {
     private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): boolean {
         const roomId = ev.getRoomId() ?? "";
         if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) return false;
-        const vm = new EventTileActionBarViewModel({
-            mxEvent: ev,
-            timelineRenderingType: TimelineRenderingType.Room,
-            canSendMessages: true,
-            canReact: false,
-        });
+        const vm = this.newActionBar(ev);
         try {
             run(vm);
             return true;
         } finally {
             vm.dispose();
         }
+    }
+
+    /** {@link actionBar} for an action that settles later: the view-model is disposed once `run` has settled. */
+    private async actionBarSettled(
+        ev: MatrixEvent,
+        run: (vm: EventTileActionBarViewModel) => Promise<void>,
+    ): Promise<void> {
+        const vm = this.newActionBar(ev);
+        try {
+            await run(vm);
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    private newActionBar(ev: MatrixEvent): EventTileActionBarViewModel {
+        return new EventTileActionBarViewModel({
+            mxEvent: ev,
+            timelineRenderingType: TimelineRenderingType.Room,
+            canSendMessages: true,
+            canReact: false,
+        });
+    }
+
+    /**
+     * B7: the Download button's click (`onDownloadClick`) for a media message, after the event is decrypted. One download
+     * per event is in flight: a repeat gets the pending call (the view-model ignores a click while it loads).
+     */
+    public download(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        const flight = `${roomId}\n${eventId}`;
+        const pending = this.downloading.get(flight);
+        if (pending) return pending;
+        const run = downloadMedia(this.client, roomId, eventId, {
+            withActionBar: (ev, use) =>
+                this.actionBarSettled(ev, (vm) =>
+                    use({
+                        offered: () => vm.getSnapshot().actions.includes(ActionBarAction.Download),
+                        click: () => vm.onDownloadClick(null),
+                    }),
+                ),
+            disposed: () => this.disposed,
+        })
+            .catch((e: unknown) => {
+                throw toActionError(e);
+            })
+            .finally(() => this.downloading.delete(flight));
+        this.downloading.set(flight, run);
+        return run;
     }
 
     public join(roomIdOrAlias: string): Promise<ActionOutcome> {

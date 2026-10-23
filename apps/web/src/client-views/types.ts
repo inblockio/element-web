@@ -82,6 +82,13 @@ export interface ViewMessage {
      * `m.text` or `m.emote` with a body). A kit offers its edit control only when this is true. Absent = not editable.
      */
     canEdit?: boolean;
+    /**
+     * Element offers a download for this message (the Download action bar button's rule: a media message whose content is
+     * actionable, `isContentActionable` and `MediaEventHelper.isEligible`). False or absent for a text message, a
+     * redacted one and one still waiting for its key; the module permission hint of the action bar view-model is not
+     * read here, `download` reports it as `forbidden`.
+     */
+    canDownload?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
@@ -287,6 +294,15 @@ export interface ClientViewBridge {
      * loaded. The kit asks for the confirmation. Interim (D16/D20): Element's own client call.
      */
     redact(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * B7: downloads the file, image, video or audio of the message `eventId` the way Element's Download action bar button
+     * does (`EventTileActionBarViewModel.onDownloadClick`): it waits until the event is decrypted, then Element fetches
+     * and decrypts the file and saves it with its own downloader. `done` once Element's click settled, which is also the
+     * case when the fetch or decryption failed: Element's own error dialog shows then and the kit shows nothing of its
+     * own. `unknown_room` / `unknown_event` for what the client cannot load, `unsupported` for a message without media,
+     * `failed` when it stays undecrypted, `forbidden` when the view-model does not offer the download.
+     */
+    download(roomId: string, eventId: string): Promise<ActionOutcome>;
     /**
      * A10: marks the room unread (the room list item's `onMarkAsUnread`: the room account data `m.marked_unread`). `done`
      * once the homeserver holds it, also for a room that already shows unread; `unsupported` for an invite or an archived
