@@ -76,7 +76,7 @@ import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
 import { CallCard } from "./CallCard";
-import { getClientViews, selectClientView } from "./registry";
+import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
@@ -1553,6 +1553,10 @@ export class ViewModelBridge implements ClientViewBridge {
 
     public views(): { id: string; name: string }[] {
         return [{ id: STOCK_VIEW, name: "Element" }, ...getClientViews().map(({ id, name }) => ({ id, name }))];
+    }
+
+    public meetUrl(): string | undefined {
+        return getMeetUrl();
     }
 
     public switchTo(viewId: string): void {

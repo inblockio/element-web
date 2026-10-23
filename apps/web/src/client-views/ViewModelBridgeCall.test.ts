@@ -105,7 +105,7 @@ vi.mock("../contexts/SDKContextClass", () => ({
     },
 }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => null }));
-vi.mock("./registry", () => ({ getClientViews: () => [], selectClientView: vi.fn() }));
+vi.mock("./registry", () => ({ getClientViews: () => [], getMeetUrl: () => undefined, selectClientView: vi.fn() }));
 
 const member = (userId: string, name: string, url?: string) =>
     new h.FakeVm({ id: userId, name, url, size: "20px", title: userId });

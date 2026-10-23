@@ -253,6 +253,12 @@ export interface ClientViewBridge {
     /** "stock" = Element's own UI */
     switchTo(viewId: string): void;
     /**
+     * The address of the call app from the host config (`client_views_meet_url`), or undefined when the instance has none:
+     * a kit then offers no call. Version 2, additive: a host without it is a host without calls. A kit builds the join
+     * link from it (`<meetUrl>/#/room/<roomId>`); the call itself runs in that app, never in the kit.
+     */
+    meetUrl(): string | undefined;
+    /**
      * Sends a plain-text message (`m.text`, no markdown) and resolves `done` + `eventId` once the server returns it.
      * `opts.txnId` is the transaction id the sent event carries (`ViewMessage.txnId`); `opts.replyTo` is the event id
      * of the replied message. In a local (not yet created) room the first send creates the room and `roomId` is the

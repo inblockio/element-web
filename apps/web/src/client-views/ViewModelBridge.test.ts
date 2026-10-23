@@ -407,6 +407,7 @@ vi.mock("./InterimActions", () => ({
 }));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
+    getMeetUrl: vi.fn(() => "https://meet.example.org"),
     selectClientView: vi.fn(async () => {}),
 }));
 
@@ -693,6 +694,13 @@ describe("ViewModelBridge", () => {
         ]);
         bridge.switchTo("stock");
         expect(selectClientView).toHaveBeenCalledWith("stock");
+    });
+
+    it("hands the kit the Meet address of the host config (lane CALL: absent = no calls)", async () => {
+        expect(bridge.meetUrl()).toBe("https://meet.example.org");
+        const { getMeetUrl } = await import("./registry");
+        vi.mocked(getMeetUrl).mockReturnValueOnce(undefined);
+        expect(bridge.meetUrl()).toBeUndefined();
     });
 
     it("fills the sender avatar from the member avatar view-model, one per sender, and follows its changes", () => {
