@@ -494,7 +494,13 @@ export async function logout(client: MatrixClient): Promise<ActionOutcome> {
             }
             await new Promise<void>((resolve, reject) => {
                 const timer = setTimeout(
-                    () => reject(new ClientViewActionError("failed", "Element did not sign out in time")),
+                    () =>
+                        reject(
+                            new ClientViewActionError(
+                                "failed",
+                                "Element did not sign out in time: reload the page before trying again",
+                            ),
+                        ),
                     LOGOUT_TIMEOUT_MS,
                 );
                 void announced.then(() => {

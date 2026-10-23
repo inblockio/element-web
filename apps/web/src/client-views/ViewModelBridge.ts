@@ -1767,7 +1767,15 @@ export class ViewModelBridge implements ClientViewBridge {
     /** A8: the files come from Element's picker unless the caller has them. */
     public async upload(roomId: string, files?: File[]): Promise<ActionOutcome> {
         this.used = true;
-        if (!this.client.getRoom(roomId)) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        const room = this.client.getRoom(roomId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        // A new DM is still a local room: Element would queue the upload on it and create the room behind the user's back.
+        // Refused before any picker or dialog; the first message creates the room.
+        if (isLocalRoom(roomId))
+            throw new ClientViewActionError(
+                "unsupported",
+                "send a message first: a new chat has no room to upload into yet",
+            );
         let chosen: File[] | null;
         if (files) chosen = await rewrapFiles(files);
         else {
@@ -1781,10 +1789,6 @@ export class ViewModelBridge implements ClientViewBridge {
             }
         }
         if (!chosen?.length) return { status: "cancelled" };
-        // A new DM is still a local room: Element queues the upload on it, and the real room is created (below) only once
-        // Element dispatches `local_room_event`, i.e. after the user confirmed.
-        const room = this.client.getRoom(roomId);
-        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
         const vm = new RoomUploadViewModel(
             room,
             this.client,
@@ -1795,7 +1799,7 @@ export class ViewModelBridge implements ClientViewBridge {
             () => {},
         );
         try {
-            return await uploadFiles(vm, room, chosen, this.client);
+            return await uploadFiles(vm, room, chosen);
         } finally {
             vm.dispose();
         }

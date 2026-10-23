@@ -7,19 +7,14 @@
 
 // @vitest-environment happy-dom
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { type MatrixClient, type Room } from "matrix-js-sdk/src/matrix";
-import { createTestClient } from "test-utils";
+import { describe, it, expect, vi } from "vitest";
+import { type Room } from "matrix-js-sdk/src/matrix";
 
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import ContentMessages from "../ContentMessages";
 import { openFilePicker, rewrapFiles, uploadFiles, UPLOAD_IDLE_MS, UPLOAD_PROCESSING_MS } from "./UploadAction";
 import { ClientViewActionError } from "./types";
-import { LocalRoom, LocalRoomState, LOCAL_ROOM_ID_PREFIX } from "../models/LocalRoom";
-import { createRoomFromLocalRoom } from "../utils/direct-messages";
-
-vi.mock("../utils/direct-messages", () => ({ createRoomFromLocalRoom: vi.fn() }));
 
 /* A8: Element's picker, the re-wrap into Element's realm, and the outcome read from Element's upload actions. */
 const room = (maySend = true): Room => ({ roomId: "!a:example.org", maySendMessage: () => maySend }) as unknown as Room;
@@ -273,75 +268,5 @@ describe("A8 idle timeout and Element's running uploads", () => {
         } finally {
             current.mockRestore();
         }
-    });
-});
-
-describe("A8 upload into a new chat (a local room): the real room exists only after the confirm", () => {
-    let client: MatrixClient;
-    let local: LocalRoom;
-    const REAL = "!real:example.org";
-    const realUp = (name: string): { fileName: string; roomId: string } => ({ fileName: name, roomId: REAL });
-    const theUpload = realUp("notes.txt");
-    /** Element's `doMaybeLocalRoomAction`: queue the upload on the local room and ask for its creation. */
-    const confirmed = (after: () => void): UploadVmLike => ({
-        initiateViaInputFiles: vi.fn(async () => {
-            local.afterCreateCallbacks.push(after);
-            defaultDispatcher.dispatch({ action: "local_room_event", roomId: local.roomId }, true);
-        }),
-    });
-    type UploadVmLike = { initiateViaInputFiles: () => Promise<void> };
-
-    beforeEach(() => {
-        vi.clearAllMocks();
-        client = createTestClient();
-        local = new LocalRoom(LOCAL_ROOM_ID_PREFIX + "dm", client, "@me:example.org");
-        vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, l) => {
-            await new Promise((r) => setTimeout(r, 10)); // the real one is a server round trip
-            l.state = LocalRoomState.CREATED;
-            l.actualRoomId = REAL;
-            const queued = l.afterCreateCallbacks;
-            l.afterCreateCallbacks = [];
-            queued.forEach((cb) => cb(REAL));
-        });
-    });
-
-    it("a dismissed confirm creates no room: cancelled, nothing queued", async () => {
-        const vm = { initiateViaInputFiles: vi.fn(async () => {}) };
-        expect(await uploadFiles(vm, local as unknown as Room, [file()], client)).toEqual({ status: "cancelled" });
-        expect(createRoomFromLocalRoom).not.toHaveBeenCalled();
-        expect(local.state).toBe(LocalRoomState.NEW);
-    });
-
-    it("a confirmed upload creates the real room, and the outcome names it", async () => {
-        const vm = confirmed(() => {
-            dispatch(Action.UploadStarted, theUpload);
-            setTimeout(() => dispatch(Action.UploadFinished, theUpload), 20);
-        });
-        expect(await uploadFiles(vm, local as unknown as Room, [file()], client)).toEqual({
-            status: "done",
-            roomId: REAL,
-        });
-        expect(createRoomFromLocalRoom).toHaveBeenCalledOnce();
-    });
-
-    it("an upload that fails after the room was created carries the real room id", async () => {
-        const vm = confirmed(() => {
-            dispatch(Action.UploadStarted, theUpload);
-            setTimeout(() => dispatch(Action.UploadFailed, theUpload), 20);
-        });
-        const error = await uploadFiles(vm, local as unknown as Room, [file()], client).catch((e: unknown) => e);
-        expect((error as ClientViewActionError).code).toBe("failed");
-        expect((error as ClientViewActionError).roomId).toBe(REAL);
-    });
-
-    it("a failed creation is failed (no room id) and leaves nothing queued to post later", async () => {
-        vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, l) => {
-            l.state = LocalRoomState.ERROR;
-        });
-        const vm = confirmed(() => dispatch(Action.UploadStarted, theUpload));
-        const error = await uploadFiles(vm, local as unknown as Room, [file()], client).catch((e: unknown) => e);
-        expect((error as ClientViewActionError).code).toBe("failed");
-        expect((error as ClientViewActionError).roomId).toBeUndefined();
-        expect(local.afterCreateCallbacks).toHaveLength(0);
     });
 });

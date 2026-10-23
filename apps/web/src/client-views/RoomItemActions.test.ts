@@ -137,6 +137,23 @@ describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () 
         expect((await setFavourite(item, r, true)).status).toBe("done");
     });
 
+    it("runs overlapping calls for one room one after the other: an opposite call does not return done on a stale tag", async () => {
+        const r = room();
+        const item = makeItem(snap());
+        const order: string[] = [];
+        item.onToggleFavorite.mockImplementation(() => {
+            const adding = !(r.tags as Record<string, unknown>)["m.favourite"];
+            order.push(adding ? "add" : "remove");
+            setTimeout(() => tagged(r, adding), 200);
+        });
+        const on = setFavourite(item, r, true);
+        const off = setFavourite(item, r, false);
+        expect((await on).status).toBe("done");
+        expect((await off).status).toBe("done");
+        expect(order).toEqual(["add", "remove"]);
+        expect((r.tags as Record<string, unknown>)["m.favourite"]).toBeUndefined();
+    });
+
     it("is network (may still apply) when the room's tag does not show it in time", async () => {
         vi.useFakeTimers();
         try {

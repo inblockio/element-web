@@ -307,6 +307,15 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(document.querySelector("input[type=file]")).toBeNull();
     });
 
+    it("A8: upload into a new chat's local room is unsupported before any picker or dialog (the first message creates the room)", async () => {
+        const local = { roomId: LOCAL_ROOM_ID_PREFIX + "dm2", name: "Bob", state: LocalRoomState.NEW, tags: {} };
+        rooms[local.roomId] = local;
+        const error = await bridge.upload(local.roomId).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(ClientViewActionError);
+        expect((error as ClientViewActionError).code).toBe("unsupported");
+        expect(document.querySelector("input[type=file]")).toBeNull();
+    });
+
     it("A10: the notification level is the echo's (the item snapshot stays stale after a change), and a change of the echo updates the list", () => {
         const seen: string[] = [];
         bridge.onChange((e) => seen.push(e.kind));

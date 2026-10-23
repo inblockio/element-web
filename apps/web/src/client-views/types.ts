@@ -191,14 +191,9 @@ export type ClientViewActionErrorCode =
 
 /** What a rejected action carries: a code a kit maps to its own error, and Element's message. */
 export class ClientViewActionError extends Error {
-    /**
-     * @param roomId the real room an action made before it failed (an upload into a new chat creates it first), so the
-     * caller can still open it
-     */
     public constructor(
         public readonly code: ClientViewActionErrorCode,
         message?: string,
-        public readonly roomId?: string,
     ) {
         super(message ?? code);
         this.name = "ClientViewActionError";

@@ -63,28 +63,42 @@ export async function markUnread(item: RoomItemActionsVm, room: Room): Promise<A
     return done(room.roomId);
 }
 
+const favouriteQueue = new Map<string, Promise<unknown>>();
+
 const FAVOURITE_TAG = "m.favourite";
 const isTagged = (room: Room): boolean => !!room.tags?.[FAVOURITE_TAG];
 
 /**
  * A10 favourite: `onToggleFavorite` dispatches `RoomListActions.tagRoom` (set / delete the room tag `m.favourite`). Its
  * result payloads name no room (any other room's tag change dispatches the same action), so none is read: the outcome is the
- * room's own `m.favourite` tag, which arrives with the sync. `done` once it is as asked; if it is not within
+ * room's own `m.favourite` tag, which arrives with the sync. Calls for one room run one after the other. `done` once it is as asked; if it is not within
  * `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (a refusal shows Element's own error dialog and leaves the tag as it was;
  * the write is not stoppable and may still apply).
  */
-export async function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): Promise<ActionOutcome> {
-    const snap = item.getSnapshot();
-    if (snap.notification.invited) throw new ClientViewActionError("unsupported", "an invite is not a favourite");
-    assertListed(room);
-    if (isTagged(room) === on) return done(room.roomId);
-    item.onToggleFavorite();
-    const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
-    while (Date.now() < until) {
+export function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): Promise<ActionOutcome> {
+    const run = async (): Promise<ActionOutcome> => {
+        const snap = item.getSnapshot();
+        if (snap.notification.invited) throw new ClientViewActionError("unsupported", "an invite is not a favourite");
+        assertListed(room);
         if (isTagged(room) === on) return done(room.roomId);
-        await new Promise((r) => setTimeout(r, 50));
-    }
-    throw new ClientViewActionError("network", "the room's tag did not change in time; it may still apply");
+        item.onToggleFavorite();
+        const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
+        while (Date.now() < until) {
+            if (isTagged(room) === on) return done(room.roomId);
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        throw new ClientViewActionError("network", "the room's tag did not change in time; it may still apply");
+    };
+    // One call at a time per room: the tag is stale until the sync, so an overlapping opposite call would toggle on a stale
+    // state (or return `done` on the first call's tag).
+    const previous = favouriteQueue.get(room.roomId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    const tail = next.catch(() => undefined);
+    favouriteQueue.set(room.roomId, tail);
+    void tail.then(() => {
+        if (favouriteQueue.get(room.roomId) === tail) favouriteQueue.delete(room.roomId);
+    });
+    return next;
 }
 
 /**
