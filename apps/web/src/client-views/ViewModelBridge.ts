@@ -84,6 +84,7 @@ import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
+import { createSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
@@ -103,6 +104,7 @@ import {
     type ViewReply,
     type ViewNotificationLevel,
     type ViewRoom,
+    type ViewSection,
     type ViewThread,
     type ViewUrlPreview,
     ClientViewActionError,
@@ -1027,6 +1029,7 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly heldForEncryption = new Set<string>();
     private statusBar?: RoomStatusBarViewModel;
     private roomCache: ViewRoom[] = [];
+    private sectionCache: ViewSection[] = [];
     /** The rooms that were invites at the last look. */
     private invitedRooms = new Set<string>();
     /** Local rooms of the chats started here (A6) that Element has not created yet; listed until they are. */
@@ -1173,6 +1176,8 @@ export class ViewModelBridge implements ClientViewBridge {
         // Item view-models exist only for rooms the list was told are visible.
         this.roomList.updateVisibleRooms(0, ids.length);
         const rooms: ViewRoom[] = this.localChatRooms();
+        // The custom sections are the same in every item's snapshot (the item lists the store's sections); the first one's is read.
+        let sections: ViewSection[] | undefined;
         for (const id of ids) {
             const item = this.roomList.getRoomItemViewModel(id);
             if (!item) continue;
@@ -1191,6 +1196,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 });
             }
             const s = item.getSnapshot();
+            sections ??= (s.sections ?? []).map(({ tag, name }, order) => ({ tag, name, order }));
             const avatarUrl = room ? (avatarUrlForRoom(room, AVATAR_PX, AVATAR_PX, "crop") ?? undefined) : undefined;
             rooms.push(toViewRoom(s, rooms.length, avatarUrl, room ? this.notificationLevelOf(room) : undefined));
             if (!this.statusBar && room) this.watchConnection(room);
@@ -1198,8 +1204,14 @@ export class ViewModelBridge implements ClientViewBridge {
         // An invite that became a join: the kit asks for the room's timeline again (none was built while it was invited).
         const joined = rooms.filter((r) => r.membership !== "invite" && this.invitedRooms.has(r.id));
         this.invitedRooms = new Set(rooms.filter((r) => r.membership === "invite").map((r) => r.id));
-        if (JSON.stringify(rooms) === JSON.stringify(this.roomCache)) return;
+        const sectionList = sections ?? [];
+        if (
+            JSON.stringify(rooms) === JSON.stringify(this.roomCache) &&
+            JSON.stringify(sectionList) === JSON.stringify(this.sectionCache)
+        )
+            return;
         this.roomCache = rooms;
+        this.sectionCache = sectionList;
         this.emit({ kind: "rooms" });
         for (const r of joined) this.emit({ kind: "timeline", roomId: r.id });
     }
@@ -1370,6 +1382,11 @@ export class ViewModelBridge implements ClientViewBridge {
     public rooms(): ViewRoom[] {
         this.used = true;
         return this.roomCache;
+    }
+
+    public sections(): ViewSection[] {
+        this.used = true;
+        return this.sectionCache;
     }
 
     public timeline(roomId: string): ViewMessage[] {
@@ -1806,7 +1823,7 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /** The room's list item view-model and Room for an A10 action, or the contract's `unknown_room`. */
-    private roomItem(roomId: string): { item: RoomItemActionsVm; room: Room } {
+    private roomItem(roomId: string): { item: RoomItemActionsVm & RoomSectionVm; room: Room } {
         const room = this.client.getRoom(roomId);
         const item = this.roomList.getRoomItemViewModel(roomId);
         if (!room || !item || !("onMarkAsUnread" in item))
@@ -1822,6 +1839,17 @@ export class ViewModelBridge implements ClientViewBridge {
     public async setFavourite(roomId: string, on: boolean): Promise<ActionOutcome> {
         const { item, room } = this.roomItem(roomId);
         return setFavourite(item, room, on);
+    }
+
+    public async setSection(roomId: string, tag: string | null): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return setSection(item, room, tag);
+    }
+
+    public async createSection(roomId?: string): Promise<ActionOutcome> {
+        if (roomId === undefined) return createSection(undefined);
+        const { room } = this.roomItem(roomId);
+        return createSection(room);
     }
 
     public async setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome> {

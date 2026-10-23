@@ -58,7 +58,15 @@ export function nodeText(node: ReactNode): string {
 export function toViewRoom(
     snapshot: Pick<
         RoomListItemViewSnapshot,
-        "id" | "name" | "isDm" | "notification" | "isFavourite" | "canMarkAsUnread" | "canMarkAsRead" | "roomNotifState"
+        | "id"
+        | "name"
+        | "isDm"
+        | "notification"
+        | "isFavourite"
+        | "canMarkAsUnread"
+        | "canMarkAsRead"
+        | "roomNotifState"
+        | "sections"
     >,
     order: number,
     avatarUrl?: string,
@@ -67,6 +75,8 @@ export function toViewRoom(
 ): ViewRoom {
     const n = snapshot.notification;
     const unreadCount = n.hasUnreadCount ? n.count : 0;
+    // Favourite and a custom section exclude each other (tagRoom keeps one); the item lists custom sections only.
+    const section = snapshot.sections?.find((s) => s.isSelected)?.tag;
     return {
         id: snapshot.id,
         name: snapshot.name,
@@ -77,6 +87,7 @@ export function toViewRoom(
         order,
         membership: n.invited ? "invite" : "join",
         isFavourite: snapshot.isFavourite,
+        ...(section === undefined ? {} : { section }),
         canMarkAsUnread: snapshot.canMarkAsUnread,
         showsUnread: !n.invited && snapshot.canMarkAsRead,
         notificationLevel: notificationLevel ?? snapshot.roomNotifState,

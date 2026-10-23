@@ -29,6 +29,12 @@ export interface ViewRoom {
     /** The room is a favourite (the room list item's `isFavourite`, the `m.favourite` room tag). */
     isFavourite: boolean;
     /**
+     * The room's custom section (the room list item's `sections`, the entry with `isSelected`): the opaque tag of one of
+     * `ClientViewBridge.sections()`. Absent for a room in no custom section. Exclusive with `isFavourite` (Element's tagRoom
+     * keeps a room in one section).
+     */
+    section?: string;
+    /**
      * Element offers "mark as unread" for the room (the item's `canMarkAsUnread`): it shows nothing unread and is not
      * archived. For a joined room, false means it already shows unread, by a count, an activity or a mark.
      */
@@ -42,6 +48,16 @@ export interface ViewRoom {
     showsUnread: boolean;
     /** The room's notification level (the item's `roomNotifState`). */
     notificationLevel: ViewNotificationLevel;
+}
+
+/**
+ * A custom room-list section (Element's `RoomList.CustomSectionData` / `RoomList.OrderedCustomSections`), as the room list
+ * item view-model's `sections` lists them. `tag` is opaque (a kit passes it back as it got it), `order` is Element's, 0 = top.
+ */
+export interface ViewSection {
+    tag: string;
+    name: string;
+    order: number;
 }
 
 /** The notification levels of a room, as the room list item view-model's `RoomNotifState` names them. */
@@ -179,7 +195,9 @@ export type ViewConnection = "online" | "connecting" | "offline";
  * What an action resolved with. `done`: the effect happened (the server answered, the snapshot changed, the dialog
  * returned). `cancelled`: the user dismissed Element's own dialog or picker (never an error).
  */
-export type ActionOutcome = { status: "done"; roomId?: string; eventId?: string } | { status: "cancelled" };
+export type ActionOutcome =
+    | { status: "done"; roomId?: string; eventId?: string; section?: string }
+    | { status: "cancelled" };
 
 export type ClientViewActionErrorCode =
     | "unknown_room"
@@ -299,6 +317,26 @@ export interface ClientViewBridge {
      * error dialog shows too).
      */
     setFavourite(roomId: string, on: boolean): Promise<ActionOutcome>;
+    /**
+     * The custom sections, in Element's order (the room list item view-model's `sections`: custom sections only, the
+     * default sections are `isFavourite` and the unsectioned rest). A change fires `onChange` with kind `rooms`. Empty while
+     * the list holds no room.
+     */
+    sections(): ViewSection[];
+    /**
+     * M6 B1: puts the room into the custom section `tag` (the item's `onToggleSection`, called only when the room's section
+     * differs: Element's tagRoom replaces a favourite or another section), or takes it out of its custom section with `null`
+     * (`onRemoveFromSection`, only when it is in one). `done` once the room's tags show the target; `unsupported` for an
+     * invite, an archived room or a tag `sections()` does not list, `unknown_room`; `network` when the tag does not show in
+     * 15 s (the write may still apply; a refusal shows Element's error dialog).
+     */
+    setSection(roomId: string, tag: string | null): Promise<ActionOutcome>;
+    /**
+     * M6 B1: Element's create-section dialog (`RoomListStoreV3.createSection`, D17), with `roomId` preselected when given.
+     * `done` + `section` (the new tag) once the section exists and, for a room the dialog kept selected, the room is in it;
+     * `cancelled` when the dialog closes without a name.
+     */
+    createSection(roomId?: string): Promise<ActionOutcome>;
     /**
      * A10: sets the room's notification level (the item's `onSetRoomNotifState`: push rules). `done` once the homeserver
      * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).

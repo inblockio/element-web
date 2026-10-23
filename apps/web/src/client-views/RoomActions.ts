@@ -35,7 +35,7 @@ const CHAT_SHOWN_MS = 5_000;
 /** How long Element's dialog may take to open after the view-model action. */
 const DIALOG_OPEN_MS = 5_000;
 
-interface DialogHandle {
+export interface DialogHandle {
     finished: Promise<unknown[]>;
 }
 
@@ -81,7 +81,7 @@ export function recordPayloads(): {
  * Runs `start` (a view-model action that makes `MatrixChat` open a dialog) and resolves with the handle of the first
  * dialog that opens, so the dialog's own result can be read. Only one such action runs at a time.
  */
-function openedDialog(start: () => void, onFinished?: () => void): Promise<DialogHandle> {
+export function openedDialog(start: () => void, onFinished?: () => void): Promise<DialogHandle> {
     return new Promise<DialogHandle>((resolve, reject) => {
         // oxlint-disable-next-line typescript/unbound-method -- put back as it was; called with `Modal` as `this` below
         const original = Modal.createDialog;
@@ -124,7 +124,7 @@ function openedDialog(start: () => void, onFinished?: () => void): Promise<Dialo
     });
 }
 
-async function dialogAction(run: () => Promise<ActionOutcome>): Promise<ActionOutcome> {
+export async function dialogAction(run: () => Promise<ActionOutcome>): Promise<ActionOutcome> {
     if (dialogActionRunning) throw new ClientViewActionError("failed", "another Element dialog action is running");
     dialogActionRunning = true;
     try {

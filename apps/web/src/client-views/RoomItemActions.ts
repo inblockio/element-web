@@ -63,7 +63,22 @@ export async function markUnread(item: RoomItemActionsVm, room: Room): Promise<A
     return done(room.roomId);
 }
 
-const favouriteQueue = new Map<string, Promise<unknown>>();
+const tagQueue = new Map<string, Promise<unknown>>();
+
+/**
+ * Runs `run` after every earlier room-tag write of the room (favourite, custom section) has settled: the room's tags are
+ * stale until the sync, and `tagRoom` toggles on them, so an overlapping call would act on a stale state.
+ */
+export function serialTagWrite<T>(roomId: string, run: () => Promise<T>): Promise<T> {
+    const previous = tagQueue.get(roomId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    const tail = next.catch(() => undefined);
+    tagQueue.set(roomId, tail);
+    void tail.then(() => {
+        if (tagQueue.get(roomId) === tail) tagQueue.delete(roomId);
+    });
+    return next;
+}
 
 const FAVOURITE_TAG = "m.favourite";
 const isTagged = (room: Room): boolean => !!room.tags?.[FAVOURITE_TAG];
@@ -91,14 +106,7 @@ export function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): 
     };
     // One call at a time per room: the tag is stale until the sync, so an overlapping opposite call would toggle on a stale
     // state (or return `done` on the first call's tag).
-    const previous = favouriteQueue.get(room.roomId) ?? Promise.resolve();
-    const next = previous.then(run, run);
-    const tail = next.catch(() => undefined);
-    favouriteQueue.set(room.roomId, tail);
-    void tail.then(() => {
-        if (favouriteQueue.get(room.roomId) === tail) favouriteQueue.delete(room.roomId);
-    });
-    return next;
+    return serialTagWrite(room.roomId, run);
 }
 
 /**
