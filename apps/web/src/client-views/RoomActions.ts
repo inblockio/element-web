@@ -140,12 +140,14 @@ const isViewRoom = (p: ActionPayload): p is ViewRoomPayload => p.action === Acti
 
 /**
  * The `ViewRoom` that the start-chat dialog's Go dispatches (`startDmOnFirstMessage`, `startDm`): an existing DM
- * (trigger `MessageUser`) or the new chat's local room, which carries the `targets`. Any other `ViewRoom` (a notification
+ * (trigger `MessageUser`), the room `startDm` makes for a single 3rd-party invite in an encrypted-by-default setup (trigger
+ * `Created`, a real room id), or the new chat's local room, which carries the `targets`. Any other `ViewRoom` (a notification
  * click, an answered call) is not the chat.
  */
 const isChatViewRoom = (p: ActionPayload): p is ViewRoomPayload =>
     isViewRoom(p) &&
     (p.metricsTrigger === "MessageUser" ||
+        p.metricsTrigger === "Created" ||
         (isLocalRoom(p.room_id) && (p as { targets?: unknown }).targets !== undefined));
 
 /**
@@ -165,7 +167,9 @@ export function createRoomViaDialog(start: () => void): Promise<ActionOutcome> {
             if (!confirmed) return { status: "cancelled" };
             const roomId = await seen.wait<string>(
                 (p) => {
-                    if (p.action === Action.JoinRoomError)
+                    // createRoom's own failure carries no `err`; RoomViewStore's (a failed join of some other room, which
+                    // may be in flight while this create runs) does, and is not this create's result.
+                    if (p.action === Action.JoinRoomError && (p as { err?: unknown }).err === undefined)
                         return new ClientViewActionError("failed", "Element could not create the room");
                     return isViewRoom(p) && p.metricsTrigger === "Created" ? p.room_id : undefined;
                 },

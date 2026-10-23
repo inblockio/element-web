@@ -91,6 +91,25 @@ describe("A6 create room (RoomListViewModel.createRoom -> Element's dialog)", ()
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
     });
 
+    it("ignores a JoinRoomError of another room's failed join after the confirmation (it carries err), fails on the create's own", async () => {
+        const d = openDialogOnStart();
+        const outcome = createRoomViaDialog(d.start);
+        d.finish(true, {});
+        await vi.advanceTimersByTimeAsync(0);
+        defaultDispatcher.dispatch(
+            { action: Action.JoinRoomError, roomId: "!other:example.org", err: new Error("no") },
+            true,
+        );
+        viewRoom("!new:example.org", "Created");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
+        const d2 = openDialogOnStart();
+        const own = createRoomViaDialog(d2.start);
+        d2.finish(true, {});
+        await vi.advanceTimersByTimeAsync(0);
+        defaultDispatcher.dispatch({ action: Action.JoinRoomError, roomId: "!x:example.org" }, true);
+        expect(await codeOf(own)).toBe("failed");
+    });
+
     it("is cancelled from the dialog's own answer, for a refusal and for a close without an answer", async () => {
         for (const result of [[false], []]) {
             const d = openDialogOnStart();
@@ -195,6 +214,16 @@ describe("A6 start chat (RoomListViewModel.createChatRoom -> Element's invite di
         });
         d.finish(true);
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+new:example.org" });
+    });
+
+    it("is done with the room startDm created for a single email invite (trigger Created, a real room id)", async () => {
+        const d = openDialogOnStart();
+        const outcome = startChatViaDialog(() => {
+            d.start();
+            viewRoom("!emailroom:example.org", "Created");
+        });
+        d.finish(true);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!emailroom:example.org" });
     });
 
     it("is cancelled when the dialog closes without success", async () => {
