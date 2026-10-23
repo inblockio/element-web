@@ -135,8 +135,13 @@ const h = vi.hoisted(() => {
                 mediaVms.push(this as never);
             }
         };
-    const actionBars: Array<{ props: Record<string, unknown>; onReplyClick: Mock; onEditClick: Mock; dispose: Mock }> =
-        [];
+    const actionBars: Array<{
+        props: Record<string, unknown>;
+        onReplyClick: Mock;
+        onEditClick: Mock;
+        onPinClick: Mock;
+        dispose: Mock;
+    }> = [];
     const eventUtils = { canEdit: true };
     const pins = { pinned: false, canPin: true, canUnpin: true, press: undefined as undefined | (() => Promise<void>) };
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
