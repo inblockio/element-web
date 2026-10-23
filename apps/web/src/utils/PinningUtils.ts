@@ -133,13 +133,15 @@ export default class PinningUtils {
         // Should have a non-local event id
         if (mxEvent.status !== null) return;
 
-        // Get the current pinned events of the room
-        const pinnedIds: Array<string> =
-            room
+        // Get the current pinned events of the room. A copy: the live state content must not change before the
+        // homeserver has accepted the new list (a refused send would leave the event shown as pinned or unpinned).
+        const pinnedIds: Array<string> = [
+            ...(room
                 .getLiveTimeline()
                 .getState(EventTimeline.FORWARDS)
                 ?.getStateEvents(EventType.RoomPinnedEvents, "")
-                ?.getContent().pinned || [];
+                ?.getContent().pinned || []),
+        ];
 
         let roomAccountDataPromise: Promise<EmptyObject | void> = Promise.resolve();
         // If the event is already pinned, unpin it

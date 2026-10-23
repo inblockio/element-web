@@ -67,6 +67,7 @@ import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { canEditContent, isContentActionable } from "../utils/EventUtils";
+import PinningUtils from "../utils/PinningUtils";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
 import { RedactedBodyViewModel } from "../viewmodels/message-body/RedactedBodyViewModel";
 import { getRedactedBodyViewModelProps } from "../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState";
@@ -84,6 +85,7 @@ import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
+import { setPinned } from "./PinAction";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
@@ -374,6 +376,16 @@ class EventRow {
     /** Element's edit rule for this event (`canEditContent`), the rule the edit action bar button follows. */
     public canEdit(): boolean {
         return canEditContent(this.client, this.ev);
+    }
+
+    /** M6 B2: the event is in the room's `m.room.pinned_events` (the action bar view-model's own source). */
+    public pinned(): boolean {
+        return PinningUtils.isPinned(this.client, this.ev);
+    }
+
+    /** M6 B2: Element offers Unpin on a pinned event and Pin on an unpinned one (`PinningUtils`, as the action bar reads them). */
+    public canPin(): boolean {
+        return this.pinned() ? PinningUtils.canUnpin(this.client, this.ev) : PinningUtils.canPin(this.client, this.ev);
     }
 
     /** The edited marker's rule (`TextualBodyViewModel`): a replacement event exists. */
@@ -1077,6 +1089,7 @@ export class ViewModelBridge implements ClientViewBridge {
         this.disposers.push(this.userMenu.subscribe(() => this.emit({ kind: "me" })));
         this.watchLocalVerification();
         this.watchEncryption();
+        this.watchPins();
         // A local chat room changes state (creating, created, error) through client room events.
         const onLocalRoom = (room: Room): void => {
             if (this.localChats.has(room.roomId)) this.syncRooms();
@@ -1121,6 +1134,20 @@ export class ViewModelBridge implements ClientViewBridge {
             if (flipped || this.heldForEncryption.delete(roomId)) this.emit({ kind: "timeline", roomId });
         };
         void pending.then(settle, () => settle(false));
+    }
+
+    /**
+     * The pinned flag of a row is read live (`PinningUtils.isPinned`): the room's rows are handed over again when its
+     * `m.room.pinned_events` changes, also by another client.
+     */
+    private watchPins(): void {
+        const onPinsState = (ev: MatrixEvent): void => {
+            const roomId = ev.getRoomId();
+            if (ev.getType() !== EventType.RoomPinnedEvents || !roomId || !this.timelines.has(roomId)) return;
+            this.emit({ kind: "timeline", roomId });
+        };
+        this.client.on(RoomStateEvent.Events, onPinsState);
+        this.disposers.push(() => this.client.off(RoomStateEvent.Events, onPinsState));
     }
 
     /** useIsEncrypted re-reads the flag on every m.room.encryption state event. */
@@ -1412,6 +1439,8 @@ export class ViewModelBridge implements ClientViewBridge {
                     edited: row.edited(),
                     editedTs: row.editedTs(),
                     redactedText: row.redactedText(),
+                    pinned: row.pinned(),
+                    canPin: row.canPin(),
                 },
             );
             if (message) {
@@ -1688,6 +1717,35 @@ export class ViewModelBridge implements ClientViewBridge {
         return editText(this.client, roomId, eventId, text, {
             onEnter: (ev) => this.actionBar(ev, (vm) => vm.onEditClick(null), true),
         });
+    }
+
+    /**
+     * M6 B2: pin / unpin through the event tile action bar view-model's `onPinClick` (D22), only when the message's pin
+     * state differs; `forbidden` when Element does not offer it. Calls for one room run one after the other.
+     */
+    public setPinned(roomId: string, eventId: string, on: boolean): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const ev = row.event;
+        return setPinned(
+            roomId,
+            {
+                pinned: () => row.pinned(),
+                canPin: () => row.canPin(),
+                press: () => {
+                    let pressed: Promise<void> = Promise.resolve();
+                    this.actionBar(ev, (vm) => (pressed = vm.onPinClick(null)), false);
+                    return pressed;
+                },
+            },
+            on,
+            () => this.disposed,
+        );
     }
 
     /** A12: interim until the event tile's action bar implements `onRemoveClick`. */

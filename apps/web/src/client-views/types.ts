@@ -82,6 +82,17 @@ export interface ViewMessage {
      * `m.text` or `m.emote` with a body). A kit offers its edit control only when this is true. Absent = not editable.
      */
     canEdit?: boolean;
+    /**
+     * M6 B2: the message is pinned (`m.room.pinned_events` of its room lists it, `PinningUtils.isPinned`). Absent = not pinned.
+     * Refreshed when the room's pinned list changes, also from another client.
+     */
+    pinned?: boolean;
+    /**
+     * M6 B2: Element offers Pin (or Unpin, when pinned) on this message to the user: the action bar's own rule
+     * (`PinningUtils.canPin` or `canUnpin`: the user may send `m.room.pinned_events` and the event is pinnable). A kit offers
+     * its pin control only when this is true. Absent = not offered.
+     */
+    canPin?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
@@ -281,6 +292,15 @@ export interface ClientViewBridge {
      * the replacement send is Element's own client call.
      */
     editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome>;
+    /**
+     * M6 B2: pins (`on`) or unpins the message `eventId` (the Matrix event id): `m.room.pinned_events` of the room. `done` once
+     * the homeserver accepted the new list and the room's state shows it (`ViewMessage.pinned` equals `on`); already as asked is
+     * `done` without a call. `forbidden` when Pin is not offered (`ViewMessage.canPin` false) or the homeserver refuses,
+     * `unknown_event` / `unknown_room`, `network` when the state did not show in time (the write may still apply). A refused
+     * write changes nothing locally. Calls for one room run one after the other. Backed by the action bar view-model's
+     * `onPinClick` (D22; Element's `PinningUtils.pinOrUnpinEvent`, copy-fixed in the hook set).
+     */
+    setPinned(roomId: string, eventId: string, on: boolean): Promise<ActionOutcome>;
     /**
      * A12: deletes (redacts) the user's own message `eventId`. `done` once the homeserver accepted the redaction;
      * `forbidden` for another user's message (also for a user with redact power), `unknown_event` when it cannot be

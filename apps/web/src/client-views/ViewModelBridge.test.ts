@@ -138,6 +138,7 @@ const h = vi.hoisted(() => {
     const actionBars: Array<{ props: Record<string, unknown>; onReplyClick: Mock; onEditClick: Mock; dispose: Mock }> =
         [];
     const eventUtils = { canEdit: true };
+    const pins = { pinned: false, canPin: true, canUnpin: true, press: undefined as undefined | (() => Promise<void>) };
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
 
     return {
@@ -146,6 +147,7 @@ const h = vi.hoisted(() => {
         redact: vi.fn(),
         actionBars,
         eventUtils,
+        pins,
         sdkContext,
         mediaVm,
         FakeVm,
@@ -380,10 +382,20 @@ vi.mock("../utils/EventUtils", async (orig) => ({
     ...(await orig<typeof import("../utils/EventUtils")>()),
     canEditContent: () => h.eventUtils.canEdit,
 }));
+vi.mock("../utils/PinningUtils", () => ({
+    default: {
+        isPinned: () => h.pins.pinned,
+        canPin: () => h.pins.canPin,
+        canUnpin: () => h.pins.canUnpin,
+    },
+}));
 vi.mock("../viewmodels/room/EventTileActionBarViewModel", () => ({
     EventTileActionBarViewModel: class {
         public onReplyClick = vi.fn();
         public onEditClick = vi.fn();
+        public onPinClick = vi.fn(async () => {
+            await h.pins.press?.();
+        });
         public dispose = vi.fn();
         public constructor(public props: Record<string, unknown>) {
             h.actionBars.push(this as never);
@@ -476,6 +488,10 @@ describe("ViewModelBridge", () => {
         h.buttonClick.run = () => {};
         h.actionBars.length = 0;
         h.eventUtils.canEdit = true;
+        h.pins.pinned = false;
+        h.pins.canPin = true;
+        h.pins.canUnpin = true;
+        h.pins.press = undefined;
         h.sdkContext.roomViewStore = { getRoomId: () => null };
     });
 
@@ -625,6 +641,71 @@ describe("ViewModelBridge", () => {
             expect(bridge.timeline("!a")).toEqual([]);
             ev.status = null;
             expect(bridge.timeline("!a").map((m) => m.id)).toEqual(["$m1"]);
+        });
+
+        describe("pin (M6 B2)", () => {
+            const stateHandler = (): ((ev: unknown) => void) => {
+                const client = (bridge as unknown as { client: { on: Mock } }).client;
+                return client.on.mock.calls.find((c) => c[0] === "RoomState.events" && c[1].name === "onPinsState")![1];
+            };
+
+            it("hands over pinned and canPin from PinningUtils, the rule of the action bar", () => {
+                const { message } = readFirst();
+                expect(message().pinned).toBeUndefined();
+                expect(message().canPin).toBe(true);
+                h.pins.pinned = true;
+                expect(message().pinned).toBe(true);
+                // a pinned message offers Unpin by canUnpin, an unpinned one Pin by canPin
+                h.pins.canPin = true;
+                h.pins.canUnpin = false;
+                expect(message().canPin).toBeUndefined();
+                h.pins.pinned = false;
+                h.pins.canPin = false;
+                h.pins.canUnpin = true;
+                expect(message().canPin).toBeUndefined();
+            });
+
+            it("hands the room's rows over again when its pinned events change, not for any other state", () => {
+                readFirst();
+                bridge.timeline("!a");
+                const seen: string[] = [];
+                bridge.onChange((e) => e.kind === "timeline" && seen.push(e.roomId ?? ""));
+                const on = stateHandler();
+                on({ getType: () => "m.room.name", getRoomId: () => "!a" });
+                expect(seen).toEqual([]);
+                on({ getType: () => "m.room.pinned_events", getRoomId: () => "!a" });
+                expect(seen).toEqual(["!a"]);
+            });
+
+            it("presses onPinClick of the message's action bar view-model once it differs, then waits for the state, then disposes it", async () => {
+                readFirst();
+                bridge.timeline("!a");
+                h.pins.press = async () => {
+                    h.pins.pinned = true;
+                };
+                await expect(bridge.setPinned("!a", "$m1", true)).resolves.toEqual({ status: "done", roomId: "!a" });
+                expect(h.actionBars).toHaveLength(1);
+                expect(h.actionBars[0].onPinClick).toHaveBeenCalledTimes(1);
+                expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+            });
+
+            it("does not press when the message is already as asked", async () => {
+                readFirst();
+                bridge.timeline("!a");
+                h.pins.pinned = true;
+                await expect(bridge.setPinned("!a", "$m1", true)).resolves.toMatchObject({ status: "done" });
+                expect(h.actionBars).toHaveLength(0);
+            });
+
+            it("is forbidden where Element offers no pin, unknown for an event the bridge never handed over", async () => {
+                readFirst();
+                bridge.timeline("!a");
+                h.pins.canPin = false;
+                await expect(bridge.setPinned("!a", "$m1", true)).rejects.toMatchObject({ code: "forbidden" });
+                expect(h.actionBars).toHaveLength(0);
+                await expect(bridge.setPinned("!a", "$nope", true)).rejects.toMatchObject({ code: "unknown_event" });
+                await expect(bridge.setPinned("!zzz", "$m1", true)).rejects.toMatchObject({ code: "unknown_room" });
+            });
         });
 
         it("hands over canEdit by Element's rule, and edited when a replacement exists", () => {
