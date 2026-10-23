@@ -77,7 +77,7 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
-import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
+import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
@@ -1719,6 +1719,11 @@ export class ViewModelBridge implements ClientViewBridge {
         if (room.tags?.[DefaultTagID.Archived])
             throw new ClientViewActionError("unsupported", "an archived room is not left");
         return leaveViaDialog(this.client, roomId, () => item.onLeaveRoom());
+    }
+
+    /** A9: interim (D16), see `InterimActions.logout`. */
+    public logout(): Promise<ActionOutcome> {
+        return logout(this.client);
     }
 
     /** A8: the files come from Element's picker unless the caller has them. */

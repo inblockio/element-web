@@ -306,6 +306,13 @@ export interface ClientViewBridge {
      * not send in the room, `unknown_room` for a room the client does not hold.
      */
     upload(roomId: string, files?: File[]): Promise<ActionOutcome>;
+    /**
+     * A9: signs the user out the way Element's own sign-out button does: `LogoutDialog` (key backup check) or, without
+     * crypto, a direct sign-out. `cancelled` when the dialog is dismissed (still signed in). On success the page leaves the
+     * session and unmounts the kit, so `done` (after Element announced `on_logged_out`) is normally not observable; `failed`
+     * when Element does not sign out within 30 s. Interim (D16): there is no sign-out action on `UserMenuViewModel`.
+     */
+    logout(): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */

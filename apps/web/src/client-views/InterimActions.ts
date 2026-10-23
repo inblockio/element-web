@@ -27,6 +27,8 @@ import {
 import { type RoomMessageEventContent } from "matrix-js-sdk/src/types";
 
 import defaultDispatcher from "../dispatcher/dispatcher";
+import Modal from "../Modal";
+import LogoutDialog, { shouldShowLogoutDialog } from "../components/views/dialogs/LogoutDialog";
 import { Action } from "../dispatcher/actions";
 import { canEditContent } from "../utils/EventUtils";
 import { addReplyToMessageContent } from "../utils/Reply";
@@ -430,5 +432,66 @@ export async function declineInvite(client: MatrixClient, roomId: string): Promi
         return { status: "done", roomId };
     } catch (e) {
         throw toActionError(e);
+    }
+}
+
+/** A9 log out: a sign-out action on `UserMenuViewModel` (none in v1.12.32; Element signs out under Settings, Account). */
+export const AWAITS_LOGOUT =
+    "a sign-out action on UserMenuViewModel (none in v1.12.32: Settings, Account has SignOutButton)";
+
+/** How long Element may take, after the user confirmed, to announce that it signed out. */
+export const LOGOUT_TIMEOUT_MS = 30_000;
+
+let logoutRunning = false;
+
+/**
+ * A9 log out. AWAITS: see `AWAITS_LOGOUT`. This is the whole sign-out path, the same decision as Element's own sign-out
+ * button (`UserProfileSettings.tsx` `SignOutButton`, lines 86-91):
+ *  - `shouldShowLogoutDialog(client)` (true whenever the client has crypto) -> Element's `LogoutDialog`. It decides by key
+ *    backup: another verified device or an active backup -> a plain "Sign out" confirm; no backup / no recovery -> an offer
+ *    to set up recovery (which is NOT a sign-out: `cancelled`) next to "I don't want my encrypted messages" (the sign-out).
+ *    Its confirm dispatches `logout`; dismissing it signs nobody out, so `cancelled`.
+ *  - no crypto -> `logout` is dispatched at once.
+ * `logout` makes `MatrixChat` hang up calls and run `Lifecycle.logout()`: the logout request (a failed one still ends the
+ * session in the page, the token then stays valid on the server: Element's own behaviour), then `onLoggedOut()`, which
+ * announces `on_logged_out`, stops the client and clears all storage (`localStorage.clear()`, IndexedDB, caches). The page
+ * then leaves the session and unmounts the kit, so the caller normally never sees the `done` that follows `on_logged_out`.
+ */
+export async function logout(client: MatrixClient): Promise<ActionOutcome> {
+    if (logoutRunning) throw new ClientViewActionError("failed", "a sign-out is already running");
+    logoutRunning = true;
+    try {
+        // Listen before anything dispatches `logout`, so the announcement cannot be missed.
+        let loggedOut: () => void = () => {};
+        const announced = new Promise<void>((resolve) => (loggedOut = resolve));
+        const token = defaultDispatcher.register((p) => {
+            if (p.action === Action.OnLoggedOut) loggedOut();
+        });
+        try {
+            if (await shouldShowLogoutDialog(client)) {
+                const { finished } = Modal.createDialog(LogoutDialog);
+                const [confirmed] = await finished;
+                if (!confirmed) return { status: "cancelled" };
+            } else {
+                defaultDispatcher.dispatch({ action: "logout" });
+            }
+            await new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(
+                    () => reject(new ClientViewActionError("failed", "Element did not sign out in time")),
+                    LOGOUT_TIMEOUT_MS,
+                );
+                void announced.then(() => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+            });
+            return { status: "done" };
+        } finally {
+            defaultDispatcher.unregister(token);
+        }
+    } catch (e) {
+        throw toActionError(e);
+    } finally {
+        logoutRunning = false;
     }
 }
