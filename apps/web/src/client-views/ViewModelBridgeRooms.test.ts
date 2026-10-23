@@ -285,4 +285,9 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         await expect(bridge.setFavourite("!inv:example.org", true)).rejects.toBeInstanceOf(ClientViewActionError);
         expect(itemActions.markUnread).not.toHaveBeenCalled();
     });
+
+    it("A8: upload into a room the client does not hold is unknown_room (no picker opens)", async () => {
+        await expect(bridge.upload("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
+        expect(document.querySelector("input[type=file]")).toBeNull();
+    });
 });

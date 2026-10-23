@@ -79,6 +79,8 @@ import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
+import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
@@ -1004,6 +1006,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
     private readonly roomList: RoomListViewModel;
+    /** The open A8 file picker, if any. */
+    private filePicker: { cancel: () => void } | undefined;
     private readonly userMenu: UserMenuViewModel;
     /** The item view-model each room's subscription follows: the list may build a new one for a room (a rename re-sorts it). */
     private readonly watchedItems = new Map<string, { item: object; off: () => void }>();
@@ -1717,6 +1721,40 @@ export class ViewModelBridge implements ClientViewBridge {
         return leaveViaDialog(this.client, roomId, () => item.onLeaveRoom());
     }
 
+    /** A8: the files come from Element's picker unless the caller has them. */
+    public async upload(roomId: string, files?: File[]): Promise<ActionOutcome> {
+        this.used = true;
+        const room = this.client.getRoom(roomId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        const vm = new RoomUploadViewModel(
+            room,
+            this.client,
+            TimelineRenderingType.Room,
+            defaultDispatcher,
+            undefined,
+            undefined,
+            () => {},
+        );
+        try {
+            let chosen: File[] | null;
+            if (files) chosen = await rewrapFiles(files);
+            else {
+                this.filePicker?.cancel();
+                const picker = openFilePicker(document);
+                this.filePicker = picker;
+                try {
+                    chosen = await picker.files;
+                } finally {
+                    if (this.filePicker === picker) this.filePicker = undefined;
+                }
+            }
+            if (!chosen?.length) return { status: "cancelled" };
+            return await uploadFiles(vm, room, chosen);
+        } finally {
+            vm.dispose();
+        }
+    }
+
     /** The room's list item view-model and Room for an A10 action, or the contract's `unknown_room`. */
     private roomItem(roomId: string): { item: RoomItemActionsVm; room: Room } {
         const room = this.client.getRoom(roomId);
@@ -1750,6 +1788,7 @@ export class ViewModelBridge implements ClientViewBridge {
     public dispose(): void {
         this.disposed = true;
         this.closeReactionPicker();
+        this.filePicker?.cancel();
         [...this.reactionWaits].forEach((cancel) => cancel());
         this.watchedItems.forEach((w) => w.off());
         this.watchedItems.clear();

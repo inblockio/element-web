@@ -297,6 +297,15 @@ export interface ClientViewBridge {
      * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).
      */
     setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome>;
+    /**
+     * A8: uploads files into a room through Element's own upload view-model (`RoomUploadViewModel.initiateViaInputFiles`).
+     * Without `files`, Element's file picker opens now (call it inside the user's click); with them (from the kit's own
+     * picker) they are re-wrapped as files of Element's realm. Element's `UploadConfirmDialog` is the one confirmation and
+     * its error dialog shows on a refusal. `done` once every confirmed file is on the homeserver as a message,
+     * `cancelled` when the picker or the confirm is dismissed, `failed` when an upload fails, `forbidden` when the user may
+     * not send in the room, `unknown_room` for a room the client does not hold.
+     */
+    upload(roomId: string, files?: File[]): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
