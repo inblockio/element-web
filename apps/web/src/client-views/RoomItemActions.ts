@@ -139,8 +139,9 @@ export async function setNotificationLevel(
     assertListed(room);
     if (!snap.showNotificationMenu)
         throw new ClientViewActionError("unsupported", "Element offers no notification level for this room");
-    if (snap.roomNotifState === level) return done(room.roomId);
     const chamber = EchoChamber.forRoom(room);
+    // The item's snapshot is not refreshed when the level changes (see `ViewModelBridge.notificationLevelOf`): the echo is.
+    if ((chamber.notificationVolume ?? snap.roomNotifState) === level) return done(room.roomId);
     const before = new Set(chamber.context.transactions);
     item.onSetRoomNotifState(level);
     const txn = chamber.context.transactions.find((t) => !before.has(t));

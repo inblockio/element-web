@@ -81,6 +81,8 @@ import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendTe
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
+import { EchoChamber } from "../stores/local-echo/EchoChamber";
+import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
@@ -1174,15 +1176,23 @@ export class ViewModelBridge implements ClientViewBridge {
         for (const id of ids) {
             const item = this.roomList.getRoomItemViewModel(id);
             if (!item) continue;
+            const room = this.client.getRoom(id);
             const watched = this.watchedItems.get(id);
             if (watched?.item !== item) {
                 watched?.off();
-                this.watchedItems.set(id, { item, off: item.subscribe(() => this.syncRooms()) });
+                const offItem = item.subscribe(() => this.syncRooms());
+                const offEcho = room ? this.watchNotificationLevel(room) : () => {};
+                this.watchedItems.set(id, {
+                    item,
+                    off: () => {
+                        offItem();
+                        offEcho();
+                    },
+                });
             }
             const s = item.getSnapshot();
-            const room = this.client.getRoom(id);
             const avatarUrl = room ? (avatarUrlForRoom(room, AVATAR_PX, AVATAR_PX, "crop") ?? undefined) : undefined;
-            rooms.push(toViewRoom(s, rooms.length, avatarUrl));
+            rooms.push(toViewRoom(s, rooms.length, avatarUrl, room ? this.notificationLevelOf(room) : undefined));
             if (!this.statusBar && room) this.watchConnection(room);
         }
         // An invite that became a join: the kit asks for the room's timeline again (none was built while it was invited).
@@ -1199,6 +1209,33 @@ export class ViewModelBridge implements ClientViewBridge {
      * first in the list. A chat whose room has been created (or whose local room is gone) is dropped: the real room is in
      * the room list view-model's own list.
      */
+    /**
+     * The room's notification level as Element's local echo holds it (`RoomEchoChamber.notificationVolume`, what the item's
+     * snapshot is built from). The item view-model builds `roomNotifState` once per update of the room's notification state,
+     * tags or name and does not listen to the echo, so after a level change its snapshot stays stale (it showed
+     * `all_messages` after the push rules held `mentions_only`): the bridge reads the echo itself and watches it
+     * (`watchNotificationLevel`). Undefined when the echo has none: the snapshot's value stands.
+     */
+    private notificationLevelOf(room: Room): ViewNotificationLevel | undefined {
+        try {
+            return EchoChamber.forRoom(room).notificationVolume;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** A change of the room's echoed notification level (a write, its echo, a revert) re-reads the room list. */
+    private watchNotificationLevel(room: Room): () => void {
+        try {
+            const chamber = EchoChamber.forRoom(room);
+            const onUpdated = (): void => this.syncRooms();
+            chamber.on(PROPERTY_UPDATED, onUpdated);
+            return () => void chamber.off(PROPERTY_UPDATED, onUpdated);
+        } catch {
+            return () => {};
+        }
+    }
+
     private localChatRooms(): ViewRoom[] {
         const out: ViewRoom[] = [];
         for (const id of this.localChats) {

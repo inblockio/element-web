@@ -137,7 +137,11 @@ describe("A10 favourite (onToggleFavorite, RoomListActions.tagRoom result)", () 
 describe("A10 notification level (onSetRoomNotifState, echo transaction)", () => {
     const client = {} as MatrixClient;
     let transactions: Array<{ status: TransactionStatus }>;
-    let chamber: { context: { transactions: unknown[] }; setClient: ReturnType<typeof vi.fn> };
+    let chamber: {
+        context: { transactions: unknown[] };
+        setClient: ReturnType<typeof vi.fn>;
+        notificationVolume?: string;
+    };
 
     beforeEach(() => {
         transactions = [];
@@ -176,6 +180,23 @@ describe("A10 notification level (onSetRoomNotifState, echo transaction)", () =>
         });
         expect(await codeOf(setNotificationLevel(item, room(), client, "mentions_only"))).toBe("failed");
         expect(chamber.setClient).toHaveBeenCalledWith(client);
+    });
+
+    it("compares with the echo's level, not the item's stale snapshot", async () => {
+        // The snapshot still says all messages after a change to mentions only: asking for all messages must write.
+        chamber.notificationVolume = "mentions_only";
+        const item = makeItem(snap({ roomNotifState: "all_messages" }));
+        item.onSetRoomNotifState.mockImplementation(() => {
+            const txn = { status: TransactionStatus.Pending };
+            transactions.push(txn);
+            setTimeout(() => (txn.status = TransactionStatus.Success), 10);
+        });
+        expect((await setNotificationLevel(item, room(), client, "all_messages")).status).toBe("done");
+        expect(item.onSetRoomNotifState).toHaveBeenCalledWith("all_messages");
+        // and nothing is written for the level the echo holds
+        const same = makeItem(snap({ roomNotifState: "all_messages" }));
+        await setNotificationLevel(same, room(), client, "mentions_only");
+        expect(same.onSetRoomNotifState).not.toHaveBeenCalled();
     });
 
     it("calls nothing for the level the room has, and refuses a room without the menu", async () => {

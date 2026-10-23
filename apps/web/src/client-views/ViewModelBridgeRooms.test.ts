@@ -106,6 +106,16 @@ const actions = vi.hoisted(() => ({
     leaveViaDialog: vi.fn(),
 }));
 vi.mock("./RoomActions", () => actions);
+const echo = vi.hoisted(() => {
+    const listeners = new Set<() => void>();
+    const chamber = {
+        notificationVolume: undefined as string | undefined,
+        on: (_e: string, cb: () => void) => listeners.add(cb),
+        off: (_e: string, cb: () => void) => listeners.delete(cb),
+    };
+    return { chamber, listeners };
+});
+vi.mock("../stores/local-echo/EchoChamber", () => ({ EchoChamber: { forRoom: () => echo.chamber } }));
 const itemActions = vi.hoisted(() => ({ markUnread: vi.fn(), setFavourite: vi.fn(), setNotificationLevel: vi.fn() }));
 vi.mock("./RoomItemActions", () => itemActions);
 
@@ -289,5 +299,16 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
     it("A8: upload into a room the client does not hold is unknown_room (no picker opens)", async () => {
         await expect(bridge.upload("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
         expect(document.querySelector("input[type=file]")).toBeNull();
+    });
+
+    it("A10: the notification level is the echo's (the item snapshot stays stale after a change), and a change of the echo updates the list", () => {
+        const seen: string[] = [];
+        bridge.onChange((e) => seen.push(e.kind));
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.notificationLevel).toBe("mentions_only");
+        echo.chamber.notificationVolume = "mute";
+        echo.listeners.forEach((cb) => cb());
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.notificationLevel).toBe("mute");
+        expect(seen).toContain("rooms");
+        echo.chamber.notificationVolume = undefined;
     });
 });

@@ -31,6 +31,7 @@ import {
     type ViewE2e,
     type ViewMedia,
     type ViewMessage,
+    type ViewNotificationLevel,
     type ViewReaction,
     type ViewReply,
     type ViewRoom,
@@ -61,6 +62,8 @@ export function toViewRoom(
     >,
     order: number,
     avatarUrl?: string,
+    /** The level Element's local echo holds, when it differs from the snapshot's (see `ViewModelBridge.notificationLevelOf`). */
+    notificationLevel?: ViewNotificationLevel,
 ): ViewRoom {
     const n = snapshot.notification;
     const unreadCount = n.hasUnreadCount ? n.count : 0;
@@ -75,7 +78,7 @@ export function toViewRoom(
         membership: n.invited ? "invite" : "join",
         isFavourite: snapshot.isFavourite,
         canMarkAsUnread: snapshot.canMarkAsUnread,
-        notificationLevel: snapshot.roomNotifState,
+        notificationLevel: notificationLevel ?? snapshot.roomNotifState,
     };
 }
 
