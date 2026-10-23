@@ -142,48 +142,6 @@ function localRoomCreationFailure(
 }
 
 /**
- * The real room behind `roomId`: the id itself for a real room, else the local room (a new DM) turned into the real one
- * by `createRoomFromLocalRoom`, as `sendText` does and `RoomView.onLocalRoomEvent` would (not mounted under a kit).
- * `failed` when the creation fails; a local room in ERROR retries it. Used by actions whose Element flow queues its work
- * on a local room and returns before the room exists (A8 upload).
- */
-export async function ensureRealRoom(client: MatrixClient, roomId: string): Promise<string> {
-    const room = client.getRoom(roomId);
-    if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
-    if (!isLocalRoom(roomId)) return roomId;
-    const local = room as LocalRoom;
-    if (local.isError) local.state = LocalRoomState.NEW;
-    const known = new Set(local.afterCreateCallbacks);
-    const resolved = doMaybeLocalRoomAction(roomId, async (actualRoomId: string) => actualRoomId, client);
-    resolved.catch(() => {});
-    const queued = local.afterCreateCallbacks.find((cb) => !known.has(cb));
-    if (!queued) return resolved; // already created
-    const { failed, stop } = localRoomCreationFailure(client, local);
-    try {
-        const startsCreation = local.isNew; // only the caller that starts it may declare it failed
-        const creation = Promise.resolve(createRoomFromLocalRoom(client, local))
-            .catch(() => {})
-            .then(() => {
-                if (startsCreation && local.state === LocalRoomState.CREATING) {
-                    local.state = LocalRoomState.ERROR;
-                    client.emit(ClientEvent.Room, local);
-                }
-                if (local.state === LocalRoomState.ERROR) {
-                    throw new ClientViewActionError("failed", "the direct message could not be created");
-                }
-                return new Promise<never>(() => {}); // creation done: the callback resolves `resolved`
-            });
-        creation.catch(() => {});
-        return await Promise.race([resolved, failed, creation]);
-    } catch (e) {
-        throw toActionError(e);
-    } finally {
-        stop();
-        local.afterCreateCallbacks = local.afterCreateCallbacks.filter((cb) => cb !== queued);
-    }
-}
-
-/**
  * Sends a plain `m.text` the way `SendMessageComposer` does (`SendMessageComposer.tsx`, `sendMessage`):
  * `doMaybeLocalRoomAction` + `client.sendMessage`, then the `message_sent` dispatch. A local room (a new DM that has
  * no real room yet) is turned into the real one by `createRoomFromLocalRoom`, as `RoomView.onLocalRoomEvent` does
@@ -486,6 +444,8 @@ export const AWAITS_LOGOUT =
 export const LOGOUT_TIMEOUT_MS = 30_000;
 
 let logoutRunning = false;
+/** Set once `logout` is dispatched, cleared by `on_logged_out`: the page leaves the session, a later call must not start another. */
+let signOutDispatched = false;
 
 /**
  * A9 log out. AWAITS: see `AWAITS_LOGOUT`. This is the whole sign-out path, the same decision as Element's own sign-out
@@ -501,23 +461,35 @@ let logoutRunning = false;
  * then leaves the session and unmounts the kit, so the caller normally never sees the `done` that follows `on_logged_out`.
  */
 export async function logout(client: MatrixClient): Promise<ActionOutcome> {
-    // Also while Element's own sign-out runs on (`Lifecycle.logout()` after the 30 s timeout cleared `logoutRunning`): a
-    // retry must not start a second one.
-    if (logoutRunning || isLoggingOut()) throw new ClientViewActionError("failed", "a sign-out is already running");
+    // Also once `logout` is dispatched and Element's own sign-out runs on (hang-up of calls, then `Lifecycle.logout()`, which
+    // sets `isLoggingOut` only later): the 30 s timeout does not re-arm a retry.
+    if (logoutRunning || signOutDispatched || isLoggingOut())
+        throw new ClientViewActionError("failed", "a sign-out is already running");
     logoutRunning = true;
     try {
         // Listen before anything dispatches `logout`, so the announcement cannot be missed.
         let loggedOut: () => void = () => {};
         const announced = new Promise<void>((resolve) => (loggedOut = resolve));
-        const token = defaultDispatcher.register((p) => {
-            if (p.action === Action.OnLoggedOut) loggedOut();
+        let token: string | undefined = defaultDispatcher.register((p) => {
+            if (p.action === "logout") signOutDispatched = true; // ours or the LogoutDialog's confirm
+            if (p.action === Action.OnLoggedOut) {
+                signOutDispatched = false;
+                loggedOut();
+                drop();
+            }
         });
+        // Kept after a timeout while a dispatched sign-out runs on, so `on_logged_out` still clears the flag.
+        const drop = (): void => {
+            if (token !== undefined) defaultDispatcher.unregister(token);
+            token = undefined;
+        };
         try {
             if (await shouldShowLogoutDialog(client)) {
                 const { finished } = Modal.createDialog(LogoutDialog);
                 const [confirmed] = await finished;
                 if (!confirmed) return { status: "cancelled" };
             } else {
+                signOutDispatched = true; // the dispatcher delivers a tick later
                 defaultDispatcher.dispatch({ action: "logout" });
             }
             await new Promise<void>((resolve, reject) => {
@@ -532,7 +504,7 @@ export async function logout(client: MatrixClient): Promise<ActionOutcome> {
             });
             return { status: "done" };
         } finally {
-            defaultDispatcher.unregister(token);
+            if (!signOutDispatched) drop();
         }
     } catch (e) {
         throw toActionError(e);

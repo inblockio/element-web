@@ -98,13 +98,35 @@ describe("A9 log out (InterimActions.logout)", () => {
         const error = await failed;
         expect(error).toBeInstanceOf(ClientViewActionError);
         expect((error as ClientViewActionError).code).toBe("failed");
-        // and the guard is free again
+        // the sign-out was dispatched and the page has not left yet: a retry is refused, nothing is dispatched twice
+        dispatched.length = 0;
+        vi.mocked(Modal.createDialog).mockClear();
+        await expect(logout(client)).rejects.toBeInstanceOf(ClientViewActionError);
+        expect(dispatched).not.toContain("logout");
+        expect(Modal.createDialog).not.toHaveBeenCalled();
+        // Element announces it: the flag is cleared
+        defaultDispatcher.dispatch({ action: Action.OnLoggedOut }, true);
+        await vi.advanceTimersByTimeAsync(10);
         logoutDialog.shouldShow.mockResolvedValue(true);
         const dialog = openDialog();
         const next = logout(client);
         await vi.advanceTimersByTimeAsync(0);
         dialog.answer(false);
         expect(await next).toEqual({ status: "cancelled" });
+    });
+
+    it("a dismissed dialog does not arm the guard", async () => {
+        logoutDialog.shouldShow.mockResolvedValue(true);
+        const one = openDialog();
+        const first = logout(client);
+        await vi.advanceTimersByTimeAsync(0);
+        one.answer(false);
+        expect(await first).toEqual({ status: "cancelled" });
+        const two = openDialog();
+        const again = logout(client);
+        await vi.advanceTimersByTimeAsync(0);
+        two.answer(false);
+        expect(await again).toEqual({ status: "cancelled" });
     });
 
     it("refuses a retry while Element's own sign-out still runs (after the timeout cleared the guard)", async () => {

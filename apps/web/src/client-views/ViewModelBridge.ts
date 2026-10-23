@@ -77,16 +77,7 @@ import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAv
 import { _t } from "../languageHandler";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
-import {
-    acceptInvite,
-    declineInvite,
-    editText,
-    ensureRealRoom,
-    joinRoom,
-    logout,
-    redact,
-    sendText,
-} from "./InterimActions";
+import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
@@ -1790,11 +1781,10 @@ export class ViewModelBridge implements ClientViewBridge {
             }
         }
         if (!chosen?.length) return { status: "cancelled" };
-        // A new DM is still a local room: Element would queue the upload on it and answer before it is sent. The real room
-        // is created first (as the text send does), the upload runs against it.
-        const realId = await ensureRealRoom(this.client, roomId);
-        const room = this.client.getRoom(realId);
-        if (!room) throw new ClientViewActionError("unknown_room", `no room ${realId}`);
+        // A new DM is still a local room: Element queues the upload on it, and the real room is created (below) only once
+        // Element dispatches `local_room_event`, i.e. after the user confirmed.
+        const room = this.client.getRoom(roomId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
         const vm = new RoomUploadViewModel(
             room,
             this.client,
@@ -1805,7 +1795,7 @@ export class ViewModelBridge implements ClientViewBridge {
             () => {},
         );
         try {
-            return await uploadFiles(vm, room, chosen);
+            return await uploadFiles(vm, room, chosen, this.client);
         } finally {
             vm.dispose();
         }

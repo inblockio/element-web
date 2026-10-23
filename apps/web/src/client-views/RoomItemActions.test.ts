@@ -14,6 +14,7 @@ import defaultDispatcher from "../dispatcher/dispatcher";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { TransactionStatus } from "../stores/local-echo/EchoTransaction";
 import { markUnread, setFavourite, setNotificationLevel, type RoomItemActionsVm } from "./RoomItemActions";
+import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import { ClientViewActionError, type ViewNotificationLevel } from "./types";
 
 vi.mock("../stores/local-echo/EchoChamber", () => ({ EchoChamber: { forRoom: vi.fn() } }));
@@ -96,9 +97,6 @@ describe("A10 mark unread (onMarkAsUnread)", () => {
 });
 
 describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () => {
-    const answer = (action: string, extra: object = {}): void => {
-        setTimeout(() => defaultDispatcher.dispatch({ action, ...extra }, true), 0);
-    };
     const tagged = (r: Room, on: boolean): void => {
         (r as unknown as { tags: Record<string, unknown> }).tags = on ? { "m.favourite": { order: 0.5 } } : {};
     };
@@ -107,11 +105,19 @@ describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () 
         const r = room();
         const item = makeItem(snap());
         item.onToggleFavorite.mockImplementation(() => {
-            answer("RoomListActions.tagRoom.success");
             setTimeout(() => tagged(r, true), 120);
         });
         expect(await setFavourite(item, r, true)).toEqual({ status: "done", roomId: "!a:example.org" });
         expect(item.onToggleFavorite).toHaveBeenCalledOnce();
+    });
+
+    it("is done for removing the tag when the room's tag is gone", async () => {
+        const r = room({ "m.favourite": { order: 0.5 } });
+        const item = makeItem(snap({ isFavourite: true }));
+        item.onToggleFavorite.mockImplementation(() => {
+            setTimeout(() => tagged(r, false), 60);
+        });
+        expect((await setFavourite(item, r, false)).status).toBe("done");
     });
 
     it("calls nothing when the room's tag already is the asked state", async () => {
@@ -121,42 +127,23 @@ describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () 
         expect(item.onToggleFavorite).not.toHaveBeenCalled();
     });
 
-    it("fails at once when Element's write for this room was refused and no other tag write was pending", async () => {
-        const refused = makeItem(snap());
-        refused.onToggleFavorite.mockImplementation(() => {
-            defaultDispatcher.dispatch(
-                { action: "RoomListActions.tagRoom.pending", request: { room: { roomId: "!a:example.org" } } },
-                true,
-            );
-            answer("RoomListActions.tagRoom.failure", { err: new Error("403") });
-        });
-        expect(await codeOf(setFavourite(refused, room(), true))).toBe("failed");
-    });
-
-    it("is not failed by another room's tagRoom.failure in the window while this room's tag arrives", async () => {
+    it("reads no tagRoom result: another room's answer (success or failure) decides nothing", async () => {
         const r = room();
         const item = makeItem(snap());
         item.onToggleFavorite.mockImplementation(() => {
-            defaultDispatcher.dispatch(
-                { action: "RoomListActions.tagRoom.pending", request: { room: { roomId: "!other:example.org" } } },
-                true,
-            );
-            answer("RoomListActions.tagRoom.failure", { err: new Error("other room") });
+            defaultDispatcher.dispatch({ action: "RoomListActions.tagRoom.failure", err: new Error("other") }, true);
             setTimeout(() => tagged(r, true), 300);
         });
         expect((await setFavourite(item, r, true)).status).toBe("done");
     });
 
-    it("fails when the tags never show it after Element answered", async () => {
+    it("is network (may still apply) when the room's tag does not show it in time", async () => {
         vi.useFakeTimers();
         try {
             const silent = makeItem(snap());
-            silent.onToggleFavorite.mockImplementation(() =>
-                defaultDispatcher.dispatch({ action: "RoomListActions.tagRoom.success" }, true),
-            );
             const result = codeOf(setFavourite(silent, room(), true));
-            await vi.advanceTimersByTimeAsync(9_000);
-            expect(await result).toBe("failed");
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+            expect(await result).toBe("network");
         } finally {
             vi.useRealTimers();
         }
@@ -164,7 +151,8 @@ describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () 
 });
 
 describe("A10 notification level (onSetRoomNotifState, echo transaction)", () => {
-    const client = {} as MatrixClient;
+    const getPushRules = vi.fn(async () => ({}));
+    const client = { getPushRules } as unknown as MatrixClient;
     let transactions: Array<{ status: TransactionStatus }>;
     let chamber: {
         context: { transactions: unknown[] };
@@ -184,6 +172,8 @@ describe("A10 notification level (onSetRoomNotifState, echo transaction)", () =>
         };
         vi.mocked(EchoChamber.forRoom).mockReturnValue(chamber as never);
         notifs.state.mockReset();
+        getPushRules.mockClear();
+        getPushRules.mockImplementation(async () => ({}));
     });
 
     it("is done when the echo transaction succeeded and the homeserver's computed level is the asked one", async () => {
@@ -199,6 +189,7 @@ describe("A10 notification level (onSetRoomNotifState, echo transaction)", () =>
             roomId: "!a:example.org",
         });
         expect(item.onSetRoomNotifState).toHaveBeenCalledWith("mute");
+        expect(getPushRules).toHaveBeenCalledOnce();
         expect(chamber.setClient).not.toHaveBeenCalled();
     });
 
@@ -213,23 +204,45 @@ describe("A10 notification level (onSetRoomNotifState, echo transaction)", () =>
         expect(chamber.setClient).toHaveBeenCalledWith(client);
     });
 
-    it("fails and drops the echo when Success was a cancelled transaction and the computed level is another", async () => {
-        vi.useFakeTimers();
-        try {
-            notifs.state.mockReturnValue("mentions_only");
-            const item = makeItem(snap());
-            item.onSetRoomNotifState.mockImplementation(() => {
-                const txn = { status: TransactionStatus.Pending };
-                transactions.push(txn);
-                setTimeout(() => (txn.status = TransactionStatus.Success), 20);
-            });
-            const result = codeOf(setNotificationLevel(item, room(), client, "mute"));
-            await vi.advanceTimersByTimeAsync(9_000);
-            expect(await result).toBe("failed");
-            expect(chamber.setClient).toHaveBeenCalledWith(client);
-        } finally {
-            vi.useRealTimers();
-        }
+    it("fails and drops the echo when Success was a cancelled transaction and the server's level is another", async () => {
+        notifs.state.mockReturnValue("mentions_only");
+        const item = makeItem(snap());
+        item.onSetRoomNotifState.mockImplementation(() => {
+            const txn = { status: TransactionStatus.Pending };
+            transactions.push(txn);
+            setTimeout(() => (txn.status = TransactionStatus.Success), 20);
+        });
+        expect(await codeOf(setNotificationLevel(item, room(), client, "mute"))).toBe("failed");
+        expect(getPushRules).toHaveBeenCalledOnce();
+        expect(chamber.setClient).toHaveBeenCalledWith(client);
+    });
+
+    it("reads the server's rules first: a stale client.pushRules does not fail an accepted level", async () => {
+        let loaded = false;
+        getPushRules.mockImplementation(async () => {
+            loaded = true;
+            return {};
+        });
+        notifs.state.mockImplementation(() => (loaded ? "mute" : "all_messages"));
+        const item = makeItem(snap());
+        item.onSetRoomNotifState.mockImplementation(() => {
+            const txn = { status: TransactionStatus.Pending };
+            transactions.push(txn);
+            setTimeout(() => (txn.status = TransactionStatus.Success), 20);
+        });
+        expect((await setNotificationLevel(item, room(), client, "mute")).status).toBe("done");
+    });
+
+    it("fails (and drops the echo) when the push rules cannot be read after Success", async () => {
+        getPushRules.mockRejectedValue(new Error("gone"));
+        const item = makeItem(snap());
+        item.onSetRoomNotifState.mockImplementation(() => {
+            const txn = { status: TransactionStatus.Pending };
+            transactions.push(txn);
+            setTimeout(() => (txn.status = TransactionStatus.Success), 20);
+        });
+        expect(await codeOf(setNotificationLevel(item, room(), client, "mute"))).toBe("failed");
+        expect(chamber.setClient).toHaveBeenCalledWith(client);
     });
 
     it("compares with the echo's level, not the item's stale snapshot", async () => {
