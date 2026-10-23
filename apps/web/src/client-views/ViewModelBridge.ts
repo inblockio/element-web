@@ -75,6 +75,7 @@ import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
+import { CallCard } from "./CallCard";
 import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
@@ -1010,6 +1011,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
     private disposed = false;
     private readonly rows = new Map<string, EventRow>();
+    /** The call card (Element's RootCallTileViewModel) of each call notification the kit was handed, by event id. */
+    private readonly callCards = new Map<string, CallCard>();
     private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
     /** Per room: encrypted once either the room state or the crypto store said so (never back to false). */
     private readonly encrypted = new Map<string, boolean>();
@@ -1336,6 +1339,11 @@ export class ViewModelBridge implements ClientViewBridge {
             if (eventItem.sendState && eventItem.sendState !== "sent") continue;
             const id = (eventItem.event as MatrixEvent).getId();
             if (!id || id.startsWith("~")) continue;
+            if ((eventItem.event as MatrixEvent).getType() === EventType.RTCNotification) {
+                const call = this.callMessage(eventItem.event as MatrixEvent, roomId);
+                if (call) messages.push(call);
+                continue;
+            }
             const row = this.row(eventItem, roomId);
             const tile = row.tile.getSnapshot().snapshot;
             // An event still waiting for its key keeps the SDK type m.room.encrypted (a failed one is m.room.message).
@@ -1373,6 +1381,34 @@ export class ViewModelBridge implements ClientViewBridge {
             }
         }
         return messages.sort((a, b) => a.ts - b.ts);
+    }
+
+    /**
+     * The message of a call's root event (`EventTileFactory` draws it as the call card): `kind` "other", no body, and
+     * `call` from the call-card view-models. Nothing for an event whose card Element cannot build.
+     */
+    private callMessage(event: MatrixEvent, roomId: string): ViewMessage | undefined {
+        if (event.status != null) return undefined;
+        const id = event.getId()!;
+        let card = this.callCards.get(id);
+        if (!card) {
+            card = CallCard.create(this.client, event, () => this.emit({ kind: "timeline", roomId }));
+            if (!card) return undefined;
+            this.callCards.set(id, card);
+        }
+        const senderId = event.getSender() ?? "";
+        const avatarUrl = senderId ? this.senderAvatarUrl(roomId, senderId) : undefined;
+        return {
+            id,
+            roomId,
+            senderId,
+            senderName: event.sender?.name || senderId,
+            ...(avatarUrl ? { senderAvatarUrl: avatarUrl } : {}),
+            ts: event.getTs(),
+            body: "",
+            kind: "other",
+            call: card.view(),
+        };
     }
 
     /** The transaction id of an own message (its local echo's, else the sync echo's `unsigned.transaction_id`). */
@@ -1726,6 +1762,7 @@ export class ViewModelBridge implements ClientViewBridge {
         this.watchedItems.clear();
         this.disposers.forEach((d) => d());
         this.rows.forEach((r) => r.dispose());
+        this.callCards.forEach((c) => c.dispose());
         this.senderAvatars.forEach((a) => a.dispose());
         this.timelines.forEach((t) => t.dispose());
         this.statusBar?.dispose();

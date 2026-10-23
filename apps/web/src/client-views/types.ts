@@ -28,6 +28,39 @@ export interface ViewRoom {
     membership?: "join" | "invite";
 }
 
+/**
+ * A call, on the message that roots it (the `org.matrix.msc4075.rtc.notification` event Element draws its call card
+ * from). Filled only from the call-card view-models: `RootCallTileViewModel` decides ongoing or ended, the Room/Dm
+ * ongoing tile view-models give the participants, `DurationViewModel` the running time, the Room/Dm tombstone ones the
+ * end and, in a DM, the decline. The host reads no MatrixRTC state of its own.
+ */
+export interface ViewCall {
+    /** The call's id: the root event's id (`ViewMessage.id`). */
+    callId: string;
+    /** `RootCallTileViewModel.tileType`: an ongoing tile is "ongoing", a tombstone tile is "ended". */
+    state: "ongoing" | "ended";
+    /** The call's intent (the tile view-models read it from the notification event: `m.call.intent`). */
+    callType: "video" | "voice";
+    /** A DM tile (`ongoing-call-dm`, `tombstone-call-dm`), else a room tile. */
+    isDm: boolean;
+    /** The face pile of the ongoing tile (Element shows at most three). Empty when ended. */
+    participants: ViewCallParticipant[];
+    /** The room tile's `totalParticipants` (everyone in the call, not only the face pile). Ongoing room tile only. */
+    participantCount?: number;
+    /** When the call started: the notification event's `origin_server_ts` (the tombstone view-models give no time other than a formatted string). */
+    startedTs: number;
+    /** `DurationViewModel.duration` in seconds. Ongoing only; ended calls have no duration in any view-model. */
+    durationSeconds?: number;
+    /** The DM tombstone tile's `isCallDeclined`. Only a DM tombstone has it. */
+    declined?: boolean;
+}
+
+export interface ViewCallParticipant {
+    userId: string;
+    name: string;
+    avatarUrl?: string;
+}
+
 /** A message as the timeline, event tile and body view-models show it. */
 export interface ViewMessage {
     id: string;
@@ -79,6 +112,11 @@ export interface ViewMessage {
      * shows none: previews hidden by the setting (room or encrypted-room default), by the user, or no link.
      */
     urlPreviews?: ViewUrlPreview[];
+    /**
+     * Set on the root event of a call (`kind` is "other", `body` is empty): the call card Element draws. See `ViewCall`.
+     * Version 2, additive: a kit that does not know the field gets a message with an empty body and no content.
+     */
+    call?: ViewCall;
 }
 
 /**
