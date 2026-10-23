@@ -20,6 +20,13 @@ import { RootCallTileViewModel } from "../viewmodels/room/timeline/event-tile/ca
 import { getIntentFromEvent } from "../viewmodels/room/timeline/event-tile/call/common";
 import { type ViewCall, type ViewCallParticipant } from "./types";
 
+/** What the card disposes: a view-model of Element's. */
+interface Disposable {
+    dispose(): void;
+}
+
+type FacePileSnapshot = { memberAvatarViewModels: unknown[] } & Record<string, unknown>;
+
 /** The tile view-model snapshots the root call tile view-model can hold. */
 type TileSnapshot = RoomOngoingCallTileViewSnapshot | DmOngoingCallTileViewSnapshot | DmTombstoneCallTileViewSnapshot;
 
@@ -34,8 +41,13 @@ const isOngoing = (tileType: string): boolean => tileType.startsWith("ongoing-")
 export class CallCard {
     private readonly root: RootCallTileViewModel;
     private readonly unsubscribe: Array<() => void> = [];
-    private followed?: ViewModel<TileSnapshot>;
-    private unfollow?: () => void;
+    /** Every view-model the card listens on (the tile, its face pile and the face pile's avatars) and how to stop. */
+    private readonly followed = new Map<Disposable, () => void>();
+    /** The tile the root held when the card last looked, to dispose it when the root swaps it. */
+    private tile?: Disposable & { getSnapshot(): TileSnapshot };
+    /** The duration view-models of the tiles seen: the tile does not track its own, and each ticks every second. */
+    private readonly durations = new Set<Disposable>();
+    private disposed = false;
 
     private constructor(
         private readonly event: MatrixEvent,
@@ -45,6 +57,11 @@ export class CallCard {
         this.root = root;
         this.unsubscribe.push(root.subscribe(this.onRoot));
         this.follow();
+    }
+
+    /** The room of the call. */
+    public get roomId(): string {
+        return this.event.getRoomId() ?? "";
     }
 
     /** The card of a call notification, or undefined when Element's view-model cannot be built for it. */
@@ -76,13 +93,54 @@ export class CallCard {
         this.changed();
     };
 
-    /** Follows the tile view-model the root holds now (the root swaps it when ongoing becomes ended). */
+    /** A change of a followed view-model: the face pile may hold other avatars now, so what is followed is re-read. */
+    private readonly onFollowed = (): void => {
+        if (this.disposed) return;
+        this.follow();
+        this.changed();
+    };
+
+    /**
+     * Follows what the card shows: the tile the root holds, and for an ongoing tile its face pile and the face pile's
+     * member avatars (the tile merges only its counts, so a swapped participant, a new name or a new avatar change only
+     * those). Called again on every change, so a face pile's new list is followed. The root swaps the tile when the call
+     * ends and keeps the replaced one (and its duration view-model, which no tile tracks): both are disposed here.
+     */
     private follow(): void {
-        const tile = this.root.getSnapshot().tileViewModel as ViewModel<TileSnapshot>;
-        if (tile === this.followed) return;
-        this.unfollow?.();
-        this.followed = tile;
-        this.unfollow = tile.subscribe(this.changed);
+        const root = this.root.getSnapshot();
+        const tile = root.tileViewModel as unknown as Disposable & { getSnapshot(): TileSnapshot };
+        const wanted = new Set<Disposable>([tile]);
+        const snapshot = tile.getSnapshot();
+        if ("facePileViewModel" in snapshot) {
+            const pile = snapshot.facePileViewModel as unknown as Disposable & ViewModel<FacePileSnapshot>;
+            wanted.add(pile);
+            for (const avatar of pile.getSnapshot().memberAvatarViewModels) wanted.add(avatar as Disposable);
+            if (snapshot.durationViewModel) this.durations.add(snapshot.durationViewModel as unknown as Disposable);
+        }
+        for (const [vm, stop] of this.followed) {
+            if (wanted.has(vm)) continue;
+            stop();
+            this.followed.delete(vm);
+        }
+        for (const vm of wanted) {
+            if (!this.followed.has(vm))
+                this.followed.set(vm, (vm as unknown as ViewModel<unknown>).subscribe(this.onFollowed));
+        }
+        const replaced = this.tile;
+        this.tile = tile;
+        if (replaced && replaced !== tile) this.release(replaced);
+    }
+
+    /** Disposes a tile the root no longer holds, with the duration view-model it made. */
+    private release(tile: Disposable & { getSnapshot(): TileSnapshot }): void {
+        const duration = (tile.getSnapshot() as { durationViewModel?: unknown }).durationViewModel as
+            | Disposable
+            | undefined;
+        if (duration) {
+            duration.dispose();
+            this.durations.delete(duration);
+        }
+        tile.dispose();
     }
 
     public view(): ViewCall {
@@ -121,10 +179,14 @@ export class CallCard {
     }
 
     public dispose(): void {
+        this.disposed = true;
         this.unsubscribe.forEach((u) => u());
         this.unsubscribe.length = 0;
-        this.unfollow?.();
-        this.unfollow = undefined;
+        this.followed.forEach((stop) => stop());
+        this.followed.clear();
+        // No duration interval outlives the card.
+        this.durations.forEach((d) => d.dispose());
+        this.durations.clear();
         this.root.dispose();
     }
 }

@@ -1333,6 +1333,8 @@ export class ViewModelBridge implements ClientViewBridge {
         const vm = this.ensureTimeline(roomId);
         if (!vm) return [];
         const messages: ViewMessage[] = [];
+        // Call events of this window, held or not: a card is dropped only when its event is no longer an item.
+        const seenCalls = new Set<string>();
         for (const item of vm.getSnapshot().items) {
             if (item.kind !== "event") continue;
             const eventItem = item;
@@ -1340,6 +1342,7 @@ export class ViewModelBridge implements ClientViewBridge {
             const id = (eventItem.event as MatrixEvent).getId();
             if (!id || id.startsWith("~")) continue;
             if ((eventItem.event as MatrixEvent).getType() === EventType.RTCNotification) {
+                seenCalls.add(id);
                 const call = this.callMessage(eventItem.event as MatrixEvent, roomId);
                 if (call) messages.push(call);
                 continue;
@@ -1380,7 +1383,17 @@ export class ViewModelBridge implements ClientViewBridge {
                 messages.push(txnId ? { ...message, txnId } : message);
             }
         }
+        this.pruneCallCards(roomId, seenCalls);
         return messages.sort((a, b) => a.ts - b.ts);
+    }
+
+    /** Drops the cards of a room's calls whose event left the timeline window (the view-model disposes its tiles). */
+    private pruneCallCards(roomId: string, seen: Set<string>): void {
+        for (const [id, card] of this.callCards) {
+            if (card.roomId !== roomId || seen.has(id)) continue;
+            card.dispose();
+            this.callCards.delete(id);
+        }
     }
 
     /**

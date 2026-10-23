@@ -281,4 +281,74 @@ describe("ViewModelBridge: ViewMessage.call (lane CALL, the call card)", () => {
         h.timeline.set({ items: items(callEvent("$broken")) });
         expect(bridge.timeline("!a:example.org")).toEqual([]);
     });
+    describe("what the card follows and releases", () => {
+        const ongoing = (avatars: unknown[]) => {
+            const pile = new h.FakeVm({ memberAvatarViewModels: avatars });
+            const duration = new h.FakeVm({ duration: 1 });
+            const tile = new h.FakeVm({
+                startedByDisplayName: "Bob",
+                facePileViewModel: pile,
+                durationViewModel: duration,
+                totalParticipants: 2,
+            });
+            return { pile, duration, tile };
+        };
+        const start = (avatars: unknown[]) => {
+            h.timeline.set({ items: items(callEvent("$call")) });
+            bridge.timeline("!a:example.org");
+            const parts = ongoing(avatars);
+            h.roots[0].set({ tileType: "ongoing-call-room", tileViewModel: parts.tile });
+            return parts;
+        };
+
+        it("a swapped participant with the same count reaches the kit: the face pile is followed, and its new avatars", () => {
+            const bob = member("@bob:example.org", "Bob");
+            const carol = member("@carol:example.org", "Carol");
+            const { pile } = start([bob]);
+            const onChange = vi.fn();
+            bridge.onChange(onChange);
+            pile.set({ memberAvatarViewModels: [carol] });
+            expect(onChange).toHaveBeenCalledWith({ kind: "timeline", roomId: "!a:example.org" });
+            expect(bridge.timeline("!a:example.org")[0].call?.participants.map((p) => p.userId)).toEqual([
+                "@carol:example.org",
+            ]);
+            // The avatar view-model that left the list is no longer followed, the new one is.
+            expect(bob.listeners.size).toBe(0);
+            expect(carol.listeners.size).toBe(1);
+            onChange.mockClear();
+            carol.set({ name: "Carol B.", url: "http://hs/carol" });
+            expect(onChange).toHaveBeenCalledWith({ kind: "timeline", roomId: "!a:example.org" });
+            expect(bridge.timeline("!a:example.org")[0].call?.participants).toEqual([
+                { userId: "@carol:example.org", name: "Carol B.", avatarUrl: "http://hs/carol" },
+            ]);
+        });
+
+        it("the ongoing tile the root replaces is disposed with its duration view-model, and nothing it followed stays followed", () => {
+            const bob = member("@bob:example.org", "Bob");
+            const { pile, duration, tile } = start([bob]);
+            expect(pile.listeners.size).toBe(1);
+            h.roots[0].set({ tileType: "tombstone-call-room", tileViewModel: new h.FakeVm({ timestamp: "17:11" }) });
+            expect(duration.dispose).toHaveBeenCalledTimes(1);
+            expect(tile.dispose).toHaveBeenCalledTimes(1);
+            expect([tile, pile, bob].map((vm) => vm.listeners.size)).toEqual([0, 0, 0]);
+        });
+
+        it("disposing the card disposes the duration view-model of the tile it holds, so no interval outlives it", () => {
+            const { duration } = start([member("@bob:example.org", "Bob")]);
+            bridge.dispose();
+            expect(duration.dispose).toHaveBeenCalledTimes(1);
+            expect(h.roots[0].dispose).toHaveBeenCalledTimes(1);
+        });
+
+        it("a card is disposed and dropped when its event leaves the room's timeline window, and built again if it comes back", () => {
+            const { duration } = start([member("@bob:example.org", "Bob")]);
+            h.timeline.set({ items: [] });
+            expect(bridge.timeline("!a:example.org").some((m) => m.call)).toBe(false);
+            expect(h.roots[0].dispose).toHaveBeenCalledTimes(1);
+            expect(duration.dispose).toHaveBeenCalledTimes(1);
+            h.timeline.set({ items: items(callEvent("$call")) });
+            bridge.timeline("!a:example.org");
+            expect(h.roots).toHaveLength(2);
+        });
+    });
 });
