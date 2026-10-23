@@ -38,8 +38,11 @@ const h = vi.hoisted(() => {
             name: "General",
             isDm: false,
             notification: { hasUnreadCount: false, count: 0, isMention: false, invited: false },
+            isFavourite: true,
+            canMarkAsUnread: false,
+            roomNotifState: "mentions_only",
         }),
-        { onLeaveRoom: vi.fn() },
+        { onLeaveRoom: vi.fn(), onMarkAsUnread: vi.fn(), onToggleFavorite: vi.fn(), onSetRoomNotifState: vi.fn() },
     );
     const invited = new FakeVm({
         id: "!inv:example.org",
@@ -103,6 +106,8 @@ const actions = vi.hoisted(() => ({
     leaveViaDialog: vi.fn(),
 }));
 vi.mock("./RoomActions", () => actions);
+const itemActions = vi.hoisted(() => ({ markUnread: vi.fn(), setFavourite: vi.fn(), setNotificationLevel: vi.fn() }));
+vi.mock("./RoomItemActions", () => itemActions);
 
 describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", () => {
     let bridge: ViewModelBridge;
@@ -256,5 +261,28 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         rooms["!a:example.org"] = { roomId: "!a:example.org", tags: { "im.vector.fake.archived": {} } };
         expect(await code(bridge.leave("!a:example.org"))).toBe("unsupported");
         expect(actions.leaveViaDialog).not.toHaveBeenCalled();
+    });
+
+    it("A10: rooms() carries the favourite flag, the unread offer and the notification level of the item's snapshot", () => {
+        const room = bridge.rooms().find((r) => r.id === "!a:example.org");
+        expect(room).toMatchObject({ isFavourite: true, canMarkAsUnread: false, notificationLevel: "mentions_only" });
+    });
+
+    it("A10: markUnread, setFavourite and setNotificationLevel run the room item's view-model actions", async () => {
+        itemActions.markUnread.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        itemActions.setFavourite.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        itemActions.setNotificationLevel.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        await bridge.markUnread("!a:example.org");
+        await bridge.setFavourite("!a:example.org", false);
+        await bridge.setNotificationLevel("!a:example.org", "mute");
+        expect(itemActions.markUnread).toHaveBeenCalledWith(h.item, rooms["!a:example.org"]);
+        expect(itemActions.setFavourite).toHaveBeenCalledWith(h.item, rooms["!a:example.org"], false);
+        expect(itemActions.setNotificationLevel).toHaveBeenCalledWith(h.item, rooms["!a:example.org"], client, "mute");
+    });
+
+    it("A10: a room the list does not hold is unknown_room", async () => {
+        await expect(bridge.markUnread("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
+        await expect(bridge.setFavourite("!inv:example.org", true)).rejects.toBeInstanceOf(ClientViewActionError);
+        expect(itemActions.markUnread).not.toHaveBeenCalled();
     });
 });

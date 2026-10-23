@@ -26,7 +26,19 @@ export interface ViewRoom {
      * joined. An invite has no inviter field (no view-model source).
      */
     membership?: "join" | "invite";
+    /** The room is a favourite (the room list item's `isFavourite`, the `m.favourite` room tag). */
+    isFavourite: boolean;
+    /**
+     * Element offers "mark as unread" for the room (the item's `canMarkAsUnread`): it shows nothing unread and is not
+     * archived. For a joined room, false means it already shows unread, by a count, an activity or a mark.
+     */
+    canMarkAsUnread: boolean;
+    /** The room's notification level (the item's `roomNotifState`). */
+    notificationLevel: ViewNotificationLevel;
 }
+
+/** The notification levels of a room, as the room list item view-model's `RoomNotifState` names them. */
+export type ViewNotificationLevel = "all_messages" | "all_messages_loud" | "mentions_only" | "mute";
 
 /** A message as the timeline, event tile and body view-models show it. */
 export interface ViewMessage {
@@ -268,6 +280,23 @@ export interface ClientViewBridge {
      * loaded. The kit asks for the confirmation. Interim (D16/D20): Element's own client call.
      */
     redact(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * A10: marks the room unread (the room list item's `onMarkAsUnread`: the room account data `m.marked_unread`). `done`
+     * once the homeserver holds it, also for a room that already shows unread; `unsupported` for an invite or an archived
+     * room, `unknown_room` for a room the list does not hold.
+     */
+    markUnread(roomId: string): Promise<ActionOutcome>;
+    /**
+     * A10: favourites or unfavourites the room (the item's `onToggleFavorite`, called only when `isFavourite` differs: the
+     * `m.favourite` tag). `done` once the homeserver holds it and the room's tags show it; `failed` when it refuses (Element's
+     * error dialog shows too).
+     */
+    setFavourite(roomId: string, on: boolean): Promise<ActionOutcome>;
+    /**
+     * A10: sets the room's notification level (the item's `onSetRoomNotifState`: push rules). `done` once the homeserver
+     * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).
+     */
+    setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */

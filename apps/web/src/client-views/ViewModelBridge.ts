@@ -79,6 +79,7 @@ import { getClientViews, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
@@ -96,6 +97,7 @@ import {
     type ViewMessage,
     type ViewReaction,
     type ViewReply,
+    type ViewNotificationLevel,
     type ViewRoom,
     type ViewThread,
     type ViewUrlPreview,
@@ -1209,6 +1211,9 @@ export class ViewModelBridge implements ClientViewBridge {
                 isDirect: true,
                 order: out.length,
                 membership: "join",
+                isFavourite: false,
+                canMarkAsUnread: false,
+                notificationLevel: "all_messages",
             });
         }
         return out;
@@ -1710,6 +1715,30 @@ export class ViewModelBridge implements ClientViewBridge {
         if (room.tags?.[DefaultTagID.Archived])
             throw new ClientViewActionError("unsupported", "an archived room is not left");
         return leaveViaDialog(this.client, roomId, () => item.onLeaveRoom());
+    }
+
+    /** The room's list item view-model and Room for an A10 action, or the contract's `unknown_room`. */
+    private roomItem(roomId: string): { item: RoomItemActionsVm; room: Room } {
+        const room = this.client.getRoom(roomId);
+        const item = this.roomList.getRoomItemViewModel(roomId);
+        if (!room || !item || !("onMarkAsUnread" in item))
+            throw new ClientViewActionError("unknown_room", `${roomId} is not in the room list`);
+        return { item, room };
+    }
+
+    public async markUnread(roomId: string): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return markUnread(item, room);
+    }
+
+    public async setFavourite(roomId: string, on: boolean): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return setFavourite(item, room, on);
+    }
+
+    public async setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return setNotificationLevel(item, room, this.client, level);
     }
 
     public onChange(cb: (e: ChangeEvent) => void): () => void {

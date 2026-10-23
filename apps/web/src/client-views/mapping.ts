@@ -55,7 +55,10 @@ export function nodeText(node: ReactNode): string {
 
 /** A room list item snapshot as a ViewRoom. */
 export function toViewRoom(
-    snapshot: Pick<RoomListItemViewSnapshot, "id" | "name" | "isDm" | "notification">,
+    snapshot: Pick<
+        RoomListItemViewSnapshot,
+        "id" | "name" | "isDm" | "notification" | "isFavourite" | "canMarkAsUnread" | "roomNotifState"
+    >,
     order: number,
     avatarUrl?: string,
 ): ViewRoom {
@@ -70,6 +73,9 @@ export function toViewRoom(
         isDirect: snapshot.isDm,
         order,
         membership: n.invited ? "invite" : "join",
+        isFavourite: snapshot.isFavourite,
+        canMarkAsUnread: snapshot.canMarkAsUnread,
+        notificationLevel: snapshot.roomNotifState,
     };
 }
 
