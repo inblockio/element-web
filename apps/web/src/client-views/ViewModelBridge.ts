@@ -1155,6 +1155,12 @@ export class ViewModelBridge implements ClientViewBridge {
         };
         this.client.on(RoomStateEvent.Events, onPinsState);
         this.disposers.push(() => this.client.off(RoomStateEvent.Events, onPinsState));
+        // matrix-js-sdk emits RoomStateEvent.Events while it stores the event and applies `RoomMember.powerLevel` only
+        // afterwards (RoomState.setStateEvents), so `canPin` read on that first emission still sees the old level. The
+        // members emission follows the applied level: the rows are handed over once more then.
+        const onPowerApplied = (ev: MatrixEvent): void => onPinsState(ev);
+        this.client.on(RoomStateEvent.Members, onPowerApplied);
+        this.disposers.push(() => this.client.off(RoomStateEvent.Members, onPowerApplied));
     }
 
     /** useIsEncrypted re-reads the flag on every m.room.encryption state event. */

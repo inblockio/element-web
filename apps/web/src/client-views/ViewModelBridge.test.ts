@@ -8,7 +8,7 @@
 // @vitest-environment happy-dom
 
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vitest";
-import { ConnectionError, type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { ConnectionError, EventType, type MatrixClient, MatrixEvent, RoomState } from "matrix-js-sdk/src/matrix";
 import { DecryptionFailureCode } from "matrix-js-sdk/src/crypto-api";
 
 import { ViewModelBridge } from "./ViewModelBridge";
@@ -690,6 +690,48 @@ describe("ViewModelBridge", () => {
                 bridge.onChange((e) => e.kind === "timeline" && seen.push(e.roomId ?? ""));
                 stateHandler()({ getType: () => "m.room.power_levels", getRoomId: () => "!a" });
                 expect(seen).toEqual(["!a"]);
+            });
+
+            // grok r2 host F2: matrix-js-sdk emits RoomStateEvent.Events while it stores the event and applies
+            // `RoomMember.powerLevel` afterwards, so a hand-over made on the first emission still reads the old level.
+            it("the hand-over after a power-levels event reads the new power level (SDK emits Events before the level is applied)", () => {
+                readFirst();
+                bridge.timeline("!a");
+                const client = (bridge as unknown as { client: { on: Mock } }).client;
+                const roomId = "!a";
+                const me = "@me:example.org";
+                const state = new RoomState(roomId);
+                // the real SDK emits on its own RoomState; the client re-emits these to its listeners
+                for (const [name, handler] of client.on.mock.calls) {
+                    if (name === "RoomState.events" || name === "RoomState.members") {
+                        (state as unknown as { on(n: string, h: unknown): void }).on(name, handler);
+                    }
+                }
+                const ev = (type: string, stateKey: string, content: object, sender = me): MatrixEvent =>
+                    new MatrixEvent({
+                        type,
+                        state_key: stateKey,
+                        content,
+                        sender,
+                        room_id: roomId,
+                        event_id: `$${type}${stateKey}${Math.random()}`,
+                        origin_server_ts: 1,
+                    });
+                state.setStateEvents([
+                    ev(EventType.RoomCreate, "", { room_version: "10" }, "@creator:example.org"),
+                    ev(EventType.RoomMember, me, { membership: "join" }),
+                    ev(EventType.RoomPowerLevels, "", { users: { [me]: 0 }, events: { "m.room.pinned_events": 50 } }),
+                ]);
+                const offered: boolean[] = [];
+                bridge.onChange((e) => {
+                    if (e.kind === "timeline") offered.push(state.maySendStateEvent(EventType.RoomPinnedEvents, me));
+                });
+                state.setStateEvents([
+                    ev(EventType.RoomPowerLevels, "", { users: { [me]: 50 }, events: { "m.room.pinned_events": 50 } }),
+                ]);
+                expect(state.maySendStateEvent(EventType.RoomPinnedEvents, me)).toBe(true);
+                expect(offered.length).toBeGreaterThan(0);
+                expect(offered[offered.length - 1]).toBe(true);
             });
 
             it("presses onPinClick of the message's action bar view-model once it differs, then waits for the state, then disposes it", async () => {

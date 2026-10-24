@@ -15,6 +15,7 @@ import {
     type Room,
     type EmptyObject,
 } from "matrix-js-sdk/src/matrix";
+import { logger } from "matrix-js-sdk/src/logger";
 
 import { isContentActionable } from "./EventUtils";
 import { ReadPinsEventId } from "../components/views/right_panel/types";
@@ -143,7 +144,7 @@ export default class PinningUtils {
         // Not an array is invalid content (`isPinned` ignores it): start a fresh list rather than spread it.
         const pinnedIds: Array<string> = Array.isArray(currentPinned) ? [...currentPinned] : [];
 
-        let roomAccountDataPromise: Promise<EmptyObject | void> = Promise.resolve();
+        let roomAccountDataPromise: Promise<EmptyObject | void> | undefined;
         // If the event is already pinned, unpin it
         if (pinnedIds.includes(eventId)) {
             pinnedIds.splice(pinnedIds.indexOf(eventId), 1);
@@ -155,10 +156,11 @@ export default class PinningUtils {
                 event_ids: [...(room.getAccountData(ReadPinsEventId)?.getContent()?.event_ids || []), eventId],
             });
         }
-        await Promise.all([
-            matrixClient.sendStateEvent(room.roomId, EventType.RoomPinnedEvents, { pinned: pinnedIds }, ""),
-            roomAccountDataPromise,
-        ]);
+        // The pin is the state event: its outcome is the outcome of the call. The read-pins account data is only the
+        // unread marker, a side effect whose failure is logged and neither fails a pin the homeserver accepted nor
+        // ends the call before the state write has settled.
+        roomAccountDataPromise?.catch((e) => logger.warn("Could not update the read pins of", room.roomId, e));
+        await matrixClient.sendStateEvent(room.roomId, EventType.RoomPinnedEvents, { pinned: pinnedIds }, "");
     }
 
     /**

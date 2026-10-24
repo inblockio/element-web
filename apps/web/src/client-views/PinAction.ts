@@ -9,7 +9,7 @@
  * M6 B2 pin / unpin: the action bar view-model's `onPinClick` (stock `PinningUtils.pinOrUnpinEvent`, which sends the room's
  * `m.room.pinned_events` list built from Element's own state). It toggles, so it is called only when the message's pin
  * state differs from the asked one. The outcome is read where the view-model leaves it: the returned promise is the
- * homeserver's answer, and the room state (which arrives with the sync) must show the change before `done`. The pinned list
+ * state write's answer (a failing read-pins account-data write is not part of it), and the room state (which arrives with the sync) must show the change before `done`. The pinned list
  * is rebuilt from the local state on every press, so calls for one room run one after the other: an overlapping press would
  * build its list from a state that does not hold the first one yet and drop it.
  */
@@ -27,9 +27,6 @@ export interface PinTarget {
     /** `EventTileActionBarViewModel.onPinClick`; rejects when the homeserver refuses. */
     press(): Promise<void>;
 }
-
-/** How long a rejected press waits for the room's list to show the change before it is reported as failed. */
-export const PIN_SETTLE_MS = 5000;
 
 const pinQueue = new Map<string, Promise<unknown>>();
 
@@ -55,11 +52,12 @@ export function setPinned(
         try {
             await target.press();
         } catch (e) {
-            // The press sends the list and a paired account-data write and rejects when either fails, so the list may
-            // have landed behind a rejection (a landed pin is reported landed, D21), and the next call in this room must
-            // not build on a state that does not hold it yet. A definite refusal (M_FORBIDDEN) is not waited for.
+            // The press is the state write (the paired read-pins account-data write is a side effect that never rejects
+            // it, `PinningUtils.pinOrUnpinEvent`), so a rejection is the homeserver's answer to the pin and the write has
+            // settled: the room's queue is released only now. A definite refusal (M_FORBIDDEN) stands; any other error
+            // (a lost connection can hide an accepted write) is checked once against the list as it is.
             const error = toActionError(e);
-            if (error.code === "forbidden" || !(await shows(PIN_SETTLE_MS))) throw error;
+            if (error.code === "forbidden" || target.pinned() !== on) throw error;
             return { status: "done", roomId };
         }
         if (await shows(ROOM_ACTION_TIMEOUT_MS)) return { status: "done", roomId };

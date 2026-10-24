@@ -80,4 +80,40 @@ describe("PinningUtils.pinOrUnpinEvent leaves the live state alone", () => {
             "",
         );
     });
+    // grok r2 (host F1, track F1/F2, one root): the pin is the state write; the paired read-pins account-data write is a
+    // side effect. Stock `Promise.all` followed whichever write failed first.
+    describe("the read-pins account-data write is a side effect", () => {
+        const deferred = <T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } => {
+            let resolve!: (v: T) => void;
+            let reject!: (e: unknown) => void;
+            const promise = new Promise<T>((res, rej) => {
+                resolve = res;
+                reject = rej;
+            });
+            return { promise, resolve, reject };
+        };
+
+        it("a failing account-data write does not fail a pin whose state write is accepted", async () => {
+            vi.mocked(client.setRoomAccountData).mockRejectedValue(new Error("403 M_FORBIDDEN"));
+            await expect(PinningUtils.pinOrUnpinEvent(client, message("$new"))).resolves.toBeUndefined();
+            expect(client.sendStateEvent).toHaveBeenCalled();
+        });
+
+        it("the outcome waits for the state write although the account-data write failed long before", async () => {
+            vi.mocked(client.setRoomAccountData).mockRejectedValue(new Error("500"));
+            const state = deferred<{ event_id: string }>();
+            vi.mocked(client.sendStateEvent).mockReturnValue(state.promise);
+            let settled = false;
+            const p = PinningUtils.pinOrUnpinEvent(client, message("$new")).finally(() => (settled = true));
+            await new Promise((r) => setTimeout(r, 20));
+            expect(settled).toBe(false);
+            state.resolve({ event_id: "$state" });
+            await expect(p).resolves.toBeUndefined();
+        });
+
+        it("a failing state write fails the pin, whatever the account-data write does", async () => {
+            vi.mocked(client.sendStateEvent).mockRejectedValue(new Error("state 500"));
+            await expect(PinningUtils.pinOrUnpinEvent(client, message("$new"))).rejects.toThrow("state 500");
+        });
+    });
 });
