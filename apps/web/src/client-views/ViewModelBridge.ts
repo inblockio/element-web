@@ -1019,6 +1019,10 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly permalinkCreators = new Map<string, RoomPermalinkCreator>();
     /** The rooms the bridge lists (set by `syncRooms`): a room that left it gets no permalink creator again. */
     private listedRoomIds = new Set<string>();
+    /** Rooms read while not listed (messages handed over without a permalink): the kit reads them again once they are listed. */
+    private readUnlisted = new Set<string>();
+    /** Rooms whose member load for the via servers failed: the next read tries it again (the SDK allows a retry). */
+    private memberLoadFailed = new Set<string>();
     /** A `loadOlder` in flight per room: a concurrent call gets the same answer. */
     private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
     private disposed = false;
@@ -1210,11 +1214,17 @@ export class ViewModelBridge implements ClientViewBridge {
             if (listed.has(roomId)) continue;
             creator.stop();
             this.permalinkCreators.delete(roomId);
+            this.memberLoadFailed.delete(roomId);
         }
-        if (JSON.stringify(rooms) === JSON.stringify(this.roomCache)) return;
-        this.roomCache = rooms;
-        this.emit({ kind: "rooms" });
-        for (const r of joined) this.emit({ kind: "timeline", roomId: r.id });
+        // A room read without permalinks while it was not listed (a rejoin the list shows late) is listed now: read it again.
+        const relisted = [...this.readUnlisted].filter((id) => listed.has(id));
+        for (const id of relisted) this.readUnlisted.delete(id);
+        if (JSON.stringify(rooms) !== JSON.stringify(this.roomCache)) {
+            this.roomCache = rooms;
+            this.emit({ kind: "rooms" });
+            for (const r of joined) this.emit({ kind: "timeline", roomId: r.id });
+        }
+        for (const id of relisted) if (!joined.some((r) => r.id === id)) this.emit({ kind: "timeline", roomId: id });
     }
 
     /**
@@ -1441,13 +1451,19 @@ export class ViewModelBridge implements ClientViewBridge {
         let creator = this.permalinkCreators.get(roomId);
         if (!creator) {
             // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
-            if (!this.listedRoomIds.has(roomId)) return undefined;
+            if (!this.listedRoomIds.has(roomId)) {
+                this.readUnlisted.add(roomId);
+                return undefined;
+            }
             const room = this.client.getRoom(roomId);
             if (!room) return undefined;
             creator = new RoomPermalinkCreator(room);
             creator.start();
             this.permalinkCreators.set(roomId, creator);
             this.loadMembersForVia(room);
+        } else if (this.memberLoadFailed.delete(roomId)) {
+            const room = this.client.getRoom(roomId);
+            if (room) this.loadMembersForVia(room);
         }
         return creator.forEvent(eventId);
     }
@@ -1463,11 +1479,13 @@ export class ViewModelBridge implements ClientViewBridge {
             () => {
                 if (this.permalinkCreators.has(room.roomId)) this.emit({ kind: "timeline", roomId: room.roomId });
             },
-            (err) =>
+            (err) => {
+                if (this.permalinkCreators.has(room.roomId)) this.memberLoadFailed.add(room.roomId);
                 logger.error(
                     `Fetching room members for ${room.roomId} failed. Permalinks may list too few servers.`,
                     err,
-                ),
+                );
+            },
         );
     }
 
@@ -1897,6 +1915,8 @@ export class ViewModelBridge implements ClientViewBridge {
         this.timelines.forEach((t) => t.dispose());
         this.permalinkCreators.forEach((c) => c.stop());
         this.permalinkCreators.clear();
+        this.memberLoadFailed.clear();
+        this.readUnlisted.clear();
         this.statusBar?.dispose();
         this.userMenu.dispose();
         this.roomList.dispose();

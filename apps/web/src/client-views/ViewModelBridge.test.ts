@@ -694,6 +694,36 @@ describe("ViewModelBridge", () => {
             expect(h.room.currentState.on).toHaveBeenCalledTimes(1);
         });
 
+        it("tells the kit to read a room again once it enters the list, when it was read without permalinks before", () => {
+            const { message } = readFirst();
+            const list = h.roomLists[h.roomLists.length - 1];
+            // A rejoined room that is open in the kit while the list does not list it (yet): no permalink.
+            list.set({ sections: [{ roomIds: [] }] });
+            expect(message().permalink).toBeUndefined();
+            const seen: Array<{ kind: string; roomId?: string }> = [];
+            bridge.onChange((e) => seen.push(e as { kind: string; roomId?: string }));
+            list.set({ sections: [{ roomIds: ["!a"] }] });
+            expect(seen).toContainEqual({ kind: "timeline", roomId: "!a" });
+            expect(message().permalink).toContain("https://matrix.to/#/!a/$m1");
+        });
+
+        it("retries the member load for the via servers on the next read after it failed", async () => {
+            h.lazyLoad.value = true;
+            h.room.loadMembersIfNeeded.mockRejectedValueOnce(new Error("offline"));
+            const { message } = readFirst();
+            message();
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            message();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(2);
+            await Promise.resolve();
+            await Promise.resolve();
+            // Loaded now: no further attempt.
+            message();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(2);
+        });
+
         it("hands over no permalink for a deleted message", () => {
             const { ev, message } = readFirst();
             (ev as { isRedacted: () => boolean }).isRedacted = () => true;
