@@ -196,6 +196,40 @@ describe("M6 B1 fix round 1 F4: favourite after a timed-out write", () => {
     });
 });
 
+describe("M6 B1 fix round 3 F1: favourite on a room that holds a custom section", () => {
+    const SECTION = "element.io.section.work";
+    const withTags = (r: Room, tags: Record<string, unknown>): void => {
+        (r as unknown as { tags: Record<string, unknown> }).tags = tags;
+    };
+
+    it("is done only once the toggle has replaced the section (the delete landed too)", async () => {
+        const r = room({ [SECTION]: {} });
+        const item = makeItem(snap());
+        item.onToggleFavorite.mockImplementation(() => {
+            setTimeout(() => withTags(r, { [SECTION]: {}, "m.favourite": { order: 0.5 } }), 100);
+            setTimeout(() => withTags(r, { "m.favourite": { order: 0.5 } }), 400);
+        });
+        expect(await setFavourite(item, r, true)).toEqual({ status: "done", roomId: "!a:example.org" });
+        expect(Object.keys(r.tags as object)).toEqual(["m.favourite"]);
+    });
+
+    it("is network (may still apply) while the old section tag is still on the room (delete not landed or refused)", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = room({ [SECTION]: {} });
+            const item = makeItem(snap());
+            item.onToggleFavorite.mockImplementation(() => {
+                setTimeout(() => withTags(r, { [SECTION]: {}, "m.favourite": { order: 0.5 } }), 100);
+            });
+            const result = codeOf(setFavourite(item, r, true));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+            expect(await result).toBe("network");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
 describe("A10 notification level (onSetRoomNotifState, echo transaction)", () => {
     const getPushRules = vi.fn(async () => ({}));
     const client = { getPushRules } as unknown as MatrixClient;
