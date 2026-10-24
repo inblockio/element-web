@@ -49,6 +49,7 @@ const h = vi.hoisted(() => {
         findThreadForEvent: () => null,
         getUnfilteredTimelineSet: () => timelineSet,
         getMyMembership: () => "join",
+        loadMembersIfNeeded: vi.fn(async (): Promise<boolean> => true),
         currentState: {
             maySendEvent: vi.fn((_type: string, _user: string): boolean => true),
             getStateEvents: vi.fn((..._args: unknown[]): unknown => undefined),
@@ -113,6 +114,8 @@ const h = vi.hoisted(() => {
     }> = [];
     const settings: Record<string, unknown> = {};
     const roomEncrypted = { value: true };
+    /** `client.hasLazyLoadMembersEnabled()`: Element's production client always has it on. */
+    const lazyLoad = { value: false };
     const watchers = new Map<string, { name: string; roomId: string | null; cb: () => void }>();
     const urlPreviewVms: Array<
         InstanceType<typeof FakeVm<Record<string, unknown>>> & {
@@ -159,6 +162,7 @@ const h = vi.hoisted(() => {
         mediaVisible,
         settings,
         roomEncrypted,
+        lazyLoad,
         watchers,
         urlPreviewVms,
         threadSummaries,
@@ -459,11 +463,13 @@ describe("ViewModelBridge", () => {
             getRoom: (id: string) => (id === "!a" ? h.room : null),
             getUserId: () => "@me:example.org",
             isRoomEncrypted: () => h.roomEncrypted.value,
+            hasLazyLoadMembersEnabled: () => h.lazyLoad.value,
             getCrypto: () => undefined,
             getEventTimeline: h.getEventTimeline,
             on: vi.fn(),
             off: vi.fn(),
         } as unknown as MatrixClient);
+        h.lazyLoad.value = false;
         h.padlocks.length = 0;
         h.bodies.length = 0;
         h.replies.length = 0;
@@ -649,6 +655,43 @@ describe("ViewModelBridge", () => {
             // The room drops out of the bridge's list: the creator is stopped.
             h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
             expect(h.room.currentState.removeListener).toHaveBeenCalledTimes(1);
+        });
+
+        it("loads the room's members once for the via servers (as RoomView does) and tells the kit to re-read when they arrived", async () => {
+            h.lazyLoad.value = true;
+            h.room.getJoinedMembers.mockReturnValue([{ userId: "@bob:small.example.org" }]);
+            const seen: Array<{ kind: string; roomId?: string }> = [];
+            bridge.onChange((e) => seen.push(e as { kind: string; roomId?: string }));
+            const { message } = readFirst();
+            expect(message().permalink).toBe("https://matrix.to/#/!a/$m1?via=small.example.org");
+            message();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            // The member list arrives: the room state updates (the started creator follows) and the kit is told.
+            h.room.getJoinedMembers.mockReturnValue([
+                { userId: "@bob:small.example.org" },
+                { userId: "@mod:big.example.org" },
+            ]);
+            seen.length = 0;
+            (h.room.currentState.on.mock.calls[0][1] as () => void)();
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(seen).toContainEqual({ kind: "timeline", roomId: "!a" });
+            expect(message().permalink).toBe("https://matrix.to/#/!a/$m1?via=small.example.org&via=big.example.org");
+        });
+
+        it("loads no members when the client does not lazy-load them", () => {
+            const { message } = readFirst();
+            message();
+            expect(h.room.loadMembersIfNeeded).not.toHaveBeenCalled();
+        });
+
+        it("does not start a permalink creator again for a room that left the list but is still read", () => {
+            const { message } = readFirst();
+            message();
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            expect(h.room.currentState.removeListener).toHaveBeenCalledTimes(1);
+            expect(message().permalink).toBeUndefined();
+            expect(h.room.currentState.on).toHaveBeenCalledTimes(1);
         });
 
         it("hands over no permalink for a deleted message", () => {
@@ -873,6 +916,7 @@ describe("ViewModelBridge", () => {
                 getRoom: (id: string) => (id === "!a" ? h.room : null),
                 getUserId: () => "@me:example.org",
                 isRoomEncrypted: () => false,
+                hasLazyLoadMembersEnabled: () => false,
                 getCrypto: () => ({
                     isEncryptionEnabledInRoom,
                     getUserVerificationStatus: async () => ({ isCrossSigningVerified: () => false }),
@@ -2074,6 +2118,7 @@ describe("ViewModelBridge", () => {
                     getRoom: (id: string) => (id === "!a" ? h.room : null),
                     getUserId: () => "@me:example.org",
                     isRoomEncrypted: () => false,
+                    hasLazyLoadMembersEnabled: () => false,
                     getCrypto: () => ({
                         isEncryptionEnabledInRoom,
                         getUserVerificationStatus: async () => ({ isCrossSigningVerified: () => false }),

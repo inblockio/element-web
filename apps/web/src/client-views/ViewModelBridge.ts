@@ -1017,6 +1017,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
     /** One started permalink creator per room (its `via` servers follow the room state); stopped when the room leaves the bridge. */
     private readonly permalinkCreators = new Map<string, RoomPermalinkCreator>();
+    /** The rooms the bridge lists (set by `syncRooms`): a room that left it gets no permalink creator again. */
+    private listedRoomIds = new Set<string>();
     /** A `loadOlder` in flight per room: a concurrent call gets the same answer. */
     private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
     private disposed = false;
@@ -1203,6 +1205,7 @@ export class ViewModelBridge implements ClientViewBridge {
         this.invitedRooms = new Set(rooms.filter((r) => r.membership === "invite").map((r) => r.id));
         // A room that left the list takes its permalink creator (a started one listens to the room state) with it.
         const listed = new Set(ids);
+        this.listedRoomIds = listed;
         for (const [roomId, creator] of this.permalinkCreators) {
             if (listed.has(roomId)) continue;
             creator.stop();
@@ -1437,13 +1440,35 @@ export class ViewModelBridge implements ClientViewBridge {
     private permalinkOf(roomId: string, eventId: string): string | undefined {
         let creator = this.permalinkCreators.get(roomId);
         if (!creator) {
+            // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
+            if (!this.listedRoomIds.has(roomId)) return undefined;
             const room = this.client.getRoom(roomId);
             if (!room) return undefined;
             creator = new RoomPermalinkCreator(room);
             creator.start();
             this.permalinkCreators.set(roomId, creator);
+            this.loadMembersForVia(room);
         }
         return creator.forEvent(eventId);
+    }
+
+    /**
+     * Element's own Copy link has the room's full member list behind its `via` servers (RoomView loads it on mount); a kit
+     * mounts no RoomView, so with lazy-loaded members only the few loaded ones would count. Load them (once per room:
+     * the SDK keeps the promise) and tell the kit to read the room again; the started creator follows the room state.
+     */
+    private loadMembersForVia(room: Room): void {
+        if (!this.client.hasLazyLoadMembersEnabled() || room.getMyMembership() !== KnownMembership.Join) return;
+        room.loadMembersIfNeeded().then(
+            () => {
+                if (this.permalinkCreators.has(room.roomId)) this.emit({ kind: "timeline", roomId: room.roomId });
+            },
+            (err) =>
+                logger.error(
+                    `Fetching room members for ${room.roomId} failed. Permalinks may list too few servers.`,
+                    err,
+                ),
+        );
     }
 
     /** The transaction id of an own message (its local echo's, else the sync echo's `unsigned.transaction_id`). */
