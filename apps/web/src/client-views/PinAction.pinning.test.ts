@@ -185,4 +185,54 @@ describe("setPinned over pinOrUnpinEvent: the state write decides", () => {
         await expect(b).resolves.toMatchObject({ status: "done" });
         expect(server).toEqual(["$b"]);
     });
+
+    // grok r4 F1: the bridge is disposed while the state PUT's answer is lost; the wait is not cut short, so the room's
+    // queue is not released onto a local list that does not hold the landed write yet.
+    it("a dispose during a lost answer does not release the queue: the next pin builds on the landed list", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 2000, new ConnectionError("down after the write"), true);
+        let disposed = false;
+        const a = setPinned(roomId, target("$a"), true, () => disposed);
+        const b = setPinned(roomId, target("$b"), true);
+        setTimeout(() => (disposed = true), 100);
+        await vi.advanceTimersByTimeAsync(40000);
+        await expect(a).resolves.toMatchObject({ status: "done" });
+        await expect(b).resolves.toMatchObject({ status: "done" });
+        expect([...server].sort()).toEqual(["$a", "$b"]);
+    });
+
+    it("a dispose during a lost answer: a queued unpin does not answer done on the stale list", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 2000, new ConnectionError("down after the write"), true);
+        let disposed = false;
+        const a = setPinned(roomId, target("$a"), true, () => disposed);
+        const b = setPinned(roomId, target("$a"), false);
+        setTimeout(() => (disposed = true), 100);
+        await vi.advanceTimersByTimeAsync(40000);
+        await expect(a).resolves.toMatchObject({ status: "done" });
+        await expect(b).resolves.toMatchObject({ status: "done" });
+        expect(server).toEqual([]);
+    });
+
+    it("a lost answer that never landed, bridge disposed: network after the full wait, not failed", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 100, new ConnectionError("down"), false);
+        let disposed = false;
+        const a = setPinned(roomId, target("$a"), true, () => disposed);
+        const ra = a.catch((e) => e);
+        setTimeout(() => (disposed = true), 100);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(server).toEqual([]);
+        await vi.advanceTimersByTimeAsync(40000);
+        expect(await ra).toMatchObject({ code: "network" });
+    });
+
+    it("a disposed bridge writes nothing: failed, the PUT is never sent", async () => {
+        homeserver(100, 100);
+        const a = setPinned(roomId, target("$a"), true, () => true);
+        const ra = a.catch((e) => e);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(await ra).toMatchObject({ code: "failed" });
+        expect(client.sendStateEvent).not.toHaveBeenCalled();
+    });
 });

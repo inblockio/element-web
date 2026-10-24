@@ -44,12 +44,14 @@ export function setPinned(
         const until = Date.now() + ms;
         while (Date.now() < until) {
             if (target.pinned() === on) return true;
-            if (isDisposed()) throw new ClientViewActionError("failed", "the bridge was disposed");
             await new Promise((r) => setTimeout(r, 50));
         }
         return target.pinned() === on;
     };
     const run = async (): Promise<ActionOutcome> => {
+        // Before the press only: once a write may be on its way, a dispose does not end the wait (it would release the
+        // room's queue onto a list that does not hold that write yet).
+        if (isDisposed()) throw new ClientViewActionError("failed", "the bridge was disposed");
         if (!target.canPin()) throw new ClientViewActionError("forbidden", "Element offers no pin on this message");
         if (target.pinned() === on) return { status: "done", roomId };
         try {

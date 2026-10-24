@@ -211,8 +211,9 @@ describe("setPinned", () => {
         await held;
     });
 
-    it("stops waiting when the bridge is disposed", async () => {
+    it("does not press when the bridge is disposed", async () => {
         const t = target({ press: vi.fn(async () => {}) });
         await expect(setPinned("!a", t, true, () => true)).rejects.toMatchObject({ code: "failed" });
+        expect(t.press).not.toHaveBeenCalled();
     });
 });
