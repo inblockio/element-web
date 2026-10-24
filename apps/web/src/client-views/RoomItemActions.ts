@@ -17,6 +17,7 @@
 import { type MatrixClient, type Room } from "matrix-js-sdk/src/matrix";
 
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
+import { isSectionTag } from "../stores/room-list-v3/section";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { TransactionStatus } from "../stores/local-echo/EchoTransaction";
 import { getRoomNotifsState } from "../RoomNotifs";
@@ -109,6 +110,27 @@ export async function awaitLateLanding(room: Room): Promise<void> {
         await new Promise((r) => setTimeout(r, 50));
 }
 
+/**
+ * Every section tag the room holds (favourite, low priority, any custom one). Element's one-section rule means a settled room
+ * holds at most one; a room made elsewhere can hold several.
+ */
+export function sectionTagsOf(room: Room): string[] {
+    return Object.keys(room.tags ?? {}).filter((tag) => isSectionTag(tag) && tag !== DefaultTagID.Invite);
+}
+
+/**
+ * `tagRoom` toggles on the first of a room's section tags, so for a room holding several no kit write (favourite on or off,
+ * section move, create with the room) is sure to reach the asked state: `unsupported`, nothing written. Element's own room
+ * list can repair such a room.
+ */
+export function assertSingleSection(room: Room): void {
+    if (sectionTagsOf(room).length > 1)
+        throw new ClientViewActionError(
+            "unsupported",
+            "the room holds several section tags (for example favourite and a category); change it in Element's own room list",
+        );
+}
+
 const FAVOURITE_TAG = "m.favourite";
 const isTagged = (room: Room): boolean => !!room.tags?.[FAVOURITE_TAG];
 
@@ -125,6 +147,7 @@ export function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): 
         const snap = item.getSnapshot();
         if (snap.notification.invited) throw new ClientViewActionError("unsupported", "an invite is not a favourite");
         assertListed(room);
+        assertSingleSection(room);
         if (isTagged(room) === on) return done(room.roomId);
         item.onToggleFavorite();
         const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;

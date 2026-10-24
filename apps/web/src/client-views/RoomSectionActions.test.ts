@@ -12,6 +12,7 @@ import { type Room } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import { createSection, setSection, type RoomSectionVm } from "./RoomSectionActions";
+import { setFavourite } from "./RoomItemActions";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import { ClientViewActionError } from "./types";
 
@@ -226,7 +227,7 @@ describe("M6 B1 fix round 1 (grok F1-F4)", () => {
         }
     });
 
-    it("F3: createSection is not done while an older section still holds the room", async () => {
+    it("F3: createSection does not report the room moved while an older section still holds it (done with the section only, F4 round 2)", async () => {
         vi.useFakeTimers();
         try {
             const r = fresh({ [B]: {} });
@@ -237,11 +238,11 @@ describe("M6 B1 fix round 1 (grok F1-F4)", () => {
                 (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
                 return Promise.resolve(A);
             });
-            const result = codeOf(createSection(r));
+            const result = createSection(r);
             await vi.advanceTimersByTimeAsync(100);
             setTags(r, { [B]: {}, [A]: {} });
             await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
-            expect(await result).toBe("network");
+            expect(await result).toEqual({ status: "done", section: A });
         } finally {
             vi.useRealTimers();
         }
@@ -265,6 +266,76 @@ describe("M6 B1 fix round 1 (grok F1-F4)", () => {
             expect((await second).status).toBe("done");
             expect(item.onRemoveFromSection).toHaveBeenCalledOnce();
             expect((r.tags as Record<string, unknown>)[A]).toBeUndefined();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
+describe("M6 B1 fix round 2 (grok delta F1-F4): a room holding several section tags is read-only for moves", () => {
+    const FAV = "m.favourite";
+    let n = 0;
+    const fresh = (tags: Record<string, unknown> = {}): Room =>
+        ({ roomId: `!g${++n}:example.org`, tags }) as unknown as Room;
+    const several = [
+        ["favourite first, section second", { [FAV]: {}, [A]: {} }],
+        ["section first, favourite second", { [A]: {}, [FAV]: {} }],
+        ["two custom sections", { [A]: {}, [B]: {} }],
+    ] as const;
+
+    for (const [label, tags] of several) {
+        for (const target of [null, A, B] as const) {
+            it(`F1/F2: setSection(${target === null ? "null" : target === A ? "A" : "B"}) on ${label} is unsupported and writes nothing`, async () => {
+                const r = fresh({ ...tags });
+                const item = makeItem();
+                expect(await codeOf(setSection(item, r, target))).toBe("unsupported");
+                expect(item.onToggleSection).not.toHaveBeenCalled();
+                expect(item.onRemoveFromSection).not.toHaveBeenCalled();
+            });
+        }
+
+        it(`F3: setFavourite on/off on ${label} is unsupported and writes nothing`, async () => {
+            const r = fresh({ ...tags });
+            const onToggleFavorite = vi.fn();
+            const item = { ...makeItem(), onToggleFavorite, getSnapshot: () => snap() } as unknown as Parameters<
+                typeof setFavourite
+            >[0];
+            expect(await codeOf(setFavourite(item, r, false))).toBe("unsupported");
+            expect(await codeOf(setFavourite(item, r, true))).toBe("unsupported");
+            expect(onToggleFavorite).not.toHaveBeenCalled();
+        });
+
+        it(`createSection with a room that holds ${label} is unsupported: no dialog, nothing written`, async () => {
+            const r = fresh({ ...tags });
+            store.createSection.mockReset();
+            expect(await codeOf(createSection(r))).toBe("unsupported");
+            expect(store.createSection).not.toHaveBeenCalled();
+        });
+    }
+
+    it("a room with one section tag and low priority counts as several", async () => {
+        const item = makeItem();
+        expect(await codeOf(setSection(item, fresh({ "m.lowpriority": {}, [A]: {} }), B))).toBe("unsupported");
+        expect(item.onToggleSection).not.toHaveBeenCalled();
+    });
+
+    it("F4: createSection answers done with the new section when the store saved it but the room's move did not settle", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = fresh({ [FAV]: {} });
+            const finished = Promise.resolve(["Projects", [r.roomId]]);
+            (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({ close: vi.fn(), finished }));
+            store.createSection.mockReset();
+            store.createSection.mockImplementation(() => {
+                (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+                return Promise.resolve(A);
+            });
+            const result = createSection(r);
+            await vi.advanceTimersByTimeAsync(100);
+            // The add landed, the favourite's delete was refused.
+            setTags(r, { [FAV]: {}, [A]: {} });
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+            expect(await result).toEqual({ status: "done", section: A });
         } finally {
             vi.useRealTimers();
         }
@@ -337,14 +408,14 @@ describe("M6 B1 createSection (RoomListStoreV3.createSection -> Element's dialog
         await expect(outcome).resolves.toEqual({ status: "cancelled" });
     });
 
-    it("is network when the preselected room does not show the section in time", async () => {
-        const outcome = codeOf(createSection(room()));
+    it("is done with the section, without the room, when the preselected room does not show it in time", async () => {
+        const outcome = createSection(room());
         await vi.advanceTimersByTimeAsync(0);
         finish("Projects", ["!a:example.org"]);
         await vi.advanceTimersByTimeAsync(0);
         storeResult(A);
         await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
-        expect(await outcome).toBe("network");
+        expect(await outcome).toEqual({ status: "done", section: A });
     });
 
     it("maps a store write that fails to the contract's error", async () => {
