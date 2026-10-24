@@ -44,6 +44,39 @@ export interface ViewRoom {
     notificationLevel: ViewNotificationLevel;
 }
 
+/**
+ * A call, on the message that roots it (the `org.matrix.msc4075.rtc.notification` event Element draws its call card
+ * from). Filled only from the call-card view-models: `RootCallTileViewModel` decides ongoing or ended, the Room/Dm
+ * ongoing tile view-models give the participants, `DurationViewModel` the running time, the Room/Dm tombstone ones the
+ * end and, in a DM, the decline. The host reads no MatrixRTC state of its own.
+ */
+export interface ViewCall {
+    /** The call's id: the root event's id (`ViewMessage.id`). */
+    callId: string;
+    /** `RootCallTileViewModel.tileType`: an ongoing tile is "ongoing", a tombstone tile is "ended". */
+    state: "ongoing" | "ended";
+    /** The call's intent (the tile view-models read it from the notification event: `m.call.intent`). */
+    callType: "video" | "voice";
+    /** A DM tile (`ongoing-call-dm`, `tombstone-call-dm`), else a room tile. */
+    isDm: boolean;
+    /** The face pile of the ongoing tile (Element shows at most three). Empty when ended. */
+    participants: ViewCallParticipant[];
+    /** The room tile's `totalParticipants` (everyone in the call, not only the face pile). Ongoing room tile only. */
+    participantCount?: number;
+    /** When the call started: the notification event's `origin_server_ts` (the tombstone view-models give no time other than a formatted string). */
+    startedTs: number;
+    /** `DurationViewModel.duration` in seconds. Ongoing only; ended calls have no duration in any view-model. */
+    durationSeconds?: number;
+    /** The DM tombstone tile's `isCallDeclined`. Only a DM tombstone has it. */
+    declined?: boolean;
+}
+
+export interface ViewCallParticipant {
+    userId: string;
+    name: string;
+    avatarUrl?: string;
+}
+
 /** The notification levels of a room, as the room list item view-model's `RoomNotifState` names them. */
 export type ViewNotificationLevel = "all_messages" | "all_messages_loud" | "mentions_only" | "mute";
 
@@ -87,6 +120,13 @@ export interface ViewMessage {
      * matrix.to or the configured permalink prefix, with `via` servers). Absent for a deleted message.
      */
     permalink?: string;
+    /**
+     * Element offers a download for this message (the Download action bar button's rule: a media message whose content is
+     * actionable, `isContentActionable` and `MediaEventHelper.isEligible`). False or absent for a text message, a
+     * redacted one and one still waiting for its key; the module permission hint of the action bar view-model is not
+     * read here, `download` reports it as `forbidden`.
+     */
+    canDownload?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
@@ -103,6 +143,11 @@ export interface ViewMessage {
      * shows none: previews hidden by the setting (room or encrypted-room default), by the user, or no link.
      */
     urlPreviews?: ViewUrlPreview[];
+    /**
+     * Set on the root event of a call (`kind` is "other", `body` is empty): the call card Element draws. See `ViewCall`.
+     * Version 2, additive: a kit that does not know the field gets a message with an empty body and no content.
+     */
+    call?: ViewCall;
 }
 
 /**
@@ -239,6 +284,12 @@ export interface ClientViewBridge {
     /** "stock" = Element's own UI */
     switchTo(viewId: string): void;
     /**
+     * The address of the call app from the host config (`client_views_meet_url`), or undefined when the instance has none:
+     * a kit then offers no call. Version 2, additive: a host without it is a host without calls. A kit builds the join
+     * link from it (`<meetUrl>/#/room/<roomId>`); the call itself runs in that app, never in the kit.
+     */
+    meetUrl(): string | undefined;
+    /**
      * Sends a plain-text message (`m.text`, no markdown) and resolves `done` + `eventId` once the server returns it.
      * `opts.txnId` is the transaction id the sent event carries (`ViewMessage.txnId`); `opts.replyTo` is the event id
      * of the replied message. In a local (not yet created) room the first send creates the room and `roomId` is the
@@ -292,6 +343,15 @@ export interface ClientViewBridge {
      * loaded. The kit asks for the confirmation. Interim (D16/D20): Element's own client call.
      */
     redact(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * B7: downloads the file, image, video or audio of the message `eventId` the way Element's Download action bar button
+     * does (`EventTileActionBarViewModel.onDownloadClick`): it waits until the event is decrypted, then Element fetches
+     * and decrypts the file and saves it with its own downloader. `done` once Element's click settled, which is also the
+     * case when the fetch or decryption failed: Element's own error dialog shows then and the kit shows nothing of its
+     * own. `unknown_room` / `unknown_event` for what the client cannot load, `unsupported` for a message without media,
+     * `failed` when it stays undecrypted, `forbidden` when the view-model does not offer the download.
+     */
+    download(roomId: string, eventId: string): Promise<ActionOutcome>;
     /**
      * A10: marks the room unread (the room list item's `onMarkAsUnread`: the room account data `m.marked_unread`). `done`
      * once the homeserver holds it, also for a room that already shows unread; `unsupported` for an invite or an archived

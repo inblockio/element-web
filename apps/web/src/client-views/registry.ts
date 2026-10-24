@@ -36,6 +36,24 @@ export function getClientViews(): ClientViewDescriptor[] {
     return [...views.values()];
 }
 
+/**
+ * The address of the call app (aqua-meet) from config.json `client_views_meet_url`, as `https://host[/path]` with no
+ * query, fragment or trailing slash; undefined when the key is absent or no http(s) address (instance policy is config:
+ * absent = calls are off in every kit).
+ */
+export function getMeetUrl(): string | undefined {
+    const value = (SdkConfig.get() as { client_views_meet_url?: unknown }).client_views_meet_url;
+    if (typeof value !== "string" || value.trim() === "") return undefined;
+    try {
+        const url = new URL(value.trim());
+        if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+        return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+    } catch {
+        logger.warn("Ignoring invalid client_views_meet_url", value);
+        return undefined;
+    }
+}
+
 /** Whether client views can be used at all: the Labs flag is on and at least one kit exists. */
 export function clientViewsAvailable(): boolean {
     return SettingsStore.getValue("feature_client_views") && getClientViews().length > 0;
