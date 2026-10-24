@@ -8,7 +8,14 @@
 // @vitest-environment happy-dom
 
 import { describe, it, expect, vi } from "vitest";
-import { type EventTimeline, EventType, MatrixEvent, type MatrixClient, RoomEvent } from "matrix-js-sdk/src/matrix";
+import {
+    type EventTimeline,
+    EventType,
+    MatrixEvent,
+    MatrixEventEvent,
+    type MatrixClient,
+    RoomEvent,
+} from "matrix-js-sdk/src/matrix";
 import { EventEmitter } from "node:events";
 import { mkEvent, mkRoom, mkRoomMember, stubClient } from "test-utils";
 
@@ -193,11 +200,21 @@ describe("LatestRtcNotificationEventStore", () => {
             return { event, crypto };
         }
 
-        function setup(cli: MatrixClient): { store: LatestRtcNotificationEventStore; room: ReturnType<typeof mkRoom> } {
+        /** A crypto backend that has no key (yet): decryption fails and the event becomes m.bad.encrypted. */
+        const failingCrypto = {
+            decryptEvent: async () => {
+                throw new Error("no key");
+            },
+        } as unknown as CryptoBackend;
+
+        function setup(
+            cli: MatrixClient,
+            timelineEvents: MatrixEvent[] = [],
+        ): { store: LatestRtcNotificationEventStore; room: ReturnType<typeof mkRoom> } {
             const room = mkRoom(cli, roomId);
             vi.spyOn(cli, "getRoom").mockImplementation(() => room);
             vi.spyOn(room, "getLiveTimeline").mockImplementation(
-                () => ({ getEvents: () => [] }) as unknown as EventTimeline,
+                () => ({ getEvents: () => timelineEvents }) as unknown as EventTimeline,
             );
 
             const call = new EventEmitter();
@@ -247,6 +264,70 @@ describe("LatestRtcNotificationEventStore", () => {
             setTimeout(() => void event.attemptDecryption(crypto), 20);
 
             await vi.waitFor(() => expect(store.getLatestEventId(roomId)).toStrictEqual("event-2"), { timeout: 1000 });
+        });
+
+        describe("when the first decryption fails", () => {
+            it("should match when a later decryption of a new timeline event succeeds", async () => {
+                const cli = stubClient();
+                const { event, crypto } = mkEncryptedNotification();
+                vi.spyOn(cli, "decryptEventIfNeeded").mockImplementation(async (e) => {
+                    await e.attemptDecryption(failingCrypto);
+                });
+                const { store, room } = setup(cli);
+
+                room.emit(RoomEvent.Timeline, event);
+                await vi.waitFor(() => expect(event.isDecryptionFailure()).toBe(true));
+                // A failed decryption leaves a clear type, the event is not m.room.encrypted any more.
+                expect(event.getType()).not.toBe(EventType.RoomMessageEncrypted);
+                expect(store.getLatestEventId(roomId)).toBeUndefined();
+
+                // The key arrives and decryption is retried.
+                await event.attemptDecryption(crypto);
+
+                await vi.waitFor(() => expect(store.getLatestEventId(roomId)).toStrictEqual("event-2"), {
+                    timeout: 1000,
+                });
+                expect(event.listenerCount(MatrixEventEvent.Decrypted)).toBe(0);
+            });
+
+            it("should match a notification that was already on the timeline, undecryptable", async () => {
+                const cli = stubClient();
+                const { event, crypto } = mkEncryptedNotification();
+                vi.spyOn(cli, "decryptEventIfNeeded").mockImplementation(async (e) => {
+                    await e.attemptDecryption(failingCrypto);
+                });
+                const { store } = setup(cli, [event]);
+
+                await vi.waitFor(() => expect(event.listenerCount(MatrixEventEvent.Decrypted)).toBe(1));
+                expect(store.getLatestEventId(roomId)).toBeUndefined();
+
+                await event.attemptDecryption(crypto);
+
+                await vi.waitFor(() => expect(store.getLatestEventId(roomId)).toStrictEqual("event-2"), {
+                    timeout: 1000,
+                });
+                expect(event.listenerCount(MatrixEventEvent.Decrypted)).toBe(0);
+            });
+
+            it("should remove the decryption listeners when no notification arrives", async () => {
+                vi.useFakeTimers();
+                try {
+                    const cli = stubClient();
+                    const { event } = mkEncryptedNotification();
+                    vi.spyOn(cli, "decryptEventIfNeeded").mockImplementation(async (e) => {
+                        await e.attemptDecryption(failingCrypto);
+                    });
+                    const { store } = setup(cli, [event]);
+                    await vi.advanceTimersByTimeAsync(100);
+                    expect(event.listenerCount(MatrixEventEvent.Decrypted)).toBe(1);
+
+                    await vi.advanceTimersByTimeAsync(10_001);
+                    expect(event.listenerCount(MatrixEventEvent.Decrypted)).toBe(0);
+                    expect(store.getLatestEventId(roomId)).toBeUndefined();
+                } finally {
+                    vi.useRealTimers();
+                }
+            });
         });
 
         it("should not leave an unhandled rejection when no notification arrives", async () => {

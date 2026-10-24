@@ -149,7 +149,11 @@ async function decryptIfNeeded(client: MatrixClient, event: MatrixEvent): Promis
 /**
  * Returns the first rtc notification event from the end of the timeline
  */
-async function getLastRtcNotificationEvent(client: MatrixClient, room: Room): Promise<MatrixEvent | undefined> {
+async function getLastRtcNotificationEvent(
+    client: MatrixClient,
+    room: Room,
+    onUndecrypted?: (event: MatrixEvent) => void,
+): Promise<MatrixEvent | undefined> {
     const events = room.getLiveTimeline().getEvents();
     for (let i = events.length - 1; i >= 0; i--) {
         const event = events[i];
@@ -158,6 +162,7 @@ async function getLastRtcNotificationEvent(client: MatrixClient, room: Room): Pr
         if (event.getType() === EventType.RTCNotification) {
             return event;
         }
+        onUndecrypted?.(event);
     }
 }
 
@@ -170,9 +175,11 @@ async function getLastRtcNotificationEvent(client: MatrixClient, room: Room): Pr
 async function getNotificationEventId(client: MatrixClient, room: Room, callMemberEventId: string): Promise<string> {
     const { promise, resolve, reject } = Promise.withResolvers<string>();
 
-    // Events that are still encrypted when they reach the timeline, and whose decryption we are waiting for.
+    // Encrypted events that are not (yet) readable, and whose later decryption we are waiting for.
     const pending = new Set<MatrixEvent>();
+    let done = false;
     const cleanup = (): void => {
+        done = true;
         room.off(RoomEvent.Timeline, onNewEvent);
         for (const event of pending) event.off(MatrixEventEvent.Decrypted, check);
         pending.clear();
@@ -191,6 +198,14 @@ async function getNotificationEventId(client: MatrixClient, room: Room, callMemb
         }
     };
 
+    // A failed decryption leaves the event with a clear type (m.bad.encrypted), so watch it for a later, successful one.
+    const watch = (event: MatrixEvent): void => {
+        const unreadable = event.getType() === EventType.RoomMessageEncrypted || event.isDecryptionFailure();
+        if (done || !event.isEncrypted() || !unreadable || pending.has(event)) return;
+        pending.add(event);
+        event.on(MatrixEventEvent.Decrypted, check);
+    };
+
     // This callback will run with new events that are added to the timeline.
     // We'll run some logic in the callback to see if we're receiving any
     // new notification event that corresponds to the call membership event.
@@ -199,12 +214,8 @@ async function getNotificationEventId(client: MatrixClient, room: Room, callMemb
         // undefined) and check the decrypted type, not the encrypted one.
         await decryptIfNeeded(client, event);
         check(event);
-
-        // Fallback if it is still not decrypted (e.g. the keys arrive later): check again once it is.
-        if (event.isEncrypted() && event.getType() === EventType.RoomMessageEncrypted) {
-            pending.add(event);
-            event.once(MatrixEventEvent.Decrypted, check);
-        }
+        // Not decrypted (yet), e.g. the keys arrive later: check again each time it is.
+        watch(event);
     };
     room.on(RoomEvent.Timeline, onNewEvent);
 
@@ -216,7 +227,7 @@ async function getNotificationEventId(client: MatrixClient, room: Room, callMemb
 
     // We might already have the notification event in the timeline. Scan it after the listener is registered, so an
     // event that arrives while older events are still decrypting is not missed.
-    const latest = await getLastRtcNotificationEvent(client, room);
+    const latest = await getLastRtcNotificationEvent(client, room, watch);
     const latestId = latest?.getId();
     if (latest?.getRelation()?.event_id === callMemberEventId && latestId) {
         cleanup();
