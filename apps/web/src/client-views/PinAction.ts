@@ -9,10 +9,13 @@
  * M6 B2 pin / unpin: the action bar view-model's `onPinClick` (stock `PinningUtils.pinOrUnpinEvent`, which sends the room's
  * `m.room.pinned_events` list built from Element's own state). It toggles, so it is called only when the message's pin
  * state differs from the asked one. The outcome is read where the view-model leaves it: the returned promise is the
- * state write's answer (a failing read-pins account-data write is not part of it), and the room state (which arrives with the sync) must show the change before `done`. The pinned list
+ * state write's answer (a failing read-pins account-data write is not part of it), and the room state (which arrives with
+ * the sync) must show the change before `done`, also after an answer that may have hidden an accepted write. The pinned list
  * is rebuilt from the local state on every press, so calls for one room run one after the other: an overlapping press would
  * build its list from a state that does not hold the first one yet and drop it.
  */
+
+import { MatrixError } from "matrix-js-sdk/src/matrix";
 
 import { toActionError } from "./actions";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
@@ -53,12 +56,13 @@ export function setPinned(
             await target.press();
         } catch (e) {
             // The press is the state write (the paired read-pins account-data write is a side effect that never rejects
-            // it, `PinningUtils.pinOrUnpinEvent`), so a rejection is the homeserver's answer to the pin and the write has
-            // settled: the room's queue is released only now. A definite refusal (M_FORBIDDEN) stands; any other error
-            // (a lost connection can hide an accepted write) is checked once against the list as it is.
+            // it, `PinningUtils.pinOrUnpinEvent`). A definite refusal (the homeserver answered with a 4xx, M_FORBIDDEN
+            // among them) left nothing behind and stands at once. Any other error (a lost connection, a timeout, a 5xx)
+            // can hide an accepted write that the list shows only with a later sync: the room's queue is held for the
+            // same wait as after a resolved press, so the next pin builds on the landed list instead of replacing it.
             const error = toActionError(e);
-            if (error.code === "forbidden" || target.pinned() !== on) throw error;
-            return { status: "done", roomId };
+            const status = e instanceof MatrixError ? (e.httpStatus ?? 0) : 0;
+            if (error.code === "forbidden" || (status >= 400 && status < 500)) throw error;
         }
         if (await shows(ROOM_ACTION_TIMEOUT_MS)) return { status: "done", roomId };
         throw new ClientViewActionError(

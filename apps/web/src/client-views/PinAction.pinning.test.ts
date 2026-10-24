@@ -8,7 +8,15 @@
 // @vitest-environment happy-dom
 
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
-import { EventTimeline, EventType, type MatrixClient, MatrixError, MatrixEvent, Room } from "matrix-js-sdk/src/matrix";
+import {
+    ConnectionError,
+    EventTimeline,
+    EventType,
+    type MatrixClient,
+    MatrixError,
+    MatrixEvent,
+    Room,
+} from "matrix-js-sdk/src/matrix";
 import { createTestClient } from "test-utils";
 
 import PinningUtils from "../utils/PinningUtils";
@@ -52,6 +60,25 @@ describe("setPinned over pinOrUnpinEvent: the state write decides", () => {
                         server = [...content.pinned];
                         setTimeout(() => (local = [...server]), syncMs);
                         resolve({ event_id: "$state" });
+                    }, putMs),
+                )) as never,
+        );
+    };
+    /** The first state PUT is answered with `error` after `putMs`, whether or not the homeserver applied it (`lands`,
+     * shown by the sync `syncMs` later); later PUTs are accepted. */
+    const lostAnswer = (putMs: number, syncMs: number, error: Error, lands: boolean): void => {
+        let calls = 0;
+        vi.mocked(client.sendStateEvent).mockImplementation(
+            ((_r: string, _t: string, content: { pinned: string[] }) =>
+                new Promise((resolve, reject) =>
+                    setTimeout(() => {
+                        const first = calls++ === 0;
+                        if (!first || lands) {
+                            server = [...content.pinned];
+                            setTimeout(() => (local = [...server]), syncMs);
+                        }
+                        if (first) reject(error);
+                        else resolve({ event_id: "$state" });
                     }, putMs),
                 )) as never,
         );
@@ -100,12 +127,62 @@ describe("setPinned over pinOrUnpinEvent: the state write decides", () => {
 
     it("a refused state PUT is a failed pin, the next one in the room still runs", async () => {
         accountData(100, new Error("500"));
-        homeserver(300, 100, new Error("state 500"));
+        homeserver(300, 100, new MatrixError({ errcode: "M_BAD_JSON", error: "no" }, 400));
         const a = setPinned(roomId, target("$a"), true);
         const b = setPinned(roomId, target("$b"), true);
         const ra = a.catch((e) => e);
         await vi.advanceTimersByTimeAsync(40000);
         expect(await ra).toMatchObject({ code: "failed" });
         await expect(b).resolves.toMatchObject({ status: "done" });
+    });
+
+    // grok r3 F1: the state PUT is answered with a lost connection, the homeserver applied it, the sync shows it later; the
+    // next pin in the room must build on that list, not on the local one that does not hold it yet.
+    it("a pin whose answer was lost but landed is not overwritten by the next pin in the room", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 2000, new ConnectionError("down after the write"), true);
+        const a = setPinned(roomId, target("$a"), true);
+        const b = setPinned(roomId, target("$b"), true);
+        await vi.advanceTimersByTimeAsync(40000);
+        await expect(a).resolves.toMatchObject({ status: "done" });
+        await expect(b).resolves.toMatchObject({ status: "done" });
+        expect([...server].sort()).toEqual(["$a", "$b"]);
+    });
+
+    it("a lost answer that never landed is a network error after the wait, then the next pin runs", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 100, new ConnectionError("down"), false);
+        const a = setPinned(roomId, target("$a"), true);
+        const b = setPinned(roomId, target("$b"), true);
+        const ra = a.catch((e) => e);
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(server).toEqual([]);
+        await vi.advanceTimersByTimeAsync(40000);
+        expect(await ra).toMatchObject({ code: "network" });
+        await expect(b).resolves.toMatchObject({ status: "done" });
+        expect(server).toEqual(["$b"]);
+    });
+
+    it("a 5xx answer hides a landed write the same way", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 2000, new MatrixError({ errcode: "M_UNKNOWN", error: "oops" }, 502), true);
+        const a = setPinned(roomId, target("$a"), true);
+        const b = setPinned(roomId, target("$b"), true);
+        await vi.advanceTimersByTimeAsync(40000);
+        await expect(a).resolves.toMatchObject({ status: "done" });
+        await expect(b).resolves.toMatchObject({ status: "done" });
+        expect([...server].sort()).toEqual(["$a", "$b"]);
+    });
+
+    it("a definite refusal (403) is a clean failure at once, the next pin runs without a wait", async () => {
+        accountData(100, new Error("500"));
+        lostAnswer(300, 100, new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403), false);
+        const a = setPinned(roomId, target("$a"), true);
+        const b = setPinned(roomId, target("$b"), true);
+        const ra = a.catch((e) => e);
+        await vi.advanceTimersByTimeAsync(1500);
+        expect(await ra).toMatchObject({ code: "forbidden" });
+        await expect(b).resolves.toMatchObject({ status: "done" });
+        expect(server).toEqual(["$b"]);
     });
 });

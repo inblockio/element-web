@@ -46,27 +46,39 @@ describe("setPinned", () => {
         expect(t.press).not.toHaveBeenCalled();
     });
 
-    it("maps a refused press: M_FORBIDDEN is forbidden, a lost connection network, anything else failed", async () => {
+    it("maps a refused press: M_FORBIDDEN is forbidden, a 4xx answer failed, a lost answer network", async () => {
         const refuse = (e: unknown) => target({ press: vi.fn(async () => Promise.reject(e)) });
         await expect(
             setPinned("!a", refuse(new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403)), true),
         ).rejects.toMatchObject({ code: "forbidden" });
-        await expect(setPinned("!a", refuse(new ConnectionError("down")), true)).rejects.toMatchObject({
-            code: "network",
-        });
-        await expect(setPinned("!a", refuse(new Error("500")), true)).rejects.toMatchObject({ code: "failed" });
+        await expect(
+            setPinned("!a", refuse(new MatrixError({ errcode: "M_BAD_JSON", error: "no" }, 400)), true),
+        ).rejects.toMatchObject({ code: "failed" });
+        vi.useFakeTimers();
+        try {
+            for (const lost of [new ConnectionError("down"), new Error("500")]) {
+                const seen = setPinned("!a", refuse(lost), true).then(
+                    () => "done",
+                    (e: unknown) => e,
+                );
+                await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 200);
+                expect(await seen).toMatchObject({ code: "network" });
+            }
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
-    it("a definite refusal (M_FORBIDDEN) is reported at once, without the settle wait", async () => {
+    it("a definite refusal (M_FORBIDDEN) is reported at once, without the wait", async () => {
         const t = target({
             press: vi.fn(async () => Promise.reject(new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403))),
         });
         await expect(setPinned("!a", t, true)).rejects.toMatchObject({ code: "forbidden" });
     });
 
-    // r2: the press rejects only with the state write's answer (the read-pins write never rejects it), so a rejection is
-    // reported at once; a lost connection that hid an accepted write is caught by one look at the list as it is.
-    it("a rejected press is reported at once, without a settle wait", async () => {
+    // r3: an answer that is not a definite refusal (lost connection, timeout, 5xx) can hide an accepted write, so it is
+    // held for the 15 s list wait and reported as "may still apply" (network), never as a clean failure.
+    it("an ambiguous rejection is held for the list wait, then reported as network", async () => {
         vi.useFakeTimers();
         try {
             const t = target({ press: vi.fn(async () => Promise.reject(new Error("500"))) });
@@ -74,8 +86,12 @@ describe("setPinned", () => {
                 () => "done",
                 (e: unknown) => e,
             );
-            await vi.advanceTimersByTimeAsync(0);
-            expect(await seen).toMatchObject({ code: "failed" });
+            let settled = false;
+            void seen.then(() => (settled = true));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS - 1000);
+            expect(settled).toBe(false);
+            await vi.advanceTimersByTimeAsync(2000);
+            expect(await seen).toMatchObject({ code: "network" });
         } finally {
             vi.useRealTimers();
         }
