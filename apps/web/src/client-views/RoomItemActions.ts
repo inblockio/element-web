@@ -80,6 +80,35 @@ export function serialTagWrite<T>(roomId: string, run: () => Promise<T>): Promis
     return next;
 }
 
+const LATE_LANDING_MS = 5_000;
+const unsettled = new WeakMap<Room, { signature: string; at: number }>();
+const tagSignature = (room: Room): string =>
+    Object.keys(room.tags ?? {})
+        .sort()
+        .join("|");
+
+/**
+ * A tag write that timed out is not stoppable and may still land (a slow or refused homeserver call looks the same from
+ * here). The room's tags at that moment are remembered so the next tag call for the room can tell a late landing from
+ * "nothing happened" (`awaitLateLanding`).
+ */
+export function noteUnsettledTagWrite(room: Room): void {
+    unsettled.set(room, { signature: tagSignature(room), at: Date.now() });
+}
+
+/**
+ * Called first in every queued tag call: after a timed-out write for this room, waits (at most `LATE_LANDING_MS` after the
+ * timeout) for the room's tags to change, so the next call acts on, and answers for, the state the late write leaves and
+ * not on the state from before it. Nothing to wait for without an earlier timeout; a refused write costs the wait once.
+ */
+export async function awaitLateLanding(room: Room): Promise<void> {
+    const mark = unsettled.get(room);
+    if (!mark) return;
+    unsettled.delete(room);
+    while (tagSignature(room) === mark.signature && Date.now() - mark.at < LATE_LANDING_MS)
+        await new Promise((r) => setTimeout(r, 50));
+}
+
 const FAVOURITE_TAG = "m.favourite";
 const isTagged = (room: Room): boolean => !!room.tags?.[FAVOURITE_TAG];
 
@@ -92,6 +121,7 @@ const isTagged = (room: Room): boolean => !!room.tags?.[FAVOURITE_TAG];
  */
 export function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): Promise<ActionOutcome> {
     const run = async (): Promise<ActionOutcome> => {
+        await awaitLateLanding(room);
         const snap = item.getSnapshot();
         if (snap.notification.invited) throw new ClientViewActionError("unsupported", "an invite is not a favourite");
         assertListed(room);
@@ -102,6 +132,7 @@ export function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): 
             if (isTagged(room) === on) return done(room.roomId);
             await new Promise((r) => setTimeout(r, 50));
         }
+        noteUnsettledTagWrite(room);
         throw new ClientViewActionError("network", "the room's tag did not change in time; it may still apply");
     };
     // One call at a time per room: the tag is stale until the sync, so an overlapping opposite call would toggle on a stale

@@ -167,6 +167,35 @@ describe("A10 favourite (onToggleFavorite, the room's own m.favourite tag)", () 
     });
 });
 
+describe("M6 B1 fix round 1 F4: favourite after a timed-out write", () => {
+    const tagged = (r: Room, on: boolean): void => {
+        (r as unknown as { tags: Record<string, unknown> }).tags = on ? { "m.favourite": { order: 0.5 } } : {};
+    };
+
+    it("a reversing call is not skipped on the stale tag of a write that landed late", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = room();
+            const item = makeItem(snap());
+            item.onToggleFavorite.mockImplementation(() => {
+                const adding = !(r.tags as Record<string, unknown>)["m.favourite"];
+                if (!adding) setTimeout(() => tagged(r, false), 50);
+            });
+            const first = codeOf(setFavourite(item, r, true));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 100);
+            expect(await first).toBe("network");
+            const second = setFavourite(item, r, false);
+            await vi.advanceTimersByTimeAsync(1_000);
+            tagged(r, true);
+            await vi.advanceTimersByTimeAsync(1_000);
+            expect((await second).status).toBe("done");
+            expect((r.tags as Record<string, unknown>)["m.favourite"]).toBeUndefined();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
 describe("A10 notification level (onSetRoomNotifState, echo transaction)", () => {
     const getPushRules = vi.fn(async () => ({}));
     const client = { getPushRules } as unknown as MatrixClient;

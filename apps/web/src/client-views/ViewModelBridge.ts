@@ -1176,7 +1176,8 @@ export class ViewModelBridge implements ClientViewBridge {
         // Item view-models exist only for rooms the list was told are visible.
         this.roomList.updateVisibleRooms(0, ids.length);
         const rooms: ViewRoom[] = this.localChatRooms();
-        // The custom sections are the same in every item's snapshot (the item lists the store's sections); the first one's is read.
+        // The custom sections are the same in every item's snapshot (the item lists the store's sections); the first one's is
+        // read, but the open non-member room's preview item has none (an empty list), so the first non-empty list wins.
         let sections: ViewSection[] | undefined;
         for (const id of ids) {
             const item = this.roomList.getRoomItemViewModel(id);
@@ -1196,7 +1197,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 });
             }
             const s = item.getSnapshot();
-            sections ??= (s.sections ?? []).map(({ tag, name }, order) => ({ tag, name, order }));
+            if (!sections?.length) sections = (s.sections ?? []).map(({ tag, name }, order) => ({ tag, name, order }));
             const avatarUrl = room ? (avatarUrlForRoom(room, AVATAR_PX, AVATAR_PX, "crop") ?? undefined) : undefined;
             rooms.push(toViewRoom(s, rooms.length, avatarUrl, room ? this.notificationLevelOf(room) : undefined));
             if (!this.statusBar && room) this.watchConnection(room);

@@ -141,6 +141,136 @@ describe("M6 B1 setSection (onToggleSection / onRemoveFromSection, the room's ow
     });
 });
 
+describe("M6 B1 fix round 1 (grok F1-F4)", () => {
+    const FAV = "m.favourite";
+    // A fresh room per case: a case that times out leaves its tag queue busy for the room.
+    let n = 0;
+    const fresh = (tags: Record<string, unknown> = {}): Room =>
+        ({ roomId: `!f${++n}:example.org`, tags }) as unknown as Room;
+
+    it("F1: setSection into a section is not done while the favourite tag still owns the room", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = fresh({ [FAV]: { order: 0.5 } });
+            const item = makeItem();
+            // tagRoom's two writes: the add lands, the delete is refused (Element's error dialog), the favourite stays.
+            item.onToggleSection.mockImplementation(
+                (tag) => void setTimeout(() => setTags(r, { [FAV]: {}, [tag]: {} }), 100),
+            );
+            const result = codeOf(setSection(item, r, A));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+            expect(await result).toBe("network");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("F1: the intermediate state (section added, favourite not yet gone) is not done, the final one is", async () => {
+        const r = fresh({ [FAV]: {} });
+        const item = makeItem();
+        item.onToggleSection.mockImplementation((tag) => {
+            setTimeout(() => setTags(r, { [FAV]: {}, [tag]: {} }), 50);
+            setTimeout(() => setTags(r, { [tag]: {} }), 400);
+        });
+        const started = Date.now();
+        expect((await setSection(item, r, A)).status).toBe("done");
+        expect(Date.now() - started).toBeGreaterThanOrEqual(380);
+    });
+
+    it("F2: setSection(null) on a room holding the favourite and a section writes nothing that could drop the favourite", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = fresh({ [FAV]: {}, [A]: {} });
+            const item = makeItem();
+            // What tagRoom does for the first ordered tag of the room, the favourite: it is deleted, the section stays.
+            item.onRemoveFromSection.mockImplementation(() => void setTimeout(() => setTags(r, { [A]: {} }), 50));
+            const result = codeOf(setSection(item, r, null));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+            expect(await result).toBe("unsupported");
+            expect(item.onRemoveFromSection).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("F2: moving a room that holds the section first and a favourite into that section does not take the section out", async () => {
+        const r = fresh({ [A]: {}, [FAV]: {} });
+        const item = makeItem();
+        expect(await codeOf(setSection(item, r, A))).toBe("unsupported");
+        expect(item.onToggleSection).not.toHaveBeenCalled();
+    });
+
+    it("F3: createSection takes its turn in the room's tag queue: the store is not asked while an earlier tag write is pending", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = fresh();
+            const item = makeItem();
+            item.onToggleSection.mockImplementation((tag) => void setTimeout(() => setTags(r, { [tag]: {} }), 2_000));
+            const finished = Promise.resolve([undefined, undefined]);
+            (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({ close: vi.fn(), finished }));
+            store.createSection.mockReset();
+            store.createSection.mockImplementation(() => {
+                (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+                return Promise.resolve(undefined);
+            });
+            const first = setSection(item, r, A);
+            const created = createSection(r);
+            await vi.advanceTimersByTimeAsync(1_000);
+            expect(store.createSection).not.toHaveBeenCalled();
+            await vi.advanceTimersByTimeAsync(2_000);
+            await first;
+            await expect(created).resolves.toEqual({ status: "cancelled" });
+            expect(store.createSection).toHaveBeenCalledOnce();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("F3: createSection is not done while an older section still holds the room", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = fresh({ [B]: {} });
+            const finished = Promise.resolve(["Projects", [r.roomId]]);
+            (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({ close: vi.fn(), finished }));
+            store.createSection.mockReset();
+            store.createSection.mockImplementation(() => {
+                (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+                return Promise.resolve(A);
+            });
+            const result = codeOf(createSection(r));
+            await vi.advanceTimersByTimeAsync(100);
+            setTags(r, { [B]: {}, [A]: {} });
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+            expect(await result).toBe("network");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("F4: a write that timed out and lands late is not answered as cleared by the next call", async () => {
+        vi.useFakeTimers();
+        try {
+            const r = fresh();
+            const item = makeItem();
+            item.onToggleSection.mockImplementation(() => {});
+            item.onRemoveFromSection.mockImplementation(() => void setTimeout(() => setTags(r, {}), 50));
+            const first = codeOf(setSection(item, r, A));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 100);
+            expect(await first).toBe("network");
+            // The first write lands late, a moment after the second call began.
+            const second = setSection(item, r, null);
+            await vi.advanceTimersByTimeAsync(1_000);
+            setTags(r, { [A]: {} });
+            await vi.advanceTimersByTimeAsync(1_000);
+            expect((await second).status).toBe("done");
+            expect(item.onRemoveFromSection).toHaveBeenCalledOnce();
+            expect((r.tags as Record<string, unknown>)[A]).toBeUndefined();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
 describe("M6 B1 createSection (RoomListStoreV3.createSection -> Element's dialog)", () => {
     let finish: (...result: unknown[]) => void;
     let storeResult: (tag: string | undefined) => void;

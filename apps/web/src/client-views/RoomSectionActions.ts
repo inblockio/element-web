@@ -17,11 +17,11 @@
 import { type Room } from "matrix-js-sdk/src/matrix";
 
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
-import { isCustomSectionTag } from "../stores/room-list-v3/section";
+import { isCustomSectionTag, isSectionTag } from "../stores/room-list-v3/section";
 import RoomListStoreV3 from "../stores/room-list-v3/RoomListStoreV3";
 import { toActionError } from "./actions";
 import { dialogAction, openedDialog, ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
-import { serialTagWrite } from "./RoomItemActions";
+import { awaitLateLanding, noteUnsettledTagWrite, serialTagWrite } from "./RoomItemActions";
 import { type ActionOutcome, ClientViewActionError } from "./types";
 
 /** The part of `RoomListItemViewModel` a section action uses. */
@@ -43,15 +43,30 @@ function sectionOf(room: Room, known: ReadonlySet<string>): string | undefined {
 }
 
 /**
+ * Every section tag the room holds (favourite, low priority, any custom one), in the order of its tags: the first one is
+ * what `tagRoom` replaces, and Element's one-section rule means a settled room holds at most one.
+ */
+function sectionTagsOf(room: Room): string[] {
+    return Object.keys(room.tags ?? {}).filter((tag) => isSectionTag(tag) && tag !== DefaultTagID.Invite);
+}
+
+const SEVERAL = "the room holds several section tags; Element's section actions cannot change only one of them";
+
+/**
  * Puts the room into the custom section `tag`, or out of its custom section with `null`. `onToggleSection` runs only when
  * the room's section differs (`tagRoom` toggles: a call for the section the room is in would take it out), and replaces a
  * favourite or another section in one go (Element's one-section rule); `onRemoveFromSection` only when the room is in a
- * custom section. `done` once the room's tags are as asked; if they are not within `ROOM_ACTION_TIMEOUT_MS` the answer is
- * `network` (a refusal shows Element's own error dialog and leaves the tags as they were; the write is not stoppable and may
- * still apply). Calls for one room run one after the other, also with a favourite call.
+ * custom section. `done` once the room's tags are as asked, for a section that is the room's only section tag (`tagRoom`'s
+ * remove and add are two writes: with the add through and the favourite's delete refused, or not yet synced, the room is
+ * still a favourite); if they are not within `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (a refusal shows Element's
+ * own error dialog and leaves the tags as they were; the write is not stoppable and may still apply, and the next call for
+ * the room waits a moment for that, `awaitLateLanding`). A room that already holds several section tags is `unsupported`
+ * where the view-model's toggle would drop the wrong one. Calls for one room run one after the other, also with a
+ * favourite call and a create.
  */
 export function setSection(item: RoomSectionVm, room: Room, tag: string | null): Promise<ActionOutcome> {
     const run = async (): Promise<ActionOutcome> => {
+        await awaitLateLanding(room);
         const snap = item.getSnapshot();
         if (snap.notification.invited) throw new ClientViewActionError("unsupported", "an invite is in no section");
         if (room.tags?.[DefaultTagID.Archived])
@@ -60,15 +75,27 @@ export function setSection(item: RoomSectionVm, room: Room, tag: string | null):
         const known = new Set(snap.sections.map((s) => s.tag));
         if (tag !== null && !known.has(tag))
             throw new ClientViewActionError("unsupported", "the tag is not one of the custom sections");
-        const target = tag ?? undefined;
-        if (sectionOf(room, known) === target) return { status: "done", roomId: room.roomId };
+        const held = sectionTagsOf(room);
+        // The state asked for: only that section tag (the toggle replaces the favourite or another section), or no known
+        // custom section (a favourite or low priority room stays one).
+        const asked = (): boolean => {
+            const now = sectionTagsOf(room);
+            return tag === null ? !sectionOf(room, known) : now.length === 1 && now[0] === tag;
+        };
+        if (asked()) return { status: "done", roomId: room.roomId };
+        // `tagRoom` toggles on the room's first section tag. For a room that holds several, "remove the section" would
+        // delete the favourite (the first ordered tag) and leave the section, and "into the section" with the section
+        // first would take it out: neither is the asked state, so nothing is written.
+        if (held.length > 1 && (tag === null || held[0] === tag))
+            throw new ClientViewActionError("unsupported", SEVERAL);
         if (tag === null) item.onRemoveFromSection();
         else item.onToggleSection(tag);
         const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
         while (Date.now() < until) {
-            if (sectionOf(room, known) === target) return { status: "done", roomId: room.roomId };
+            if (asked()) return { status: "done", roomId: room.roomId };
             await new Promise((r) => setTimeout(r, POLL_MS));
         }
+        noteUnsettledTagWrite(room);
         throw new ClientViewActionError("network", "the room's tags did not change in time; the write may still apply");
     };
     return serialTagWrite(room.roomId, run);
@@ -81,7 +108,14 @@ export function setSection(item: RoomSectionVm, room: Room, tag: string | null):
  * selected, once the room's tags show the section. A preselected room the user deselected is not waited for.
  */
 export function createSection(room: Room | undefined): Promise<ActionOutcome> {
+    // The store tags the room with a plain `tagRoom` once the dialog is confirmed: with a room, the whole dialog takes its
+    // turn in the room's tag queue, so no earlier write is in flight when it does and none starts before it is through.
+    return room ? serialTagWrite(room.roomId, () => createSectionNow(room)) : createSectionNow(undefined);
+}
+
+function createSectionNow(room: Room | undefined): Promise<ActionOutcome> {
     return dialogAction(async () => {
+        if (room) await awaitLateLanding(room);
         let created: Promise<string | undefined> | undefined;
         const dialog = await openedDialog(() => {
             created = RoomListStoreV3.instance.createSection(room?.roomId);
@@ -97,9 +131,13 @@ export function createSection(room: Room | undefined): Promise<ActionOutcome> {
         if (room && kept) {
             const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
             for (;;) {
-                if (room.tags?.[tag]) break;
-                if (Date.now() >= until)
+                // Only the new section: an older section or the favourite the tag replaces may still be on the room.
+                const held = sectionTagsOf(room);
+                if (held.length === 1 && held[0] === tag) break;
+                if (Date.now() >= until) {
+                    noteUnsettledTagWrite(room);
                     throw new ClientViewActionError("network", "the room's tags did not show the new section in time");
+                }
                 await new Promise((r) => setTimeout(r, POLL_MS));
             }
         }

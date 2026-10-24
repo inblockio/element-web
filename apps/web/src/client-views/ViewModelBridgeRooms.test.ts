@@ -56,7 +56,8 @@ const h = vi.hoisted(() => {
         notification: { hasUnreadCount: false, count: 0, isMention: false, invited: true },
     });
     const list = { createRoom: vi.fn(), createChatRoom: vi.fn() };
-    const current = { a: item as unknown as { getSnapshot: () => object; subscribe: (cb: () => void) => () => void } };
+    type ItemVm = { getSnapshot: () => object; subscribe: (cb: () => void) => () => void };
+    const current: { a: ItemVm; pre?: ItemVm } = { a: item as unknown as ItemVm };
     const lists: Array<{ set: (s: object) => void }> = [];
     const headers: Record<string, { isExpanded: boolean }> = {};
     const store = { listeners: new Set<() => void>() };
@@ -78,7 +79,13 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
         public createRoom = h.list.createRoom;
         public createChatRoom = h.list.createChatRoom;
         public getRoomItemViewModel = (id: string) =>
-            id === "!a:example.org" ? h.current.a : id === "!inv:example.org" ? h.invited : undefined;
+            id === "!a:example.org"
+                ? h.current.a
+                : id === "!inv:example.org"
+                  ? h.invited
+                  : id === "!pre:example.org"
+                    ? h.current.pre
+                    : undefined;
     },
 }));
 vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({
@@ -365,6 +372,32 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
             "element.io.section.s1",
         ]);
         expect(seen).toEqual(["rooms"]);
+    });
+
+    it("M6 B1 F5: sections() is the real rooms' sections when the preview row (empty sections) comes first", () => {
+        const savedIds = [...h.ids];
+        const preview = new h.FakeVm({
+            id: "!pre:example.org",
+            name: "Preview",
+            isDm: false,
+            notification: { hasUnreadCount: false, count: 0, isMention: false, invited: false },
+            isFavourite: false,
+            canMarkAsUnread: false,
+            canMarkAsRead: false,
+            roomNotifState: "all_messages",
+            sections: [],
+        });
+        try {
+            h.ids.splice(0, h.ids.length, "!pre:example.org", "!a:example.org");
+            h.current.pre = preview as unknown as NonNullable<typeof h.current.pre>;
+            h.item.set({});
+            const real = h.item.snapshot.sections.map((x) => x.tag);
+            expect(real.length).toBeGreaterThan(0);
+            expect(bridge.sections().map((x) => x.tag)).toEqual(real);
+        } finally {
+            delete h.current.pre;
+            h.ids.splice(0, h.ids.length, ...savedIds);
+        }
     });
 
     it("M6 B1: setSection and createSection run the room item's section actions; an unknown room is unknown_room", async () => {
