@@ -26,6 +26,22 @@ export interface ViewRoom {
      * joined. An invite has no inviter field (no view-model source).
      */
     membership?: "join" | "invite";
+    /** The room is a favourite (the room list item's `isFavourite`, the `m.favourite` room tag). */
+    isFavourite: boolean;
+    /**
+     * Element offers "mark as unread" for the room (the item's `canMarkAsUnread`): it shows nothing unread and is not
+     * archived. For a joined room, false means it already shows unread, by a count, an activity or a mark.
+     */
+    canMarkAsUnread: boolean;
+    /**
+     * Element shows the room as unread (the item's `canMarkAsRead`: a count, an activity or a "marked unread" mark; the
+     * room's notification level is above none). False for a joined room that shows nothing unread, for a local room (a
+     * new DM before its first message) and for the preview of a left room: those have no unread state. The kit's unread
+     * look (bold row) reads this, not `canMarkAsUnread`.
+     */
+    showsUnread: boolean;
+    /** The room's notification level (the item's `roomNotifState`). */
+    notificationLevel: ViewNotificationLevel;
 }
 
 /**
@@ -60,6 +76,9 @@ export interface ViewCallParticipant {
     name: string;
     avatarUrl?: string;
 }
+
+/** The notification levels of a room, as the room list item view-model's `RoomNotifState` names them. */
+export type ViewNotificationLevel = "all_messages" | "all_messages_loud" | "mentions_only" | "mute";
 
 /** A message as the timeline, event tile and body view-models show it. */
 export interface ViewMessage {
@@ -96,6 +115,13 @@ export interface ViewMessage {
      * `m.text` or `m.emote` with a body). A kit offers its edit control only when this is true. Absent = not editable.
      */
     canEdit?: boolean;
+    /**
+     * Element offers a download for this message (the Download action bar button's rule: a media message whose content is
+     * actionable, `isContentActionable` and `MediaEventHelper.isEligible`). False or absent for a text message, a
+     * redacted one and one still waiting for its key; the module permission hint of the action bar view-model is not
+     * read here, `download` reports it as `forbidden`.
+     */
+    canDownload?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
@@ -312,6 +338,48 @@ export interface ClientViewBridge {
      * loaded. The kit asks for the confirmation. Interim (D16/D20): Element's own client call.
      */
     redact(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * B7: downloads the file, image, video or audio of the message `eventId` the way Element's Download action bar button
+     * does (`EventTileActionBarViewModel.onDownloadClick`): it waits until the event is decrypted, then Element fetches
+     * and decrypts the file and saves it with its own downloader. `done` once Element's click settled, which is also the
+     * case when the fetch or decryption failed: Element's own error dialog shows then and the kit shows nothing of its
+     * own. `unknown_room` / `unknown_event` for what the client cannot load, `unsupported` for a message without media,
+     * `failed` when it stays undecrypted, `forbidden` when the view-model does not offer the download.
+     */
+    download(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * A10: marks the room unread (the room list item's `onMarkAsUnread`: the room account data `m.marked_unread`). `done`
+     * once the homeserver holds it, also for a room that already shows unread; `unsupported` for an invite or an archived
+     * room, `unknown_room` for a room the list does not hold.
+     */
+    markUnread(roomId: string): Promise<ActionOutcome>;
+    /**
+     * A10: favourites or unfavourites the room (the item's `onToggleFavorite`, called only when `isFavourite` differs: the
+     * `m.favourite` tag). `done` once the homeserver holds it and the room's tags show it; `failed` when it refuses (Element's
+     * error dialog shows too).
+     */
+    setFavourite(roomId: string, on: boolean): Promise<ActionOutcome>;
+    /**
+     * A10: sets the room's notification level (the item's `onSetRoomNotifState`: push rules). `done` once the homeserver
+     * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).
+     */
+    setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome>;
+    /**
+     * A8: uploads files into a room through Element's own upload view-model (`RoomUploadViewModel.initiateViaInputFiles`).
+     * Without `files`, Element's file picker opens now (call it inside the user's click); with them (from the kit's own
+     * picker) they are re-wrapped as files of Element's realm. Element's `UploadConfirmDialog` is the one confirmation and
+     * its error dialog shows on a refusal. `done` once every confirmed file is on the homeserver as a message,
+     * `cancelled` when the picker or the confirm is dismissed, `failed` when an upload fails, `forbidden` when the user may
+     * not send in the room, `unknown_room` for a room the client does not hold.
+     */
+    upload(roomId: string, files?: File[]): Promise<ActionOutcome>;
+    /**
+     * A9: signs the user out the way Element's own sign-out button does: `LogoutDialog` (key backup check) or, without
+     * crypto, a direct sign-out. `cancelled` when the dialog is dismissed (still signed in). On success the page leaves the
+     * session and unmounts the kit, so `done` (after Element announced `on_logged_out`) is normally not observable; `failed`
+     * when Element does not sign out within 30 s. Interim (D16): there is no sign-out action on `UserMenuViewModel`.
+     */
+    logout(): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */

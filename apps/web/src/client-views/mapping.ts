@@ -31,6 +31,7 @@ import {
     type ViewE2e,
     type ViewMedia,
     type ViewMessage,
+    type ViewNotificationLevel,
     type ViewReaction,
     type ViewReply,
     type ViewRoom,
@@ -55,9 +56,14 @@ export function nodeText(node: ReactNode): string {
 
 /** A room list item snapshot as a ViewRoom. */
 export function toViewRoom(
-    snapshot: Pick<RoomListItemViewSnapshot, "id" | "name" | "isDm" | "notification">,
+    snapshot: Pick<
+        RoomListItemViewSnapshot,
+        "id" | "name" | "isDm" | "notification" | "isFavourite" | "canMarkAsUnread" | "canMarkAsRead" | "roomNotifState"
+    >,
     order: number,
     avatarUrl?: string,
+    /** The level Element's local echo holds, when it differs from the snapshot's (see `ViewModelBridge.notificationLevelOf`). */
+    notificationLevel?: ViewNotificationLevel,
 ): ViewRoom {
     const n = snapshot.notification;
     const unreadCount = n.hasUnreadCount ? n.count : 0;
@@ -70,6 +76,10 @@ export function toViewRoom(
         isDirect: snapshot.isDm,
         order,
         membership: n.invited ? "invite" : "join",
+        isFavourite: snapshot.isFavourite,
+        canMarkAsUnread: snapshot.canMarkAsUnread,
+        showsUnread: !n.invited && snapshot.canMarkAsRead,
+        notificationLevel: notificationLevel ?? snapshot.roomNotifState,
     };
 }
 
@@ -164,7 +174,13 @@ export function toViewMessage(
     thread?: ViewThread,
     media?: ViewMedia,
     urlPreviews?: ViewUrlPreview[],
-    flags: { canEdit?: boolean; edited?: boolean; editedTs?: number; redactedText?: string } = {},
+    flags: {
+        canEdit?: boolean;
+        canDownload?: boolean;
+        edited?: boolean;
+        editedTs?: number;
+        redactedText?: string;
+    } = {},
 ): ViewMessage | undefined {
     const id = tile.event.eventId;
     if (!id) return undefined;
@@ -202,6 +218,7 @@ export function toViewMessage(
         ...(media ? { media } : {}),
         ...(urlPreviews?.length ? { urlPreviews } : {}),
         ...(flags.canEdit ? { canEdit: true } : {}),
+        ...(flags.canDownload ? { canDownload: true } : {}),
         ...(flags.edited ? { edited: true as const } : {}),
         ...(flags.edited && flags.editedTs !== undefined ? { editedTs: flags.editedTs } : {}),
     };

@@ -42,7 +42,7 @@ interface DialogHandle {
 let dialogActionRunning = false;
 
 /** The dispatched payloads of one action, newest last, until `stop`. */
-function recordPayloads(): {
+export function recordPayloads(): {
     payloads: ActionPayload[];
     stop: () => void;
     wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since?: number) => Promise<T>;

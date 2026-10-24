@@ -38,8 +38,12 @@ const h = vi.hoisted(() => {
             name: "General",
             isDm: false,
             notification: { hasUnreadCount: false, count: 0, isMention: false, invited: false },
+            isFavourite: true,
+            canMarkAsUnread: false,
+            canMarkAsRead: true,
+            roomNotifState: "mentions_only",
         }),
-        { onLeaveRoom: vi.fn() },
+        { onLeaveRoom: vi.fn(), onMarkAsUnread: vi.fn(), onToggleFavorite: vi.fn(), onSetRoomNotifState: vi.fn() },
     );
     const invited = new FakeVm({
         id: "!inv:example.org",
@@ -103,6 +107,18 @@ const actions = vi.hoisted(() => ({
     leaveViaDialog: vi.fn(),
 }));
 vi.mock("./RoomActions", () => actions);
+const echo = vi.hoisted(() => {
+    const listeners = new Set<() => void>();
+    const chamber = {
+        notificationVolume: undefined as string | undefined,
+        on: (_e: string, cb: () => void) => listeners.add(cb),
+        off: (_e: string, cb: () => void) => listeners.delete(cb),
+    };
+    return { chamber, listeners };
+});
+vi.mock("../stores/local-echo/EchoChamber", () => ({ EchoChamber: { forRoom: () => echo.chamber } }));
+const itemActions = vi.hoisted(() => ({ markUnread: vi.fn(), setFavourite: vi.fn(), setNotificationLevel: vi.fn() }));
+vi.mock("./RoomItemActions", () => itemActions);
 
 describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", () => {
     let bridge: ViewModelBridge;
@@ -256,5 +272,58 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         rooms["!a:example.org"] = { roomId: "!a:example.org", tags: { "im.vector.fake.archived": {} } };
         expect(await code(bridge.leave("!a:example.org"))).toBe("unsupported");
         expect(actions.leaveViaDialog).not.toHaveBeenCalled();
+    });
+
+    it("A10: rooms() carries the favourite flag, the unread offer and the notification level of the item's snapshot", () => {
+        const room = bridge.rooms().find((r) => r.id === "!a:example.org");
+        expect(room).toMatchObject({
+            isFavourite: true,
+            canMarkAsUnread: false,
+            showsUnread: true,
+            notificationLevel: "mentions_only",
+        });
+    });
+
+    it("A10: markUnread, setFavourite and setNotificationLevel run the room item's view-model actions", async () => {
+        itemActions.markUnread.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        itemActions.setFavourite.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        itemActions.setNotificationLevel.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        await bridge.markUnread("!a:example.org");
+        await bridge.setFavourite("!a:example.org", false);
+        await bridge.setNotificationLevel("!a:example.org", "mute");
+        expect(itemActions.markUnread).toHaveBeenCalledWith(h.item, rooms["!a:example.org"]);
+        expect(itemActions.setFavourite).toHaveBeenCalledWith(h.item, rooms["!a:example.org"], false);
+        expect(itemActions.setNotificationLevel).toHaveBeenCalledWith(h.item, rooms["!a:example.org"], client, "mute");
+    });
+
+    it("A10: a room the list does not hold is unknown_room", async () => {
+        await expect(bridge.markUnread("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
+        await expect(bridge.setFavourite("!inv:example.org", true)).rejects.toBeInstanceOf(ClientViewActionError);
+        expect(itemActions.markUnread).not.toHaveBeenCalled();
+    });
+
+    it("A8: upload into a room the client does not hold is unknown_room (no picker opens)", async () => {
+        await expect(bridge.upload("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
+        expect(document.querySelector("input[type=file]")).toBeNull();
+    });
+
+    it("A8: upload into a new chat's local room is unsupported before any picker or dialog (the first message creates the room)", async () => {
+        const local = { roomId: LOCAL_ROOM_ID_PREFIX + "dm2", name: "Bob", state: LocalRoomState.NEW, tags: {} };
+        rooms[local.roomId] = local;
+        const error = await bridge.upload(local.roomId).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(ClientViewActionError);
+        expect((error as ClientViewActionError).code).toBe("unsupported");
+        expect(document.querySelector("input[type=file]")).toBeNull();
+    });
+
+    it("A10: the notification level is the echo's (the item snapshot stays stale after a change), and a change of the echo updates the list", () => {
+        const seen: string[] = [];
+        bridge.onChange((e) => seen.push(e.kind));
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.notificationLevel).toBe("mentions_only");
+        echo.chamber.notificationVolume = "mute";
+        echo.listeners.forEach((cb) => cb());
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.notificationLevel).toBe("mute");
+        expect(seen).toContain("rooms");
+        echo.chamber.notificationVolume = undefined;
     });
 });

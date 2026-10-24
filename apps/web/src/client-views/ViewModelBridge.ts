@@ -32,6 +32,7 @@ import {
     type ImageBodyViewSnapshot,
     type TimelineItem,
     type VideoBodyViewSnapshot,
+    ActionBarAction,
     RoomStatusBarState,
 } from "@element-hq/web-shared-components";
 
@@ -78,8 +79,14 @@ import { _t } from "../languageHandler";
 import { CallCard } from "./CallCard";
 import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
-import { acceptInvite, declineInvite, editText, joinRoom, redact, sendText } from "./InterimActions";
+import { canDownloadMedia, downloadMedia } from "./DownloadAction";
+import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
+import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
+import { EchoChamber } from "../stores/local-echo/EchoChamber";
+import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
+import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
@@ -97,6 +104,7 @@ import {
     type ViewMessage,
     type ViewReaction,
     type ViewReply,
+    type ViewNotificationLevel,
     type ViewRoom,
     type ViewThread,
     type ViewUrlPreview,
@@ -369,6 +377,11 @@ class EventRow {
     /** Element's edit rule for this event (`canEditContent`), the rule the edit action bar button follows. */
     public canEdit(): boolean {
         return canEditContent(this.client, this.ev);
+    }
+
+    /** Element's rule for the Download action bar button (no view-model per row), see {@link canDownloadMedia}. */
+    public canDownload(): boolean {
+        return canDownloadMedia(this.ev);
     }
 
     /** The edited marker's rule (`TextualBodyViewModel`): a replacement event exists. */
@@ -1003,6 +1016,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
     private readonly roomList: RoomListViewModel;
+    /** The open A8 file picker, if any. */
+    private filePicker: { cancel: () => void } | undefined;
     private readonly userMenu: UserMenuViewModel;
     /** The item view-model each room's subscription follows: the list may build a new one for a room (a rename re-sorts it). */
     private readonly watchedItems = new Map<string, { item: object; off: () => void }>();
@@ -1031,6 +1046,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private localDeviceVerified = false;
     /** Reaction presses waiting for their snapshot change, per (event, key): a repeat joins the pending one. */
     private readonly reacting = new Map<string, Promise<ActionOutcome>>();
+    /** B7: the downloads in flight, by room and event. */
+    private readonly downloading = new Map<string, Promise<ActionOutcome>>();
     private readonly reactionWaits = new Set<() => void>();
     /** The reaction picker the host shows over the kit, with the call that waits for its close. */
     private pickerCount = 0;
@@ -1171,15 +1188,23 @@ export class ViewModelBridge implements ClientViewBridge {
         for (const id of ids) {
             const item = this.roomList.getRoomItemViewModel(id);
             if (!item) continue;
+            const room = this.client.getRoom(id);
             const watched = this.watchedItems.get(id);
             if (watched?.item !== item) {
                 watched?.off();
-                this.watchedItems.set(id, { item, off: item.subscribe(() => this.syncRooms()) });
+                const offItem = item.subscribe(() => this.syncRooms());
+                const offEcho = room ? this.watchNotificationLevel(room) : () => {};
+                this.watchedItems.set(id, {
+                    item,
+                    off: () => {
+                        offItem();
+                        offEcho();
+                    },
+                });
             }
             const s = item.getSnapshot();
-            const room = this.client.getRoom(id);
             const avatarUrl = room ? (avatarUrlForRoom(room, AVATAR_PX, AVATAR_PX, "crop") ?? undefined) : undefined;
-            rooms.push(toViewRoom(s, rooms.length, avatarUrl));
+            rooms.push(toViewRoom(s, rooms.length, avatarUrl, room ? this.notificationLevelOf(room) : undefined));
             if (!this.statusBar && room) this.watchConnection(room);
         }
         // An invite that became a join: the kit asks for the room's timeline again (none was built while it was invited).
@@ -1196,6 +1221,33 @@ export class ViewModelBridge implements ClientViewBridge {
      * first in the list. A chat whose room has been created (or whose local room is gone) is dropped: the real room is in
      * the room list view-model's own list.
      */
+    /**
+     * The room's notification level as Element's local echo holds it (`RoomEchoChamber.notificationVolume`, what the item's
+     * snapshot is built from). The item view-model builds `roomNotifState` once per update of the room's notification state,
+     * tags or name and does not listen to the echo, so after a level change its snapshot stays stale (it showed
+     * `all_messages` after the push rules held `mentions_only`): the bridge reads the echo itself and watches it
+     * (`watchNotificationLevel`). Undefined when the echo has none: the snapshot's value stands.
+     */
+    private notificationLevelOf(room: Room): ViewNotificationLevel | undefined {
+        try {
+            return EchoChamber.forRoom(room).notificationVolume;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** A change of the room's echoed notification level (a write, its echo, a revert) re-reads the room list. */
+    private watchNotificationLevel(room: Room): () => void {
+        try {
+            const chamber = EchoChamber.forRoom(room);
+            const onUpdated = (): void => this.syncRooms();
+            chamber.on(PROPERTY_UPDATED, onUpdated);
+            return () => void chamber.off(PROPERTY_UPDATED, onUpdated);
+        } catch {
+            return () => {};
+        }
+    }
+
     private localChatRooms(): ViewRoom[] {
         const out: ViewRoom[] = [];
         for (const id of this.localChats) {
@@ -1212,6 +1264,10 @@ export class ViewModelBridge implements ClientViewBridge {
                 isDirect: true,
                 order: out.length,
                 membership: "join",
+                isFavourite: false,
+                canMarkAsUnread: false,
+                showsUnread: false,
+                notificationLevel: "all_messages",
             });
         }
         return out;
@@ -1373,6 +1429,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.urlPreviews(),
                 {
                     canEdit: row.canEdit(),
+                    canDownload: row.canDownload(),
                     edited: row.edited(),
                     editedTs: row.editedTs(),
                     redactedText: row.redactedText(),
@@ -1713,18 +1770,62 @@ export class ViewModelBridge implements ClientViewBridge {
     private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): boolean {
         const roomId = ev.getRoomId() ?? "";
         if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) return false;
-        const vm = new EventTileActionBarViewModel({
-            mxEvent: ev,
-            timelineRenderingType: TimelineRenderingType.Room,
-            canSendMessages: true,
-            canReact: false,
-        });
+        const vm = this.newActionBar(ev);
         try {
             run(vm);
             return true;
         } finally {
             vm.dispose();
         }
+    }
+
+    /** {@link actionBar} for an action that settles later: the view-model is disposed once `run` has settled. */
+    private async actionBarSettled(
+        ev: MatrixEvent,
+        run: (vm: EventTileActionBarViewModel) => Promise<void>,
+    ): Promise<void> {
+        const vm = this.newActionBar(ev);
+        try {
+            await run(vm);
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    private newActionBar(ev: MatrixEvent): EventTileActionBarViewModel {
+        return new EventTileActionBarViewModel({
+            mxEvent: ev,
+            timelineRenderingType: TimelineRenderingType.Room,
+            canSendMessages: true,
+            canReact: false,
+        });
+    }
+
+    /**
+     * B7: the Download button's click (`onDownloadClick`) for a media message, after the event is decrypted. One download
+     * per event is in flight: a repeat gets the pending call (the view-model ignores a click while it loads).
+     */
+    public download(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        const flight = `${roomId}\n${eventId}`;
+        const pending = this.downloading.get(flight);
+        if (pending) return pending;
+        const run = downloadMedia(this.client, roomId, eventId, {
+            withActionBar: (ev, use) =>
+                this.actionBarSettled(ev, (vm) =>
+                    use({
+                        offered: () => vm.getSnapshot().actions.includes(ActionBarAction.Download),
+                        click: () => vm.onDownloadClick(null),
+                    }),
+                ),
+            disposed: () => this.disposed,
+        })
+            .catch((e: unknown) => {
+                throw toActionError(e);
+            })
+            .finally(() => this.downloading.delete(flight));
+        this.downloading.set(flight, run);
+        return run;
     }
 
     public join(roomIdOrAlias: string): Promise<ActionOutcome> {
@@ -1765,6 +1866,76 @@ export class ViewModelBridge implements ClientViewBridge {
         return leaveViaDialog(this.client, roomId, () => item.onLeaveRoom());
     }
 
+    /** A9: interim (D16), see `InterimActions.logout`. */
+    public logout(): Promise<ActionOutcome> {
+        return logout(this.client);
+    }
+
+    /** A8: the files come from Element's picker unless the caller has them. */
+    public async upload(roomId: string, files?: File[]): Promise<ActionOutcome> {
+        this.used = true;
+        const room = this.client.getRoom(roomId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        // A new DM is still a local room: Element would queue the upload on it and create the room behind the user's back.
+        // Refused before any picker or dialog; the first message creates the room.
+        if (isLocalRoom(roomId))
+            throw new ClientViewActionError(
+                "unsupported",
+                "send a message first: a new chat has no room to upload into yet",
+            );
+        let chosen: File[] | null;
+        if (files) chosen = await rewrapFiles(files);
+        else {
+            this.filePicker?.cancel();
+            const picker = openFilePicker(document);
+            this.filePicker = picker;
+            try {
+                chosen = await picker.files;
+            } finally {
+                if (this.filePicker === picker) this.filePicker = undefined;
+            }
+        }
+        if (!chosen?.length) return { status: "cancelled" };
+        const vm = new RoomUploadViewModel(
+            room,
+            this.client,
+            TimelineRenderingType.Room,
+            defaultDispatcher,
+            undefined,
+            undefined,
+            () => {},
+        );
+        try {
+            return await uploadFiles(vm, room, chosen);
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    /** The room's list item view-model and Room for an A10 action, or the contract's `unknown_room`. */
+    private roomItem(roomId: string): { item: RoomItemActionsVm; room: Room } {
+        const room = this.client.getRoom(roomId);
+        const item = this.roomList.getRoomItemViewModel(roomId);
+        if (!room || !item || !("onMarkAsUnread" in item))
+            throw new ClientViewActionError("unknown_room", `${roomId} is not in the room list`);
+        return { item, room };
+    }
+
+    public async markUnread(roomId: string): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return markUnread(item, room);
+    }
+
+    public async setFavourite(roomId: string, on: boolean): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return setFavourite(item, room, on);
+    }
+
+    public async setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome> {
+        const { item, room } = this.roomItem(roomId);
+        return setNotificationLevel(item, room, this.client, level);
+    }
+
     public onChange(cb: (e: ChangeEvent) => void): () => void {
         this.used = true;
         this.listeners.add(cb);
@@ -1774,6 +1945,7 @@ export class ViewModelBridge implements ClientViewBridge {
     public dispose(): void {
         this.disposed = true;
         this.closeReactionPicker();
+        this.filePicker?.cancel();
         [...this.reactionWaits].forEach((cancel) => cancel());
         this.watchedItems.forEach((w) => w.off());
         this.watchedItems.clear();
