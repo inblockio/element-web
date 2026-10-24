@@ -32,6 +32,7 @@ import {
     type ImageBodyViewSnapshot,
     type TimelineItem,
     type VideoBodyViewSnapshot,
+    ActionBarAction,
     RoomStatusBarState,
 } from "@element-hq/web-shared-components";
 
@@ -67,6 +68,7 @@ import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { canEditContent, isContentActionable } from "../utils/EventUtils";
+import { RoomPermalinkCreator } from "../utils/permalinks/Permalinks";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
 import { RedactedBodyViewModel } from "../viewmodels/message-body/RedactedBodyViewModel";
 import { getRedactedBodyViewModelProps } from "../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState";
@@ -75,8 +77,10 @@ import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
-import { getClientViews, selectClientView } from "./registry";
+import { CallCard } from "./CallCard";
+import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
+import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
@@ -376,6 +380,11 @@ class EventRow {
     /** Element's edit rule for this event (`canEditContent`), the rule the edit action bar button follows. */
     public canEdit(): boolean {
         return canEditContent(this.client, this.ev);
+    }
+
+    /** Element's rule for the Download action bar button (no view-model per row), see {@link canDownloadMedia}. */
+    public canDownload(): boolean {
+        return canDownloadMedia(this.ev);
     }
 
     /** The edited marker's rule (`TextualBodyViewModel`): a replacement event exists. */
@@ -1016,10 +1025,20 @@ export class ViewModelBridge implements ClientViewBridge {
     /** The item view-model each room's subscription follows: the list may build a new one for a room (a rename re-sorts it). */
     private readonly watchedItems = new Map<string, { item: object; off: () => void }>();
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
+    /** One started permalink creator per room (its `via` servers follow the room state); stopped when the room leaves the bridge. */
+    private readonly permalinkCreators = new Map<string, RoomPermalinkCreator>();
+    /** The rooms the bridge lists (set by `syncRooms`): a room that left it gets no permalink creator again. */
+    private listedRoomIds = new Set<string>();
+    /** Rooms read while not listed (messages handed over without a permalink): the kit reads them again once they are listed. */
+    private readUnlisted = new Set<string>();
+    /** Rooms whose member load for the via servers failed: the next read tries it again (the SDK allows a retry). */
+    private memberLoadFailed = new Set<string>();
     /** A `loadOlder` in flight per room: a concurrent call gets the same answer. */
     private readonly olderLoads = new Map<string, Promise<LoadOlderResult>>();
     private disposed = false;
     private readonly rows = new Map<string, EventRow>();
+    /** The call card (Element's RootCallTileViewModel) of each call notification the kit was handed, by event id. */
+    private readonly callCards = new Map<string, CallCard>();
     private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
     /** Per room: encrypted once either the room state or the crypto store said so (never back to false). */
     private readonly encrypted = new Map<string, boolean>();
@@ -1039,6 +1058,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private localDeviceVerified = false;
     /** Reaction presses waiting for their snapshot change, per (event, key): a repeat joins the pending one. */
     private readonly reacting = new Map<string, Promise<ActionOutcome>>();
+    /** B7: the downloads in flight, by room and event. */
+    private readonly downloading = new Map<string, Promise<ActionOutcome>>();
     private readonly reactionWaits = new Set<() => void>();
     /** The reaction picker the host shows over the kit, with the call that waits for its close. */
     private pickerCount = 0;
@@ -1205,16 +1226,29 @@ export class ViewModelBridge implements ClientViewBridge {
         // An invite that became a join: the kit asks for the room's timeline again (none was built while it was invited).
         const joined = rooms.filter((r) => r.membership !== "invite" && this.invitedRooms.has(r.id));
         this.invitedRooms = new Set(rooms.filter((r) => r.membership === "invite").map((r) => r.id));
+        // A room that left the list takes its permalink creator (a started one listens to the room state) with it.
+        const listed = new Set(ids);
+        this.listedRoomIds = listed;
+        for (const [roomId, creator] of this.permalinkCreators) {
+            if (listed.has(roomId)) continue;
+            creator.stop();
+            this.permalinkCreators.delete(roomId);
+            this.memberLoadFailed.delete(roomId);
+        }
+        // A room read without permalinks while it was not listed (a rejoin the list shows late) is listed now: read it again.
+        const relisted = [...this.readUnlisted].filter((id) => listed.has(id));
+        for (const id of relisted) this.readUnlisted.delete(id);
         const sectionList = sections ?? [];
         if (
-            JSON.stringify(rooms) === JSON.stringify(this.roomCache) &&
-            JSON.stringify(sectionList) === JSON.stringify(this.sectionCache)
-        )
-            return;
-        this.roomCache = rooms;
-        this.sectionCache = sectionList;
-        this.emit({ kind: "rooms" });
-        for (const r of joined) this.emit({ kind: "timeline", roomId: r.id });
+            JSON.stringify(rooms) !== JSON.stringify(this.roomCache) ||
+            JSON.stringify(sectionList) !== JSON.stringify(this.sectionCache)
+        ) {
+            this.roomCache = rooms;
+            this.sectionCache = sectionList;
+            this.emit({ kind: "rooms" });
+            for (const r of joined) this.emit({ kind: "timeline", roomId: r.id });
+        }
+        for (const id of relisted) if (!joined.some((r) => r.id === id)) this.emit({ kind: "timeline", roomId: id });
     }
 
     /**
@@ -1395,12 +1429,20 @@ export class ViewModelBridge implements ClientViewBridge {
         const vm = this.ensureTimeline(roomId);
         if (!vm) return [];
         const messages: ViewMessage[] = [];
+        // Call events of this window, held or not: a card is dropped only when its event is no longer an item.
+        const seenCalls = new Set<string>();
         for (const item of vm.getSnapshot().items) {
             if (item.kind !== "event") continue;
             const eventItem = item;
             if (eventItem.sendState && eventItem.sendState !== "sent") continue;
             const id = (eventItem.event as MatrixEvent).getId();
             if (!id || id.startsWith("~")) continue;
+            if ((eventItem.event as MatrixEvent).getType() === EventType.RTCNotification) {
+                seenCalls.add(id);
+                const call = this.callMessage(eventItem.event as MatrixEvent, roomId);
+                if (call) messages.push(call);
+                continue;
+            }
             const row = this.row(eventItem, roomId);
             const tile = row.tile.getSnapshot().snapshot;
             // An event still waiting for its key keeps the SDK type m.room.encrypted (a failed one is m.room.message).
@@ -1427,9 +1469,11 @@ export class ViewModelBridge implements ClientViewBridge {
                 row.urlPreviews(),
                 {
                     canEdit: row.canEdit(),
+                    canDownload: row.canDownload(),
                     edited: row.edited(),
                     editedTs: row.editedTs(),
                     redactedText: row.redactedText(),
+                    permalink: this.permalinkOf(roomId, id),
                 },
             );
             if (message) {
@@ -1437,7 +1481,88 @@ export class ViewModelBridge implements ClientViewBridge {
                 messages.push(txnId ? { ...message, txnId } : message);
             }
         }
+        this.pruneCallCards(roomId, seenCalls);
         return messages.sort((a, b) => a.ts - b.ts);
+    }
+
+    /** Element's permalink of an event (`RoomPermalinkCreator.forEvent`, `via` included), undefined for a room the client does not know. */
+    private permalinkOf(roomId: string, eventId: string): string | undefined {
+        let creator = this.permalinkCreators.get(roomId);
+        if (!creator) {
+            // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
+            if (!this.listedRoomIds.has(roomId)) {
+                this.readUnlisted.add(roomId);
+                return undefined;
+            }
+            const room = this.client.getRoom(roomId);
+            if (!room) return undefined;
+            creator = new RoomPermalinkCreator(room);
+            creator.start();
+            this.permalinkCreators.set(roomId, creator);
+            this.loadMembersForVia(room);
+        } else if (this.memberLoadFailed.delete(roomId)) {
+            const room = this.client.getRoom(roomId);
+            if (room) this.loadMembersForVia(room);
+        }
+        return creator.forEvent(eventId);
+    }
+
+    /**
+     * Element's own Copy link has the room's full member list behind its `via` servers (RoomView loads it on mount); a kit
+     * mounts no RoomView, so with lazy-loaded members only the few loaded ones would count. Load them (once per room:
+     * the SDK keeps the promise) and tell the kit to read the room again; the started creator follows the room state.
+     */
+    private loadMembersForVia(room: Room): void {
+        if (!this.client.hasLazyLoadMembersEnabled() || room.getMyMembership() !== KnownMembership.Join) return;
+        room.loadMembersIfNeeded().then(
+            () => {
+                if (this.permalinkCreators.has(room.roomId)) this.emit({ kind: "timeline", roomId: room.roomId });
+            },
+            (err) => {
+                if (this.permalinkCreators.has(room.roomId)) this.memberLoadFailed.add(room.roomId);
+                logger.error(
+                    `Fetching room members for ${room.roomId} failed. Permalinks may list too few servers.`,
+                    err,
+                );
+            },
+        );
+    }
+
+    /** Drops the cards of a room's calls whose event left the timeline window (the view-model disposes its tiles). */
+    private pruneCallCards(roomId: string, seen: Set<string>): void {
+        for (const [id, card] of this.callCards) {
+            if (card.roomId !== roomId || seen.has(id)) continue;
+            card.dispose();
+            this.callCards.delete(id);
+        }
+    }
+
+    /**
+     * The message of a call's root event (`EventTileFactory` draws it as the call card): `kind` "other", no body, and
+     * `call` from the call-card view-models. Nothing for an event whose card Element cannot build.
+     */
+    private callMessage(event: MatrixEvent, roomId: string): ViewMessage | undefined {
+        if (event.status != null) return undefined;
+        const id = event.getId()!;
+        let card = this.callCards.get(id);
+        if (!card) {
+            card = CallCard.create(this.client, event, () => this.emit({ kind: "timeline", roomId }));
+            if (!card) return undefined;
+            this.callCards.set(id, card);
+        }
+        const senderId = event.getSender() ?? "";
+        const avatarUrl = senderId ? this.senderAvatarUrl(roomId, senderId) : undefined;
+        return {
+            id,
+            roomId,
+            senderId,
+            senderName: event.sender?.name || senderId,
+            ...(avatarUrl ? { senderAvatarUrl: avatarUrl } : {}),
+            ts: event.getTs(),
+            body: "",
+            kind: "other",
+            call: card.view(),
+        };
     }
 
     /** The transaction id of an own message (its local echo's, else the sync echo's `unsigned.transaction_id`). */
@@ -1569,6 +1694,10 @@ export class ViewModelBridge implements ClientViewBridge {
 
     public views(): { id: string; name: string }[] {
         return [{ id: STOCK_VIEW, name: "Element" }, ...getClientViews().map(({ id, name }) => ({ id, name }))];
+    }
+
+    public meetUrl(): string | undefined {
+        return getMeetUrl();
     }
 
     public switchTo(viewId: string): void {
@@ -1725,18 +1854,62 @@ export class ViewModelBridge implements ClientViewBridge {
     private actionBar(ev: MatrixEvent, run: (vm: EventTileActionBarViewModel) => void, navigates: boolean): boolean {
         const roomId = ev.getRoomId() ?? "";
         if (navigates && roomId !== SDKContextClass.instance.roomViewStore.getRoomId()) return false;
-        const vm = new EventTileActionBarViewModel({
-            mxEvent: ev,
-            timelineRenderingType: TimelineRenderingType.Room,
-            canSendMessages: true,
-            canReact: false,
-        });
+        const vm = this.newActionBar(ev);
         try {
             run(vm);
             return true;
         } finally {
             vm.dispose();
         }
+    }
+
+    /** {@link actionBar} for an action that settles later: the view-model is disposed once `run` has settled. */
+    private async actionBarSettled(
+        ev: MatrixEvent,
+        run: (vm: EventTileActionBarViewModel) => Promise<void>,
+    ): Promise<void> {
+        const vm = this.newActionBar(ev);
+        try {
+            await run(vm);
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    private newActionBar(ev: MatrixEvent): EventTileActionBarViewModel {
+        return new EventTileActionBarViewModel({
+            mxEvent: ev,
+            timelineRenderingType: TimelineRenderingType.Room,
+            canSendMessages: true,
+            canReact: false,
+        });
+    }
+
+    /**
+     * B7: the Download button's click (`onDownloadClick`) for a media message, after the event is decrypted. One download
+     * per event is in flight: a repeat gets the pending call (the view-model ignores a click while it loads).
+     */
+    public download(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        const flight = `${roomId}\n${eventId}`;
+        const pending = this.downloading.get(flight);
+        if (pending) return pending;
+        const run = downloadMedia(this.client, roomId, eventId, {
+            withActionBar: (ev, use) =>
+                this.actionBarSettled(ev, (vm) =>
+                    use({
+                        offered: () => vm.getSnapshot().actions.includes(ActionBarAction.Download),
+                        click: () => vm.onDownloadClick(null),
+                    }),
+                ),
+            disposed: () => this.disposed,
+        })
+            .catch((e: unknown) => {
+                throw toActionError(e);
+            })
+            .finally(() => this.downloading.delete(flight));
+        this.downloading.set(flight, run);
+        return run;
     }
 
     public join(roomIdOrAlias: string): Promise<ActionOutcome> {
@@ -1873,8 +2046,13 @@ export class ViewModelBridge implements ClientViewBridge {
         this.watchedItems.clear();
         this.disposers.forEach((d) => d());
         this.rows.forEach((r) => r.dispose());
+        this.callCards.forEach((c) => c.dispose());
         this.senderAvatars.forEach((a) => a.dispose());
         this.timelines.forEach((t) => t.dispose());
+        this.permalinkCreators.forEach((c) => c.stop());
+        this.permalinkCreators.clear();
+        this.memberLoadFailed.clear();
+        this.readUnlisted.clear();
         this.statusBar?.dispose();
         this.userMenu.dispose();
         this.roomList.dispose();

@@ -44,13 +44,17 @@ const h = vi.hoisted(() => {
     const room = {
         roomId: "!a",
         getMember: () => member,
+        getJoinedMembers: vi.fn((): Array<{ userId: string }> => []),
         findEventById: vi.fn((_id: string): unknown => undefined),
         findThreadForEvent: () => null,
         getUnfilteredTimelineSet: () => timelineSet,
         getMyMembership: () => "join",
+        loadMembersIfNeeded: vi.fn(async (): Promise<boolean> => true),
         currentState: {
             maySendEvent: vi.fn((_type: string, _user: string): boolean => true),
             getStateEvents: vi.fn((..._args: unknown[]): unknown => undefined),
+            on: vi.fn(),
+            removeListener: vi.fn(),
         },
         on: vi.fn(),
         off: vi.fn(),
@@ -110,6 +114,8 @@ const h = vi.hoisted(() => {
     }> = [];
     const settings: Record<string, unknown> = {};
     const roomEncrypted = { value: true };
+    /** `client.hasLazyLoadMembersEnabled()`: Element's production client always has it on. */
+    const lazyLoad = { value: false };
     const watchers = new Map<string, { name: string; roomId: string | null; cb: () => void }>();
     const urlPreviewVms: Array<
         InstanceType<typeof FakeVm<Record<string, unknown>>> & {
@@ -135,18 +141,27 @@ const h = vi.hoisted(() => {
                 mediaVms.push(this as never);
             }
         };
-    const actionBars: Array<{ props: Record<string, unknown>; onReplyClick: Mock; onEditClick: Mock; dispose: Mock }> =
-        [];
-    const eventUtils = { canEdit: true };
+    const actionBars: Array<{
+        props: Record<string, unknown>;
+        onReplyClick: Mock;
+        onEditClick: Mock;
+        onDownloadClick: Mock;
+        showDownload: boolean;
+        dispose: Mock;
+    }> = [];
+    const eventUtils = { canEdit: true, canDownload: true };
+    const roomLists: Array<InstanceType<typeof FakeVm<{ sections: { roomIds: string[] }[] }>>> = [];
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
 
     return {
         sendText: vi.fn(),
         editText: vi.fn(),
         redact: vi.fn(),
+        downloadMedia: vi.fn(),
         actionBars,
         eventUtils,
         sdkContext,
+        roomLists,
         mediaVm,
         FakeVm,
         mediaVms,
@@ -154,6 +169,7 @@ const h = vi.hoisted(() => {
         mediaVisible,
         settings,
         roomEncrypted,
+        lazyLoad,
         watchers,
         urlPreviewVms,
         threadSummaries,
@@ -178,6 +194,7 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
     RoomListViewModel: class extends h.FakeVm<{ sections: { roomIds: string[] }[] }> {
         public constructor() {
             super({ sections: [{ roomIds: ["!a"] }] });
+            h.roomLists.push(this);
         }
         public updateVisibleRooms = vi.fn();
         public get roomIds(): string[] {
@@ -384,6 +401,9 @@ vi.mock("../viewmodels/room/EventTileActionBarViewModel", () => ({
     EventTileActionBarViewModel: class {
         public onReplyClick = vi.fn();
         public onEditClick = vi.fn();
+        public onDownloadClick = vi.fn(async () => {});
+        public showDownload = true;
+        public getSnapshot = (): { actions: string[] } => ({ actions: this.showDownload ? ["download"] : [] });
         public dispose = vi.fn();
         public constructor(public props: Record<string, unknown>) {
             h.actionBars.push(this as never);
@@ -405,8 +425,13 @@ vi.mock("./InterimActions", () => ({
     editText: (...args: unknown[]) => h.editText(...args),
     redact: (...args: unknown[]) => h.redact(...args),
 }));
+vi.mock("./DownloadAction", () => ({
+    canDownloadMedia: () => h.eventUtils.canDownload,
+    downloadMedia: (...args: unknown[]) => h.downloadMedia(...args),
+}));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
+    getMeetUrl: vi.fn(() => "https://meet.example.org"),
     selectClientView: vi.fn(async () => {}),
 }));
 
@@ -446,17 +471,20 @@ describe("ViewModelBridge", () => {
 
     beforeEach(() => {
         vi.clearAllMocks();
+        h.roomLists.length = 0;
         // The fakes outlive each test's bridge; drop the previous bridge's subscriptions.
         h.timeline.listeners.clear();
         bridge = new ViewModelBridge({
             getRoom: (id: string) => (id === "!a" ? h.room : null),
             getUserId: () => "@me:example.org",
             isRoomEncrypted: () => h.roomEncrypted.value,
+            hasLazyLoadMembersEnabled: () => h.lazyLoad.value,
             getCrypto: () => undefined,
             getEventTimeline: h.getEventTimeline,
             on: vi.fn(),
             off: vi.fn(),
         } as unknown as MatrixClient);
+        h.lazyLoad.value = false;
         h.padlocks.length = 0;
         h.bodies.length = 0;
         h.replies.length = 0;
@@ -476,6 +504,8 @@ describe("ViewModelBridge", () => {
         h.buttonClick.run = () => {};
         h.actionBars.length = 0;
         h.eventUtils.canEdit = true;
+        h.eventUtils.canDownload = true;
+        h.downloadMedia.mockReset();
         h.sdkContext.roomViewStore = { getRoomId: () => null };
     });
 
@@ -613,6 +643,90 @@ describe("ViewModelBridge", () => {
             expect(h.redact).toHaveBeenCalledWith(expect.anything(), "!a", "$mine");
         });
 
+        describe("B7 download", () => {
+            const run = (
+                use: (bar: { offered(): boolean; click(): Promise<void> }) => Promise<void>,
+                ev: unknown = target("$file"),
+            ) => {
+                h.downloadMedia.mockImplementationOnce(
+                    async (
+                        _client: unknown,
+                        roomId: string,
+                        eventId: string,
+                        hooks: {
+                            withActionBar(ev: unknown, use: (bar: never) => Promise<void>): Promise<void>;
+                            disposed(): boolean;
+                        },
+                    ) => {
+                        await hooks.withActionBar(ev, use as never);
+                        return { status: "done", roomId, eventId };
+                    },
+                );
+            };
+
+            it("hands the click of the stock action bar view-model over and disposes it after the click settled", async () => {
+                let finish: () => void = () => {};
+                run(async (bar) => {
+                    const click = h.actionBars[0].onDownloadClick;
+                    click.mockImplementationOnce(
+                        () =>
+                            new Promise<void>((resolve) => {
+                                finish = resolve;
+                            }),
+                    );
+                    await bar.click();
+                });
+                const p = bridge.download("!a", "$file");
+                await Promise.resolve();
+                await Promise.resolve();
+                expect(h.actionBars).toHaveLength(1);
+                expect(h.actionBars[0].props).toMatchObject({ canSendMessages: true });
+                expect(h.actionBars[0].dispose).not.toHaveBeenCalled();
+                finish();
+                await expect(p).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$file" });
+                expect(h.actionBars[0].onDownloadClick).toHaveBeenCalledWith(null);
+                expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+            });
+
+            it("reads the offer from the view-model's showDownload", async () => {
+                let seen: boolean[] = [];
+                run(async (bar) => {
+                    seen = [bar.offered()];
+                    h.actionBars[0].showDownload = false;
+                    seen.push(bar.offered());
+                });
+                await bridge.download("!a", "$file");
+                expect(seen).toEqual([true, false]);
+            });
+
+            it("maps a failure to the contract's error and disposes the view-model", async () => {
+                run(async () => {
+                    throw new Error("boom");
+                });
+                await expect(bridge.download("!a", "$file")).rejects.toMatchObject({ code: "failed", message: "boom" });
+                expect(h.actionBars[0].dispose).toHaveBeenCalledTimes(1);
+            });
+
+            it("gives a repeat the pending download, and a later one its own", async () => {
+                let finish: () => void = () => {};
+                h.downloadMedia.mockImplementationOnce(
+                    () =>
+                        new Promise((resolve) => {
+                            finish = () => resolve({ status: "done" });
+                        }),
+                );
+                const first = bridge.download("!a", "$file");
+                const second = bridge.download("!a", "$file");
+                expect(second).toBe(first);
+                expect(h.downloadMedia).toHaveBeenCalledTimes(1);
+                finish();
+                await first;
+                h.downloadMedia.mockResolvedValueOnce({ status: "done" });
+                await bridge.download("!a", "$file");
+                expect(h.downloadMedia).toHaveBeenCalledTimes(2);
+            });
+        });
+
         const readFirst = () => {
             const ev = fakeEvent("$m1", { getSender: () => "@me:example.org" });
             h.timeline.snapshot = { items: [{ kind: "event", event: ev, continuation: false }], atLiveEnd: true };
@@ -627,6 +741,97 @@ describe("ViewModelBridge", () => {
             expect(bridge.timeline("!a").map((m) => m.id)).toEqual(["$m1"]);
         });
 
+        it("hands over Element's permalink with the via servers, one started creator per room, stopped when the room leaves", () => {
+            h.room.getJoinedMembers.mockReturnValue([
+                { userId: "@bob:one.example.org" },
+                { userId: "@carol:one.example.org" },
+                { userId: "@dave:two.example.org" },
+            ]);
+            const { message } = readFirst();
+            expect(message().permalink).toBe("https://matrix.to/#/!a/$m1?via=one.example.org&via=two.example.org");
+            // Read again: the same creator (one start, one state listener), not a new one per read.
+            message();
+            expect(h.room.currentState.on).toHaveBeenCalledTimes(1);
+            expect(h.room.currentState.removeListener).not.toHaveBeenCalled();
+            // The room drops out of the bridge's list: the creator is stopped.
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            expect(h.room.currentState.removeListener).toHaveBeenCalledTimes(1);
+        });
+
+        it("loads the room's members once for the via servers (as RoomView does) and tells the kit to re-read when they arrived", async () => {
+            h.lazyLoad.value = true;
+            h.room.getJoinedMembers.mockReturnValue([{ userId: "@bob:small.example.org" }]);
+            const seen: Array<{ kind: string; roomId?: string }> = [];
+            bridge.onChange((e) => seen.push(e as { kind: string; roomId?: string }));
+            const { message } = readFirst();
+            expect(message().permalink).toBe("https://matrix.to/#/!a/$m1?via=small.example.org");
+            message();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            // The member list arrives: the room state updates (the started creator follows) and the kit is told.
+            h.room.getJoinedMembers.mockReturnValue([
+                { userId: "@bob:small.example.org" },
+                { userId: "@mod:big.example.org" },
+            ]);
+            seen.length = 0;
+            (h.room.currentState.on.mock.calls[0][1] as () => void)();
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(seen).toContainEqual({ kind: "timeline", roomId: "!a" });
+            expect(message().permalink).toBe("https://matrix.to/#/!a/$m1?via=small.example.org&via=big.example.org");
+        });
+
+        it("loads no members when the client does not lazy-load them", () => {
+            const { message } = readFirst();
+            message();
+            expect(h.room.loadMembersIfNeeded).not.toHaveBeenCalled();
+        });
+
+        it("does not start a permalink creator again for a room that left the list but is still read", () => {
+            const { message } = readFirst();
+            message();
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            expect(h.room.currentState.removeListener).toHaveBeenCalledTimes(1);
+            expect(message().permalink).toBeUndefined();
+            expect(h.room.currentState.on).toHaveBeenCalledTimes(1);
+        });
+
+        it("tells the kit to read a room again once it enters the list, when it was read without permalinks before", () => {
+            const { message } = readFirst();
+            const list = h.roomLists[h.roomLists.length - 1];
+            // A rejoined room that is open in the kit while the list does not list it (yet): no permalink.
+            list.set({ sections: [{ roomIds: [] }] });
+            expect(message().permalink).toBeUndefined();
+            const seen: Array<{ kind: string; roomId?: string }> = [];
+            bridge.onChange((e) => seen.push(e as { kind: string; roomId?: string }));
+            list.set({ sections: [{ roomIds: ["!a"] }] });
+            expect(seen).toContainEqual({ kind: "timeline", roomId: "!a" });
+            expect(message().permalink).toContain("https://matrix.to/#/!a/$m1");
+        });
+
+        it("retries the member load for the via servers on the next read after it failed", async () => {
+            h.lazyLoad.value = true;
+            h.room.loadMembersIfNeeded.mockRejectedValueOnce(new Error("offline"));
+            const { message } = readFirst();
+            message();
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            message();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(2);
+            await Promise.resolve();
+            await Promise.resolve();
+            // Loaded now: no further attempt.
+            message();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(2);
+        });
+
+        it("hands over no permalink for a deleted message", () => {
+            const { ev, message } = readFirst();
+            (ev as { isRedacted: () => boolean }).isRedacted = () => true;
+            expect(message().redacted).toBe(true);
+            expect(message().permalink).toBeUndefined();
+        });
+
         it("hands over canEdit by Element's rule, and edited when a replacement exists", () => {
             const { ev, message } = readFirst();
             expect(message().canEdit).toBe(true);
@@ -636,6 +841,13 @@ describe("ViewModelBridge", () => {
             expect(message().canEdit).toBeUndefined();
             expect(message().edited).toBe(true);
             expect(message().editedTs).toBeUndefined();
+        });
+
+        it("hands over canDownload by Element's Download button rule", () => {
+            const { message } = readFirst();
+            expect(message().canDownload).toBe(true);
+            h.eventUtils.canDownload = false;
+            expect(message().canDownload).toBeUndefined();
         });
 
         it("hands over editedTs: the replacement's timestamp, only with edited", () => {
@@ -693,6 +905,13 @@ describe("ViewModelBridge", () => {
         ]);
         bridge.switchTo("stock");
         expect(selectClientView).toHaveBeenCalledWith("stock");
+    });
+
+    it("hands the kit the Meet address of the host config (lane CALL: absent = no calls)", async () => {
+        expect(bridge.meetUrl()).toBe("https://meet.example.org");
+        const { getMeetUrl } = await import("./registry");
+        vi.mocked(getMeetUrl).mockReturnValueOnce(undefined);
+        expect(bridge.meetUrl()).toBeUndefined();
     });
 
     it("fills the sender avatar from the member avatar view-model, one per sender, and follows its changes", () => {
@@ -842,6 +1061,7 @@ describe("ViewModelBridge", () => {
                 getRoom: (id: string) => (id === "!a" ? h.room : null),
                 getUserId: () => "@me:example.org",
                 isRoomEncrypted: () => false,
+                hasLazyLoadMembersEnabled: () => false,
                 getCrypto: () => ({
                     isEncryptionEnabledInRoom,
                     getUserVerificationStatus: async () => ({ isCrossSigningVerified: () => false }),
@@ -2043,6 +2263,7 @@ describe("ViewModelBridge", () => {
                     getRoom: (id: string) => (id === "!a" ? h.room : null),
                     getUserId: () => "@me:example.org",
                     isRoomEncrypted: () => false,
+                    hasLazyLoadMembersEnabled: () => false,
                     getCrypto: () => ({
                         isEncryptionEnabledInRoom,
                         getUserVerificationStatus: async () => ({ isCrossSigningVerified: () => false }),

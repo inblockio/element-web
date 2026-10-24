@@ -16,6 +16,7 @@ import {
     clientViewsAvailable,
     getActiveClientView,
     getClientViews,
+    getMeetUrl,
     isHandedOver,
     selectClientView,
     setHandedOver,
@@ -93,5 +94,29 @@ describe("client view registry", () => {
         expect(watcher).toHaveBeenCalledTimes(2);
         unwatch();
         expect(settings.clientView).toBe("fixture");
+    });
+
+    it("reads the Meet address from client_views_meet_url: an http(s) address without query, fragment or trailing slash", () => {
+        expect(getMeetUrl()).toBeUndefined();
+        SdkConfig.put({ client_views_meet_url: "https://dev.meet.inblock.io/" } as never);
+        expect(getMeetUrl()).toBe("https://dev.meet.inblock.io");
+        SdkConfig.put({ client_views_meet_url: " http://localhost:8080/app/?x=1#/y " } as never);
+        expect(getMeetUrl()).toBe("http://localhost:8080/app");
+    });
+
+    it("treats an empty, relative, non-http or non-string Meet address as absent", () => {
+        for (const value of [
+            "",
+            "  ",
+            "meet.example.org",
+            "/meet",
+            "javascript:alert(1)",
+            "ftp://meet.example.org",
+            7,
+            null,
+        ]) {
+            SdkConfig.put({ client_views_meet_url: value } as never);
+            expect(getMeetUrl()).toBeUndefined();
+        }
     });
 });

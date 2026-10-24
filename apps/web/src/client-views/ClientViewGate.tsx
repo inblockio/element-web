@@ -212,9 +212,10 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
             <iframe
                 ref={attach}
                 onLoad={onLoad}
-                // The kit reads the bridge from its own window, so it stays same-origin, as modal widgets do.
+                // The kit reads the bridge from its own window, so it stays same-origin, as modal widgets do. A window the kit
+                // opens (the call app, lane CALL) escapes the sandbox: it is another site and must not inherit this one.
                 // oxlint-disable-next-line react/iframe-missing-sandbox
-                sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-downloads"
+                sandbox="allow-forms allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads"
                 title={view.name}
                 src={view.url}
                 data-client-view={view.id}
