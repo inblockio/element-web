@@ -135,13 +135,13 @@ export default class PinningUtils {
 
         // Get the current pinned events of the room. A copy: the live state content must not change before the
         // homeserver has accepted the new list (a refused send would leave the event shown as pinned or unpinned).
-        const pinnedIds: Array<string> = [
-            ...(room
-                .getLiveTimeline()
-                .getState(EventTimeline.FORWARDS)
-                ?.getStateEvents(EventType.RoomPinnedEvents, "")
-                ?.getContent().pinned || []),
-        ];
+        const currentPinned = room
+            .getLiveTimeline()
+            .getState(EventTimeline.FORWARDS)
+            ?.getStateEvents(EventType.RoomPinnedEvents, "")
+            ?.getContent().pinned;
+        // Not an array is invalid content (`isPinned` ignores it): start a fresh list rather than spread it.
+        const pinnedIds: Array<string> = Array.isArray(currentPinned) ? [...currentPinned] : [];
 
         let roomAccountDataPromise: Promise<EmptyObject | void> = Promise.resolve();
         // If the event is already pinned, unpin it

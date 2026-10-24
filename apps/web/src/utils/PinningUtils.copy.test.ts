@@ -66,4 +66,18 @@ describe("PinningUtils.pinOrUnpinEvent leaves the live state alone", () => {
         );
         expect(live).toEqual(["$other"]);
     });
+
+    // grok host F3: a non-array value is invalid (`isPinned` and usePinnedEvents ignore it); spreading a string wrote
+    // its characters as the room's list.
+    it("a non-array pinned value is replaced, not spread into characters", async () => {
+        // @ts-ignore deliberately invalid state content
+        live = "$existing";
+        await PinningUtils.pinOrUnpinEvent(client, message("$new"));
+        expect(client.sendStateEvent).toHaveBeenCalledWith(
+            roomId,
+            EventType.RoomPinnedEvents,
+            { pinned: ["$new"] },
+            "",
+        );
+    });
 });

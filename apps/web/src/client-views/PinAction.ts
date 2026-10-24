@@ -28,6 +28,9 @@ export interface PinTarget {
     press(): Promise<void>;
 }
 
+/** How long a rejected press waits for the room's list to show the change before it is reported as failed. */
+export const PIN_SETTLE_MS = 5000;
+
 const pinQueue = new Map<string, Promise<unknown>>();
 
 export function setPinned(
@@ -36,20 +39,30 @@ export function setPinned(
     on: boolean,
     isDisposed: () => boolean = () => false,
 ): Promise<ActionOutcome> {
+    // Waits for the room's list to show the asked state; true when it did within `ms`.
+    const shows = async (ms: number): Promise<boolean> => {
+        const until = Date.now() + ms;
+        while (Date.now() < until) {
+            if (target.pinned() === on) return true;
+            if (isDisposed()) throw new ClientViewActionError("failed", "the bridge was disposed");
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        return target.pinned() === on;
+    };
     const run = async (): Promise<ActionOutcome> => {
         if (!target.canPin()) throw new ClientViewActionError("forbidden", "Element offers no pin on this message");
         if (target.pinned() === on) return { status: "done", roomId };
         try {
             await target.press();
         } catch (e) {
-            throw toActionError(e);
+            // The press sends the list and a paired account-data write and rejects when either fails, so the list may
+            // have landed behind a rejection (a landed pin is reported landed, D21), and the next call in this room must
+            // not build on a state that does not hold it yet. A definite refusal (M_FORBIDDEN) is not waited for.
+            const error = toActionError(e);
+            if (error.code === "forbidden" || !(await shows(PIN_SETTLE_MS))) throw error;
+            return { status: "done", roomId };
         }
-        const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
-        while (Date.now() < until) {
-            if (target.pinned() === on) return { status: "done", roomId };
-            if (isDisposed()) throw new ClientViewActionError("failed", "the bridge was disposed");
-            await new Promise((r) => setTimeout(r, 50));
-        }
+        if (await shows(ROOM_ACTION_TIMEOUT_MS)) return { status: "done", roomId };
         throw new ClientViewActionError(
             "network",
             "the room's pinned list did not show the change in time; it may still apply",

@@ -1138,12 +1138,19 @@ export class ViewModelBridge implements ClientViewBridge {
 
     /**
      * The pinned flag of a row is read live (`PinningUtils.isPinned`): the room's rows are handed over again when its
-     * `m.room.pinned_events` changes, also by another client.
+     * `m.room.pinned_events` (or the power levels behind `canPin`) change, also by another client.
      */
     private watchPins(): void {
         const onPinsState = (ev: MatrixEvent): void => {
             const roomId = ev.getRoomId();
-            if (ev.getType() !== EventType.RoomPinnedEvents || !roomId || !this.timelines.has(roomId)) return;
+            // The power levels decide the offer (`canPin`), so a change of them hands the rows over again too.
+            const type = ev.getType();
+            if (
+                (type !== EventType.RoomPinnedEvents && type !== EventType.RoomPowerLevels) ||
+                !roomId ||
+                !this.timelines.has(roomId)
+            )
+                return;
             this.emit({ kind: "timeline", roomId });
         };
         this.client.on(RoomStateEvent.Events, onPinsState);

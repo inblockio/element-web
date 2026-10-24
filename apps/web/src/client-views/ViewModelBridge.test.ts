@@ -682,6 +682,16 @@ describe("ViewModelBridge", () => {
                 expect(seen).toEqual(["!a"]);
             });
 
+            // grok host F4: the offer follows the power level, so a change of it hands the rows over again
+            it("hands the room's rows over again when its power levels change (canPin is read from them)", () => {
+                readFirst();
+                bridge.timeline("!a");
+                const seen: string[] = [];
+                bridge.onChange((e) => e.kind === "timeline" && seen.push(e.roomId ?? ""));
+                stateHandler()({ getType: () => "m.room.power_levels", getRoomId: () => "!a" });
+                expect(seen).toEqual(["!a"]);
+            });
+
             it("presses onPinClick of the message's action bar view-model once it differs, then waits for the state, then disposes it", async () => {
                 readFirst();
                 bridge.timeline("!a");
