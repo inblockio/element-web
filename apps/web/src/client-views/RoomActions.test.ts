@@ -23,7 +23,17 @@ import {
 } from "./RoomActions";
 import { ClientViewActionError } from "./types";
 
-vi.mock("../Modal", () => ({ default: { createDialog: vi.fn() } }));
+vi.mock("../Modal", async () => {
+    // A fake ModalManager: an emitter with the three private places Element keeps its dialogs in.
+    const { EventEmitter } = await import("events");
+    const manager = Object.assign(new EventEmitter(), {
+        createDialog: vi.fn(),
+        modals: [] as object[],
+        priorityModal: null as object | null,
+        staticModal: null as object | null,
+    });
+    return { default: manager, ModalManagerEvent: { Opened: "opened", Closed: "closed" } };
+});
 
 /** A dialog the fake Modal opens: `finish` is the dialog's own result (`[]` = closed without an answer). */
 function openDialogOnStart(): { finish: (...result: unknown[]) => void; start: () => void } {
@@ -350,5 +360,32 @@ describe("E5 view source (Element's ViewSource dialog over the kit)", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+});
+
+describe("E5 view source released when Element drops the dialog (Modal.tsx wipes the stack on a priority close)", () => {
+    it("ends done when a priority dialog closes over it, and the next dialog action is not refused", async () => {
+        const fake = Modal as unknown as {
+            createDialog: unknown;
+            modals: object[];
+            emit: (e: string) => void;
+        };
+        // A dialog that never reports `finished`, as ViewSource under a priority dialog that closed.
+        fake.createDialog = vi.fn(() => {
+            fake.modals.unshift({});
+            return { close: vi.fn(), finished: new Promise<unknown[]>(() => {}) };
+        });
+        const start = () => void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+        const outcome = viewSourceViaDialog("!a:example.org", "$e", start);
+        await Promise.resolve();
+        // The priority dialog opened over it and was dismissed: Modal.tsx sets `modals = []` and emits `closed`.
+        fake.modals = [];
+        fake.emit("closed");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
+
+        const d = openDialogOnStart();
+        const next = viewSourceViaDialog("!a:example.org", "$f", d.start);
+        d.finish();
+        await expect(next).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$f" });
     });
 });
