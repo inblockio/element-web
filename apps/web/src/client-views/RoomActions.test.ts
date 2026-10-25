@@ -338,17 +338,31 @@ describe("A7 leave (RoomListItemViewModel.onLeaveRoom -> Element's confirm)", ()
  */
 function forwardClient(
     rooms: Record<string, MatrixEvent[]> = {},
+    forwardedType = "m.room.message",
 ): MatrixClient & { rawSend: ReturnType<typeof vi.fn> } {
+    // The forwarded event "$e" sits in the source room "!a:example.org" (the kit looks its type up there).
+    const sourceRoom = {
+        roomId: "!a:example.org",
+        getPendingEvents: () => [],
+        findEventById: (id: string) => (id === "$e" ? { getType: () => forwardedType } : undefined),
+    };
     let n = 0;
-    const rawSend = vi.fn((roomId: string, _type: string, _content: unknown, txnId?: string) => {
-        rooms[roomId].push(pendingEvent(EventStatus.NOT_SENT, txnId));
+    const rawSend = vi.fn((roomId: string, ...rest: unknown[]) => {
+        // Overloads: (roomId, type, content, txnId?) and (roomId, threadId | null, type, content, txnId?).
+        const threaded = rest[0] === null || (typeof rest[0] === "string" && rest[0].startsWith("$"));
+        rooms[roomId].push(pendingEvent(EventStatus.NOT_SENT, rest[threaded ? 3 : 2] as string | undefined));
         return Promise.reject(new Error("send failed"));
     });
     return {
         rawSend,
         sendEvent: rawSend,
         makeTxnId: () => `txn${++n}`,
-        getRoom: (roomId: string) => (rooms[roomId] ? { roomId, getPendingEvents: () => rooms[roomId] } : null),
+        getRoom: (roomId: string) =>
+            rooms[roomId]
+                ? { roomId, getPendingEvents: () => rooms[roomId] }
+                : roomId === sourceRoom.roomId
+                  ? sourceRoom
+                  : null,
         getRooms: () => Object.keys(rooms).map((roomId) => ({ roomId, getPendingEvents: () => rooms[roomId] })),
         cancelPendingEvent: vi.fn((ev: MatrixEvent) => {
             for (const list of Object.values(rooms)) {
@@ -395,10 +409,15 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
     });
 
     describe("cancels exactly the echo of the dialog's own failed send", () => {
+        // ForwardDialog builds one content object (`transformEvent`) and hands it to every Entry.
+        let copy: { body: string };
+        beforeEach(() => {
+            copy = { body: "x" };
+        });
         const dialogSend = async (c: MatrixClient, roomId: string): Promise<unknown> => {
             // What ForwardDialog's Entry.send calls: no thread id, no txnId.
             const send = c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>;
-            return send.call(c, roomId, "m.room.message", { body: "x" }).catch((e: Error) => e);
+            return send.call(c, roomId, "m.room.message", copy).catch((e: Error) => e);
         };
 
         it("a send failing while the dialog is open: its echo is cancelled, the rejection still reaches the dialog", async () => {
@@ -409,7 +428,7 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
             await tick();
             const result = await dialogSend(c, "!b:example.org");
             expect(result).toBeInstanceOf(Error);
-            expect(c.rawSend).toHaveBeenCalledWith("!b:example.org", "m.room.message", { body: "x" }, "txn1");
+            expect(c.rawSend).toHaveBeenCalledWith("!b:example.org", "m.room.message", copy, "txn1");
             expect(c.cancelPendingEvent).toHaveBeenCalledTimes(1);
             expect(rooms["!b:example.org"]).toEqual([]);
             d.finish();
@@ -430,7 +449,7 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
             const sent = (c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>)(
                 "!b:example.org",
                 "m.room.message",
-                {},
+                copy,
             ).catch(() => {});
             d.finish();
             await outcome;
@@ -471,7 +490,7 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
             await outcome;
         });
 
-        it("keeps the txnId and the thread id of a call that carries them, and leaves a still-sending echo alone", async () => {
+        it("keeps the txnId of a call that carries one, and leaves a still-sending echo alone", async () => {
             const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
             const c = forwardClient(rooms);
             c.rawSend.mockImplementation(() => Promise.resolve({ event_id: "$ok" }));
@@ -479,12 +498,85 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
             const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
             await tick();
             const send = c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>;
-            await send("!b:example.org", "m.room.message", {}, "mine");
-            await send("!b:example.org", "$thread", "m.room.message", {});
-            expect(c.rawSend).toHaveBeenNthCalledWith(1, "!b:example.org", "m.room.message", {}, "mine");
-            expect(c.rawSend).toHaveBeenNthCalledWith(2, "!b:example.org", "$thread", "m.room.message", {}, "txn1");
+            await send("!b:example.org", "m.room.message", copy, "mine");
+            expect(c.rawSend).toHaveBeenNthCalledWith(1, "!b:example.org", "m.room.message", copy, "mine");
             d.finish();
             await outcome;
+        });
+
+        describe("leaves every other send alone while the dialog is open", () => {
+            // Each rejects like a failed send and leaves a NOT_SENT echo; none may be cancelled (Element retries them).
+            const otherSend = async (args: unknown[], forwardedType?: string, claimFirst = false) => {
+                const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+                const c = forwardClient(rooms, forwardedType);
+                const d = openDialogOnStart();
+                const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+                await tick();
+                if (claimFirst) {
+                    await dialogSend(c, "!b:example.org");
+                    c.rawSend.mockClear();
+                    (c.cancelPendingEvent as ReturnType<typeof vi.fn>).mockClear();
+                }
+                const send = c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>;
+                await send.call(c, "!b:example.org", ...args).catch(() => {});
+                await tick();
+                const sent = [...c.rawSend.mock.calls[0]];
+                const kept = rooms["!b:example.org"].length;
+                d.finish();
+                await outcome;
+                return { c, sent, kept };
+            };
+
+            it("a sendMessage-style 5-arg send (threadId null) that rejects keeps its NOT_SENT echo", async () => {
+                const args = [null, "m.room.message", { body: "file" }, "upload-txn"];
+                const { c, sent, kept } = await otherSend(args);
+                expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+                expect(kept).toBe(1);
+                expect(sent).toEqual(["!b:example.org", ...args]);
+            });
+
+            it("the same without a caller txnId gets none injected", async () => {
+                const args = [null, "m.room.message", { body: "file" }];
+                const { c, sent, kept } = await otherSend(args);
+                expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+                expect(kept).toBe(1);
+                expect(sent).toEqual(["!b:example.org", ...args]);
+            });
+
+            it("a threaded send that rejects keeps its NOT_SENT echo", async () => {
+                const args = ["$thread", "m.room.message", { body: "in thread" }];
+                const { c, sent, kept } = await otherSend(args);
+                expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+                expect(kept).toBe(1);
+                expect(sent).toEqual(["!b:example.org", ...args]);
+            });
+
+            it("a 3-arg send of a different event type (a reaction) that rejects keeps its echo", async () => {
+                const args = ["m.reaction", { "m.relates_to": { key: "x" } }];
+                const { c, sent, kept } = await otherSend(args);
+                expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+                expect(kept).toBe(1);
+                expect(sent).toEqual(["!b:example.org", ...args]);
+            });
+
+            it("a 3-arg send of the same type but another content object, after the dialog's copy was seen, keeps its echo", async () => {
+                const args = ["m.room.message", { body: "typed meanwhile" }];
+                const { c, kept } = await otherSend(args, undefined, true);
+                expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+                expect(kept).toBe(1); // the dialog's own copy was cancelled before; this one stays
+            });
+
+            it("a forwarded beacon is sent as m.room.message: that copy is the dialog's", async () => {
+                const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+                const c = forwardClient(rooms, "org.matrix.msc3672.beacon");
+                const d = openDialogOnStart();
+                const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+                await tick();
+                await dialogSend(c, "!b:example.org");
+                expect(c.cancelPendingEvent).toHaveBeenCalledTimes(1);
+                d.finish();
+                await outcome;
+            });
         });
 
         it("puts sendEvent back when the dialog closes, and when it never opens", async () => {

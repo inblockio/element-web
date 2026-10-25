@@ -14,7 +14,7 @@
  * `ViewRoom` Element dispatches after a create, the membership that drops after a leave. No `ViewRoom` of our own.
  */
 
-import { EventStatus, type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { EventStatus, EventType, M_BEACON, type MatrixClient } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -220,7 +220,7 @@ export function forwardViaDialog(
 ): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
-        const unwrap = cancelOwnFailedSends(client);
+        const unwrap = cancelOwnFailedSends(client, sourceRoomId, eventId);
         try {
             const dialog = await openedDialog(start);
             await dialog.finished;
@@ -238,23 +238,37 @@ export function forwardViaDialog(
 
 /**
  * ForwardDialog never cancels the NOT_SENT echo of a copy that failed, and the kit hides NOT_SENT echoes, so it would block
- * that room for good. While the dialog is open `client.sendEvent` is wrapped pass-through: each call carries a txnId, and
- * when its promise rejects (also after the dialog closed) the pending event with that txnId is cancelled. Returns the
- * function that puts `sendEvent` back (the wrapper already handed out keeps working for its in-flight sends).
+ * that room for good. While the dialog is open `client.sendEvent` is wrapped, and the wrapper claims only the dialog's own
+ * copy sends: the 3-arg non-threaded form `sendEvent(roomId, type, content)` (what ForwardDialog's Entry calls) with no
+ * caller txnId, whose `type` is the forwarded event's type (as `transformEvent` sends it: a beacon goes out as
+ * `m.room.message`, looked up with `findEventById` in the source room) and whose `content` is the dialog's one content
+ * object (the first matching call's object; only that identity is claimed afterwards). A claimed call gets a txnId and,
+ * when its promise rejects (also after the dialog closed), the pending event with that txnId is cancelled. Every other
+ * call (a file upload's 5-arg send, a threaded send, a reaction, any other content) passes through untouched: same args,
+ * no txnId injected, no rejection handler, so Element keeps its NOT_SENT echo and its retry. Returns the function that
+ * puts `sendEvent` back (the wrapper already handed out keeps working for its in-flight sends).
  */
-function cancelOwnFailedSends(client: MatrixClient): () => void {
+function cancelOwnFailedSends(client: MatrixClient, sourceRoomId: string, eventId: string): () => void {
     const ownBefore = Object.prototype.hasOwnProperty.call(client, "sendEvent");
     // oxlint-disable-next-line typescript/unbound-method -- called with `client` as `this` below, put back as it was
     const original = client.sendEvent;
+    let claimedContent: unknown;
+    const forwardedType = (): string | undefined => {
+        const type = client.getRoom(sourceRoomId)?.findEventById(eventId)?.getType();
+        return type !== undefined && M_BEACON.matches(type) ? EventType.RoomMessage : type;
+    };
     const wrapper = function (this: unknown, ...args: unknown[]): Promise<unknown> {
-        // Overloads: (roomId, eventType, content, txnId?) and (roomId, threadId | null, eventType, content, txnId?).
-        const threaded = args[1] === null || (typeof args[1] === "string" && args[1].startsWith("$"));
-        const txnIndex = threaded ? 4 : 3;
-        const call = args.slice();
-        if (call[txnIndex] === undefined) call[txnIndex] = client.makeTxnId();
-        const txnId = call[txnIndex] as string;
-        const roomId = call[0] as string;
-        const promise = (original as (...a: unknown[]) => Promise<unknown>).apply(client, call);
+        // The dialog's copy: (roomId, type, content) with no txnId, no thread id.
+        const own =
+            args.length === 3 &&
+            typeof args[1] === "string" &&
+            args[1] === forwardedType() &&
+            (claimedContent === undefined || args[2] === claimedContent);
+        if (!own) return (original as (...a: unknown[]) => Promise<unknown>).apply(client, args);
+        claimedContent = args[2];
+        const txnId = client.makeTxnId();
+        const roomId = args[0] as string;
+        const promise = (original as (...a: unknown[]) => Promise<unknown>).apply(client, [...args, txnId]);
         promise.then(undefined, () => {
             const pending = [...(client.getRoom(roomId)?.getPendingEvents() ?? [])];
             const echo = pending.find((ev) => ev.getTxnId() === txnId);
