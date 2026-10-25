@@ -1047,6 +1047,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly userProviders = new Map<string, UserProvider>();
     /** The rooms the bridge lists (set by `syncRooms`): a room that left it gets no permalink creator again. */
     private listedRoomIds = new Set<string>();
+    /** Per room, how often it left the list: a mention lookup whose member load spans a leave keeps no provider. */
+    private readonly roomLeftCount = new Map<string, number>();
     /** Rooms read while not listed (messages handed over without a permalink): the kit reads them again once they are listed. */
     private readUnlisted = new Set<string>();
     /** Rooms whose member load for the via servers failed: the next read tries it again (the SDK allows a retry). */
@@ -1274,12 +1276,16 @@ export class ViewModelBridge implements ClientViewBridge {
         this.invitedRooms = new Set(rooms.filter((r) => r.membership === "invite").map((r) => r.id));
         // A room that left the list takes its permalink creator (a started one listens to the room state) with it.
         const listed = new Set(ids);
+        const previouslyListed = this.listedRoomIds;
         this.listedRoomIds = listed;
         for (const [roomId, creator] of this.permalinkCreators) {
             if (listed.has(roomId)) continue;
             creator.stop();
             this.permalinkCreators.delete(roomId);
             this.memberLoadFailed.delete(roomId);
+        }
+        for (const roomId of previouslyListed) {
+            if (!listed.has(roomId)) this.roomLeftCount.set(roomId, (this.roomLeftCount.get(roomId) ?? 0) + 1);
         }
         for (const [roomId, provider] of this.userProviders) {
             if (listed.has(roomId)) continue;
@@ -1929,17 +1935,30 @@ export class ViewModelBridge implements ClientViewBridge {
     ): Promise<{ userId: string; displayName: string; avatarUrl?: string }[]> {
         const room = this.client.getRoom(roomId);
         if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
-        await room.loadMembersIfNeeded();
+        // Element's composer offers nobody once the token holds whitespace or starts with a separator.
+        if (/\s/.test(query) || /^[/,.():;]/.test(query)) return [];
+        const leftBefore = this.roomLeftCount.get(roomId) ?? 0;
+        try {
+            await room.loadMembersIfNeeded();
+        } catch (e) {
+            throw toActionError(e);
+        }
+        if (this.disposed) throw new ClientViewActionError("failed", "bridge disposed");
+        const caret = { beginning: true, start: query.length, end: query.length };
         let provider = this.userProviders.get(roomId);
+        let transient = false;
         if (!provider) {
             provider = new UserProvider(room);
-            this.userProviders.set(roomId, provider);
+            // The room left the list during the load: its provider is not kept (nothing would destroy it).
+            if ((this.roomLeftCount.get(roomId) ?? 0) !== leftBefore) transient = true;
+            else this.userProviders.set(roomId, provider);
         }
-        const completions = await provider.getCompletions(
-            query,
-            { beginning: true, start: query.length, end: query.length },
-            true,
-        );
+        let completions;
+        try {
+            completions = await provider.getCompletions(query, caret, true);
+        } finally {
+            if (transient) provider.destroy();
+        }
         return completions.flatMap((c) =>
             c.completionId ? [{ userId: c.completionId, displayName: c.completion ?? c.completionId }] : [],
         );

@@ -12,6 +12,7 @@ import { ConnectionError, EventType, type MatrixClient, MatrixEvent, RoomState }
 import { DecryptionFailureCode } from "matrix-js-sdk/src/crypto-api";
 
 import { ViewModelBridge } from "./ViewModelBridge";
+import { ClientViewActionError } from "./types";
 import { selectClientView } from "./registry";
 import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
@@ -653,6 +654,54 @@ describe("ViewModelBridge", () => {
             await bridge.mentionCandidates("!a", "b");
             bridge.dispose();
             expect(h.userProviders[0].destroy).toHaveBeenCalledTimes(1);
+        });
+
+        it("F1: keeps no provider when the bridge is disposed while the members load", async () => {
+            let release: (v: boolean) => void = () => {};
+            h.room.loadMembersIfNeeded.mockImplementationOnce(() => new Promise<boolean>((r) => (release = r)));
+            const pending = bridge.mentionCandidates("!a", "b");
+            const settled = pending.then(
+                () => "resolved",
+                (e: unknown) => (e as { code?: string }).code,
+            );
+            bridge.dispose();
+            release(true);
+            expect(await settled).toBe("failed");
+            const kept = h.userProviders.filter((p) => p.destroy.mock.calls.length === 0);
+            expect(kept).toHaveLength(0);
+        });
+
+        it("F1: keeps no provider when the room left the list while the members load", async () => {
+            h.userProviderCompletions.mockResolvedValue([]);
+            let release: (v: boolean) => void = () => {};
+            h.room.loadMembersIfNeeded.mockImplementationOnce(() => new Promise<boolean>((r) => (release = r)));
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: ["!a"] }] });
+            const pending = bridge.mentionCandidates("!a", "b");
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            release(true);
+            await pending;
+            const kept = h.userProviders.filter((p) => p.destroy.mock.calls.length === 0);
+            expect(kept).toHaveLength(0);
+            bridge.dispose();
+            expect(h.userProviders.every((p) => p.destroy.mock.calls.length === 1)).toBe(true);
+        });
+
+        it.each(["mary a", "mary ", ".mary", "/mary", ",mary", "(mary", ")mary", ":mary", ";mary", " mary"])(
+            "F2: answers nobody for the query %j (whitespace or a leading separator)",
+            async (query) => {
+                h.userProviderCompletions.mockResolvedValue([
+                    { completion: "Mary", completionId: "@mary:example.org", type: "user" },
+                ]);
+                await expect(bridge.mentionCandidates("!a", query)).resolves.toEqual([]);
+                expect(h.userProviderCompletions).not.toHaveBeenCalled();
+            },
+        );
+
+        it("F4: a failing member load rejects with a coded ClientViewActionError", async () => {
+            h.room.loadMembersIfNeeded.mockRejectedValueOnce(new Error("offline"));
+            const error = await bridge.mentionCandidates("!a", "b").catch((e: unknown) => e);
+            expect(error).toBeInstanceOf(ClientViewActionError);
+            expect(error).toMatchObject({ code: "failed", message: "offline" });
         });
     });
 
