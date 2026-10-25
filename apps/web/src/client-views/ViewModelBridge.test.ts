@@ -1769,6 +1769,16 @@ describe("ViewModelBridge", () => {
             });
         });
 
+        it("reports through Element's dialog for others' messages (M7 E4), forbidden for an own one, names unknowns", async () => {
+            // $1 is bob's (the picker tests above), $mine is the user's own message
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
+            const own = fakeEvent("$mine", { getSender: () => "@me:example.org" });
+            read(fakeEvent("$1"), own);
+            await expect(bridge.openReport("!a", "$mine")).rejects.toMatchObject({ code: "forbidden" });
+            await expect(bridge.openReport("!nope", "$1")).rejects.toMatchObject({ code: "unknown_room" });
+            await expect(bridge.openReport("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
+        });
+
         it("does not count a redacted own reaction as selected and drops an emptied key", () => {
             const mine = reaction("@me:example.org", "👍", { isRedacted: () => true });
             h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(
