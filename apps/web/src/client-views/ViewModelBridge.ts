@@ -90,6 +90,7 @@ import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { setPinned } from "./PinAction";
+import { openReport } from "./ReportAction";
 import { createSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
@@ -1709,6 +1710,21 @@ export class ViewModelBridge implements ClientViewBridge {
             this.picker = { request, resolve };
             this.pickerListeners.forEach((cb) => cb(request));
         });
+    }
+
+    /**
+     * M7 E4: Element's report dialog over the kit, as the message context menu opens it (interim D31, see `ReportAction`).
+     * `forbidden` for an own event; `done` when the dialog closes (a report, a cancel or a dismissal alike).
+     */
+    public openReport(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        return openReport(this.client, row.event);
     }
 
     /** Closes an open picker (a new one replaces it, the bridge going away ends it): its call resolves `done`. */

@@ -447,6 +447,13 @@ export interface ClientViewBridge {
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
     openReactionPicker(roomId: string, eventId: string, anchor: ViewAnchor): Promise<ActionOutcome>;
+    /**
+     * M7 E4: Element's own report dialog over the kit (`Action.OpenReportEventDialog`, as the message context menu opens
+     * it). `done` when the dialog closes (a report sent, cancelled or dismissed alike: Element shows the result itself,
+     * the kit keeps no state), `forbidden` for an own message (Element offers Report only on others'), `unknown_room` /
+     * `unknown_event` for a message the bridge does not hold. Interim (D31): no report action on a shared view-model.
+     */
+    openReport(roomId: string, eventId: string): Promise<ActionOutcome>;
 }
 
 /** A kit that runs in a same-origin iframe loaded from `url`. */
