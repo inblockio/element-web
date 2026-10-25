@@ -206,6 +206,34 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
 }
 
 /**
+ * E3 forward: Element's forward dialog (`DialogOpener` on `OpenForwardDialog`, the way the message context menu opens it).
+ * The dialog sends each copy itself and shows its own sending / sent / failed state (D17), so the kit keeps nothing from
+ * this action: `done` when the dialog closes. The room name in a dialog row is a jump (`ViewRoom`, trigger
+ * `WebForwardShortcut`, then the dialog closes): `done` + that room's id, so the kit follows to it (H5); without a jump
+ * `done` + the source room and event. `start` is the dispatch of `OpenForwardDialog`.
+ */
+export function forwardViaDialog(sourceRoomId: string, eventId: string, start: () => void): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        const seen = recordPayloads();
+        try {
+            const dialog = await openedDialog(start);
+            await dialog.finished;
+            // Element dispatches the jump before it closes the dialog; one tick covers a queued dispatch.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const jump = seen.payloads.filter(isForwardJump).pop();
+            return jump
+                ? { status: "done", roomId: jump.room_id }
+                : { status: "done", roomId: sourceRoomId, eventId };
+        } finally {
+            seen.stop();
+        }
+    });
+}
+
+const isForwardJump = (p: ActionPayload): p is ViewRoomPayload =>
+    isViewRoom(p) && p.metricsTrigger === "WebForwardShortcut" && !!p.room_id;
+
+/**
  * A7 leave: Element's leave confirm (`MatrixChat.leaveRoom`). Confirmed, it leaves and dispatches `AfterLeaveRoom` (also
  * when the leave failed, after an error dialog), so the membership decides: `done` once it went from what it was (join,
  * invite, knock) to leave or ban, or the room is gone; `failed` if it still is what it was a moment after, `cancelled` when the confirm says no.

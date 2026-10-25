@@ -41,6 +41,7 @@ import { TimelineRenderingType } from "../contexts/RoomContext";
 import SettingsStore from "../settings/SettingsStore";
 import { OwnProfileStore } from "../stores/OwnProfileStore";
 import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
 import { avatarUrlForRoom } from "../Avatar";
 import { resolveRoomMemberProfile, roomMemberToMemberInfo } from "../hooks/room/useRoomMemberProfile";
 import { RoomListViewModel } from "../viewmodels/room-list/RoomListViewModel";
@@ -68,6 +69,8 @@ import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { canEditContent, isContentActionable } from "../utils/EventUtils";
+import { getForwardableEvent } from "../events/forward/getForwardableEvent";
+import { type OpenForwardDialogPayload } from "../dispatcher/payloads/OpenForwardDialogPayload";
 import PinningUtils from "../utils/PinningUtils";
 import { RoomPermalinkCreator } from "../utils/permalinks/Permalinks";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
@@ -83,7 +86,7 @@ import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
-import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import { createRoomViaDialog, forwardViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
@@ -1529,15 +1532,18 @@ export class ViewModelBridge implements ClientViewBridge {
 
     /** Element's permalink of an event (`RoomPermalinkCreator.forEvent`, `via` included), undefined for a room the client does not know. */
     private permalinkOf(roomId: string, eventId: string): string | undefined {
+        // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
+        if (!this.permalinkCreators.has(roomId) && !this.listedRoomIds.has(roomId)) this.readUnlisted.add(roomId);
+        return this.permalinkCreatorOf(roomId)?.forEvent(eventId);
+    }
+
+    /** The room's permalink creator (one per listed room, started once, stopped with the bridge), null when there is none. */
+    private permalinkCreatorOf(roomId: string): RoomPermalinkCreator | null {
         let creator = this.permalinkCreators.get(roomId);
         if (!creator) {
-            // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
-            if (!this.listedRoomIds.has(roomId)) {
-                this.readUnlisted.add(roomId);
-                return undefined;
-            }
+            if (!this.listedRoomIds.has(roomId)) return null;
             const room = this.client.getRoom(roomId);
-            if (!room) return undefined;
+            if (!room) return null;
             creator = new RoomPermalinkCreator(room);
             creator.start();
             this.permalinkCreators.set(roomId, creator);
@@ -1546,7 +1552,7 @@ export class ViewModelBridge implements ClientViewBridge {
             const room = this.client.getRoom(roomId);
             if (room) this.loadMembersForVia(room);
         }
-        return creator.forEvent(eventId);
+        return creator;
     }
 
     /**
@@ -1709,6 +1715,35 @@ export class ViewModelBridge implements ClientViewBridge {
             this.picker = { request, resolve };
             this.pickerListeners.forEach((cb) => cb(request));
         });
+    }
+
+    /**
+     * E3: Element's forward dialog over the kit, opened the way the message context menu opens it (`OpenForwardDialog`
+     * with `getForwardableEvent` and the room's permalink creator). `unsupported` where Element offers no Forward (content
+     * not actionable, or an event type it does not forward, e.g. a poll). `done` when the dialog closes; the copy is sent
+     * and its result shown by the dialog itself. A jump through the dialog's room name answers `done` + that room's id.
+     * Interim (D31): there is no forward action on a shared message view-model.
+     */
+    public openForward(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const forwardable = row.actionable() ? getForwardableEvent(row.event, this.client) : null;
+        if (!forwardable) {
+            return Promise.reject(new ClientViewActionError("unsupported", "this message cannot be forwarded"));
+        }
+        const permalinkCreator = this.permalinkCreatorOf(roomId);
+        return forwardViaDialog(roomId, eventId, () =>
+            defaultDispatcher.dispatch<OpenForwardDialogPayload>({
+                action: Action.OpenForwardDialog,
+                event: forwardable,
+                permalinkCreator,
+            }),
+        );
     }
 
     /** Closes an open picker (a new one replaces it, the bridge going away ends it): its call resolves `done`. */
