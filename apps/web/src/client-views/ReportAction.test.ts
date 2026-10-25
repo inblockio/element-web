@@ -5,6 +5,7 @@
  * Please see LICENSE files in the repository root for full details.
  */
 
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { type MatrixClient, type MatrixEvent } from "matrix-js-sdk/src/matrix";
 
 import defaultDispatcher from "../dispatcher/dispatcher";
