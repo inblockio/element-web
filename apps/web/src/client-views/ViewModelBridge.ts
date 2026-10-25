@@ -1862,7 +1862,11 @@ export class ViewModelBridge implements ClientViewBridge {
         return { added: ids.length, ids, ...state() };
     }
 
-    public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {
+    public sendText(
+        roomId: string,
+        text: string,
+        opts?: { txnId?: string; replyTo?: string; markdown?: boolean; mentions?: string[] },
+    ): Promise<ActionOutcome> {
         this.used = true;
         // A3: the replied event is started through its action bar view-model's `onReplyClick` (the reply state Element's
         // composer reads); the content send is the interim path with the reply relation.
@@ -1872,11 +1876,16 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /** A11: the replacement send is interim; the edit state is entered through the row's `onEditClick`. */
-    public editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome> {
+    public editText(
+        roomId: string,
+        eventId: string,
+        text: string,
+        opts?: { markdown?: boolean; mentions?: string[] },
+    ): Promise<ActionOutcome> {
         this.used = true;
-        return editText(this.client, roomId, eventId, text, {
-            onEnter: (ev) => this.actionBar(ev, (vm) => vm.onEditClick(null), true),
-        });
+        const hooks = { onEnter: (ev: MatrixEvent) => this.actionBar(ev, (vm) => vm.onEditClick(null), true) };
+        // M7 E1: the options go along only when the caller gave some (the plain call is unchanged).
+        return opts ? editText(this.client, roomId, eventId, text, hooks, opts) : editText(this.client, roomId, eventId, text, hooks);
     }
 
     /**
