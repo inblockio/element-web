@@ -18,6 +18,7 @@ import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineV
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
 import defaultDispatcher from "../dispatcher/dispatcher";
+import DMRoomMap from "../utils/DMRoomMap";
 import { Action } from "../dispatcher/actions";
 import Modal from "../Modal";
 import ForwardDialog from "../components/views/dialogs/ForwardDialog";
@@ -621,8 +622,8 @@ describe("ViewModelBridge", () => {
         h.statusBar.set({ state: null });
     });
 
-    it("is bridge version 2 and hands the send to the interim action", async () => {
-        expect(bridge.version).toBe(2);
+    it("is bridge version 3 and hands the send to the interim action", async () => {
+        expect(bridge.version).toBe(3);
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
         expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));
@@ -2125,6 +2126,150 @@ describe("ViewModelBridge", () => {
             const first = bridge.openThread("!a", "$1");
             const second = bridge.openThread("!a", "$2");
             bridge.closeThread();
+            await Promise.all([first, second]);
+            expect(spy.mock.calls.filter(([p]) => (p as { action: string }).action === Action.ViewRoom)).toEqual([]);
+            spy.mockRestore();
+        });
+    });
+    describe("openPanel (M9 P, interim D39)", () => {
+        type Req = {
+            key: string;
+            card: string;
+            dmMember?: unknown;
+            finish(): void;
+            jump(id: string): void;
+            openRoom(id: string): void;
+            openThreadOn(root: unknown): void;
+        };
+        const watch = () => {
+            const shown: Array<Req | null> = [];
+            bridge.onCardPanel((r) => shown.push(r as never));
+            return shown;
+        };
+
+        it("hands the host a request for the card, done with the room when it finishes (once)", async () => {
+            const shown = watch();
+            const call = bridge.openPanel("!a", "members");
+            const request = shown[0]!;
+            expect(request.card).toBe("members");
+            expect(request.key).toContain("!a/members");
+            request.finish();
+            request.finish();
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a" });
+            expect(shown).toEqual([request, null]);
+        });
+
+        it("rejects an unknown room, search (item S), a room not joined and a DM whose other member is unknown", async () => {
+            await expect(bridge.openPanel("!nope", "info")).rejects.toMatchObject({ code: "unknown_room" });
+            await expect(bridge.openPanel("!a", "search")).rejects.toMatchObject({ code: "unsupported" });
+            const membership = vi.spyOn(h.room, "getMyMembership").mockReturnValue("invite");
+            await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
+            membership.mockRestore();
+            const dm = vi.spyOn(DMRoomMap, "shared").mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const member = vi.spyOn(h.room, "getMember").mockReturnValue(null as never);
+            await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
+            member.mockRestore();
+            dm.mockRestore();
+        });
+
+        it("a DM's info card carries the other member (user info), a plain room's does not", async () => {
+            const shown = watch();
+            const dm = vi.spyOn(DMRoomMap, "shared").mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const call = bridge.openPanel("!a", "info");
+            expect(shown[0]!.dmMember).toMatchObject({ userId: "@bob:example.org" });
+            bridge.closePanel();
+            await call;
+            dm.mockReturnValue({ getUserIdForRoomId: () => undefined } as never);
+            const plain = bridge.openPanel("!a", "info");
+            expect(shown.at(-1)!.dmMember).toBeUndefined();
+            bridge.closePanel();
+            await plain;
+            dm.mockRestore();
+        });
+
+        it("a card replaces an open thread panel and the other way round; closePanel, closeThread and dispose close either", async () => {
+            const row = fakeEvent("$1");
+            h.timeline.snapshot = { items: [{ kind: "event", event: row, continuation: false }], atLiveEnd: true };
+            bridge.timeline("!a");
+            const threads: unknown[] = [];
+            bridge.onThreadPanel((r) => threads.push(r));
+            const cards = watch();
+            const thread = bridge.openThread("!a", "$1");
+            const card = bridge.openPanel("!a", "pinned");
+            await expect(thread).resolves.toMatchObject({ status: "done", eventId: "$1" });
+            expect(threads.at(-1)).toBeNull();
+            const again = bridge.openThread("!a", "$1");
+            await expect(card).resolves.toEqual({ status: "done", roomId: "!a" });
+            expect(cards.at(-1)).toBeNull();
+            bridge.closePanel();
+            await again;
+            const second = bridge.openPanel("!a", "files");
+            bridge.closeThread();
+            await expect(second).resolves.toMatchObject({ status: "done" });
+            const third = bridge.openPanel("!a", "info");
+            bridge.dispose();
+            await expect(third).resolves.toMatchObject({ status: "done" });
+        });
+
+        it("jump and openRoom reach the kit hooks; openRoom closes the panel; a local chat is registered first (F4)", async () => {
+            const shown = watch();
+            const jumps: unknown[] = [];
+            const opened: unknown[] = [];
+            bridge.onJump((j) => jumps.push(j));
+            bridge.onRoomOpen((o) => opened.push(o));
+            const sync = vi.spyOn(bridge as unknown as { syncRooms(): void }, "syncRooms");
+            const call = bridge.openPanel("!a", "pinned");
+            const request = shown[0]!;
+            request.jump("$e1");
+            expect(jumps).toEqual([{ roomId: "!a", eventId: "$e1" }]);
+            request.openRoom("!b:example.org");
+            expect(sync).not.toHaveBeenCalled();
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a" });
+            expect(opened).toEqual([{ roomId: "!b:example.org" }]);
+            request.jump("$late");
+            request.openRoom("!c");
+            expect(jumps).toHaveLength(1);
+            expect(opened).toHaveLength(1);
+
+            const dmCall = bridge.openPanel("!a", "info");
+            shown.at(-1)!.openRoom("local+123");
+            expect(sync).toHaveBeenCalledTimes(1);
+            await dmCall;
+            expect(opened.at(-1)).toEqual({ roomId: "local+123" });
+        });
+
+        it("openThreadOn replaces the card by the thread panel on that root (F3)", async () => {
+            const root = fakeEvent("$root");
+            const threads: Array<{ mxEvent: unknown } | null> = [];
+            bridge.onThreadPanel((r) => threads.push(r as never));
+            const shown = watch();
+            const call = bridge.openPanel("!a", "pinned");
+            shown[0]!.openThreadOn(root);
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a" });
+            expect(threads[0]!.mxEvent).toBe(root);
+            expect(shown.at(-1)).toBeNull();
+            bridge.closePanel();
+        });
+
+        it("finishes when the user leaves the room", async () => {
+            const client = (bridge as unknown as { client: { on: Mock; off: Mock } }).client;
+            const call = bridge.openPanel("!a", "members");
+            const onMembership = client.on.mock.calls.filter((c) => c[0] === "Room.myMembership").at(-1)![1] as (
+                r: { roomId: string },
+                m: string,
+            ) => void;
+            onMembership({ roomId: "!a" }, "leave");
+            await expect(call).resolves.toMatchObject({ status: "done" });
+            expect(client.off).toHaveBeenCalledWith("Room.myMembership", onMembership);
+        });
+
+        it("open, replace, jump, close and room switch dispatch no Action.ViewRoom of the host's own", async () => {
+            const spy = vi.spyOn(defaultDispatcher, "dispatch");
+            const shown = watch();
+            const first = bridge.openPanel("!a", "info");
+            const second = bridge.openPanel("!a", "files");
+            shown.at(-1)!.jump("$x");
+            shown.at(-1)!.openRoom("local+9");
             await Promise.all([first, second]);
             expect(spy.mock.calls.filter(([p]) => (p as { action: string }).action === Action.ViewRoom)).toEqual([]);
             spy.mockRestore();

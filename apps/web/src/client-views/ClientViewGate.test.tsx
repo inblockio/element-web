@@ -67,6 +67,9 @@ vi.mock("./ViewModelBridge", () => ({
         public onThreadPanel =
             (_cb: (request: unknown) => void): (() => void) =>
             () => {};
+        public onCardPanel =
+            (_cb: (request: unknown) => void): (() => void) =>
+            () => {};
     },
 }));
 // The picker stack (menu, emoji grid) is Element's own; the stubs pin what the host hands it.

@@ -301,7 +301,7 @@ export interface LoadOlderResult {
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 2;
+    readonly version: 3;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -502,8 +502,23 @@ export interface ClientViewBridge {
      * change. Interim (D37): awaits a thread view-model (`ThreadViewModel` / shared `ThreadViewActions`).
      */
     openThread(roomId: string, eventId: string): Promise<ActionOutcome>;
-    /** M8 T1: closes an open thread panel (its `openThread` resolves `done`); a no-op when none is open. */
+    /** M8 T1: closes an open thread panel (its `openThread` resolves `done`); a no-op when none is open (alias of `closePanel`). */
     closeThread(): void;
+    /**
+     * M9 (version 3, interim D39): one of Element's own right-panel cards in the host panel slot over the kit: `info` (the
+     * room's info card; in a DM, Element's user info of the other member), `members`, `files` or `pinned`. Replaces an open
+     * panel or thread panel. `done` (`roomId`) when it closes: its close button, Escape, a later open, `closePanel`, the room
+     * left, another room opened from it, the bridge disposed. `unknown_room` as the other actions; `unsupported` for `search`
+     * (not built yet), a room the user has not joined, and a DM whose other member is unknown. The card's own writes
+     * (favourite, leave, invite, unpin ...) are Element's. Awaits a right-panel view-model.
+     */
+    openPanel(roomId: string, card: "info" | "members" | "files" | "pinned" | "search"): Promise<ActionOutcome>;
+    /** M9: closes whatever the host panel slot shows (a card panel or a thread panel); a no-op when it is empty. */
+    closePanel(): void;
+    /** M9: Element asked, from a card panel, to show an event of the panel's room (a Pinned "View in timeline", a file's jump). */
+    onJump(cb: (jump: { roomId: string; eventId: string }) => void): () => void;
+    /** M9: Element asked, from a card panel, to show another room (a "Message" from user info); the panel is closed. */
+    onRoomOpen(cb: (open: { roomId: string }) => void): () => void;
     /**
      * M7 E4: Element's own report dialog over the kit (`Action.OpenReportEventDialog`, as the message context menu opens
      * it). `done` when the dialog closes (a report sent, cancelled or dismissed alike: Element shows the result itself,

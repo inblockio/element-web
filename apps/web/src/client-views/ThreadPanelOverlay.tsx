@@ -6,7 +6,7 @@
  */
 
 import { EventType, KnownMembership, RoomEvent, RoomStateEvent } from "matrix-js-sdk/src/matrix";
-import { type MatrixClient, type MatrixEvent, type RoomState } from "matrix-js-sdk/src/matrix";
+import { type MatrixClient, type MatrixEvent, type Room, type RoomState } from "matrix-js-sdk/src/matrix";
 import React, { type JSX, useContext, useEffect, useMemo, useState } from "react";
 
 import ThreadView from "../components/structures/ThreadView";
@@ -29,8 +29,12 @@ import { type ThreadPanelRequest, type ViewModelBridge } from "./ViewModelBridge
  *    (RoomView and LegacyCallHandler read it outside it).
  *  - `rightPanelStore.roomPhaseHistory` -> [] and `popCard` -> no-op: BaseCard offers no back button (it pops the stock
  *    right-panel history, a store the kit never set) and nothing can write the store from the panel.
+ * `rightPanelOverrides` (M9, the card panel) answers the named store members first, from the panel's own in-panel stack.
  */
-export function panelSdkContext(real: SDKContextClass): SDKContextClass {
+export function panelSdkContext(
+    real: SDKContextClass,
+    rightPanelOverrides: Record<string | symbol, unknown> = {},
+): SDKContextClass {
     const widgetLayoutStore = new Proxy(real.widgetLayoutStore, {
         get(target, prop) {
             if (prop === "hasMaximisedWidget") return () => true;
@@ -39,6 +43,7 @@ export function panelSdkContext(real: SDKContextClass): SDKContextClass {
     });
     const rightPanelStore = new Proxy(real.rightPanelStore, {
         get(target, prop) {
+            if (prop in rightPanelOverrides) return rightPanelOverrides[prop];
             if (prop === "roomPhaseHistory") return [];
             if (prop === "popCard") return () => {};
             return Reflect.get(target, prop, target);
@@ -53,23 +58,17 @@ export function panelSdkContext(real: SDKContextClass): SDKContextClass {
     });
 }
 
-const focusKit = (): void => {
-    document.querySelector<HTMLElement>("iframe[data-client-view]")?.focus();
-};
-
 /**
- * Element's own thread panel over a kit (D37): ThreadView, mounted in the host's tree at the right edge, with the room
- * context RoomView would give it. Reads every value from the SDK room or Element's settings at open (no own data layer).
+ * The room context a host panel's subtree reads (frozen note F3): the inherited one with the room's own values, from the SDK
+ * room and Element's settings at open (no own data layer). Room state the context reads is recomputed on the events
+ * RoomView listens to, so the composer, the tombstone notice and the redact/react rights follow the room while a panel is
+ * open. `encrypted` is null until answered (F1): a thread view is not rendered before, so no URL preview is fetched for a
+ * room that may be encrypted. No crypto (or a failed answer) falls back to the room's m.room.encryption state.
  */
-export function ThreadPanelOverlay({ request }: { request: ThreadPanelRequest }): JSX.Element {
+export function usePanelRoomContext(room: Room): { context: RoomContextType; encrypted: boolean | null } {
     const inherited = useContext(RoomContext);
     const sdk = useContext(SDKContext);
-    const { room, mxEvent, finish } = request;
     const client = sdk.client!;
-    const panelSdk = useMemo(() => panelSdkContext(sdk), [sdk]);
-
-    // Room state the context reads (frozen note F3): recomputed on the same events RoomView listens to, so the composer,
-    // the tombstone notice and the redact/react rights follow the room while the panel is open.
     const [stateTick, setStateTick] = useState(0);
     useEffect(() => {
         const onState = (_ev: MatrixEvent, state: RoomState): void => {
@@ -135,6 +134,23 @@ export function ThreadPanelOverlay({ request }: { request: ThreadPanelRequest })
         // stateTick: the room object is the same across state events, so it is a dependency of its own.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [inherited, client, room, sdk, encrypted, stateTick]);
+    return { context, encrypted };
+}
+
+const focusKit = (): void => {
+    document.querySelector<HTMLElement>("iframe[data-client-view]")?.focus();
+};
+
+/**
+ * Element's own thread panel over a kit (D37): ThreadView, mounted in the host's tree at the right edge, with the room
+ * context RoomView would give it. Reads every value from the SDK room or Element's settings at open (no own data layer).
+ */
+export function ThreadPanelOverlay({ request }: { request: ThreadPanelRequest }): JSX.Element {
+    const sdk = useContext(SDKContext);
+    const { room, mxEvent, finish } = request;
+    const panelSdk = useMemo(() => panelSdkContext(sdk), [sdk]);
+
+    const { context, encrypted } = usePanelRoomContext(room);
 
     // Navigation out of the panel closes it: "View in room", a permalink (the timestamp, the lightbox's), /join, /msg,
     // "View related event" and the composer's "room upgraded" link all dispatch `ViewRoom`. The action is neither

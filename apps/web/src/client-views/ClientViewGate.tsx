@@ -28,7 +28,7 @@ import AudioFeedArrayForLegacyCall from "../components/views/voip/AudioFeedArray
 import { getActiveClientView, isHandedOver, selectClientView, setHandedOver, watchHandOver } from "./registry";
 import { ViewModelBridge } from "./ViewModelBridge";
 import { HostReactionPicker } from "./ReactionPickerOverlay";
-import { HostThreadPanel } from "./ThreadPanelOverlay";
+import { HostPanelSlot } from "./CardPanelOverlay";
 import { BRIDGE_GLOBAL, type ClientViewDescriptor, STOCK_VIEW } from "./types";
 
 type BridgeHolder = { [BRIDGE_GLOBAL]?: ViewModelBridge };
@@ -224,7 +224,7 @@ function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientVi
             />
             <HostOverlays client={client} />
             <HostReactionPicker client={client} bridge={bridge} />
-            <HostThreadPanel client={client} bridge={bridge} />
+            <HostPanelSlot client={client} bridge={bridge} />
             {failed && <BootFailed view={view} />}
         </>
     );

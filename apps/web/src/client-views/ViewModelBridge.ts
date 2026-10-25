@@ -24,6 +24,7 @@ import {
     THREAD_RELATION_TYPE,
     ThreadEvent,
     EventStatus,
+    type RoomMember,
 } from "matrix-js-sdk/src/matrix";
 import { uniq, uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
@@ -107,6 +108,7 @@ import { setPinned } from "./PinAction";
 import { openReport } from "./ReportAction";
 import { createSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
+import DMRoomMap from "../utils/DMRoomMap";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
 import RoomListStoreV3, { RoomListStoreV3Event } from "../stores/room-list-v3/RoomListStoreV3";
@@ -181,6 +183,31 @@ export interface ThreadPanelRequest {
     mxEvent: MatrixEvent;
     permalinkCreator?: RoomPermalinkCreator;
     finish: () => void;
+}
+
+/** The cards the host panel slot can show (M9, D39); `search` is item S's. */
+export type PanelCardName = "info" | "members" | "files" | "pinned";
+
+/**
+ * One of Element's right-panel cards over the kit (M9 P): what the host renders (CardPanelOverlay) until `finish`.
+ * The overlay never dispatches `ViewRoom` and never writes the stock right-panel store: what a card asks of the kit
+ * goes through `jump`, `openRoom` and `openThreadOn`.
+ */
+export interface CardPanelRequest {
+    /** Unique per request (room, card plus a counter): the host keys the panel by it so a replacement remounts. */
+    key: string;
+    room: Room;
+    card: PanelCardName;
+    /** `info` in a DM: the other member, whose user info is the card (as the DM header of the kit shows the user). */
+    dmMember?: RoomMember;
+    permalinkCreator: RoomPermalinkCreator;
+    finish: () => void;
+    /** Element asked to show an event of the panel's room: the kit scrolls to it (the panel stays open). */
+    jump: (eventId: string) => void;
+    /** Element asked to show another room (F4): the kit opens it, the panel closes. */
+    openRoom: (roomId: string) => void;
+    /** Element asked for a thread (F3): the panel is replaced by the thread panel on this root. */
+    openThreadOn: (root: MatrixEvent) => void;
 }
 
 /** An event, or the replacement it shows, that is still waiting for its key or failed to decrypt. */
@@ -1078,7 +1105,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 2;
+    public readonly version = 3;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -1137,6 +1164,12 @@ export class ViewModelBridge implements ClientViewBridge {
     private threadCount = 0;
     private thread?: { request: ThreadPanelRequest };
     private readonly threadListeners = new Set<(request: ThreadPanelRequest | null) => void>();
+    /** The card panel in the host's slot (M9): at most one of `thread` and `panel` is set. */
+    private panelCount = 0;
+    private panel?: { request: CardPanelRequest };
+    private readonly panelListeners = new Set<(request: CardPanelRequest | null) => void>();
+    private readonly jumpListeners = new Set<(jump: { roomId: string; eventId: string }) => void>();
+    private readonly roomOpenListeners = new Set<(open: { roomId: string }) => void>();
     private isUsed = false;
     /** Called when a kit document first reads the bridge, from inside its scripts (before its DOMContentLoaded). */
     public onUse?: () => void;
@@ -1864,18 +1897,31 @@ export class ViewModelBridge implements ClientViewBridge {
         const rootId = event.isRelation(THREAD_RELATION_TYPE.name) ? event.threadRootId : eventId;
         const root = rootId === eventId ? event : (room.findEventById(rootId!) ?? event.getThread()?.rootEvent);
         if (!root) return Promise.reject(new ClientViewActionError("unknown_event", `unknown thread root ${rootId}`));
-        this.closeThread();
+        return this.showThread(room, root);
+    }
+
+    /** Ends `onGone` when the room is left or deleted: the panels' shared close trigger. Returns the stop function. */
+    private watchRoomGone(roomId: string, onGone: () => void): () => void {
+        const onMembership = (r: Room, membership: string): void => {
+            if (r.roomId === roomId && membership !== KnownMembership.Join) onGone();
+        };
+        const onDeleted = (id: string): void => {
+            if (id === roomId) onGone();
+        };
+        this.client.on(RoomEvent.MyMembership, onMembership);
+        this.client.on(ClientEvent.DeleteRoom, onDeleted);
+        return () => {
+            this.client.off(RoomEvent.MyMembership, onMembership);
+            this.client.off(ClientEvent.DeleteRoom, onDeleted);
+        };
+    }
+
+    /** The thread panel on `root` in the slot (replacing whatever it shows); `done` when it closes. */
+    private showThread(room: Room, root: MatrixEvent): Promise<ActionOutcome> {
+        const roomId = room.roomId;
+        this.closePanel();
         return new Promise<ActionOutcome>((resolve) => {
-            const stop = (): void => {
-                this.client.off(RoomEvent.MyMembership, onMembership);
-                this.client.off(ClientEvent.DeleteRoom, onDeleted);
-            };
-            const onMembership = (r: Room, membership: string): void => {
-                if (r.roomId === roomId && membership !== KnownMembership.Join) request.finish();
-            };
-            const onDeleted = (id: string): void => {
-                if (id === roomId) request.finish();
-            };
+            const stop = this.watchRoomGone(roomId, () => request.finish());
             const request: ThreadPanelRequest = {
                 key: `${root.getId()}#${++this.threadCount}`,
                 room,
@@ -1889,16 +1935,112 @@ export class ViewModelBridge implements ClientViewBridge {
                     resolve({ status: "done", roomId, eventId: root.getId()! });
                 },
             };
-            this.client.on(RoomEvent.MyMembership, onMembership);
-            this.client.on(ClientEvent.DeleteRoom, onDeleted);
             this.thread = { request };
             this.threadListeners.forEach((cb) => cb(request));
         });
     }
 
-    /** M8 T1: closes the open thread panel (its `openThread` resolves `done`); a no-op when none is open. */
+    /** M8 T1: closes the open thread panel (its `openThread` resolves `done`); a no-op when none is open. Alias of `closePanel`. */
     public closeThread(): void {
+        this.closePanel();
+    }
+
+    /** M9: closes whatever the host panel slot shows (thread or card panel; each open call resolves `done`). */
+    public closePanel(): void {
         this.thread?.request.finish();
+        this.panel?.request.finish();
+    }
+
+    /**
+     * M9 (interim D39): one of Element's right-panel cards in the host panel slot over the kit. See `ClientViewBridge`.
+     * The card panel keeps its own stack (never `RightPanelStore`); what Element asks of the kit (a jump to an event, another
+     * room) goes through `onJump` / `onRoomOpen`, a thread through the thread panel.
+     */
+    public openPanel(roomId: string, card: PanelCardName | "search"): Promise<ActionOutcome> {
+        this.used = true;
+        const room = this.client.getRoom(roomId);
+        if (!room) return Promise.reject(new ClientViewActionError("unknown_room", `unknown room ${roomId}`));
+        if (card !== "info" && card !== "members" && card !== "files" && card !== "pinned") {
+            return Promise.reject(new ClientViewActionError("unsupported", `no ${card} card yet`));
+        }
+        if (room.getMyMembership() !== KnownMembership.Join) {
+            return Promise.reject(new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"));
+        }
+        let dmMember: RoomMember | undefined;
+        if (card === "info") {
+            let otherId: string | null | undefined;
+            try {
+                otherId = DMRoomMap.shared().getUserIdForRoomId(roomId);
+            } catch {
+                otherId = undefined; // no DM map (not started): a plain room
+            }
+            if (otherId) {
+                dmMember = room.getMember(otherId) ?? undefined;
+                if (!dmMember) {
+                    return Promise.reject(new ClientViewActionError("unsupported", "the other member of this chat is unknown"));
+                }
+            }
+        }
+        this.closePanel();
+        return new Promise<ActionOutcome>((resolve) => {
+            const stop = this.watchRoomGone(roomId, () => request.finish());
+            const current = (): boolean => this.panel?.request === request;
+            const request: CardPanelRequest = {
+                key: `${roomId}/${card}#${++this.panelCount}`,
+                room,
+                card,
+                dmMember,
+                // A room the kit does not list has no creator of the bridge's: a plain one stands in (not started).
+                permalinkCreator: this.permalinkCreatorOf(roomId) ?? new RoomPermalinkCreator(room),
+                finish: () => {
+                    if (!current()) return;
+                    stop();
+                    this.panel = undefined;
+                    this.panelListeners.forEach((cb) => cb(null));
+                    resolve({ status: "done", roomId });
+                },
+                jump: (eventId) => {
+                    if (!current()) return;
+                    this.jumpListeners.forEach((cb) => cb({ roomId, eventId }));
+                },
+                openRoom: (id) => {
+                    if (!current()) return;
+                    // F4: the kit opens only rooms it lists; a chat Element just started is a local room until its first send.
+                    if (isLocalRoom(id)) {
+                        this.localChats.add(id);
+                        this.syncRooms();
+                    }
+                    request.finish();
+                    this.roomOpenListeners.forEach((cb) => cb({ roomId: id }));
+                },
+                openThreadOn: (root) => {
+                    if (!current()) return;
+                    // Replaces the slot: this panel's `finish` runs inside `showThread` (its `openPanel` resolves `done`).
+                    void this.showThread(room, root);
+                },
+            };
+            this.panel = { request };
+            this.panelListeners.forEach((cb) => cb(request));
+        });
+    }
+
+    /** The host's hook: called with the card panel to show, and with null when it is gone. Returns the unsubscribe. */
+    public onCardPanel(cb: (request: CardPanelRequest | null) => void): () => void {
+        this.panelListeners.add(cb);
+        if (this.panel) cb(this.panel.request);
+        return () => this.panelListeners.delete(cb);
+    }
+
+    /** M9: Element asked, from a card panel, to show an event of the panel's room. Returns the unsubscribe. */
+    public onJump(cb: (jump: { roomId: string; eventId: string }) => void): () => void {
+        this.jumpListeners.add(cb);
+        return () => this.jumpListeners.delete(cb);
+    }
+
+    /** M9: Element asked, from a card panel, to show another room (the panel is already closed). Returns the unsubscribe. */
+    public onRoomOpen(cb: (open: { roomId: string }) => void): () => void {
+        this.roomOpenListeners.add(cb);
+        return () => this.roomOpenListeners.delete(cb);
     }
 
     /** The host's hook: called with the thread panel to show, and with null when it is gone. Returns the unsubscribe. */
@@ -2375,7 +2517,7 @@ export class ViewModelBridge implements ClientViewBridge {
     public dispose(): void {
         this.disposed = true;
         this.closeReactionPicker();
-        this.closeThread();
+        this.closePanel();
         this.filePicker?.cancel();
         [...this.reactionWaits].forEach((cancel) => cancel());
         this.watchedItems.forEach((w) => w.off());
