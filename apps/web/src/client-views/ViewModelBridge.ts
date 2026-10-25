@@ -92,6 +92,7 @@ import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { setPinned } from "./PinAction";
+import { openReport } from "./ReportAction";
 import { createSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
@@ -1731,6 +1732,21 @@ export class ViewModelBridge implements ClientViewBridge {
         });
     }
 
+    /**
+     * M7 E4: Element's report dialog over the kit, as the message context menu opens it (interim D31, see `ReportAction`).
+     * `forbidden` for an own event; `done` when the dialog closes (a report, a cancel or a dismissal alike).
+     */
+    public openReport(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        return openReport(this.client, row.event);
+    }
+
     /** Closes an open picker (a new one replaces it, the bridge going away ends it): its call resolves `done`. */
     private closeReactionPicker(): void {
         this.picker?.request.finish();
@@ -1882,7 +1898,11 @@ export class ViewModelBridge implements ClientViewBridge {
         return { added: ids.length, ids, ...state() };
     }
 
-    public sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome> {
+    public sendText(
+        roomId: string,
+        text: string,
+        opts?: { txnId?: string; replyTo?: string; markdown?: boolean; mentions?: string[] },
+    ): Promise<ActionOutcome> {
         this.used = true;
         // A3: the replied event is started through its action bar view-model's `onReplyClick` (the reply state Element's
         // composer reads); the content send is the interim path with the reply relation.
@@ -1892,11 +1912,16 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /** A11: the replacement send is interim; the edit state is entered through the row's `onEditClick`. */
-    public editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome> {
+    public editText(
+        roomId: string,
+        eventId: string,
+        text: string,
+        opts?: { markdown?: boolean; mentions?: string[] },
+    ): Promise<ActionOutcome> {
         this.used = true;
-        return editText(this.client, roomId, eventId, text, {
-            onEnter: (ev) => this.actionBar(ev, (vm) => vm.onEditClick(null), true),
-        });
+        const hooks = { onEnter: (ev: MatrixEvent) => this.actionBar(ev, (vm) => vm.onEditClick(null), true) };
+        // M7 E1: the options go along only when the caller gave some (the plain call is unchanged).
+        return opts ? editText(this.client, roomId, eventId, text, hooks, opts) : editText(this.client, roomId, eventId, text, hooks);
     }
 
     /**

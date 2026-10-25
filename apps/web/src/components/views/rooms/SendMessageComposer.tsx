@@ -79,6 +79,8 @@ export function createMessageContent(
     model: EditorModel,
     replyToEvent: MatrixEvent | undefined,
     relation: IEventRelation | undefined,
+    // client-views (M7 E1): a kit sending Markdown forces it, whatever the account preference says.
+    options: { useMarkdown?: boolean } = {},
 ): RoomMessageEventContent {
     const isEmote = containsEmote(model);
     if (isEmote) {
@@ -96,7 +98,7 @@ export function createMessageContent(
         body: body,
     };
     const formattedBody = htmlSerializeIfNeeded(model, {
-        useMarkdown: SettingsStore.getValue("MessageComposerInput.useMarkdown"),
+        useMarkdown: options.useMarkdown ?? SettingsStore.getValue("MessageComposerInput.useMarkdown"),
     });
     if (formattedBody) {
         content.format = "org.matrix.custom.html";
