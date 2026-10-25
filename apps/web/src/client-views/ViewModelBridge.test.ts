@@ -17,6 +17,9 @@ import { selectClientView } from "./registry";
 import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
+import defaultDispatcher from "../dispatcher/dispatcher";
+import Modal from "../Modal";
+import ForwardDialog from "../components/views/dialogs/ForwardDialog";
 
 /*
  * The bridge only wires view-models together; the view-models themselves are replaced by small fakes here so the
@@ -163,6 +166,7 @@ const h = vi.hoisted(() => {
         editText: vi.fn(),
         redact: vi.fn(),
         downloadMedia: vi.fn(),
+        forwardViaDialog: vi.fn(),
         viewSourceViaDialog: vi.fn(),
         createDialog: vi.fn(),
         actionBars,
@@ -458,6 +462,7 @@ vi.mock("./DownloadAction", () => ({
 }));
 vi.mock("./RoomActions", async (orig) => ({
     ...(await orig<typeof import("./RoomActions")>()),
+    forwardViaDialog: (...args: unknown[]) => h.forwardViaDialog(...args),
     viewSourceViaDialog: (...args: unknown[]) => h.viewSourceViaDialog(...args),
 }));
 vi.mock("../Modal", () => ({ default: { createDialog: (...args: unknown[]) => h.createDialog(...args) } }));
@@ -545,6 +550,7 @@ describe("ViewModelBridge", () => {
         h.pins.press = undefined;
         h.eventUtils.canDownload = true;
         h.downloadMedia.mockReset();
+        h.forwardViaDialog.mockReset();
         h.viewSourceViaDialog.mockReset();
         h.createDialog.mockReset();
         h.sdkContext.roomViewStore = { getRoomId: () => null };
@@ -1891,6 +1897,59 @@ describe("ViewModelBridge", () => {
                 ).rejects.toMatchObject({
                     code: "forbidden",
                 });
+            });
+        });
+
+        describe("openForward (E3)", () => {
+            it("opens Element's ForwardDialog with the event, the permalink creator and the dialog's client view, and answers what the dialog action answers", async () => {
+                const create = vi.spyOn(Modal, "createDialog").mockImplementation((() => ({})) as never);
+                const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
+                try {
+                    const event = fakeEvent("$1");
+                    read(event);
+                    const view = { dialogView: true };
+                    h.forwardViaDialog.mockImplementation(
+                        (_c: unknown, roomId: string, eventId: string, start: (c: unknown) => void) => {
+                            start(view);
+                            return Promise.resolve({ status: "done", roomId, eventId });
+                        },
+                    );
+                    await expect(bridge.openForward("!a", "$1")).resolves.toEqual({
+                        status: "done",
+                        roomId: "!a",
+                        eventId: "$1",
+                    });
+                    expect(h.forwardViaDialog).toHaveBeenCalledWith(
+                        expect.anything(),
+                        "!a",
+                        "$1",
+                        expect.any(Function),
+                    );
+                    // DialogOpener's props, with `matrixClient` the dialog's own client view; nothing is dispatched.
+                    expect(create).toHaveBeenCalledTimes(1);
+                    expect(create.mock.calls[0][0]).toBe(ForwardDialog);
+                    expect(create.mock.calls[0][1]).toMatchObject({ matrixClient: view, event });
+                    expect(create.mock.calls[0][1]).toHaveProperty("permalinkCreator");
+                    expect(dispatch).not.toHaveBeenCalled();
+                } finally {
+                    create.mockRestore();
+                    dispatch.mockRestore();
+                }
+            });
+
+            it("is unsupported for a poll, for content that is not actionable, and opens nothing", async () => {
+                read(fakeEvent("$poll", { getType: () => "org.matrix.msc3381.poll.start", getContent: () => ({}) }));
+                read(fakeEvent("$gone", { isRedacted: () => true }));
+                await expect(bridge.openForward("!a", "$poll")).rejects.toMatchObject({ code: "unsupported" });
+                await expect(bridge.openForward("!a", "$gone")).rejects.toMatchObject({ code: "unsupported" });
+                expect(h.forwardViaDialog).not.toHaveBeenCalled();
+            });
+
+            it("names an unknown room or event", async () => {
+                read(fakeEvent("$1"));
+                await expect(bridge.openForward("!nope", "$1")).rejects.toMatchObject({ code: "unknown_room" });
+                await expect(bridge.openForward("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
+                expect(h.forwardViaDialog).not.toHaveBeenCalled();
             });
         });
 

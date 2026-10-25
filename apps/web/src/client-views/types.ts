@@ -475,6 +475,16 @@ export interface ClientViewBridge {
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
     openReactionPicker(roomId: string, eventId: string, anchor: ViewAnchor): Promise<ActionOutcome>;
     /**
+     * E3: Element's own forward dialog over the kit (what the message context menu opens), for a message the kit shows.
+     * `done` when the dialog closes (the dialog sends each copy and shows its result itself; the kit keeps no state from
+     * it); a jump through the dialog's room name answers `done` + that room's `roomId`, which the kit follows to (otherwise
+     * `roomId` is the message's room and `eventId` the message). `unsupported` for content Element does not offer Forward
+     * on (not actionable, a poll, a beacon without a location); `unknown_room` / `unknown_event` as the other message
+     * actions; `failed` when the dialog does not open or another Element dialog action is running. Interim (D31): awaits a
+     * forward action on a shared message view-model.
+     */
+    openForward(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
      * E5: Element's own View source dialog over the kit (what the message context menu opens): the event id and the event
      * JSON of a message the kit shows, for an encrypted event the decrypted and the original source. `done` when the dialog
      * closes (it changes nothing; `roomId` + `eventId` are the message). `unknown_room` / `unknown_event` as the other

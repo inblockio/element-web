@@ -68,6 +68,7 @@ import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { canEditContent, isContentActionable } from "../utils/EventUtils";
+import { getForwardableEvent } from "../events/forward/getForwardableEvent";
 import PinningUtils from "../utils/PinningUtils";
 import { RoomPermalinkCreator } from "../utils/permalinks/Permalinks";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
@@ -84,8 +85,9 @@ import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewU
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import UserProvider from "../autocomplete/UserProvider";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
-import { createRoomViaDialog, leaveViaDialog, startChatViaDialog, viewSourceViaDialog } from "./RoomActions";
+import { createRoomViaDialog, forwardViaDialog, leaveViaDialog, startChatViaDialog, viewSourceViaDialog } from "./RoomActions";
 import Modal from "../Modal";
+import ForwardDialog from "../components/views/dialogs/ForwardDialog";
 import ViewSource from "../components/structures/ViewSource";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
@@ -1546,15 +1548,18 @@ export class ViewModelBridge implements ClientViewBridge {
 
     /** Element's permalink of an event (`RoomPermalinkCreator.forEvent`, `via` included), undefined for a room the client does not know. */
     private permalinkOf(roomId: string, eventId: string): string | undefined {
+        // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
+        if (!this.permalinkCreators.has(roomId) && !this.listedRoomIds.has(roomId)) this.readUnlisted.add(roomId);
+        return this.permalinkCreatorOf(roomId)?.forEvent(eventId);
+    }
+
+    /** The room's permalink creator (one per listed room, started once, stopped with the bridge), null when there is none. */
+    private permalinkCreatorOf(roomId: string): RoomPermalinkCreator | null {
         let creator = this.permalinkCreators.get(roomId);
         if (!creator) {
-            // A cached timeline outlives its room's place in the list: no creator (and state listener) for it again.
-            if (!this.listedRoomIds.has(roomId)) {
-                this.readUnlisted.add(roomId);
-                return undefined;
-            }
+            if (!this.listedRoomIds.has(roomId)) return null;
             const room = this.client.getRoom(roomId);
-            if (!room) return undefined;
+            if (!room) return null;
             creator = new RoomPermalinkCreator(room);
             creator.start();
             this.permalinkCreators.set(roomId, creator);
@@ -1563,7 +1568,7 @@ export class ViewModelBridge implements ClientViewBridge {
             const room = this.client.getRoom(roomId);
             if (room) this.loadMembersForVia(room);
         }
-        return creator.forEvent(eventId);
+        return creator;
     }
 
     /**
@@ -1726,6 +1731,38 @@ export class ViewModelBridge implements ClientViewBridge {
             this.picker = { request, resolve };
             this.pickerListeners.forEach((cb) => cb(request));
         });
+    }
+
+    /**
+     * E3: Element's forward dialog over the kit, opened the way `DialogOpener` opens it for the message context menu's
+     * `OpenForwardDialog` (`getForwardableEvent`, the room's permalink creator), with the dialog's own client view. `unsupported` where Element offers no Forward (content
+     * not actionable, or an event type it does not forward, e.g. a poll). `done` when the dialog closes; the copy is sent
+     * and its result shown by the dialog itself. A jump through the dialog's room name answers `done` + that room's id.
+     * Interim (D31): there is no forward action on a shared message view-model.
+     */
+    public openForward(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const forwardable = row.actionable() ? getForwardableEvent(row.event, this.client) : null;
+        if (!forwardable) {
+            return Promise.reject(new ClientViewActionError("unsupported", "this message cannot be forwarded"));
+        }
+        const permalinkCreator = this.permalinkCreatorOf(roomId);
+        // The same dialog and props as `DialogOpener` on `OpenForwardDialog`, but with the dialog's own client view as
+        // `matrixClient` (see `forwardDialogClient`), so that only the dialog's own sends are claimed. Like the payload
+        // `DialogOpener` receives, `permalinkCreator` may be null (the dialog types it non-null).
+        return forwardViaDialog(this.client, roomId, eventId, (matrixClient) =>
+            Modal.createDialog(ForwardDialog, {
+                matrixClient,
+                event: forwardable,
+                permalinkCreator: permalinkCreator!,
+            }),
+        );
     }
 
     /**
