@@ -710,9 +710,7 @@ class EventRow {
         }
         if (!snapshot.isVisible) return undefined;
         // The thread timeline also holds reactions and edits once fetched; only replies count (as Thread.length).
-        const replies = thread.events.filter(
-            (e) => e.getId() !== thread.id && e.isRelation(THREAD_RELATION_TYPE.name),
-        );
+        const replies = thread.events.filter((e) => e.getId() !== thread.id && e.isRelation(THREAD_RELATION_TYPE.name));
         // A reply the homeserver has not taken (sending, queued, failed) is not a reply yet: a refused send leaves no
         // count. Thread.length counts the room's pending local echoes too, so those are taken off by identity.
         const room = this.client.getRoom(this.ev.getRoomId() ?? "");
