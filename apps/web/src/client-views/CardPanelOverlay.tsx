@@ -225,7 +225,8 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
     // Focus moves into the panel (so Escape reaches it) and returns to the kit's frame when it closes.
     const ref = useRef<HTMLDivElement>(null);
     useEffect(() => {
-        ref.current?.focus();
+        // A card that focuses its own field on open (the search card) keeps that focus: child effects run before this one.
+        if (!ref.current?.contains(document.activeElement)) ref.current?.focus();
         return focusKit;
     }, []);
 
