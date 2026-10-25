@@ -375,6 +375,31 @@ describe("CardPanelOverlay", () => {
         expect(req.jump).not.toHaveBeenCalled();
     });
 
+    it("r2 F2: an all-rooms hit that is a thread reply opens its room at the thread root; a plain event keeps its own id; no event id opens the room", async () => {
+        mount("search");
+        const root = plainEvent("$root", { isThreadRoot: true, getId: () => "$root" });
+        h.fetched.set("$reply", plainEvent("$reply", { getThread: () => ({ rootEvent: root }) }));
+        await dispatch({ action: Action.ViewRoom, room_id: "!other", event_id: "$reply" });
+        expect(req.openRoom).toHaveBeenLastCalledWith("!other", "$root");
+        // thread relation without a resolved thread: the relation's root id
+        h.fetched.set(
+            "$reply2",
+            plainEvent("$reply2", { isRelation: (t?: string) => t === "m.thread", threadRootId: "$root2" }),
+        );
+        await dispatch({ action: Action.ViewRoom, room_id: "!other", event_id: "$reply2" });
+        expect(req.openRoom).toHaveBeenLastCalledWith("!other", "$root2");
+        // a plain event, and one that cannot be fetched, keep their own id
+        h.fetched.set("$plain", plainEvent("$plain"));
+        await dispatch({ action: Action.ViewRoom, room_id: "!other", event_id: "$plain" });
+        expect(req.openRoom).toHaveBeenLastCalledWith("!other", "$plain");
+        await dispatch({ action: Action.ViewRoom, room_id: "!other", event_id: "$gone" });
+        expect(req.openRoom).toHaveBeenLastCalledWith("!other", "$gone");
+        await dispatch({ action: Action.ViewRoom, room_id: "!other" });
+        expect(req.openRoom).toHaveBeenLastCalledWith("!other");
+        expect(req.jump).not.toHaveBeenCalled();
+        expect(req.openThreadOn).not.toHaveBeenCalled();
+    });
+
     it("F4: another room (Message from user info) asks the kit to open it, starts no call and does not hand over to Element's UI", async () => {
         const create = vi.spyOn(ElementCall, "create").mockImplementation(() => {});
         mount("info");
@@ -432,6 +457,24 @@ describe("CardPanelOverlay", () => {
         expect(cancel).toHaveBeenCalledTimes(1);
         expect(req.finish).not.toHaveBeenCalled();
         expect(screen.getByTestId("card-user")).toBeTruthy();
+    });
+
+    it("r2 F1: Escape on the panel root takes the one close decision: a pending verification is cancelled and the panel stays, otherwise it closes", async () => {
+        const cancel = vi.fn(async () => undefined);
+        h.verification = { pending: true, cancel };
+        mount("info");
+        fireEvent.click(await screen.findByText("verify"));
+        const user = await screen.findByTestId("card-user");
+        const panelRoot = user.closest("[tabindex]") as HTMLElement;
+        expect(panelRoot).toBeTruthy();
+        fireEvent.keyDown(panelRoot, { key: "Escape" });
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(req.finish).not.toHaveBeenCalled();
+        expect(screen.getByTestId("card-user")).toBeTruthy();
+        (h.verification as { pending: boolean }).pending = false;
+        fireEvent.keyDown(panelRoot, { key: "Escape" });
+        expect(req.finish).toHaveBeenCalledTimes(1);
+        expect(cancel).toHaveBeenCalledTimes(1);
     });
 
     it("Escape closes (a prevented one does not); a listener is gone after unmount", async () => {

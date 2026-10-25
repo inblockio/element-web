@@ -170,8 +170,20 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
             if (!roomId) return;
             if (roomId !== room.roomId) {
                 // A2: a hit of another room (all-rooms scope) carries its event; the kit opens the room at it.
-                if (payload.event_id) request.openRoom(roomId, payload.event_id);
-                else request.openRoom(roomId);
+                // r2 F2: a thread reply opens its room at the thread root (the main timeline does not hold the reply).
+                const hitId = payload.event_id;
+                if (!hitId) {
+                    request.openRoom(roomId);
+                    return;
+                }
+                const hit = await fetchInitialEvent(client, roomId, hitId);
+                if (!live) return;
+                const rootId =
+                    hit && !hit.isThreadRoot
+                        ? (hit.getThread()?.rootEvent?.getId() ??
+                          (hit.isRelation(THREAD_RELATION_TYPE.name) ? hit.threadRootId : undefined))
+                        : undefined;
+                request.openRoom(roomId, rootId ?? hitId);
                 return;
             }
             const eventId = payload.event_id;
@@ -346,7 +358,7 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
                     onKeyDown={(ev) => {
                         if (ev.key === "Escape" && !ev.defaultPrevented) {
                             ev.stopPropagation();
-                            finish();
+                            closeTop();
                         }
                     }}
                 >
