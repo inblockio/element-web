@@ -272,7 +272,9 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
         it("sends the content Element's composer builds for a picked member: m.mentions and the pill link", async () => {
             await sendText(client, room.roomId, `hi ${BOB} there`, { markdown: true, mentions: [BOB] });
             const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
-            expect(sent).toEqual(createMessageContent("@me:example.org", picked(["hi ", "BOB", " there"]), undefined, undefined));
+            expect(sent).toEqual(
+                createMessageContent("@me:example.org", picked(["hi ", "BOB", " there"]), undefined, undefined),
+            );
             expect(sent["m.mentions"]).toEqual({ user_ids: [BOB] });
             expect(sent.body).toBe("hi Bob Builder there");
             expect(sent.formatted_body).toBe(`hi <a href="https://matrix.to/#/${BOB}">Bob Builder</a> there`);
@@ -290,7 +292,10 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
         });
 
         it("a token inside a longer word or id is not a mention; punctuation after it is", async () => {
-            await sendText(client, room.roomId, `x${BOB} and ${BOB}.org and ${BOB}x`, { markdown: true, mentions: [BOB] });
+            await sendText(client, room.roomId, `x${BOB} and ${BOB}.org and ${BOB}x`, {
+                markdown: true,
+                mentions: [BOB],
+            });
             expect((vi.mocked(client.sendMessage).mock.calls[0][2] as any)["m.mentions"]).toEqual({});
             await sendText(client, room.roomId, `hey ${BOB}, ok? ${BOB}.`, { markdown: true, mentions: [BOB] });
             const sent = vi.mocked(client.sendMessage).mock.calls[1][2] as Record<string, any>;
@@ -323,7 +328,9 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
             const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
             expect(sent).toEqual(createEditContent(picked(["hi ", "BOB", " again"]), ev));
             expect(sent["m.new_content"]["m.mentions"]).toEqual({ user_ids: [BOB] });
-            expect(sent["m.new_content"].formatted_body).toBe(`hi <a href="https://matrix.to/#/${BOB}">Bob Builder</a> again`);
+            expect(sent["m.new_content"].formatted_body).toBe(
+                `hi <a href="https://matrix.to/#/${BOB}">Bob Builder</a> again`,
+            );
             expect(sent["m.mentions"]).toEqual({});
         });
     });

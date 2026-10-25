@@ -157,6 +157,8 @@ const h = vi.hoisted(() => {
 
     return {
         sendText: vi.fn(),
+        userProviders: [] as { room: unknown; destroy: Mock }[],
+        userProviderCompletions: vi.fn(),
         editText: vi.fn(),
         redact: vi.fn(),
         downloadMedia: vi.fn(),
@@ -435,6 +437,15 @@ vi.mock("../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState", () 
 }));
 vi.mock("../stores/OwnProfileStore", () => ({ OwnProfileStore: { instance: {} } }));
 vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => "http://avatar/room" }));
+vi.mock("../autocomplete/UserProvider", () => ({
+    default: class UserProviderStub {
+        public constructor(public room: unknown) {
+            h.userProviders.push(this as unknown as (typeof h.userProviders)[number]);
+        }
+        public getCompletions = (...args: unknown[]) => h.userProviderCompletions(...args);
+        public destroy = vi.fn();
+    },
+}));
 vi.mock("./InterimActions", () => ({
     sendText: (...args: unknown[]) => h.sendText(...args),
     editText: (...args: unknown[]) => h.editText(...args),
@@ -493,6 +504,8 @@ describe("ViewModelBridge", () => {
     beforeEach(() => {
         vi.clearAllMocks();
         h.roomLists.length = 0;
+        h.userProviders.length = 0;
+        h.userProviderCompletions.mockReset();
         // The fakes outlive each test's bridge; drop the previous bridge's subscriptions.
         h.timeline.listeners.clear();
         bridge = new ViewModelBridge({
@@ -601,6 +614,46 @@ describe("ViewModelBridge", () => {
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
         expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));
+    });
+
+    describe("M7 E2 mentionCandidates (Element's UserProvider, the bare query without @)", () => {
+        it("throws unknown_room for a room the client does not know", async () => {
+            await expect(bridge.mentionCandidates("!nope", "bo")).rejects.toMatchObject({ code: "unknown_room" });
+            expect(h.userProviders).toHaveLength(0);
+        });
+
+        it("loads the members, asks the provider with force and the bare query, and maps id and display name", async () => {
+            h.userProviderCompletions.mockResolvedValue([
+                { completion: "Bob", completionId: "@bob:example.org", type: "user" },
+                { completion: "Bobby", completionId: "@bobby:example.org", type: "user" },
+                { completion: "no id", type: "user" },
+            ]);
+            await expect(bridge.mentionCandidates("!a", "bo")).resolves.toEqual([
+                { userId: "@bob:example.org", displayName: "Bob" },
+                { userId: "@bobby:example.org", displayName: "Bobby" },
+            ]);
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            expect(h.userProviderCompletions).toHaveBeenCalledWith("bo", { beginning: true, start: 2, end: 2 }, true);
+        });
+
+        it("keeps one provider per room and destroys it when the room leaves the list", async () => {
+            h.userProviderCompletions.mockResolvedValue([]);
+            await bridge.mentionCandidates("!a", "b");
+            await bridge.mentionCandidates("!a", "bo");
+            expect(h.userProviders).toHaveLength(1);
+            expect(h.userProviders[0].room).toBe(h.room);
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            expect(h.userProviders[0].destroy).toHaveBeenCalledTimes(1);
+            await bridge.mentionCandidates("!a", "b");
+            expect(h.userProviders).toHaveLength(2);
+        });
+
+        it("destroys the providers on dispose", async () => {
+            h.userProviderCompletions.mockResolvedValue([]);
+            await bridge.mentionCandidates("!a", "b");
+            bridge.dispose();
+            expect(h.userProviders[0].destroy).toHaveBeenCalledTimes(1);
+        });
     });
 
     describe("action bar (A3 reply, A11 edit) and delete (A12)", () => {

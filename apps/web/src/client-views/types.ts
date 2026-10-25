@@ -341,7 +341,10 @@ export interface ClientViewBridge {
      * members included), after the room's members are loaded. Interim (D31): not the v1 member-list hook. An empty
      * query lists nobody (as the composer for a bare `@`). `unknown_room` when the room is not known.
      */
-    mentionCandidates(roomId: string, query: string): Promise<{ userId: string; displayName: string; avatarUrl?: string }[]>;
+    mentionCandidates(
+        roomId: string,
+        query: string,
+    ): Promise<{ userId: string; displayName: string; avatarUrl?: string }[]>;
     /**
      * Loads the next page of older messages of a room and resolves when the page is in (the room's `timeline` has
      * changed by then). Concurrent calls for a room share one load. Backed by the timeline view-model's

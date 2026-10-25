@@ -1935,7 +1935,11 @@ export class ViewModelBridge implements ClientViewBridge {
             provider = new UserProvider(room);
             this.userProviders.set(roomId, provider);
         }
-        const completions = await provider.getCompletions(query, { beginning: true, start: query.length, end: query.length }, true);
+        const completions = await provider.getCompletions(
+            query,
+            { beginning: true, start: query.length, end: query.length },
+            true,
+        );
         return completions.flatMap((c) =>
             c.completionId ? [{ userId: c.completionId, displayName: c.completion ?? c.completionId }] : [],
         );
