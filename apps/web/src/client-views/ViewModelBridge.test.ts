@@ -2216,6 +2216,51 @@ describe("ViewModelBridge", () => {
             dm.mockRestore();
         });
 
+        it("a rejected openPanel does not supersede an in-flight DM info open (F2)", async () => {
+            const shown = watch();
+            const dm = vi
+                .spyOn(DMRoomMap, "shared")
+                .mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const bob = { userId: "@bob:example.org" };
+            let loaded = false;
+            const getMember = vi.spyOn(h.room, "getMember").mockImplementation((() => (loaded ? bob : null)) as never);
+            let release!: () => void;
+            h.room.loadMembersIfNeeded.mockImplementationOnce(
+                () => new Promise<boolean>((r) => (release = () => ((loaded = true), r(true)))),
+            );
+            const slow = bridge.openPanel("!a", "info");
+            await expect(bridge.openPanel("!nope", "info")).rejects.toMatchObject({ code: "unknown_room" });
+            await expect(bridge.openPanel("!a", "search")).rejects.toMatchObject({ code: "unsupported" });
+            release();
+            await vi.waitFor(() => expect(shown.at(-1)?.dmMember).toMatchObject({ userId: "@bob:example.org" }));
+            bridge.closePanel();
+            await expect(slow).resolves.toMatchObject({ status: "done" });
+            getMember.mockRestore();
+            dm.mockRestore();
+        });
+
+        it("a DM info open whose room is left while the members load rejects unsupported and mounts nothing (F1)", async () => {
+            const shown = watch();
+            const dm = vi
+                .spyOn(DMRoomMap, "shared")
+                .mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const bob = { userId: "@bob:example.org" };
+            let loaded = false;
+            const getMember = vi.spyOn(h.room, "getMember").mockImplementation((() => (loaded ? bob : null)) as never);
+            const membership = vi.spyOn(h.room, "getMyMembership");
+            h.room.loadMembersIfNeeded.mockImplementationOnce(async () => {
+                loaded = true;
+                membership.mockReturnValue("leave");
+                return true;
+            });
+            const countBefore = shown.length;
+            await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
+            expect(shown.length).toBe(countBefore);
+            membership.mockRestore();
+            getMember.mockRestore();
+            dm.mockRestore();
+        });
+
         it("a DM's info card carries the other member (user info), a plain room's does not", async () => {
             const shown = watch();
             const dm = vi

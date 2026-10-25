@@ -1959,7 +1959,6 @@ export class ViewModelBridge implements ClientViewBridge {
      */
     public openPanel(roomId: string, card: PanelCardName | "search"): Promise<ActionOutcome> {
         this.used = true;
-        const seq = ++this.panelCount;
         const room = this.client.getRoom(roomId);
         if (!room) return Promise.reject(new ClientViewActionError("unknown_room", `unknown room ${roomId}`));
         if (card !== "info" && card !== "members" && card !== "files" && card !== "pinned") {
@@ -1970,6 +1969,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"),
             );
         }
+        const seq = ++this.panelCount; // only an accepted call supersedes an in-flight open
         let dmMember: RoomMember | undefined;
         if (card === "info") {
             let otherId: string | null | undefined;
@@ -1994,6 +1994,15 @@ export class ViewModelBridge implements ClientViewBridge {
                         }
                         // A later openPanel / closePanel bumped the counter while the members loaded: that one wins.
                         if (seq !== this.panelCount) return { status: "done", roomId };
+                        // Left, kicked or forgotten while the members loaded: no card for a room not joined.
+                        if (this.client.getRoom(roomId) !== room || room.getMyMembership() !== KnownMembership.Join) {
+                            return Promise.reject(
+                                new ClientViewActionError(
+                                    "unsupported",
+                                    "Element offers no cards for a room not joined",
+                                ),
+                            );
+                        }
                         const member = room.getMember(otherId) ?? undefined;
                         if (!member) return unknown();
                         return this.mountCardPanel(room, roomId, card, member);
