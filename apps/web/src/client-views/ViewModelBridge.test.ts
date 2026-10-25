@@ -639,6 +639,7 @@ describe("ViewModelBridge", () => {
 
         it("keeps one provider per room and destroys it when the room leaves the list", async () => {
             h.userProviderCompletions.mockResolvedValue([]);
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: ["!a"] }] });
             await bridge.mentionCandidates("!a", "b");
             await bridge.mentionCandidates("!a", "bo");
             expect(h.userProviders).toHaveLength(1);
@@ -651,6 +652,7 @@ describe("ViewModelBridge", () => {
 
         it("destroys the providers on dispose", async () => {
             h.userProviderCompletions.mockResolvedValue([]);
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: ["!a"] }] });
             await bridge.mentionCandidates("!a", "b");
             bridge.dispose();
             expect(h.userProviders[0].destroy).toHaveBeenCalledTimes(1);
@@ -684,6 +686,17 @@ describe("ViewModelBridge", () => {
             expect(kept).toHaveLength(0);
             bridge.dispose();
             expect(h.userProviders.every((p) => p.destroy.mock.calls.length === 1)).toBe(true);
+        });
+
+        it("F5: keeps no provider for a room already unlisted but still known to the client", async () => {
+            h.userProviderCompletions.mockResolvedValue([]);
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: ["!a"] }] });
+            h.roomLists[h.roomLists.length - 1].set({ sections: [{ roomIds: [] }] });
+            await expect(bridge.mentionCandidates("!a", "b")).resolves.toEqual([]);
+            expect(h.userProviders).toHaveLength(1);
+            expect(h.userProviders[0].destroy).toHaveBeenCalledTimes(1);
+            bridge.dispose();
+            expect(h.userProviders[0].destroy).toHaveBeenCalledTimes(1);
         });
 
         it.each(["mary a", "mary ", ".mary", "/mary", ",mary", "(mary", ")mary", ":mary", ";mary", " mary"])(

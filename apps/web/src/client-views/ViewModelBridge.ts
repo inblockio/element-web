@@ -1949,8 +1949,10 @@ export class ViewModelBridge implements ClientViewBridge {
         let transient = false;
         if (!provider) {
             provider = new UserProvider(room);
-            // The room left the list during the load: its provider is not kept (nothing would destroy it).
-            if ((this.roomLeftCount.get(roomId) ?? 0) !== leftBefore) transient = true;
+            // Kept only for a listed room that did not leave the list during the load: the unlist pass destroys the
+            // kept ones, so a provider for an unlisted room (or one that left meanwhile) is transient.
+            if (!this.listedRoomIds.has(roomId) || (this.roomLeftCount.get(roomId) ?? 0) !== leftBefore)
+                transient = true;
             else this.userProviders.set(roomId, provider);
         }
         let completions;
