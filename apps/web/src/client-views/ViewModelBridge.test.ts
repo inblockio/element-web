@@ -2207,6 +2207,28 @@ describe("ViewModelBridge", () => {
             expect(m.thread).toMatchObject({ replyCount: 1, participantIds: ["@bob:example.org"] });
         });
 
+        it("takes the latest reply and its time from the newest accepted reply, not an unsent one", () => {
+            const { root } = rootWith([
+                reply("$r1", "@bob:example.org", { getTs: () => 3000 }),
+                reply("~local", "@alice:example.org", { status: "not_sent", getTs: () => 9000 }),
+            ]);
+            expect(read(root)[0].thread).toEqual({
+                replyCount: 1,
+                lastReplyTs: 3000,
+                lastReply: { eventId: "$r1", senderId: "@bob:example.org", text: "text of $r1" },
+                participantIds: ["@bob:example.org"],
+            });
+        });
+
+        it("has no latest reply and uses the root's time while no reply is accepted", () => {
+            const { root } = rootWith([
+                reply("~local", "@alice:example.org", { status: "sending", getTs: () => 9000 }),
+            ]);
+            const [m] = read(root);
+            expect(m.thread).toMatchObject({ replyCount: 0, lastReplyTs: 1000 });
+            expect(m.thread).not.toHaveProperty("lastReply");
+        });
+
         it("shows no count while the only reply is still sending", () => {
             const { root } = rootWith([reply("~local", "@alice:example.org", { status: "sending" })]);
             expect(read(root)[0].thread?.replyCount).toBe(0);

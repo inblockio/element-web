@@ -709,20 +709,6 @@ class EventRow {
             this.threadSummaryRelease = () => unsubscribes.forEach((u) => u());
         }
         if (!snapshot.isVisible) return undefined;
-        const last = thread.replyToEvent;
-        this.followLastReplyEdit(last?.replacingEvent() ?? null);
-        const body = last?.getContent().body;
-        // An edit's body has no reply fallback to strip (as replyTo).
-        const text =
-            !last || unreadable(last) || typeof body !== "string"
-                ? ""
-                : last.replacingEvent()
-                  ? body
-                  : stripPlainReply(body);
-        const lastReply =
-            last && last.getId() && !isUnsent(last)
-                ? { eventId: last.getId()!, senderId: last.getSender() ?? "", text }
-                : undefined;
         // The thread timeline also holds reactions and edits once fetched; only replies count (as Thread.length).
         const replies = thread.events.filter(
             (e) => e.getId() !== thread.id && e.isRelation(THREAD_RELATION_TYPE.name),
@@ -735,6 +721,21 @@ class EventRow {
         );
         const unsent = new Set([...replies, ...pending].filter(isUnsent));
         const confirmed = replies.filter((e) => !unsent.has(e));
+        // The newest reply the homeserver took (not `thread.replyToEvent`, which may be an
+        // unsent one); with none, no lastReply and the root's time.
+        const last = confirmed.length ? confirmed[confirmed.length - 1] : undefined;
+        this.followLastReplyEdit(last?.replacingEvent() ?? null);
+        const body = last?.getContent().body;
+        // An edit's body has no reply fallback to strip (as replyTo).
+        const text =
+            !last || unreadable(last) || typeof body !== "string"
+                ? ""
+                : last.replacingEvent()
+                  ? body
+                  : stripPlainReply(body);
+        const lastReply = last?.getId()
+            ? { eventId: last.getId()!, senderId: last.getSender() ?? "", text }
+            : undefined;
         const repliers = confirmed.map((e) => e.getSender() ?? "");
         return {
             replyCount: Math.max(0, thread.length - unsent.size),

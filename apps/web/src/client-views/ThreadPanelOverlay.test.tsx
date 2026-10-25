@@ -224,25 +224,42 @@ describe("ThreadPanelOverlay", () => {
         expect(h.mounts).toBe(2);
     });
 
-    it("F2/F4: the timestamp permalink, the room-upgraded link and the root's View in room item dispatch no ViewRoom", () => {
-        const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
-        mount();
-        const viewRooms = () =>
-            dispatch.mock.calls.filter(([p]) => (p as { action: string }).action === Action.ViewRoom);
+    it("a ViewRoom dispatched while the panel is open closes it, whoever dispatches it; none after close", () => {
+        const { unmount } = mount();
+        act(() => {
+            viewRoom();
+            vi.runAllTimers();
+        });
+        expect(finish).toHaveBeenCalledTimes(1);
+        // Links and menu items are not blocked: their ViewRoom is what closes the panel.
         fireEvent.click(screen.getByText("timestamp"));
         fireEvent.click(screen.getByText("upgraded"));
         fireEvent.click(screen.getByText(_t("timeline|mab|view_in_room")));
-        expect(viewRooms()).toEqual([]);
-        // Other controls (a plain link, another menu item) still work.
-        fireEvent.click(screen.getByText("Copy link"));
+        act(() => void vi.runAllTimers());
+        expect(finish).toHaveBeenCalledTimes(4);
+        unmount();
+        act(() => {
+            viewRoom();
+            vi.runAllTimers();
+        });
+        expect(finish).toHaveBeenCalledTimes(4);
+    });
+
+    it("a non-ViewRoom action does not close; Share / Copy link and a plain link are not prevented", () => {
+        const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
+        mount();
+        const copy = new MouseEvent("click", { bubbles: true, cancelable: true });
+        screen.getByText("Copy link").dispatchEvent(copy);
+        expect(copy.defaultPrevented).toBe(false);
         expect(dispatch).toHaveBeenCalledWith({ action: "other_item" });
         const plain = new MouseEvent("click", { bubbles: true, cancelable: true });
         screen.getByText("plain link").dispatchEvent(plain);
         expect(plain.defaultPrevented).toBe(false);
-        // The links' default action (navigation) is stopped too.
         const nav = new MouseEvent("click", { bubbles: true, cancelable: true });
         screen.getByText("timestamp").dispatchEvent(nav);
-        expect(nav.defaultPrevented).toBe(true);
+        expect(nav.defaultPrevented).toBe(false);
+        act(() => void vi.runAllTimers());
+        expect(finish).toHaveBeenCalledTimes(1); // only the timestamp's ViewRoom
     });
 
     describe("F1: encryption known before ThreadView and before any URL preview", () => {

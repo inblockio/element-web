@@ -7,7 +7,7 @@
 
 import { EventType, KnownMembership, RoomEvent, RoomStateEvent } from "matrix-js-sdk/src/matrix";
 import { type MatrixClient, type MatrixEvent, type RoomState } from "matrix-js-sdk/src/matrix";
-import React, { type JSX, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { type JSX, useContext, useEffect, useMemo, useState } from "react";
 
 import ThreadView from "../components/structures/ThreadView";
 import RoomContext, { type RoomContextType, TimelineRenderingType } from "../contexts/RoomContext";
@@ -18,8 +18,6 @@ import { isRoomEncrypted } from "../hooks/useIsEncrypted";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import SettingsStore from "../settings/SettingsStore";
-import { _t } from "../languageHandler";
-import { parsePermalink } from "../utils/permalinks/Permalinks";
 import { type ThreadPanelRequest, type ViewModelBridge } from "./ViewModelBridge";
 
 /**
@@ -53,26 +51,6 @@ export function panelSdkContext(real: SDKContextClass): SDKContextClass {
             return Reflect.get(target, prop, target);
         },
     });
-}
-
-/**
- * Capture-phase click guard for the panel wrapper (frozen notes F2/F4). Three controls inside ThreadView dispatch
- * `Action.ViewRoom`, which would switch Element's room (or join a replacement room) under the kit; none has a switch to
- * turn it off, so the click is stopped before it reaches them. React's synthetic events travel through portals, so the
- * root's context menu (rendered in a portal) is covered by the same guard.
- *  - a link to a room or an event (the timestamp permalink; the composer's "room upgraded" link),
- *  - the "View in room" item of the message context menu.
- */
-export function blocksViewRoom(target: EventTarget | null): boolean {
-    if (!(target instanceof Element)) return false;
-    const link = target.closest("a[href]");
-    if (link) {
-        if (link.classList.contains("mx_MessageComposer_roomReplaced_link")) return true;
-        const parts = parsePermalink(link.getAttribute("href") ?? "");
-        if (parts && (parts.roomIdOrAlias || parts.eventId)) return true;
-    }
-    const item = target.closest(".mx_MessageContextMenu [role^='menuitem']");
-    return !!item && item.textContent?.trim() === _t("timeline|mab|view_in_room");
 }
 
 const focusKit = (): void => {
@@ -158,12 +136,16 @@ export function ThreadPanelOverlay({ request }: { request: ThreadPanelRequest })
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [inherited, client, room, sdk, encrypted, stateTick]);
 
-    const guardClick = useCallback((ev: React.SyntheticEvent): void => {
-        if (blocksViewRoom(ev.target)) {
-            ev.preventDefault();
-            ev.stopPropagation();
-        }
-    }, []);
+    // Navigation out of the panel closes it: "View in room", a permalink (the timestamp, the lightbox's), /join, /msg,
+    // "View related event" and the composer's "room upgraded" link all dispatch `ViewRoom`. The action is neither
+    // cancelled nor re-dispatched. LIMIT (M9 candidate): Element's room may switch under the kit, the kit does not
+    // follow.
+    useEffect(() => {
+        const token = defaultDispatcher.register((payload) => {
+            if (payload.action === Action.ViewRoom) finish();
+        });
+        return () => defaultDispatcher.unregister(token);
+    }, [finish]);
 
     // F2: nothing in ThreadView focuses its composer or closes on Escape, so the panel does both: focus leaves the kit's
     // frame for the thread composer once it is there, and returns to the frame when the panel closes.
@@ -203,8 +185,6 @@ export function ThreadPanelOverlay({ request }: { request: ThreadPanelRequest })
                         background: "var(--cpd-color-bg-canvas-default)",
                         boxShadow: "0 0 12px rgba(0, 0, 0, 0.3)",
                     }}
-                    onClickCapture={guardClick}
-                    onAuxClickCapture={guardClick}
                     onKeyDown={(ev) => {
                         if (ev.key === "Escape" && !ev.defaultPrevented) {
                             ev.stopPropagation();
