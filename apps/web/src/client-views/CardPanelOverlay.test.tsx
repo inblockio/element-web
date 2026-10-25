@@ -368,6 +368,13 @@ describe("CardPanelOverlay", () => {
         expect(req.openThreadOn).not.toHaveBeenCalled();
     });
 
+    it("A2: a hit of another room (all-rooms scope) hands its event to the kit with the room", async () => {
+        mount("search");
+        await dispatch({ action: Action.ViewRoom, room_id: "!other", event_id: "$hit" });
+        expect(req.openRoom).toHaveBeenCalledWith("!other", "$hit");
+        expect(req.jump).not.toHaveBeenCalled();
+    });
+
     it("F4: another room (Message from user info) asks the kit to open it, starts no call and does not hand over to Element's UI", async () => {
         const create = vi.spyOn(ElementCall, "create").mockImplementation(() => {});
         mount("info");

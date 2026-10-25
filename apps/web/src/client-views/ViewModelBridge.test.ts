@@ -2138,7 +2138,7 @@ describe("ViewModelBridge", () => {
             dmMember?: unknown;
             finish(): void;
             jump(id: string): void;
-            openRoom(id: string): void;
+            openRoom(id: string, eventId?: string): void;
             openThreadOn(root: unknown): void;
         };
         const watch = () => {
@@ -2317,6 +2317,7 @@ describe("ViewModelBridge", () => {
             expect(sync).not.toHaveBeenCalled();
             await expect(call).resolves.toEqual({ status: "done", roomId: "!a" });
             expect(opened).toEqual([{ roomId: "!b:example.org" }]);
+            expect(Object.keys(opened[0] as object)).toEqual(["roomId"]);
             request.jump("$late");
             request.openRoom("!c");
             expect(jumps).toHaveLength(1);
@@ -2327,6 +2328,10 @@ describe("ViewModelBridge", () => {
             expect(sync).toHaveBeenCalledTimes(1);
             await dmCall;
             expect(opened.at(-1)).toEqual({ roomId: "local+123" });
+            const hitCall = bridge.openPanel("!a", "info");
+            shown.at(-1)!.openRoom("!d", "$hit");
+            await hitCall;
+            expect(opened.at(-1)).toEqual({ roomId: "!d", eventId: "$hit" });
         });
 
         it("openThreadOn replaces the card by the thread panel on that root (F3)", async () => {

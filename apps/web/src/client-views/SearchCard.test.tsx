@@ -127,6 +127,7 @@ describe("SearchCard", () => {
 
     it("runs RoomSearchView under RoomContext timelineRenderingType Search, scoped and legacy", () => {
         mount({ initialTerm: "x" });
+        act(() => void vi.advanceTimersByTime(300));
         const view = screen.getByTestId("search-view");
         expect(view.dataset.scoped).toBe(TimelineRenderingType.Search);
         expect(view.dataset.legacy).toBe(TimelineRenderingType.Search);
@@ -145,8 +146,12 @@ describe("SearchCard", () => {
         expect(signals[1].aborted).toBe(true);
     });
 
-    it("opens with the term the info card handed over and searches at once, cursor at the end", () => {
+    it("opens with the term the info card handed over, searches after the same 300 ms debounce as typing (F2), cursor at the end", () => {
         mount({ initialTerm: "handed" });
+        expect(search).not.toHaveBeenCalled();
+        act(() => void vi.advanceTimersByTime(299));
+        expect(search).not.toHaveBeenCalled();
+        act(() => void vi.advanceTimersByTime(1));
         expect(search).toHaveBeenCalledTimes(1);
         expect(search).toHaveBeenCalledWith(client, "handed", "!a", expect.any(AbortSignal));
         expect(input().value).toBe("handed");
@@ -156,6 +161,7 @@ describe("SearchCard", () => {
     it("an empty term clears the search (no request); Escape clears a non-empty field and stays, an empty one bubbles", () => {
         const outer = vi.fn();
         mount({ initialTerm: "x" });
+        act(() => void vi.advanceTimersByTime(300));
         document.body.addEventListener("keydown", outer);
         expect(search).toHaveBeenCalledTimes(1);
         fireEvent.keyDown(input(), { key: "Escape" });
@@ -173,6 +179,7 @@ describe("SearchCard", () => {
 
     it("onUpdate feeds the aux panel's count; the aux panel waits for the encryption answer and passes it on (SearchWarning LIMIT)", () => {
         const { rerender } = mount({ initialTerm: "x" }, null);
+        act(() => void vi.advanceTimersByTime(300));
         expect(screen.queryByTestId("aux")).toBeNull();
         rerender(
             <SDKContext.Provider value={sdk}>

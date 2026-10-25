@@ -517,7 +517,7 @@ export interface ClientViewBridge {
     /** M9: Element asked, from a card panel, to show an event of the panel's room (a Pinned "View in timeline", a file's jump). */
     onJump(cb: (jump: { roomId: string; eventId: string }) => void): () => void;
     /** M9: Element asked, from a card panel, to show another room (a "Message" from user info); the panel is closed. */
-    onRoomOpen(cb: (open: { roomId: string }) => void): () => void;
+    onRoomOpen(cb: (open: { roomId: string; eventId?: string }) => void): () => void;
     /**
      * M7 E4: Element's own report dialog over the kit (`Action.OpenReportEventDialog`, as the message context menu opens
      * it). `done` when the dialog closes (a report sent, cancelled or dismissed alike: Element shows the result itself,

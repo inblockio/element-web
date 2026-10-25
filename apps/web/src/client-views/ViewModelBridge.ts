@@ -204,8 +204,8 @@ export interface CardPanelRequest {
     finish: () => void;
     /** Element asked to show an event of the panel's room: the kit scrolls to it (the panel stays open). */
     jump: (eventId: string) => void;
-    /** Element asked to show another room (F4): the kit opens it, the panel closes. */
-    openRoom: (roomId: string) => void;
+    /** Element asked to show another room (F4): the kit opens it (at `eventId` when given, A2), the panel closes. */
+    openRoom: (roomId: string, eventId?: string) => void;
     /** Element asked for a thread (F3): the panel is replaced by the thread panel on this root. */
     openThreadOn: (root: MatrixEvent) => void;
 }
@@ -1169,7 +1169,7 @@ export class ViewModelBridge implements ClientViewBridge {
     private panel?: { request: CardPanelRequest };
     private readonly panelListeners = new Set<(request: CardPanelRequest | null) => void>();
     private readonly jumpListeners = new Set<(jump: { roomId: string; eventId: string }) => void>();
-    private readonly roomOpenListeners = new Set<(open: { roomId: string }) => void>();
+    private readonly roomOpenListeners = new Set<(open: { roomId: string; eventId?: string }) => void>();
     private isUsed = false;
     /** Called when a kit document first reads the bridge, from inside its scripts (before its DOMContentLoaded). */
     public onUse?: () => void;
@@ -2041,7 +2041,7 @@ export class ViewModelBridge implements ClientViewBridge {
                     if (!current()) return;
                     this.jumpListeners.forEach((cb) => cb({ roomId, eventId }));
                 },
-                openRoom: (id) => {
+                openRoom: (id, eventId) => {
                     if (!current()) return;
                     // F4: the kit opens only rooms it lists; a chat Element just started is a local room until its first send.
                     if (isLocalRoom(id)) {
@@ -2049,7 +2049,7 @@ export class ViewModelBridge implements ClientViewBridge {
                         this.syncRooms();
                     }
                     request.finish();
-                    this.roomOpenListeners.forEach((cb) => cb({ roomId: id }));
+                    this.roomOpenListeners.forEach((cb) => cb(eventId ? { roomId: id, eventId } : { roomId: id }));
                 },
                 openThreadOn: (root) => {
                     if (!current()) return;
@@ -2076,7 +2076,7 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /** M9: Element asked, from a card panel, to show another room (the panel is already closed). Returns the unsubscribe. */
-    public onRoomOpen(cb: (open: { roomId: string }) => void): () => void {
+    public onRoomOpen(cb: (open: { roomId: string; eventId?: string }) => void): () => void {
         this.roomOpenListeners.add(cb);
         return () => this.roomOpenListeners.delete(cb);
     }

@@ -169,7 +169,9 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
             const roomId = payload.room_id;
             if (!roomId) return;
             if (roomId !== room.roomId) {
-                request.openRoom(roomId);
+                // A2: a hit of another room (all-rooms scope) carries its event; the kit opens the room at it.
+                if (payload.event_id) request.openRoom(roomId, payload.event_id);
+                else request.openRoom(roomId);
                 return;
             }
             const eventId = payload.event_id;

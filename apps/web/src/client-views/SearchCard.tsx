@@ -70,7 +70,8 @@ export function SearchCard({ room, initialTerm = "", onClose }: SearchCardProps)
     const runDebounced = useMemo(() => debounce(run, SEARCH_DEBOUNCE_MS), [run]);
 
     useEffect(() => {
-        if (initialTerm) run(initialTerm);
+        // The handed term goes through the same 300 ms debounce as a typed one (RoomView's onSearchChange).
+        if (initialTerm) runDebounced(initialTerm);
         const input = inputRef.current;
         if (input) {
             input.focus();
