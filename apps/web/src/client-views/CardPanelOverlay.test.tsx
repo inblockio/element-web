@@ -381,6 +381,20 @@ describe("CardPanelOverlay", () => {
         expect(req.finish).toHaveBeenCalledTimes(1);
     });
 
+    it("Escape with focus on body and a pending verification cancels the request and keeps the panel (F1)", async () => {
+        const cancel = vi.fn(async () => undefined);
+        h.verification = { pending: true, cancel };
+        mount("info");
+        fireEvent.click(await screen.findByText("verify"));
+        await screen.findByTestId("card-user");
+        (document.activeElement as HTMLElement | null)?.blur();
+        expect(document.activeElement).toBe(document.body);
+        fireEvent.keyDown(document.body, { key: "Escape" });
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(req.finish).not.toHaveBeenCalled();
+        expect(screen.getByTestId("card-user")).toBeTruthy();
+    });
+
     it("Escape closes (a prevented one does not); a listener is gone after unmount", async () => {
         const { unmount } = mount("members");
         const panel = await screen.findByTestId("card-members");

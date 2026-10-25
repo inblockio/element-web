@@ -6,7 +6,7 @@
  */
 
 import { RoomMember, THREAD_RELATION_TYPE, type MatrixClient, type MatrixEvent } from "matrix-js-sdk/src/matrix";
-import React, { type JSX, useContext, useEffect, useMemo, useRef, useState } from "react";
+import React, { type JSX, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 
 import RoomContext from "../contexts/RoomContext";
 import { MatrixClientContextProvider } from "../components/structures/MatrixClientContextProvider";
@@ -222,6 +222,15 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
         return focusKit;
     }, []);
 
+    // The one close decision (stock RightPanel.onClose): Cancel on a pending verification cancels the request and keeps
+    // the panel, otherwise the panel closes. The card's close control and the document-level Escape both take it.
+    const closeTop = useCallback((): void => {
+        const cur = ops.stack()[ops.stack().length - 1];
+        const pending = cur?.state?.verificationRequest;
+        if (cur?.phase === RightPanelPhases.EncryptionPanel && pending?.pending) void pending.cancel();
+        else finish();
+    }, [ops, finish]);
+
     // Escape also closes once focus has left the panel (in-card navigation unmounts the clicked button, an item vanishes):
     // a document-level listener, like Element's own right panel. A keydown inside the kit's iframe never reaches this document.
     useEffect(() => {
@@ -231,11 +240,11 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
             const target = ev.target instanceof HTMLElement ? ev.target : null;
             // A field outside the panel (the composer, a search box) uses Escape itself; inside it the panel's own handler decides.
             if (target?.closest("input, textarea, select, [contenteditable]:not([contenteditable=false])")) return;
-            finish();
+            closeTop();
         };
         document.addEventListener("keydown", onKeyDown);
         return () => document.removeEventListener("keydown", onKeyDown);
-    }, [finish]);
+    }, [closeTop]);
 
     const current = stack[stack.length - 1];
     let card: JSX.Element | null = null;
@@ -256,13 +265,7 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
                         user={member}
                         room={memberRoom}
                         key={`${stack.length}/${member.userId}`}
-                        onClose={() => {
-                            // Stock RightPanel.onClose: Cancel on a pending verification cancels the request and keeps the panel.
-                            const pending = current.state?.verificationRequest;
-                            if (current.phase === RightPanelPhases.EncryptionPanel && pending?.pending)
-                                void pending.cancel();
-                            else finish();
-                        }}
+                        onClose={closeTop}
                         phase={current.phase}
                         verificationRequest={current.state?.verificationRequest}
                         verificationRequestPromise={current.state?.verificationRequestPromise}
