@@ -721,9 +721,16 @@ class EventRow {
         );
         const unsent = new Set([...replies, ...pending].filter(isUnsent));
         const confirmed = replies.filter((e) => !unsent.has(e));
-        // The newest reply the homeserver took (not `thread.replyToEvent`, which may be an
-        // unsent one); with none, no lastReply and the root's time.
-        const last = confirmed.length ? confirmed[confirmed.length - 1] : undefined;
+        // The newest reply the homeserver took (not `thread.replyToEvent`, which may be an unsent one). While the
+        // thread's timeline holds none (not fetched yet), the SDK's bundled latest reply (private `lastEvent`, read
+        // through `thread.replyToEvent`) stands in when it is a sent reply, not the root; with neither, no lastReply
+        // and the root's time.
+        const bundled = thread.replyToEvent;
+        const last = confirmed.length
+            ? confirmed[confirmed.length - 1]
+            : bundled && bundled.getId() !== thread.id && !isUnsent(bundled)
+              ? bundled
+              : undefined;
         this.followLastReplyEdit(last?.replacingEvent() ?? null);
         const body = last?.getContent().body;
         // An edit's body has no reply fallback to strip (as replyTo).

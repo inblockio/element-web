@@ -2220,6 +2220,20 @@ describe("ViewModelBridge", () => {
             });
         });
 
+        it("falls back to the SDK's bundled latest reply while the thread timeline is empty", () => {
+            const { root, thread } = rootWith([]);
+            Object.assign(thread, {
+                length: 3,
+                replyToEvent: reply("$bundled", "@bob:example.org", { getTs: () => 4000 }),
+            });
+            expect(read(root)[0].thread).toEqual({
+                replyCount: 3,
+                lastReplyTs: 4000,
+                lastReply: { eventId: "$bundled", senderId: "@bob:example.org", text: "text of $bundled" },
+                participantIds: ["@bob:example.org"],
+            });
+        });
+
         it("has no latest reply and uses the root's time while no reply is accepted", () => {
             const { root } = rootWith([
                 reply("~local", "@alice:example.org", { status: "sending", getTs: () => 9000 }),
