@@ -54,14 +54,16 @@ function modalStack(): Set<object> {
 function finishedOrDropped(handle: DialogHandle, mine: object | undefined): Promise<unknown[]> {
     if (!mine) return handle.finished;
     return new Promise<unknown[]>((resolve, reject) => {
-        const check = (): void => {
-            if (modalStack().has(mine)) return;
-            release();
-            resolve([]);
-        };
+        let dropped: ReturnType<typeof setTimeout> | undefined;
         const release = (): void => {
+            clearTimeout(dropped);
             Modal.off(ModalManagerEvent.Closed, check);
             Modal.off(ModalManagerEvent.Opened, check);
+        };
+        const check = (): void => {
+            if (modalStack().has(mine) || dropped !== undefined) return;
+            // Modal.tsx resolves `finished` and then emits Closed on one stack: one macrotask lets that answer win over the drop.
+            dropped = setTimeout(() => (release(), resolve([])), 0);
         };
         Modal.on(ModalManagerEvent.Closed, check);
         Modal.on(ModalManagerEvent.Opened, check);

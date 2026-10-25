@@ -389,3 +389,79 @@ describe("E5 view source released when Element drops the dialog (Modal.tsx wipes
         await expect(next).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$f" });
     });
 });
+
+describe("a confirmed dialog answer wins over the drop signal (Modal.tsx resolves `finished`, then emits `closed`, on one stack)", () => {
+    /** A dialog held in the fake modal stack; `confirm` does what ModalManager.getCloseFn does: resolve, remove, emit. */
+    function stackedDialog(): { confirm: (...result: unknown[]) => void; start: () => void } {
+        const fake = Modal as unknown as { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+        const modal = {};
+        let resolve: (r: unknown[]) => void = () => {};
+        const finished = new Promise<unknown[]>((r) => (resolve = r));
+        fake.createDialog = vi.fn(() => {
+            fake.modals.unshift(modal);
+            return { close: vi.fn(), finished };
+        });
+        return {
+            confirm: (...result) => {
+                resolve(result);
+                fake.modals = fake.modals.filter((m) => m !== modal);
+                fake.emit("closed");
+            },
+            start: () => void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {}),
+        };
+    }
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it("create room: the confirmed dialog is not answered as cancelled", async () => {
+        const d = stackedDialog();
+        const outcome = createRoomViaDialog(d.start);
+        await vi.advanceTimersByTimeAsync(0);
+        d.confirm(true, { name: "x" });
+        await vi.advanceTimersByTimeAsync(0);
+        viewRoom("!new:example.org", "Created");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
+    });
+
+    it("start chat: the confirmed dialog is not answered as cancelled", async () => {
+        const d = stackedDialog();
+        const outcome = startChatViaDialog(() => {
+            d.start();
+            viewRoom("!dm:example.org", "MessageUser");
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        d.confirm(true);
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+    });
+
+    it("leave: the confirmed dialog is not answered as cancelled", async () => {
+        let membership = "join";
+        const client = { getRoom: () => ({ getMyMembership: () => membership }) } as unknown as MatrixClient;
+        const d = stackedDialog();
+        const outcome = leaveViaDialog(client, "!a:example.org", d.start);
+        await vi.advanceTimersByTimeAsync(0);
+        d.confirm(true);
+        await vi.advanceTimersByTimeAsync(0);
+        membership = "leave";
+        defaultDispatcher.dispatch({ action: Action.AfterLeaveRoom, room_id: "!a:example.org" }, true);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org" });
+    });
+
+    it("a dialog wiped without an answer still ends as closed (the timer is cleared once settled)", async () => {
+        const fake = Modal as unknown as { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+        const d = stackedDialog();
+        const outcome = createRoomViaDialog(d.start);
+        await vi.advanceTimersByTimeAsync(0);
+        fake.modals = [];
+        fake.emit("closed");
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});

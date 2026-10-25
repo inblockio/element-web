@@ -16,7 +16,16 @@ import { setFavourite } from "./RoomItemActions";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import { ClientViewActionError } from "./types";
 
-vi.mock("../Modal", () => ({ default: { createDialog: vi.fn() } }));
+vi.mock("../Modal", async () => {
+    const { EventEmitter } = await import("events");
+    const manager = Object.assign(new EventEmitter(), {
+        createDialog: vi.fn(),
+        modals: [] as object[],
+        priorityModal: null as object | null,
+        staticModal: null as object | null,
+    });
+    return { default: manager, ModalManagerEvent: { Opened: "opened", Closed: "closed" } };
+});
 const store = vi.hoisted(() => ({ createSection: vi.fn() }));
 vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({ default: { instance: store } }));
 
@@ -431,5 +440,35 @@ describe("M6 B1 createSection (RoomListStoreV3.createSection -> Element's dialog
         await vi.advanceTimersByTimeAsync(0);
         storeResult(undefined);
         expect(await outcome).toBe("failed");
+    });
+});
+
+describe("createSection: a confirmed dialog answer wins over the drop signal (Modal.tsx resolves `finished`, then emits `closed`)", () => {
+    it("is done with the new tag, not cancelled, when the dialog closes on the answer", async () => {
+        vi.useFakeTimers();
+        try {
+            const fake = Modal as unknown as { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+            const modal = {};
+            let resolve: (r: unknown[]) => void = () => {};
+            const finished = new Promise<unknown[]>((r) => (resolve = r));
+            fake.createDialog = vi.fn(() => {
+                fake.modals.unshift(modal);
+                return { close: vi.fn(), finished };
+            });
+            store.createSection.mockReset();
+            store.createSection.mockImplementation(() => {
+                (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+                return Promise.resolve(A);
+            });
+            const outcome = createSection(undefined);
+            await vi.advanceTimersByTimeAsync(0);
+            resolve(["Projects", []]);
+            fake.modals = fake.modals.filter((m) => m !== modal);
+            fake.emit("closed");
+            await vi.advanceTimersByTimeAsync(0);
+            await expect(outcome).resolves.toEqual({ status: "done", section: A });
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
