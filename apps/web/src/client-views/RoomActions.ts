@@ -220,10 +220,8 @@ export function forwardViaDialog(sourceRoomId: string, eventId: string, start: (
             await dialog.finished;
             // Element dispatches the jump before it closes the dialog; one tick covers a queued dispatch.
             await new Promise((resolve) => setTimeout(resolve, 0));
-            const jump = seen.payloads.filter(isForwardJump).pop();
-            return jump
-                ? { status: "done", roomId: jump.room_id }
-                : { status: "done", roomId: sourceRoomId, eventId };
+            const jump = [...seen.payloads].reverse().find(isForwardJump);
+            return jump ? { status: "done", roomId: jump.room_id } : { status: "done", roomId: sourceRoomId, eventId };
         } finally {
             seen.stop();
         }
