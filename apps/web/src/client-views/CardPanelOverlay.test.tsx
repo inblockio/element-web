@@ -27,6 +27,21 @@ import { type CardPanelRequest, type ThreadPanelRequest, type ViewModelBridge } 
 const h = vi.hoisted(() => ({
     fetched: new Map<string, unknown>(),
     summaryProps: [] as Array<Record<string, unknown>>,
+    cardStub: async (testId: string, extra?: (props: Record<string, unknown>, R: typeof import("react")) => unknown) => {
+        const R = await import("react");
+        const { SDKContext } = await import("../contexts/SDKContext");
+        return function CardStub(props: Record<string, unknown>) {
+            const store = R.useContext(SDKContext).rightPanelStore;
+            const history = store.roomPhaseHistory;
+            return R.createElement(
+                "div",
+                { "data-testid": testId, "data-history": history.map((c) => c.phase).join(">") },
+                history.length > 1 ? R.createElement("button", { onClick: () => store.popCard() }, "back") : null,
+                R.createElement("button", { onClick: props.onClose as () => void }, "close"),
+                extra?.(props, R) as never,
+            );
+        };
+    },
 }));
 
 vi.mock("../utils/EventUtils", async (orig) => ({
@@ -58,31 +73,16 @@ vi.mock("../components/views/right_panel/RoomSummaryCardView", async () => {
         },
     };
 });
-const cardStub = async (testId: string, extra?: (props: Record<string, unknown>, R: typeof import("react")) => unknown) => {
-    const R = await import("react");
-    const { SDKContext } = await import("../contexts/SDKContext");
-    return function CardStub(props: Record<string, unknown>) {
-        const store = R.useContext(SDKContext).rightPanelStore;
-        const history = store.roomPhaseHistory;
-        return R.createElement(
-            "div",
-            { "data-testid": testId, "data-history": history.map((c) => c.phase).join(">") },
-            history.length > 1 ? R.createElement("button", { onClick: () => store.popCard() }, "back") : null,
-            R.createElement("button", { onClick: props.onClose as () => void }, "close"),
-            extra?.(props, R) as never,
-        );
-    };
-};
 vi.mock("../components/views/right_panel/UserInfo", async () => ({
-    default: await cardStub("card-user", (p, R) =>
+    default: await h.cardStub("card-user", (p, R) =>
         R.createElement("span", { "data-testid": "user-id" }, (p.user as { userId: string }).userId),
     ),
 }));
-vi.mock("../components/views/rooms/ThirdPartyMemberInfo", async () => ({ default: await cardStub("card-3pid") }));
+vi.mock("../components/views/rooms/ThirdPartyMemberInfo", async () => ({ default: await h.cardStub("card-3pid") }));
 vi.mock("../components/views/rooms/MemberList/MemberListView", async () => {
     const { default: defaultDispatcher } = await import("../dispatcher/dispatcher");
     return {
-        default: await cardStub("card-members", (_p, R) =>
+        default: await h.cardStub("card-members", (_p, R) =>
             R.createElement(
                 "button",
                 {
@@ -98,9 +98,9 @@ vi.mock("../components/views/rooms/MemberList/MemberListView", async () => {
         ),
     };
 });
-vi.mock("../components/structures/FilePanel", async () => ({ default: await cardStub("card-files") }));
+vi.mock("../components/structures/FilePanel", async () => ({ default: await h.cardStub("card-files") }));
 vi.mock("../components/views/right_panel/PinnedMessagesCard", async () => ({
-    PinnedMessagesCard: await cardStub("card-pinned"),
+    PinnedMessagesCard: await h.cardStub("card-pinned"),
 }));
 
 const makeSdk = () => {
@@ -115,6 +115,7 @@ const makeSdk = () => {
     };
     const client = Object.assign(new EventEmitter(), {
         getSafeUserId: () => "@me:example.org",
+        getUserId: () => "@me:example.org",
         getCrypto: (): unknown => undefined,
         getRoom: (): unknown => undefined,
     }) as unknown as MatrixClient;
@@ -305,7 +306,7 @@ describe("CardPanelOverlay", () => {
     it("Escape closes (a prevented one does not); a listener is gone after unmount", async () => {
         const { unmount } = mount("members");
         const panel = await screen.findByTestId("card-members");
-        panel.addEventListener("keydown", (e) => e.preventDefault());
+        panel.addEventListener("keydown", (e) => e.preventDefault(), { once: true });
         fireEvent.keyDown(panel, { key: "Escape" });
         expect(req.finish).not.toHaveBeenCalled();
         fireEvent.keyDown(screen.getByText("close"), { key: "Escape" });
