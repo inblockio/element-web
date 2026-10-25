@@ -145,16 +145,42 @@ function localRoomCreationFailure(
     return { failed, stop };
 }
 
+/** Characters a Matrix id token must not touch on either side (a longer word, a path, a domain label continuing). */
+const MENTION_BEFORE = "(?<![A-Za-z0-9_=/+-])";
+const MENTION_AFTER = "(?![A-Za-z0-9_=/+-]|[.:][A-Za-z0-9])";
+
+/**
+ * M7 E2: the plain line split at every `@<userId>` token whose id is in `mentions`: the pieces between are plain text
+ * parts, a token is the user pill the autocomplete inserts (`PartCreator.userPill(rawDisplayName, userId)`, the
+ * display name as `UserProvider` completes it). Boundaries: the token is not part of a longer word or domain.
+ */
+function mentionParts(pc: PartCreator, room: Room, line: string, mentions: string[]): Part[] {
+    const ids = [...new Set(mentions)].filter((id) => id.startsWith("@")).sort((a, b) => b.length - a.length);
+    if (!ids.length) return [pc.plain(line)];
+    const escaped = ids.map((id) => id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const re = new RegExp(`${MENTION_BEFORE}(${escaped.join("|")})${MENTION_AFTER}`, "g");
+    const parts: Part[] = [];
+    let last = 0;
+    for (const m of line.matchAll(re)) {
+        if (m.index > last) parts.push(pc.plain(line.slice(last, m.index)));
+        parts.push(pc.userPill(room.getMember(m[1])?.rawDisplayName ?? m[1], m[1]));
+        last = m.index + m[0].length;
+    }
+    if (last < line.length) parts.push(pc.plain(line.slice(last)));
+    return parts;
+}
+
 /**
  * M7 E1: the editor model Element's composer holds for a typed text: one plain part per line, a newline part between.
- * No autocomplete pills (E2 adds the mentions) and no `@room` detection: the text is what the user typed.
+ * M7 E2: a `@<userId>` token of `mentions` is a user pill part (Element's `attachMentions` then sets `m.mentions`, the
+ * serializer the pill link). No `@room` detection: the text is what the user typed.
  */
-function markdownModel(client: MatrixClient, room: Room, text: string): EditorModel {
+function markdownModel(client: MatrixClient, room: Room, text: string, mentions: string[] = []): EditorModel {
     const pc = new PartCreator(room, client);
     const parts: Part[] = [];
     text.split(/\r\n|\r|\n/).forEach((line, i) => {
         if (i > 0) parts.push(pc.newline());
-        if (line) parts.push(pc.plain(line));
+        if (line) parts.push(...mentionParts(pc, room, line, mentions));
     });
     return new EditorModel(parts, pc);
 }
@@ -184,10 +210,15 @@ export async function sendText(
     let content: RoomMessageEventContent;
     if (opts.markdown) {
         // M7 E1: the content Element's composer builds for this text (Markdown forced, `createMessageContent` also
-        // attaches the mentions, the reply relation and the reply fallback). `opts.mentions` is E2's.
-        content = createMessageContent(client.getSafeUserId(), markdownModel(client, room, text), replyTo, undefined, {
-            useMarkdown: true,
-        });
+        // attaches the mentions, the reply relation and the reply fallback). `opts.mentions` (E2): the picked users, each
+        // `@<id>` token of the text with such an id is a user pill part.
+        content = createMessageContent(
+            client.getSafeUserId(),
+            markdownModel(client, room, text, opts.mentions),
+            replyTo,
+            undefined,
+            { useMarkdown: true },
+        );
         // As `SendMessageComposer.sendMessage`: a body left blank (`/me ` and whitespace) is not sent.
         if (!content.body.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
         if (replyTo) hooks.onReplyTarget?.(replyTo);
@@ -339,7 +370,7 @@ export async function editText(
         // `ev.getContent()` is the aggregated content `parseEvent` reads). `createEditContent` attaches mentions and the relation.
         const prefix = ev.getContent().msgtype === MsgType.Emote ? "/me " : "";
         content = createEditContent(
-            markdownModel(client, room, prefix + text),
+            markdownModel(client, room, prefix + text, opts.mentions),
             withSender(room, ev), // `createEditContent` reads `editedEvent.sender.userId`
             repliedTo ? withSender(room, repliedTo) : undefined,
             { useMarkdown: true },

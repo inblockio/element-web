@@ -240,4 +240,91 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
             expect(content["m.new_content"]).toEqual({ "msgtype": "m.text", "body": "now **bold**", "m.mentions": {} });
         });
     });
+
+    describe("M7 E2 mentions (pill parts as the autocomplete inserts them)", () => {
+        const BOB = "@bob:example.org";
+        const own = (content: Record<string, unknown>) =>
+            new MatrixEvent({
+                type: "m.room.message",
+                room_id: "!a:example.org",
+                event_id: "$mine",
+                sender: "@me:example.org",
+                content,
+            });
+
+        beforeEach(() => {
+            vi.spyOn(SettingsStore, "getValue").mockImplementation((n: string) =>
+                n === "MessageComposerInput.useMarkdown" ? true : false,
+            );
+            const member = { rawDisplayName: "Bob Builder", userId: BOB } as any;
+            vi.spyOn(room, "getMember").mockImplementation((id: string) => (id === BOB ? member : null));
+        });
+
+        /** What the composer holds after the user picked Bob from the popup and typed around him. */
+        const picked = (parts: (string | "BOB")[]): EditorModel => {
+            const pc = new PartCreator(room, client);
+            return new EditorModel(
+                parts.map((p) => (p === "BOB" ? pc.userPill("Bob Builder", BOB) : pc.plain(p))),
+                pc,
+            );
+        };
+
+        it("sends the content Element's composer builds for a picked member: m.mentions and the pill link", async () => {
+            await sendText(client, room.roomId, `hi ${BOB} there`, { markdown: true, mentions: [BOB] });
+            const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(sent).toEqual(createMessageContent("@me:example.org", picked(["hi ", "BOB", " there"]), undefined, undefined));
+            expect(sent["m.mentions"]).toEqual({ user_ids: [BOB] });
+            expect(sent.body).toBe("hi Bob Builder there");
+            expect(sent.formatted_body).toBe(`hi <a href="https://matrix.to/#/${BOB}">Bob Builder</a> there`);
+        });
+
+        it("a token whose id is not in `mentions` stays text; a mention at the start and the end works", async () => {
+            await sendText(client, room.roomId, `${BOB} and @carol:example.org`, { markdown: true, mentions: [BOB] });
+            const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(sent["m.mentions"]).toEqual({ user_ids: [BOB] });
+            expect(sent.body).toBe("Bob Builder and @carol:example.org");
+            await sendText(client, room.roomId, `no mentions list ${BOB}`, { markdown: true });
+            const plain = vi.mocked(client.sendMessage).mock.calls[1][2] as Record<string, any>;
+            expect(plain["m.mentions"]).toEqual({});
+            expect(plain.body).toBe(`no mentions list ${BOB}`);
+        });
+
+        it("a token inside a longer word or id is not a mention; punctuation after it is", async () => {
+            await sendText(client, room.roomId, `x${BOB} and ${BOB}.org and ${BOB}x`, { markdown: true, mentions: [BOB] });
+            expect((vi.mocked(client.sendMessage).mock.calls[0][2] as any)["m.mentions"]).toEqual({});
+            await sendText(client, room.roomId, `hey ${BOB}, ok? ${BOB}.`, { markdown: true, mentions: [BOB] });
+            const sent = vi.mocked(client.sendMessage).mock.calls[1][2] as Record<string, any>;
+            expect(sent["m.mentions"]).toEqual({ user_ids: [BOB] });
+            expect(sent.body).toBe("hey Bob Builder, ok? Bob Builder.");
+        });
+
+        it("a mention with no room member record falls back to the id as the display name; own id is not mentioned", async () => {
+            vi.spyOn(room, "getMember").mockReturnValue(null);
+            await sendText(client, room.roomId, `hi ${BOB} and @me:example.org`, {
+                markdown: true,
+                mentions: [BOB, "@me:example.org"],
+            });
+            const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(sent["m.mentions"]).toEqual({ user_ids: [BOB] });
+            expect(sent.body).toBe(`hi ${BOB} and @me:example.org`);
+        });
+
+        it("a mention on a second line keeps the newline", async () => {
+            await sendText(client, room.roomId, `first\n${BOB} second`, { markdown: true, mentions: [BOB] });
+            const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(sent["m.mentions"]).toEqual({ user_ids: [BOB] });
+            expect(sent.body).toBe("first\nBob Builder second");
+        });
+
+        it("an edit keeps the pill in m.new_content; the outer m.mentions lists only new users", async () => {
+            const ev = own({ "msgtype": "m.text", "body": "hi Bob Builder", "m.mentions": { user_ids: [BOB] } });
+            vi.spyOn(room, "findEventById").mockReturnValue(ev);
+            await editText(client, room.roomId, "$mine", `hi ${BOB} again`, {}, { markdown: true, mentions: [BOB] });
+            const sent = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(sent).toEqual(createEditContent(picked(["hi ", "BOB", " again"]), ev));
+            expect(sent["m.new_content"]["m.mentions"]).toEqual({ user_ids: [BOB] });
+            expect(sent["m.new_content"].formatted_body).toBe(`hi <a href="https://matrix.to/#/${BOB}">Bob Builder</a> again`);
+            expect(sent["m.mentions"]).toEqual({});
+        });
+    });
 });

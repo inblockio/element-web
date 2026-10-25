@@ -82,6 +82,7 @@ import { CallCard } from "./CallCard";
 import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
+import UserProvider from "../autocomplete/UserProvider";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, leaveViaDialog, startChatViaDialog, viewSourceViaDialog } from "./RoomActions";
 import Modal from "../Modal";
@@ -1042,6 +1043,8 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly timelines = new Map<string, RoomTimelineViewModel>();
     /** One started permalink creator per room (its `via` servers follow the room state); stopped when the room leaves the bridge. */
     private readonly permalinkCreators = new Map<string, RoomPermalinkCreator>();
+    /** M7 E2: one autocomplete user provider per room (it listens to the client), destroyed when the room leaves the bridge. */
+    private readonly userProviders = new Map<string, UserProvider>();
     /** The rooms the bridge lists (set by `syncRooms`): a room that left it gets no permalink creator again. */
     private listedRoomIds = new Set<string>();
     /** Rooms read while not listed (messages handed over without a permalink): the kit reads them again once they are listed. */
@@ -1277,6 +1280,11 @@ export class ViewModelBridge implements ClientViewBridge {
             creator.stop();
             this.permalinkCreators.delete(roomId);
             this.memberLoadFailed.delete(roomId);
+        }
+        for (const [roomId, provider] of this.userProviders) {
+            if (listed.has(roomId)) continue;
+            provider.destroy();
+            this.userProviders.delete(roomId);
         }
         // A room read without permalinks while it was not listed (a rejoin the list shows late) is listed now: read it again.
         const relisted = [...this.readUnlisted].filter((id) => listed.has(id));
@@ -1911,6 +1919,28 @@ export class ViewModelBridge implements ClientViewBridge {
         });
     }
 
+    /**
+     * M7 E2: the members Element's composer offers for `@<query>`: `UserProvider.getCompletions` with `force` (the bare
+     * query, no `@`) after the room's members are loaded (lazy loading; no RoomView mounted under a kit).
+     */
+    public async mentionCandidates(
+        roomId: string,
+        query: string,
+    ): Promise<{ userId: string; displayName: string; avatarUrl?: string }[]> {
+        const room = this.client.getRoom(roomId);
+        if (!room) throw new ClientViewActionError("unknown_room", `no room ${roomId}`);
+        await room.loadMembersIfNeeded();
+        let provider = this.userProviders.get(roomId);
+        if (!provider) {
+            provider = new UserProvider(room);
+            this.userProviders.set(roomId, provider);
+        }
+        const completions = await provider.getCompletions(query, { beginning: true, start: query.length, end: query.length }, true);
+        return completions.flatMap((c) =>
+            c.completionId ? [{ userId: c.completionId, displayName: c.completion ?? c.completionId }] : [],
+        );
+    }
+
     /** A11: the replacement send is interim; the edit state is entered through the row's `onEditClick`. */
     public editText(
         roomId: string,
@@ -2169,6 +2199,8 @@ export class ViewModelBridge implements ClientViewBridge {
         this.timelines.forEach((t) => t.dispose());
         this.permalinkCreators.forEach((c) => c.stop());
         this.permalinkCreators.clear();
+        this.userProviders.forEach((p) => p.destroy());
+        this.userProviders.clear();
         this.memberLoadFailed.clear();
         this.readUnlisted.clear();
         this.statusBar?.dispose();

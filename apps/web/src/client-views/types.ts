@@ -325,13 +325,23 @@ export interface ClientViewBridge {
      * real one. Interim (D16): Element's own client call, until a composer send view-model ships.
      * Version 2, additive (M7 E1): `opts.markdown` builds the content as Element's composer does for that text
      * (`createMessageContent`, Markdown forced): `body` is the text serialize, `format` + `formatted_body` are set only
-     * when Markdown yields HTML. `opts.mentions` (E2) is accepted, an empty list changes nothing.
+     * when Markdown yields HTML. Version 2, additive (M7 E2): `opts.mentions` are the Matrix ids of the picked members
+     * (with `markdown`): every `@<userId>` token of `text` whose id is listed becomes the user pill Element's
+     * autocomplete inserts (`PartCreator.userPill`), so `m.mentions.user_ids` and the pill link in `formatted_body` are
+     * what `createMessageContent` / `attachMentions` produce; an empty list changes nothing.
      */
     sendText(
         roomId: string,
         text: string,
         opts?: { txnId?: string; replyTo?: string; markdown?: boolean; mentions?: string[] },
     ): Promise<ActionOutcome>;
+    /**
+     * M7 E2: the members of `roomId` Element's composer would offer for `@<query>` (`query` without the `@`): Element's
+     * own `UserProvider` (name and Matrix id match, the room's recent speakers first, the own user left out; invited
+     * members included), after the room's members are loaded. Interim (D31): not the v1 member-list hook. An empty
+     * query lists nobody (as the composer for a bare `@`). `unknown_room` when the room is not known.
+     */
+    mentionCandidates(roomId: string, query: string): Promise<{ userId: string; displayName: string; avatarUrl?: string }[]>;
     /**
      * Loads the next page of older messages of a room and resolves when the page is in (the room's `timeline` has
      * changed by then). Concurrent calls for a room share one load. Backed by the timeline view-model's
@@ -371,7 +381,8 @@ export interface ClientViewBridge {
      * Element does not let the user edit (`ViewMessage.canEdit`), `unknown_event` when it cannot be loaded, `failed`
      * for a blank text (nothing is sent). Interim (D16/D20): entry through the action bar view-model's `onEditClick`,
      * the replacement send is Element's own client call. Version 2, additive (M7 E1): `opts.markdown` builds the
-     * replacement as Element's edit composer does (`createEditContent`, Markdown forced); `opts.mentions` is E2's.
+     * replacement as Element's edit composer does (`createEditContent`, Markdown forced); `opts.mentions` (E2) as for `sendText`: the pills stay in
+     * `m.new_content` (the outer `m.mentions` lists only newly added users, as Element's edit composer sets it).
      */
     editText(
         roomId: string,
