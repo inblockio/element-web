@@ -141,6 +141,15 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
         expect(sent["m.mentions"]).toEqual({ user_ids: ["@bob:example.org"] });
     });
 
+    it("a blank emote (`/me ` and nothing else) is not sent, as the composer drops it (grok F2)", async () => {
+        for (const text of ["/me  ", "/me \n", "/me \n  "]) {
+            await expect(sendText(client, room.roomId, text, { markdown: true })).rejects.toMatchObject({
+                code: "failed",
+            });
+        }
+        expect(client.sendMessage).not.toHaveBeenCalled();
+    });
+
     describe("edit", () => {
         const own = (content: Record<string, unknown>) =>
             new MatrixEvent({
@@ -193,6 +202,29 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
                 body: "waves *hard*",
                 formatted_body: "waves <em>hard</em>",
             });
+        });
+
+        it("a later edit follows the type on screen: an m.text edited to an emote stays an emote (grok F1)", async () => {
+            const ev = own({ msgtype: "m.text", body: "first" });
+            const replacement = new MatrixEvent({
+                type: "m.room.message",
+                room_id: "!a:example.org",
+                event_id: "$edit1",
+                sender: "@me:example.org",
+                content: {
+                    "msgtype": "m.emote",
+                    "body": "* waves",
+                    "m.new_content": { msgtype: "m.emote", body: "waves" },
+                    "m.relates_to": { rel_type: "m.replace", event_id: "$mine" },
+                },
+            });
+            ev.makeReplaced(replacement);
+            expect(ev.getContent().msgtype).toBe("m.emote");
+            vi.spyOn(room, "findEventById").mockReturnValue(ev);
+            await editText(client, room.roomId, "$mine", "waves again", {}, { markdown: true });
+            const content = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
+            expect(content.msgtype).toBe("m.emote");
+            expect(content["m.new_content"]).toMatchObject({ msgtype: "m.emote", body: "waves again" });
         });
 
         it("without markdown the replacement is the plain one (no formatted_body)", async () => {

@@ -192,6 +192,8 @@ export async function sendText(
             undefined,
             { useMarkdown: true },
         );
+        // As `SendMessageComposer.sendMessage`: a body left blank (`/me ` and whitespace) is not sent.
+        if (!content.body.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
         if (replyTo) hooks.onReplyTarget?.(replyTo);
     } else {
         content = { msgtype: MsgType.Text, body: text };
@@ -337,8 +339,9 @@ export async function editText(
     let newContent: Record<string, unknown>;
     if (opts.markdown) {
         // M7 E1: the replacement Element's edit composer builds for this text (Markdown forced; an emote is edited
-        // with its `/me ` prefix, as the editor holds it). `createEditContent` attaches mentions and the relation.
-        const prefix = original.msgtype === MsgType.Emote ? "/me " : "";
+        // with its `/me ` prefix, as the editor holds it, from the type on screen: a replacement can have changed it,
+        // `ev.getContent()` is the aggregated content `parseEvent` reads). `createEditContent` attaches mentions and the relation.
+        const prefix = ev.getContent().msgtype === MsgType.Emote ? "/me " : "";
         content = createEditContent(
             markdownModel(client, room, prefix + text),
             withSender(room, ev), // `createEditContent` reads `editedEvent.sender.userId`
