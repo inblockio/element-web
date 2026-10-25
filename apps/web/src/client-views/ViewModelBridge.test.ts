@@ -2159,9 +2159,9 @@ describe("ViewModelBridge", () => {
             expect(shown).toEqual([request, null]);
         });
 
-        it("rejects an unknown room, search (item S), a room not joined and a DM whose other member is unknown", async () => {
+        it("rejects an unknown room, an unknown card, a room not joined and a DM whose other member is unknown", async () => {
             await expect(bridge.openPanel("!nope", "info")).rejects.toMatchObject({ code: "unknown_room" });
-            await expect(bridge.openPanel("!a", "search")).rejects.toMatchObject({ code: "unsupported" });
+            await expect(bridge.openPanel("!a", "nope" as never)).rejects.toMatchObject({ code: "unsupported" });
             const membership = vi.spyOn(h.room, "getMyMembership").mockReturnValue("invite");
             await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
             membership.mockRestore();
@@ -2230,7 +2230,7 @@ describe("ViewModelBridge", () => {
             );
             const slow = bridge.openPanel("!a", "info");
             await expect(bridge.openPanel("!nope", "info")).rejects.toMatchObject({ code: "unknown_room" });
-            await expect(bridge.openPanel("!a", "search")).rejects.toMatchObject({ code: "unsupported" });
+            await expect(bridge.openPanel("!a", "nope" as never)).rejects.toMatchObject({ code: "unsupported" });
             release();
             await vi.waitFor(() => expect(shown.at(-1)?.dmMember).toMatchObject({ userId: "@bob:example.org" }));
             bridge.closePanel();

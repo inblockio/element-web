@@ -185,8 +185,8 @@ export interface ThreadPanelRequest {
     finish: () => void;
 }
 
-/** The cards the host panel slot can show (M9, D39); `search` is item S's. */
-export type PanelCardName = "info" | "members" | "files" | "pinned";
+/** The cards the host panel slot can show (M9, D39). */
+export type PanelCardName = "info" | "members" | "files" | "pinned" | "search";
 
 /**
  * One of Element's right-panel cards over the kit (M9 P): what the host renders (CardPanelOverlay) until `finish`.
@@ -1957,12 +1957,12 @@ export class ViewModelBridge implements ClientViewBridge {
      * The card panel keeps its own stack (never `RightPanelStore`); what Element asks of the kit (a jump to an event, another
      * room) goes through `onJump` / `onRoomOpen`, a thread through the thread panel.
      */
-    public openPanel(roomId: string, card: PanelCardName | "search"): Promise<ActionOutcome> {
+    public openPanel(roomId: string, card: PanelCardName): Promise<ActionOutcome> {
         this.used = true;
         const room = this.client.getRoom(roomId);
         if (!room) return Promise.reject(new ClientViewActionError("unknown_room", `unknown room ${roomId}`));
-        if (card !== "info" && card !== "members" && card !== "files" && card !== "pinned") {
-            return Promise.reject(new ClientViewActionError("unsupported", `no ${card} card yet`));
+        if (card !== "info" && card !== "members" && card !== "files" && card !== "pinned" && card !== "search") {
+            return Promise.reject(new ClientViewActionError("unsupported", `no ${String(card)} card`));
         }
         if (room.getMyMembership() !== KnownMembership.Join) {
             return Promise.reject(

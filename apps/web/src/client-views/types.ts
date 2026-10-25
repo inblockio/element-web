@@ -506,10 +506,9 @@ export interface ClientViewBridge {
     closeThread(): void;
     /**
      * M9 (version 3, interim D39): one of Element's own right-panel cards in the host panel slot over the kit: `info` (the
-     * room's info card; in a DM, Element's user info of the other member), `members`, `files` or `pinned`. Replaces an open
+     * room's info card; in a DM, Element's user info of the other member), `members`, `files`, `pinned` or `search` (Element's own message search: the field and the results, RoomView's search path). Replaces an open
      * panel or thread panel. `done` (`roomId`) when it closes: its close button, Escape, a later open, `closePanel`, the room
-     * left, another room opened from it, the bridge disposed. `unknown_room` as the other actions; `unsupported` for `search`
-     * (not built yet), a room the user has not joined, and a DM whose other member is unknown. The card's own writes
+     * left, another room opened from it, the bridge disposed. `unknown_room` as the other actions; `unsupported` for a room the user has not joined, and a DM whose other member is unknown. The card's own writes
      * (favourite, leave, invite, unpin ...) are Element's. Awaits a right-panel view-model.
      */
     openPanel(roomId: string, card: "info" | "members" | "files" | "pinned" | "search"): Promise<ActionOutcome>;
