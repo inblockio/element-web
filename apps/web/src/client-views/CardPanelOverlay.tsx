@@ -11,6 +11,7 @@ import React, { type JSX, useContext, useEffect, useMemo, useRef, useState } fro
 import RoomContext from "../contexts/RoomContext";
 import { MatrixClientContextProvider } from "../components/structures/MatrixClientContextProvider";
 import { SDKContext } from "../contexts/SDKContext";
+import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { type ActionPayload } from "../dispatcher/payloads";
@@ -220,6 +221,21 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
         ref.current?.focus();
         return focusKit;
     }, []);
+
+    // Escape also closes once focus has left the panel (in-card navigation unmounts the clicked button, an item vanishes):
+    // a document-level listener, like Element's own right panel. A keydown inside the kit's iframe never reaches this document.
+    useEffect(() => {
+        const onKeyDown = (ev: KeyboardEvent): void => {
+            if (ev.key !== "Escape" || ev.defaultPrevented) return;
+            if (Modal.hasDialogs() || document.querySelector(".mx_Dialog_wrapper, .mx_Dialog")) return;
+            const target = ev.target instanceof HTMLElement ? ev.target : null;
+            // A field outside the panel (the composer, a search box) uses Escape itself; inside it the panel's own handler decides.
+            if (target?.closest("input, textarea, select, [contenteditable]:not([contenteditable=false])")) return;
+            finish();
+        };
+        document.addEventListener("keydown", onKeyDown);
+        return () => document.removeEventListener("keydown", onKeyDown);
+    }, [finish]);
 
     const current = stack[stack.length - 1];
     let card: JSX.Element | null = null;

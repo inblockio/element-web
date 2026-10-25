@@ -15,6 +15,7 @@ import { EventEmitter } from "events";
 
 import { SDKContext } from "../contexts/SDKContext";
 import { type SDKContextClass } from "../contexts/SDKContextClass";
+import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { RightPanelPhases } from "../stores/right-panel/RightPanelStorePhases";
@@ -344,6 +345,40 @@ describe("CardPanelOverlay", () => {
         expect(needsStockUi({ action: Action.ViewRoom, room_id: "local+1", metricsTrigger: "MessageUser" })).toBe(
             false,
         );
+    });
+
+    it("Escape closes at the document level after focus was lost (People -> back), not under a dialog or from the composer", async () => {
+        mount("info");
+        fireEvent.click(await screen.findByText("People"));
+        fireEvent.click(await screen.findByText("back"));
+        await screen.findByTestId("card-info");
+        // the clicked Back button unmounted: focus is on body
+        (document.activeElement as HTMLElement | null)?.blur();
+        expect(document.activeElement).toBe(document.body);
+
+        const dialog = document.body.appendChild(document.createElement("div"));
+        dialog.className = "mx_Dialog";
+        fireEvent.keyDown(document.body, { key: "Escape" });
+        expect(req.finish).not.toHaveBeenCalled();
+        dialog.remove();
+
+        vi.spyOn(Modal, "hasDialogs").mockReturnValue(true);
+        fireEvent.keyDown(document.body, { key: "Escape" });
+        expect(req.finish).not.toHaveBeenCalled();
+        vi.mocked(Modal.hasDialogs).mockReturnValue(false);
+
+        const composer = document.body.appendChild(document.createElement("textarea"));
+        fireEvent.keyDown(composer, { key: "Escape" });
+        expect(req.finish).not.toHaveBeenCalled();
+        composer.remove();
+
+        const ev = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+        ev.preventDefault();
+        document.body.dispatchEvent(ev);
+        expect(req.finish).not.toHaveBeenCalled();
+
+        fireEvent.keyDown(document.body, { key: "Escape" });
+        expect(req.finish).toHaveBeenCalledTimes(1);
     });
 
     it("Escape closes (a prevented one does not); a listener is gone after unmount", async () => {
