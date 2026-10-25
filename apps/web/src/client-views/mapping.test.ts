@@ -136,6 +136,29 @@ describe("client view mapping", () => {
         expect([shown(true), shown(false), shown(true, true)]).toEqual([true, false, false]);
     });
 
+    it("M6 B1: the room's custom section is the item's selected `sections` entry, absent when none is selected", () => {
+        const room = (sections: Array<{ tag: string; name: string; isSelected: boolean }>) =>
+            toViewRoom(
+                {
+                    id: "!r",
+                    name: "General",
+                    isDm: false,
+                    notification: { hasUnreadCount: false, count: 0, isMention: false },
+                    isFavourite: false,
+                    sections,
+                } as never,
+                0,
+            );
+        expect(room([])).not.toHaveProperty("section");
+        expect(room([{ tag: "element.io.section.a", name: "Work", isSelected: false }])).not.toHaveProperty("section");
+        expect(
+            room([
+                { tag: "element.io.section.a", name: "Work", isSelected: false },
+                { tag: "element.io.section.b", name: "Home", isSelected: true },
+            ]).section,
+        ).toBe("element.io.section.b");
+    });
+
     it("reads text from nested nodes", () => {
         expect(nodeText(["a", 1, null, false, ["b"]])).toBe("a1b");
     });

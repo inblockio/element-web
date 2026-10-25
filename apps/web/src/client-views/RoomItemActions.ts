@@ -17,6 +17,7 @@
 import { type MatrixClient, type Room } from "matrix-js-sdk/src/matrix";
 
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
+import { isSectionTag } from "../stores/room-list-v3/section";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
 import { TransactionStatus } from "../stores/local-echo/EchoTransaction";
 import { getRoomNotifsState } from "../RoomNotifs";
@@ -63,42 +64,107 @@ export async function markUnread(item: RoomItemActionsVm, room: Room): Promise<A
     return done(room.roomId);
 }
 
-const favouriteQueue = new Map<string, Promise<unknown>>();
+const tagQueue = new Map<string, Promise<unknown>>();
+
+/**
+ * Runs `run` after every earlier room-tag write of the room (favourite, custom section) has settled: the room's tags are
+ * stale until the sync, and `tagRoom` toggles on them, so an overlapping call would act on a stale state.
+ */
+export function serialTagWrite<T>(roomId: string, run: () => Promise<T>): Promise<T> {
+    const previous = tagQueue.get(roomId) ?? Promise.resolve();
+    const next = previous.then(run, run);
+    const tail = next.catch(() => undefined);
+    tagQueue.set(roomId, tail);
+    void tail.then(() => {
+        if (tagQueue.get(roomId) === tail) tagQueue.delete(roomId);
+    });
+    return next;
+}
+
+const LATE_LANDING_MS = 5_000;
+const unsettled = new WeakMap<Room, { signature: string; at: number }>();
+const tagSignature = (room: Room): string =>
+    Object.keys(room.tags ?? {})
+        .sort()
+        .join("|");
+
+/**
+ * A tag write that timed out is not stoppable and may still land (a slow or refused homeserver call looks the same from
+ * here). The room's tags at that moment are remembered so the next tag call for the room can tell a late landing from
+ * "nothing happened" (`awaitLateLanding`).
+ */
+export function noteUnsettledTagWrite(room: Room): void {
+    unsettled.set(room, { signature: tagSignature(room), at: Date.now() });
+}
+
+/**
+ * Called first in every queued tag call: after a timed-out write for this room, waits (at most `LATE_LANDING_MS` after the
+ * timeout) for the room's tags to change, so the next call acts on, and answers for, the state the late write leaves and
+ * not on the state from before it. Nothing to wait for without an earlier timeout; a refused write costs the wait once.
+ */
+export async function awaitLateLanding(room: Room): Promise<void> {
+    const mark = unsettled.get(room);
+    if (!mark) return;
+    unsettled.delete(room);
+    while (tagSignature(room) === mark.signature && Date.now() - mark.at < LATE_LANDING_MS)
+        await new Promise((r) => setTimeout(r, 50));
+}
+
+/**
+ * Every section tag the room holds (favourite, low priority, any custom one). Element's one-section rule means a settled room
+ * holds at most one; a room made elsewhere can hold several.
+ */
+export function sectionTagsOf(room: Room): string[] {
+    return Object.keys(room.tags ?? {}).filter((tag) => isSectionTag(tag) && tag !== DefaultTagID.Invite);
+}
+
+/**
+ * `tagRoom` toggles on the first of a room's section tags, so for a room holding several no kit write (favourite on or off,
+ * section move, create with the room) is sure to reach the asked state: `unsupported`, nothing written. Element's own room
+ * list can repair such a room.
+ */
+export function assertSingleSection(room: Room): void {
+    if (sectionTagsOf(room).length > 1)
+        throw new ClientViewActionError(
+            "unsupported",
+            "the room holds several section tags (for example favourite and a category); change it in Element's own room list",
+        );
+}
 
 const FAVOURITE_TAG = "m.favourite";
 const isTagged = (room: Room): boolean => !!room.tags?.[FAVOURITE_TAG];
+/** Favourite on is settled once the toggle has also replaced the room's section (its delete landed): favourite is the only one left. */
+const isSettled = (room: Room, on: boolean): boolean =>
+    on ? sectionTagsOf(room).length === 1 && isTagged(room) : !isTagged(room);
 
 /**
  * A10 favourite: `onToggleFavorite` dispatches `RoomListActions.tagRoom` (set / delete the room tag `m.favourite`). Its
  * result payloads name no room (any other room's tag change dispatches the same action), so none is read: the outcome is the
- * room's own `m.favourite` tag, which arrives with the sync. Calls for one room run one after the other. `done` once it is as asked; if it is not within
+ * room's own tags, which arrive with the sync. Calls for one room run one after the other. `done` once it is as asked (favourite on:
+ * `m.favourite` is the room's only section tag, the toggle also replaced a section it held); if it is not within
  * `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (a refusal shows Element's own error dialog and leaves the tag as it was;
  * the write is not stoppable and may still apply).
  */
 export function setFavourite(item: RoomItemActionsVm, room: Room, on: boolean): Promise<ActionOutcome> {
     const run = async (): Promise<ActionOutcome> => {
+        await awaitLateLanding(room);
         const snap = item.getSnapshot();
         if (snap.notification.invited) throw new ClientViewActionError("unsupported", "an invite is not a favourite");
         assertListed(room);
+        assertSingleSection(room);
         if (isTagged(room) === on) return done(room.roomId);
         item.onToggleFavorite();
         const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
         while (Date.now() < until) {
-            if (isTagged(room) === on) return done(room.roomId);
+            if (isSettled(room, on)) return done(room.roomId);
             await new Promise((r) => setTimeout(r, 50));
         }
+        noteUnsettledTagWrite(room);
         throw new ClientViewActionError("network", "the room's tag did not change in time; it may still apply");
     };
     // One call at a time per room: the tag is stale until the sync, so an overlapping opposite call would toggle on a stale
     // state (or return `done` on the first call's tag).
-    const previous = favouriteQueue.get(room.roomId) ?? Promise.resolve();
-    const next = previous.then(run, run);
-    const tail = next.catch(() => undefined);
-    favouriteQueue.set(room.roomId, tail);
-    void tail.then(() => {
-        if (favouriteQueue.get(room.roomId) === tail) favouriteQueue.delete(room.roomId);
-    });
-    return next;
+    return serialTagWrite(room.roomId, run);
 }
 
 /**

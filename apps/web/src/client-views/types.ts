@@ -29,6 +29,12 @@ export interface ViewRoom {
     /** The room is a favourite (the room list item's `isFavourite`, the `m.favourite` room tag). */
     isFavourite: boolean;
     /**
+     * The room's custom section (the room list item's `sections`, the entry with `isSelected`): the opaque tag of one of
+     * `ClientViewBridge.sections()`. Absent for a room in no custom section. Exclusive with `isFavourite` (Element's tagRoom
+     * keeps a room in one section).
+     */
+    section?: string;
+    /**
      * Element offers "mark as unread" for the room (the item's `canMarkAsUnread`): it shows nothing unread and is not
      * archived. For a joined room, false means it already shows unread, by a count, an activity or a mark.
      */
@@ -42,6 +48,49 @@ export interface ViewRoom {
     showsUnread: boolean;
     /** The room's notification level (the item's `roomNotifState`). */
     notificationLevel: ViewNotificationLevel;
+}
+
+/**
+ * A custom room-list section (Element's `RoomList.CustomSectionData` / `RoomList.OrderedCustomSections`), as the room list
+ * item view-model's `sections` lists them. `tag` is opaque (a kit passes it back as it got it), `order` is Element's, 0 = top.
+ */
+export interface ViewSection {
+    tag: string;
+    name: string;
+    order: number;
+}
+
+/**
+ * A call, on the message that roots it (the `org.matrix.msc4075.rtc.notification` event Element draws its call card
+ * from). Filled only from the call-card view-models: `RootCallTileViewModel` decides ongoing or ended, the Room/Dm
+ * ongoing tile view-models give the participants, `DurationViewModel` the running time, the Room/Dm tombstone ones the
+ * end and, in a DM, the decline. The host reads no MatrixRTC state of its own.
+ */
+export interface ViewCall {
+    /** The call's id: the root event's id (`ViewMessage.id`). */
+    callId: string;
+    /** `RootCallTileViewModel.tileType`: an ongoing tile is "ongoing", a tombstone tile is "ended". */
+    state: "ongoing" | "ended";
+    /** The call's intent (the tile view-models read it from the notification event: `m.call.intent`). */
+    callType: "video" | "voice";
+    /** A DM tile (`ongoing-call-dm`, `tombstone-call-dm`), else a room tile. */
+    isDm: boolean;
+    /** The face pile of the ongoing tile (Element shows at most three). Empty when ended. */
+    participants: ViewCallParticipant[];
+    /** The room tile's `totalParticipants` (everyone in the call, not only the face pile). Ongoing room tile only. */
+    participantCount?: number;
+    /** When the call started: the notification event's `origin_server_ts` (the tombstone view-models give no time other than a formatted string). */
+    startedTs: number;
+    /** `DurationViewModel.duration` in seconds. Ongoing only; ended calls have no duration in any view-model. */
+    durationSeconds?: number;
+    /** The DM tombstone tile's `isCallDeclined`. Only a DM tombstone has it. */
+    declined?: boolean;
+}
+
+export interface ViewCallParticipant {
+    userId: string;
+    name: string;
+    avatarUrl?: string;
 }
 
 /** The notification levels of a room, as the room list item view-model's `RoomNotifState` names them. */
@@ -93,6 +142,18 @@ export interface ViewMessage {
      * its pin control only when this is true. Absent = not offered.
      */
     canPin?: boolean;
+    /**
+     * Element's permalink for this event, as its own "Copy link" / Share gives it (`RoomPermalinkCreator.forEvent`:
+     * matrix.to or the configured permalink prefix, with `via` servers). Absent for a deleted message.
+     */
+    permalink?: string;
+    /**
+     * Element offers a download for this message (the Download action bar button's rule: a media message whose content is
+     * actionable, `isContentActionable` and `MediaEventHelper.isEligible`). False or absent for a text message, a
+     * redacted one and one still waiting for its key; the module permission hint of the action bar view-model is not
+     * read here, `download` reports it as `forbidden`.
+     */
+    canDownload?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
@@ -109,6 +170,11 @@ export interface ViewMessage {
      * shows none: previews hidden by the setting (room or encrypted-room default), by the user, or no link.
      */
     urlPreviews?: ViewUrlPreview[];
+    /**
+     * Set on the root event of a call (`kind` is "other", `body` is empty): the call card Element draws. See `ViewCall`.
+     * Version 2, additive: a kit that does not know the field gets a message with an empty body and no content.
+     */
+    call?: ViewCall;
 }
 
 /**
@@ -190,7 +256,9 @@ export type ViewConnection = "online" | "connecting" | "offline";
  * What an action resolved with. `done`: the effect happened (the server answered, the snapshot changed, the dialog
  * returned). `cancelled`: the user dismissed Element's own dialog or picker (never an error).
  */
-export type ActionOutcome = { status: "done"; roomId?: string; eventId?: string } | { status: "cancelled" };
+export type ActionOutcome =
+    | { status: "done"; roomId?: string; eventId?: string; section?: string }
+    | { status: "cancelled" };
 
 export type ClientViewActionErrorCode =
     | "unknown_room"
@@ -244,6 +312,12 @@ export interface ClientViewBridge {
     views(): { id: string; name: string }[];
     /** "stock" = Element's own UI */
     switchTo(viewId: string): void;
+    /**
+     * The address of the call app from the host config (`client_views_meet_url`), or undefined when the instance has none:
+     * a kit then offers no call. Version 2, additive: a host without it is a host without calls. A kit builds the join
+     * link from it (`<meetUrl>/#/room/<roomId>`); the call itself runs in that app, never in the kit.
+     */
+    meetUrl(): string | undefined;
     /**
      * Sends a plain-text message (`m.text`, no markdown) and resolves `done` + `eventId` once the server returns it.
      * `opts.txnId` is the transaction id the sent event carries (`ViewMessage.txnId`); `opts.replyTo` is the event id
@@ -308,6 +382,15 @@ export interface ClientViewBridge {
      */
     redact(roomId: string, eventId: string): Promise<ActionOutcome>;
     /**
+     * B7: downloads the file, image, video or audio of the message `eventId` the way Element's Download action bar button
+     * does (`EventTileActionBarViewModel.onDownloadClick`): it waits until the event is decrypted, then Element fetches
+     * and decrypts the file and saves it with its own downloader. `done` once Element's click settled, which is also the
+     * case when the fetch or decryption failed: Element's own error dialog shows then and the kit shows nothing of its
+     * own. `unknown_room` / `unknown_event` for what the client cannot load, `unsupported` for a message without media,
+     * `failed` when it stays undecrypted, `forbidden` when the view-model does not offer the download.
+     */
+    download(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
      * A10: marks the room unread (the room list item's `onMarkAsUnread`: the room account data `m.marked_unread`). `done`
      * once the homeserver holds it, also for a room that already shows unread; `unsupported` for an invite or an archived
      * room, `unknown_room` for a room the list does not hold.
@@ -319,6 +402,26 @@ export interface ClientViewBridge {
      * error dialog shows too).
      */
     setFavourite(roomId: string, on: boolean): Promise<ActionOutcome>;
+    /**
+     * The custom sections, in Element's order (the room list item view-model's `sections`: custom sections only, the
+     * default sections are `isFavourite` and the unsectioned rest). A change fires `onChange` with kind `rooms`. Empty while
+     * the list holds no room.
+     */
+    sections(): ViewSection[];
+    /**
+     * M6 B1: puts the room into the custom section `tag` (the item's `onToggleSection`, called only when the room's section
+     * differs: Element's tagRoom replaces a favourite or another section), or takes it out of its custom section with `null`
+     * (`onRemoveFromSection`, only when it is in one). `done` once the room's tags show the target; `unsupported` for an
+     * invite, an archived room or a tag `sections()` does not list, `unknown_room`; `network` when the tag does not show in
+     * 15 s (the write may still apply; a refusal shows Element's error dialog).
+     */
+    setSection(roomId: string, tag: string | null): Promise<ActionOutcome>;
+    /**
+     * M6 B1: Element's create-section dialog (`RoomListStoreV3.createSection`, D17), with `roomId` preselected when given.
+     * `done` + `section` (the new tag) once the section exists and, for a room the dialog kept selected, the room is in it;
+     * `cancelled` when the dialog closes without a name.
+     */
+    createSection(roomId?: string): Promise<ActionOutcome>;
     /**
      * A10: sets the room's notification level (the item's `onSetRoomNotifState`: push rules). `done` once the homeserver
      * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).

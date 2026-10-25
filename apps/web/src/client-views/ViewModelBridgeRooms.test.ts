@@ -42,6 +42,10 @@ const h = vi.hoisted(() => {
             canMarkAsUnread: false,
             canMarkAsRead: true,
             roomNotifState: "mentions_only",
+            sections: [
+                { tag: "element.io.section.s1", name: "Work", isSelected: false },
+                { tag: "element.io.section.s2", name: "Home", isSelected: false },
+            ],
         }),
         { onLeaveRoom: vi.fn(), onMarkAsUnread: vi.fn(), onToggleFavorite: vi.fn(), onSetRoomNotifState: vi.fn() },
     );
@@ -52,7 +56,8 @@ const h = vi.hoisted(() => {
         notification: { hasUnreadCount: false, count: 0, isMention: false, invited: true },
     });
     const list = { createRoom: vi.fn(), createChatRoom: vi.fn() };
-    const current = { a: item as unknown as { getSnapshot: () => object; subscribe: (cb: () => void) => () => void } };
+    type ItemVm = { getSnapshot: () => object; subscribe: (cb: () => void) => () => void };
+    const current: { a: ItemVm; pre?: ItemVm } = { a: item as unknown as ItemVm };
     const lists: Array<{ set: (s: object) => void }> = [];
     const headers: Record<string, { isExpanded: boolean }> = {};
     const store = { listeners: new Set<() => void>() };
@@ -74,7 +79,13 @@ vi.mock("../viewmodels/room-list/RoomListViewModel", () => ({
         public createRoom = h.list.createRoom;
         public createChatRoom = h.list.createChatRoom;
         public getRoomItemViewModel = (id: string) =>
-            id === "!a:example.org" ? h.current.a : id === "!inv:example.org" ? h.invited : undefined;
+            id === "!a:example.org"
+                ? h.current.a
+                : id === "!inv:example.org"
+                  ? h.invited
+                  : id === "!pre:example.org"
+                    ? h.current.pre
+                    : undefined;
     },
 }));
 vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({
@@ -119,6 +130,8 @@ const echo = vi.hoisted(() => {
 vi.mock("../stores/local-echo/EchoChamber", () => ({ EchoChamber: { forRoom: () => echo.chamber } }));
 const itemActions = vi.hoisted(() => ({ markUnread: vi.fn(), setFavourite: vi.fn(), setNotificationLevel: vi.fn() }));
 vi.mock("./RoomItemActions", () => itemActions);
+const sectionActions = vi.hoisted(() => ({ setSection: vi.fn(), createSection: vi.fn() }));
+vi.mock("./RoomSectionActions", () => sectionActions);
 
 describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", () => {
     let bridge: ViewModelBridge;
@@ -325,5 +338,87 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.notificationLevel).toBe("mute");
         expect(seen).toContain("rooms");
         echo.chamber.notificationVolume = undefined;
+    });
+
+    it("M6 B1: rooms() names the room's custom section and sections() lists the custom sections in Element's order", () => {
+        const sec = (tag: string, isSelected: boolean) => ({
+            tag,
+            name: tag.endsWith("s1") ? "Work" : "Home",
+            isSelected,
+        });
+        // No section: the field is absent.
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")).not.toHaveProperty("section");
+        expect(bridge.sections()).toEqual([
+            { tag: "element.io.section.s1", name: "Work", order: 0 },
+            { tag: "element.io.section.s2", name: "Home", order: 1 },
+        ]);
+        const seen: string[] = [];
+        bridge.onChange((e) => seen.push(e.kind));
+        h.item.set({ sections: [sec("element.io.section.s1", false), sec("element.io.section.s2", true)] });
+        expect(bridge.rooms().find((r) => r.id === "!a:example.org")?.section).toBe("element.io.section.s2");
+        expect(seen).toContain("rooms");
+        // A section created (or reordered) without any room changing is a change of the list too.
+        seen.length = 0;
+        h.item.set({
+            sections: [
+                sec("element.io.section.s2", true),
+                { tag: "element.io.section.s3", name: "New", isSelected: false },
+                sec("element.io.section.s1", false),
+            ],
+        });
+        expect(bridge.sections().map((x) => x.tag)).toEqual([
+            "element.io.section.s2",
+            "element.io.section.s3",
+            "element.io.section.s1",
+        ]);
+        expect(seen).toEqual(["rooms"]);
+    });
+
+    it("M6 B1 F5: sections() is the real rooms' sections when the preview row (empty sections) comes first", () => {
+        const savedIds = [...h.ids];
+        const preview = new h.FakeVm({
+            id: "!pre:example.org",
+            name: "Preview",
+            isDm: false,
+            notification: { hasUnreadCount: false, count: 0, isMention: false, invited: false },
+            isFavourite: false,
+            canMarkAsUnread: false,
+            canMarkAsRead: false,
+            roomNotifState: "all_messages",
+            sections: [],
+        });
+        try {
+            h.ids.splice(0, h.ids.length, "!pre:example.org", "!a:example.org");
+            h.current.pre = preview as unknown as NonNullable<typeof h.current.pre>;
+            h.item.set({});
+            const real = h.item.snapshot.sections.map((x) => x.tag);
+            expect(real.length).toBeGreaterThan(0);
+            expect(bridge.sections().map((x) => x.tag)).toEqual(real);
+        } finally {
+            delete h.current.pre;
+            h.ids.splice(0, h.ids.length, ...savedIds);
+        }
+    });
+
+    it("M6 B1: setSection and createSection run the room item's section actions; an unknown room is unknown_room", async () => {
+        sectionActions.setSection.mockResolvedValue({ status: "done", roomId: "!a:example.org" });
+        sectionActions.createSection.mockResolvedValue({ status: "done", section: "element.io.section.n" });
+        await bridge.setSection("!a:example.org", "element.io.section.s1");
+        await bridge.setSection("!a:example.org", null);
+        expect(sectionActions.setSection).toHaveBeenNthCalledWith(
+            1,
+            h.item,
+            rooms["!a:example.org"],
+            "element.io.section.s1",
+        );
+        expect(sectionActions.setSection).toHaveBeenNthCalledWith(2, h.item, rooms["!a:example.org"], null);
+        await bridge.createSection("!a:example.org");
+        await bridge.createSection();
+        expect(sectionActions.createSection).toHaveBeenNthCalledWith(1, rooms["!a:example.org"]);
+        expect(sectionActions.createSection).toHaveBeenNthCalledWith(2, undefined);
+        await expect(bridge.setSection("!nope:example.org", null)).rejects.toBeInstanceOf(ClientViewActionError);
+        await expect(bridge.createSection("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
+        expect(sectionActions.setSection).toHaveBeenCalledTimes(2);
+        expect(sectionActions.createSection).toHaveBeenCalledTimes(2);
     });
 });
