@@ -121,7 +121,8 @@ function createSectionNow(room: Room | undefined): Promise<ActionOutcome> {
         });
         const [name, roomsToTag] = await dialog.finished;
         if (!name) {
-            await created?.catch(() => undefined);
+            // A dropped dialog never settles the store's promise (Modal.tsx's wipe): bound the wait, or the dialog lock and the room queue hang.
+            await within(created, ROOM_ACTION_TIMEOUT_MS).catch(() => undefined);
             return { status: "cancelled" };
         }
         const tag = await within(created, ROOM_ACTION_TIMEOUT_MS);

@@ -472,3 +472,66 @@ describe("createSection: a confirmed dialog answer wins over the drop signal (Mo
         }
     });
 });
+
+describe("createSection: a dialog dropped by Modal.tsx's priority/static wipe (grok delta2 F1)", () => {
+    type Fake = { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+
+    /** Opens create-section, then drops its dialog: `finished` never settles and the store's promise never ends. */
+    async function openAndDrop(r: Room | undefined): Promise<{ outcome: Promise<unknown> }> {
+        const fake = Modal as unknown as Fake;
+        const modal = {};
+        fake.createDialog = vi.fn(() => {
+            fake.modals.unshift(modal);
+            return { close: vi.fn(), finished: new Promise<unknown[]>(() => {}) };
+        });
+        store.createSection.mockReset();
+        store.createSection.mockImplementation(() => {
+            (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+            return new Promise<string | undefined>(() => {});
+        });
+        const outcome = createSection(r);
+        await vi.advanceTimersByTimeAsync(0);
+        fake.modals = fake.modals.filter((m) => m !== modal);
+        fake.emit("closed");
+        return { outcome };
+    }
+
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => {
+        vi.useRealTimers();
+        (Modal as unknown as Fake).modals = [];
+    });
+
+    it("answers cancelled in bounded time and accepts the next dialog action", async () => {
+        const { outcome } = await openAndDrop(undefined);
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+
+        (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({
+            close: vi.fn(),
+            finished: Promise.resolve([undefined, undefined]),
+        }));
+        store.createSection.mockReset();
+        store.createSection.mockImplementation(() => {
+            (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+            return Promise.resolve(undefined);
+        });
+        const next = createSection(undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(next).resolves.toEqual({ status: "cancelled" });
+    });
+
+    it("with a room: the room's tag queue drains, so the next tag write for the room starts", async () => {
+        const r = room();
+        const { outcome } = await openAndDrop(r);
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+
+        const item = makeItem();
+        item.onToggleSection.mockImplementation((tag) => void setTimeout(() => setTags(r, { [tag]: {} }), 50));
+        const next = setSection(item, r, A);
+        await vi.advanceTimersByTimeAsync(500);
+        expect(item.onToggleSection).toHaveBeenCalledExactlyOnceWith(A);
+        await expect(next).resolves.toMatchObject({ status: "done" });
+    });
+});
