@@ -78,6 +78,8 @@ import { ShareFormat } from "../../dispatcher/payloads/SharePayload.ts";
 import { clearStorage } from "../../Lifecycle";
 import UserSettingsDialog from "../../components/views/dialogs/UserSettingsDialog.tsx";
 import { SDKContextClass } from "../../contexts/SDKContextClass";
+import RightPanelStore from "../../stores/right-panel/RightPanelStore";
+import { markHostPanelSlotMounted } from "../../client-views/hostPanelSlot";
 import { type QrLoginCredentials } from "../../components/views/auth/LoginWithQR.tsx";
 import { storeAuthContext } from "../../utils/oauth/persistOAuthSettings.ts";
 
@@ -368,6 +370,41 @@ describe("<MatrixChat />", () => {
         defaultDispatcher.dispatch({ action: Action.ViewRoom, room_id: "!room:server.org", focusNext: "threadsPanel" });
         await waitFor(() => {
             expect(defaultDispatcher.fire).toHaveBeenCalledWith(Action.FocusThreadsPanel);
+        });
+    });
+
+    describe("ShowThread (inblock D39 panel, F5)", () => {
+        const showThread = (): void =>
+            defaultDispatcher.dispatch({
+                action: Action.ShowThread,
+                rootEvent: { getId: () => "$root" },
+                push: false,
+            });
+
+        it("writes the stock right-panel store when no host panel slot is mounted", async () => {
+            const setCards = vi.spyOn(RightPanelStore.instance, "setCards").mockImplementation(() => {});
+            getComponent();
+            showThread();
+            await waitFor(() => expect(setCards).toHaveBeenCalled());
+        });
+
+        it("leaves the stock right-panel store alone while a host panel slot is mounted", async () => {
+            const setCards = vi.spyOn(RightPanelStore.instance, "setCards").mockImplementation(() => {});
+            const pushCard = vi.spyOn(RightPanelStore.instance, "pushCard").mockImplementation(() => true);
+            const unmark = markHostPanelSlotMounted();
+            try {
+                getComponent();
+                showThread();
+                // The stock arm also fires FocusSendMessageComposer on the thread; it must not run either.
+                await act(() => sleep(50));
+                expect(setCards).not.toHaveBeenCalled();
+                expect(pushCard).not.toHaveBeenCalled();
+                expect(defaultDispatcher.dispatch).not.toHaveBeenCalledWith(
+                    expect.objectContaining({ action: Action.FocusSendMessageComposer }),
+                );
+            } finally {
+                unmark();
+            }
         });
     });
 
