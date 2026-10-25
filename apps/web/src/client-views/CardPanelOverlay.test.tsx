@@ -22,7 +22,7 @@ import { RightPanelPhases } from "../stores/right-panel/RightPanelStorePhases";
 import { ElementCall } from "../models/Call";
 import { isHostPanelSlotMounted } from "./hostPanelSlot";
 import { needsStockUi } from "./ClientViewGate";
-import { CardPanelOverlay, HostPanelSlot, rootCard } from "./CardPanelOverlay";
+import { CardPanelOverlay, HostPanelSlot, rootCard, SEARCH_PHASE } from "./CardPanelOverlay";
 import { type CardPanelRequest, type ThreadPanelRequest, type ViewModelBridge } from "./ViewModelBridge";
 
 const h = vi.hoisted(() => ({
@@ -121,6 +121,12 @@ vi.mock("../components/views/right_panel/PinnedMessagesCard", async () => ({
     PinnedMessagesCard: await h.cardStub("card-pinned"),
 }));
 
+vi.mock("./SearchCard", async () => ({
+    SearchCard: await h.cardStub("card-search", (p, R) =>
+        R.createElement("span", { "data-testid": "search-term" }, String(p.initialTerm ?? "")),
+    ),
+}));
+
 const makeSdk = () => {
     const rightPanelStore = {
         roomPhaseHistory: [] as unknown[],
@@ -209,6 +215,7 @@ describe("CardPanelOverlay", () => {
         expect(rootCard({ card: "members" }).phase).toBe(RightPanelPhases.MemberList);
         expect(rootCard({ card: "files" }).phase).toBe(RightPanelPhases.FilePanel);
         expect(rootCard({ card: "pinned" }).phase).toBe(RightPanelPhases.PinnedMessages);
+        expect(rootCard({ card: "search" }).phase).toBe(SEARCH_PHASE);
         const bob = { userId: "@bob:example.org", roomId: "!a" };
         expect(rootCard({ card: "info", dmMember: bob as never }).phase).toBe(RightPanelPhases.MemberInfo);
         mount("info", { dmMember: bob as never });
@@ -220,11 +227,36 @@ describe("CardPanelOverlay", () => {
         ["members", "card-members"],
         ["files", "card-files"],
         ["pinned", "card-pinned"],
+        ["search", "card-search"],
     ] as const)("shows Element's %s card, with the hosted-panel hide on the info card (F6)", async (card, testId) => {
         mount(card);
         expect(await screen.findByTestId(testId)).toBeTruthy();
         if (card === "info") expect(h.summaryProps[0]).toMatchObject({ room, hostPanel: true });
         expect(screen.getByTestId("client-view-card-panel").getAttribute("data-card")).toBe(card);
+    });
+
+    it("the info card's search field hands its term to the search card (pushed on the stack); back returns; an empty term pushes nothing", async () => {
+        mount("info");
+        await screen.findByTestId("card-info");
+        const onSearchChange = h.summaryProps[0].onSearchChange as (t: string) => void;
+        expect(typeof onSearchChange).toBe("function");
+        act(() => onSearchChange(""));
+        expect(screen.queryByTestId("card-search")).toBeNull();
+        act(() => onSearchChange("needle"));
+        expect(await screen.findByTestId("card-search")).toBeTruthy();
+        expect(screen.getByTestId("search-term").textContent).toBe("needle");
+        fireEvent.click(screen.getByText("back"));
+        expect(await screen.findByTestId("card-info")).toBeTruthy();
+        noStoreWrites();
+    });
+
+    it("a hit's jump from the search card is the panel's jump (the panel stays)", async () => {
+        mount("search");
+        await screen.findByTestId("card-search");
+        events.set("$e", plainEvent("$e"));
+        await dispatch({ action: Action.ViewRoom, room_id: "!a", event_id: "$e" });
+        expect(req.jump).toHaveBeenCalledWith("$e");
+        expect(req.finish).not.toHaveBeenCalled();
     });
 
     it("the in-panel stack: People pushes, back pops, close at the root finishes; the stock store is never written", async () => {

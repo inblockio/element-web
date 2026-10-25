@@ -25,10 +25,14 @@ import ThirdPartyMemberInfo from "../components/views/rooms/ThirdPartyMemberInfo
 import MemberListView from "../components/views/rooms/MemberList/MemberListView";
 import FilePanel from "../components/structures/FilePanel";
 import { PinnedMessagesCard } from "../components/views/right_panel/PinnedMessagesCard";
+import { SearchCard } from "./SearchCard";
 import { fetchInitialEvent } from "../utils/EventUtils";
 import { markHostPanelSlotMounted } from "./hostPanelSlot";
 import { panelSdkContext, ThreadPanelOverlay, usePanelRoomContext } from "./ThreadPanelOverlay";
 import { type CardPanelRequest, type ThreadPanelRequest, type ViewModelBridge } from "./ViewModelBridge";
+
+/** The search card has no stock right-panel phase: a host-only one, stack-internal (never written to the store). */
+export const SEARCH_PHASE = "HostSearch" as RightPanelPhases;
 
 /** The phases the slot shows (frozen note F6): a push of any other phase (Threads, Extensions, widgets ...) is ignored. */
 const SHOWN = new Set<RightPanelPhases | null>([
@@ -39,6 +43,7 @@ const SHOWN = new Set<RightPanelPhases | null>([
     RightPanelPhases.ThreePidMemberInfo,
     RightPanelPhases.PinnedMessages,
     RightPanelPhases.FilePanel,
+    SEARCH_PHASE,
 ]);
 
 /** The first card of a request: the in-panel stack starts with it (a DM's info card is the other member's user info). */
@@ -50,6 +55,8 @@ export function rootCard(request: Pick<CardPanelRequest, "card" | "dmMember">): 
             return { phase: RightPanelPhases.FilePanel, state: {} };
         case "pinned":
             return { phase: RightPanelPhases.PinnedMessages, state: {} };
+        case "search":
+            return { phase: SEARCH_PHASE, state: { searchTerm: "" } as IRightPanelCard["state"] };
         default:
             return request.dmMember
                 ? { phase: RightPanelPhases.MemberInfo, state: { member: request.dmMember } }
@@ -241,7 +248,31 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
     let card: JSX.Element | null = null;
     switch (current?.phase) {
         case RightPanelPhases.RoomSummary:
-            card = <RoomSummaryCardView room={room} permalinkCreator={request.permalinkCreator} hostPanel />;
+            card = (
+                <RoomSummaryCardView
+                    room={room}
+                    permalinkCreator={request.permalinkCreator}
+                    hostPanel
+                    // The info card's search field hands its term to the search card (pushed on the in-panel stack).
+                    onSearchChange={(term) => {
+                        if (term)
+                            ops.set([
+                                ...ops.stack(),
+                                { phase: SEARCH_PHASE, state: { searchTerm: term } as IRightPanelCard["state"] },
+                            ]);
+                    }}
+                />
+            );
+            break;
+        case SEARCH_PHASE:
+            card = (
+                <SearchCard
+                    room={room}
+                    key={stack.length}
+                    initialTerm={(current.state as { searchTerm?: string } | undefined)?.searchTerm}
+                    onClose={finish}
+                />
+            );
             break;
         case RightPanelPhases.MemberList:
             card = <MemberListView roomId={room.roomId} onClose={finish} />;
