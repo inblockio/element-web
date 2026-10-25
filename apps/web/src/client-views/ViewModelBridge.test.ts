@@ -2198,6 +2198,20 @@ describe("ViewModelBridge", () => {
             return { root, thread };
         };
 
+        it("does not count a reply the homeserver has not taken (a refused send leaves no count)", () => {
+            const { root } = rootWith([
+                reply("$r1", "@bob:example.org"),
+                reply("~local", "@alice:example.org", { status: "not_sent" }),
+            ]);
+            const [m] = read(root);
+            expect(m.thread).toMatchObject({ replyCount: 1, participantIds: ["@bob:example.org"] });
+        });
+
+        it("shows no count while the only reply is still sending", () => {
+            const { root } = rootWith([reply("~local", "@alice:example.org", { status: "sending" })]);
+            expect(read(root)[0].thread?.replyCount).toBe(0);
+        });
+
         it("hands over the reply count, the latest reply and the repliers from the thread summary view-model", () => {
             const { root, thread } = rootWith([reply("$r1", "@bob:example.org"), reply("$r2", "@carol:example.org")]);
             const [m] = read(root);

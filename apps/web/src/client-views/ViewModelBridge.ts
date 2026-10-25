@@ -23,6 +23,7 @@ import {
     RoomStateEvent,
     THREAD_RELATION_TYPE,
     ThreadEvent,
+    EventStatus,
 } from "matrix-js-sdk/src/matrix";
 import { uniq, uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
@@ -143,6 +144,9 @@ const PAGE_SIZE = 100;
 /** How often `loadOlder` looks at the view-model while it waits for it, and how long it waits at most. */
 const LOAD_OLDER_POLL_MS = 25;
 const LOAD_OLDER_TIMEOUT_MS = 30_000;
+/** A local echo the homeserver has not accepted (no status = a remote event; SENT = accepted, awaiting the echo). */
+const isUnsent = (e: MatrixEvent): boolean => !!e.status && e.status !== EventStatus.SENT;
+
 /** The pause before a failed fetch of a replied event outside the timeline is tried again. */
 const REPLY_RETRY_MS = 30_000;
 /** How long a reaction press waits for the snapshot to show it before it is reported failed. */
@@ -342,6 +346,12 @@ class EventRow {
         const room = client.getRoom(ev.getRoomId() ?? "");
         room?.on(ThreadEvent.New, this.onNewThread);
         this.unsubscribe.push(() => room?.off(ThreadEvent.New, this.onNewThread));
+        // A thread reply's send state (sending, failed) decides whether the summary counts it.
+        const onEcho = (echo: MatrixEvent): void => {
+            if (echo.isRelation(THREAD_RELATION_TYPE.name) && echo.threadRootId === ev.getId()) changed();
+        };
+        room?.on(RoomEvent.LocalEchoUpdated, onEcho);
+        this.unsubscribe.push(() => room?.off(RoomEvent.LocalEchoUpdated, onEcho));
         this.followReplacement();
         this.padlock.start();
     }
@@ -710,13 +720,24 @@ class EventRow {
                   ? body
                   : stripPlainReply(body);
         const lastReply =
-            last && last.getId() ? { eventId: last.getId()!, senderId: last.getSender() ?? "", text } : undefined;
+            last && last.getId() && !isUnsent(last)
+                ? { eventId: last.getId()!, senderId: last.getSender() ?? "", text }
+                : undefined;
         // The thread timeline also holds reactions and edits once fetched; only replies count (as Thread.length).
-        const repliers = thread.events
-            .filter((e) => e.getId() !== thread.id && e.isRelation(THREAD_RELATION_TYPE.name))
-            .map((e) => e.getSender() ?? "");
+        const replies = thread.events.filter(
+            (e) => e.getId() !== thread.id && e.isRelation(THREAD_RELATION_TYPE.name),
+        );
+        // A reply the homeserver has not taken (sending, queued, failed) is not a reply yet: a refused send leaves no
+        // count. Thread.length counts the room's pending local echoes too, so those are taken off by identity.
+        const room = this.client.getRoom(this.ev.getRoomId() ?? "");
+        const pending = (room?.getPendingEvents?.() ?? []).filter(
+            (e) => e.isRelation(THREAD_RELATION_TYPE.name) && e.threadRootId === thread.id,
+        );
+        const unsent = new Set([...replies, ...pending].filter(isUnsent));
+        const confirmed = replies.filter((e) => !unsent.has(e));
+        const repliers = confirmed.map((e) => e.getSender() ?? "");
         return {
-            replyCount: thread.length,
+            replyCount: Math.max(0, thread.length - unsent.size),
             lastReplyTs: (last ?? this.ev).getTs(),
             ...(lastReply ? { lastReply } : {}),
             participantIds: uniq([...repliers, ...(lastReply ? [lastReply.senderId] : [])].filter(Boolean)),
