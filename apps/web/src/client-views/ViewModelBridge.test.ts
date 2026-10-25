@@ -17,7 +17,8 @@ import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineV
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
 import defaultDispatcher from "../dispatcher/dispatcher";
-import { Action } from "../dispatcher/actions";
+import Modal from "../Modal";
+import ForwardDialog from "../components/views/dialogs/ForwardDialog";
 
 /*
  * The bridge only wires view-models together; the view-models themselves are replaced by small fakes here so the
@@ -1778,14 +1779,16 @@ describe("ViewModelBridge", () => {
         });
 
         describe("openForward (E3)", () => {
-            it("dispatches Element's OpenForwardDialog with the event and answers what the dialog action answers", async () => {
+            it("opens Element's ForwardDialog with the event, the permalink creator and the dialog's client view, and answers what the dialog action answers", async () => {
+                const create = vi.spyOn(Modal, "createDialog").mockImplementation((() => ({})) as never);
                 const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
                 try {
                     const event = fakeEvent("$1");
                     read(event);
+                    const view = { dialogView: true };
                     h.forwardViaDialog.mockImplementation(
-                        (_c: unknown, roomId: string, eventId: string, start: () => void) => {
-                            start();
+                        (_c: unknown, roomId: string, eventId: string, start: (c: unknown) => void) => {
+                            start(view);
                             return Promise.resolve({ status: "done", roomId, eventId });
                         },
                     );
@@ -1800,9 +1803,14 @@ describe("ViewModelBridge", () => {
                         "$1",
                         expect.any(Function),
                     );
-                    expect(dispatch).toHaveBeenCalledTimes(1);
-                    expect(dispatch.mock.calls[0][0]).toMatchObject({ action: Action.OpenForwardDialog, event });
+                    // DialogOpener's props, with `matrixClient` the dialog's own client view; nothing is dispatched.
+                    expect(create).toHaveBeenCalledTimes(1);
+                    expect(create.mock.calls[0][0]).toBe(ForwardDialog);
+                    expect(create.mock.calls[0][1]).toMatchObject({ matrixClient: view, event });
+                    expect(create.mock.calls[0][1]).toHaveProperty("permalinkCreator");
+                    expect(dispatch).not.toHaveBeenCalled();
                 } finally {
+                    create.mockRestore();
                     dispatch.mockRestore();
                 }
             });

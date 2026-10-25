@@ -41,7 +41,6 @@ import { TimelineRenderingType } from "../contexts/RoomContext";
 import SettingsStore from "../settings/SettingsStore";
 import { OwnProfileStore } from "../stores/OwnProfileStore";
 import defaultDispatcher from "../dispatcher/dispatcher";
-import { Action } from "../dispatcher/actions";
 import { avatarUrlForRoom } from "../Avatar";
 import { resolveRoomMemberProfile, roomMemberToMemberInfo } from "../hooks/room/useRoomMemberProfile";
 import { RoomListViewModel } from "../viewmodels/room-list/RoomListViewModel";
@@ -70,7 +69,6 @@ import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-t
 import { getEventTileReactionRelations } from "../viewmodels/room/timeline/event-tile/reactions/EventTileReactionState";
 import { canEditContent, isContentActionable } from "../utils/EventUtils";
 import { getForwardableEvent } from "../events/forward/getForwardableEvent";
-import { type OpenForwardDialogPayload } from "../dispatcher/payloads/OpenForwardDialogPayload";
 import PinningUtils from "../utils/PinningUtils";
 import { RoomPermalinkCreator } from "../utils/permalinks/Permalinks";
 import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionBarViewModel";
@@ -87,6 +85,8 @@ import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewU
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import { createRoomViaDialog, forwardViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import Modal from "../Modal";
+import ForwardDialog from "../components/views/dialogs/ForwardDialog";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
@@ -1718,8 +1718,8 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /**
-     * E3: Element's forward dialog over the kit, opened the way the message context menu opens it (`OpenForwardDialog`
-     * with `getForwardableEvent` and the room's permalink creator). `unsupported` where Element offers no Forward (content
+     * E3: Element's forward dialog over the kit, opened the way `DialogOpener` opens it for the message context menu's
+     * `OpenForwardDialog` (`getForwardableEvent`, the room's permalink creator), with the dialog's own client view. `unsupported` where Element offers no Forward (content
      * not actionable, or an event type it does not forward, e.g. a poll). `done` when the dialog closes; the copy is sent
      * and its result shown by the dialog itself. A jump through the dialog's room name answers `done` + that room's id.
      * Interim (D31): there is no forward action on a shared message view-model.
@@ -1737,11 +1737,14 @@ export class ViewModelBridge implements ClientViewBridge {
             return Promise.reject(new ClientViewActionError("unsupported", "this message cannot be forwarded"));
         }
         const permalinkCreator = this.permalinkCreatorOf(roomId);
-        return forwardViaDialog(this.client, roomId, eventId, () =>
-            defaultDispatcher.dispatch<OpenForwardDialogPayload>({
-                action: Action.OpenForwardDialog,
+        // The same dialog and props as `DialogOpener` on `OpenForwardDialog`, but with the dialog's own client view as
+        // `matrixClient` (see `forwardDialogClient`), so that only the dialog's own sends are claimed. Like the payload
+        // `DialogOpener` receives, `permalinkCreator` may be null (the dialog types it non-null).
+        return forwardViaDialog(this.client, roomId, eventId, (matrixClient) =>
+            Modal.createDialog(ForwardDialog, {
+                matrixClient,
                 event: forwardable,
-                permalinkCreator,
+                permalinkCreator: permalinkCreator!,
             }),
         );
     }

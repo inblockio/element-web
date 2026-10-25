@@ -14,7 +14,7 @@
  * `ViewRoom` Element dispatches after a create, the membership that drops after a leave. No `ViewRoom` of our own.
  */
 
-import { EventStatus, EventType, M_BEACON, type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { EventStatus, type MatrixClient } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -210,80 +210,72 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
  * The dialog sends each copy itself and shows its own sending / sent / failed state (D17), so the kit keeps nothing from
  * this action: `done` when the dialog closes. The room name in a dialog row is a jump (`ViewRoom`, trigger
  * `WebForwardShortcut`, then the dialog closes): `done` + that room's id, so the kit follows to it (H5); without a jump
- * `done` + the source room and event. `start` is the dispatch of `OpenForwardDialog`.
+ * `done` + the source room and event. `start` opens the dialog and is handed the dialog's own client view
+ * (`forwardDialogClient`, the `matrixClient` prop of `ForwardDialog`): only sends made through that view are claimed,
+ * so a send anyone else makes on the real client is never touched.
  */
 export function forwardViaDialog(
     client: MatrixClient,
     sourceRoomId: string,
     eventId: string,
-    start: () => void,
+    start: (dialogClient: MatrixClient) => void,
 ): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
-        const unwrap = cancelOwnFailedSends(client, sourceRoomId, eventId);
         try {
-            const dialog = await openedDialog(start);
+            const dialog = await openedDialog(() => start(forwardDialogClient(client)));
             await dialog.finished;
-            unwrap();
             // Element dispatches the jump before it closes the dialog; one tick covers a queued dispatch.
             await new Promise((resolve) => setTimeout(resolve, 0));
             const jump = [...seen.payloads].reverse().find(isForwardJump);
             return jump ? { status: "done", roomId: jump.room_id } : { status: "done", roomId: sourceRoomId, eventId };
         } finally {
-            unwrap();
             seen.stop();
         }
     });
 }
 
 /**
- * ForwardDialog never cancels the NOT_SENT echo of a copy that failed, and the kit hides NOT_SENT echoes, so it would block
- * that room for good. While the dialog is open `client.sendEvent` is wrapped, and the wrapper claims only the dialog's own
- * copy sends: the 3-arg non-threaded form `sendEvent(roomId, type, content)` (what ForwardDialog's Entry calls) with no
- * caller txnId, whose `type` is the forwarded event's type (as `transformEvent` sends it: a beacon goes out as
- * `m.room.message`, looked up with `findEventById` in the source room) and whose `content` is the dialog's one content
- * object (the first matching call's object; only that identity is claimed afterwards). A claimed call gets a txnId and,
- * when its promise rejects (also after the dialog closed), the pending event with that txnId is cancelled. Every other
- * call (a file upload's 5-arg send, a threaded send, a reaction, any other content) passes through untouched: same args,
- * no txnId injected, no rejection handler, so Element keeps its NOT_SENT echo and its retry. Returns the function that
- * puts `sendEvent` back (the wrapper already handed out keeps working for its in-flight sends).
+ * The forward dialog's own client view: a proxy of the real client that the dialog gets as its `matrixClient` prop (the
+ * only way `ForwardDialog` and its entries send), so only its sends are claimed. ForwardDialog never cancels the NOT_SENT
+ * echo of a copy that failed, and the kit hides NOT_SENT echoes, so it would block that room for good. Its `sendEvent`
+ * (either overload: `(roomId, type, content, txnId?)` or `(roomId, threadId | null, type, content, txnId?)`) gives each
+ * call a txnId when the caller gave none and, when the promise rejects (also after the dialog closed) and the pending
+ * event with that txnId is NOT_SENT, cancels it; the rejection still reaches the dialog. Every other property is the real
+ * client's (`Reflect.get` on the real client, functions bound to it), and `client.sendEvent` itself is never replaced, so
+ * a widget's, an upload's or a reaction's send on the real client keeps its echo and its retry.
  */
-function cancelOwnFailedSends(client: MatrixClient, sourceRoomId: string, eventId: string): () => void {
-    const ownBefore = Object.prototype.hasOwnProperty.call(client, "sendEvent");
-    // oxlint-disable-next-line typescript/unbound-method -- called with `client` as `this` below, put back as it was
-    const original = client.sendEvent;
-    let claimedContent: unknown;
-    const forwardedType = (): string | undefined => {
-        const type = client.getRoom(sourceRoomId)?.findEventById(eventId)?.getType();
-        return type !== undefined && M_BEACON.matches(type) ? EventType.RoomMessage : type;
-    };
-    const wrapper = function (this: unknown, ...args: unknown[]): Promise<unknown> {
-        // The dialog's copy: (roomId, type, content) with no txnId, no thread id.
-        const own =
-            args.length === 3 &&
-            typeof args[1] === "string" &&
-            args[1] === forwardedType() &&
-            (claimedContent === undefined || args[2] === claimedContent);
-        if (!own) return (original as (...a: unknown[]) => Promise<unknown>).apply(client, args);
-        claimedContent = args[2];
-        const txnId = client.makeTxnId();
+export function forwardDialogClient(client: MatrixClient): MatrixClient {
+    const sendEvent = (...args: unknown[]): Promise<unknown> => {
+        // Non-threaded: content at 2; threaded (thread id or null at 1): type at 2, content at 3.
+        const txnAt = typeof args[2] === "object" && args[2] !== null ? 3 : 4;
+        if (args[txnAt] === undefined || args[txnAt] === null) {
+            while (args.length < txnAt) args.push(undefined);
+            args[txnAt] = client.makeTxnId();
+        }
         const roomId = args[0] as string;
-        const promise = (original as (...a: unknown[]) => Promise<unknown>).apply(client, [...args, txnId]);
+        const txnId = args[txnAt];
+        const promise = (client.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>).apply(client, args);
         promise.then(undefined, () => {
-            const pending = [...(client.getRoom(roomId)?.getPendingEvents() ?? [])];
-            const echo = pending.find((ev) => ev.getTxnId() === txnId);
+            const echo = [...(client.getRoom(roomId)?.getPendingEvents() ?? [])].find((ev) => ev.getTxnId() === txnId);
             if (echo?.status === EventStatus.NOT_SENT) client.cancelPendingEvent(echo);
         });
         return promise;
     };
-    client.sendEvent = wrapper as unknown as typeof client.sendEvent;
-    let done = false;
-    return () => {
-        if (done) return;
-        done = true;
-        if (ownBefore) client.sendEvent = original;
-        else delete (client as { sendEvent?: unknown }).sendEvent;
-    };
+    const bound = new Map<PropertyKey, unknown>();
+    return new Proxy(client, {
+        get(target, key) {
+            if (key === "sendEvent") return sendEvent;
+            const value = Reflect.get(target, key, target);
+            if (typeof value !== "function" || key === "constructor") return value;
+            let fn = bound.get(key);
+            if (!fn || (fn as { original?: unknown }).original !== value) {
+                fn = Object.assign(value.bind(target), { original: value });
+                bound.set(key, fn);
+            }
+            return fn;
+        },
+    });
 }
 
 const isForwardJump = (p: ActionPayload): p is ViewRoomPayload =>
