@@ -375,7 +375,8 @@ describe("E5 view source released when Element drops the dialog (Modal.tsx wipes
             fake.modals.unshift({});
             return { close: vi.fn(), finished: new Promise<unknown[]>(() => {}) };
         });
-        const start = () => void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+        const start = () =>
+            void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
         const outcome = viewSourceViaDialog("!a:example.org", "$e", start);
         await Promise.resolve();
         // The priority dialog opened over it and was dismissed: Modal.tsx sets `modals = []` and emits `closed`.
@@ -407,7 +408,8 @@ describe("a confirmed dialog answer wins over the drop signal (Modal.tsx resolve
                 fake.modals = fake.modals.filter((m) => m !== modal);
                 fake.emit("closed");
             },
-            start: () => void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {}),
+            start: () =>
+                void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {}),
         };
     }
 

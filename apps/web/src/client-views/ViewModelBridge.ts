@@ -1921,7 +1921,9 @@ export class ViewModelBridge implements ClientViewBridge {
         this.used = true;
         const hooks = { onEnter: (ev: MatrixEvent) => this.actionBar(ev, (vm) => vm.onEditClick(null), true) };
         // M7 E1: the options go along only when the caller gave some (the plain call is unchanged).
-        return opts ? editText(this.client, roomId, eventId, text, hooks, opts) : editText(this.client, roomId, eventId, text, hooks);
+        return opts
+            ? editText(this.client, roomId, eventId, text, hooks, opts)
+            : editText(this.client, roomId, eventId, text, hooks);
     }
 
     /**

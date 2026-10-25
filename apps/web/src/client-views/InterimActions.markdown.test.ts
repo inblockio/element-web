@@ -74,7 +74,12 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
                 vi.spyOn(SettingsStore, "getValue").mockImplementation((n: string) =>
                     n === "MessageComposerInput.useMarkdown" ? true : false,
                 );
-                const reference = createMessageContent("@me:example.org", await typed(client, room, text), undefined, undefined);
+                const reference = createMessageContent(
+                    "@me:example.org",
+                    await typed(client, room, text),
+                    undefined,
+                    undefined,
+                );
                 expect(sent).toEqual(reference);
             }
         });
@@ -83,8 +88,8 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
     it("yields format + formatted_body only when Markdown produces HTML", async () => {
         await sendText(client, room.roomId, "just text", { markdown: true });
         expect(vi.mocked(client.sendMessage).mock.calls[0][2]).toEqual({
-            msgtype: "m.text",
-            body: "just text",
+            "msgtype": "m.text",
+            "body": "just text",
             "m.mentions": {},
         });
         await sendText(client, room.roomId, "a **b** c", { markdown: true });
@@ -232,7 +237,7 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
             await editText(client, room.roomId, "$mine", "now **bold**");
             const content = vi.mocked(client.sendMessage).mock.calls[0][2] as Record<string, any>;
             expect(content.format).toBeUndefined();
-            expect(content["m.new_content"]).toEqual({ msgtype: "m.text", body: "now **bold**", "m.mentions": {} });
+            expect(content["m.new_content"]).toEqual({ "msgtype": "m.text", "body": "now **bold**", "m.mentions": {} });
         });
     });
 });

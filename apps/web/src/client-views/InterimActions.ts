@@ -185,13 +185,9 @@ export async function sendText(
     if (opts.markdown) {
         // M7 E1: the content Element's composer builds for this text (Markdown forced, `createMessageContent` also
         // attaches the mentions, the reply relation and the reply fallback). `opts.mentions` is E2's.
-        content = createMessageContent(
-            client.getSafeUserId(),
-            markdownModel(client, room, text),
-            replyTo,
-            undefined,
-            { useMarkdown: true },
-        );
+        content = createMessageContent(client.getSafeUserId(), markdownModel(client, room, text), replyTo, undefined, {
+            useMarkdown: true,
+        });
         // As `SendMessageComposer.sendMessage`: a body left blank (`/me ` and whitespace) is not sent.
         if (!content.body.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
         if (replyTo) hooks.onReplyTarget?.(replyTo);
