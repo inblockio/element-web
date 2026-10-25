@@ -27,7 +27,10 @@ import { type CardPanelRequest, type ThreadPanelRequest, type ViewModelBridge } 
 const h = vi.hoisted(() => ({
     fetched: new Map<string, unknown>(),
     summaryProps: [] as Array<Record<string, unknown>>,
-    cardStub: async (testId: string, extra?: (props: Record<string, unknown>, R: typeof import("react")) => unknown) => {
+    cardStub: async (
+        testId: string,
+        extra?: (props: Record<string, unknown>, R: typeof import("react")) => unknown,
+    ) => {
         const R = await import("react");
         const { SDKContext } = await import("../contexts/SDKContext");
         return function CardStub(props: Record<string, unknown>) {
@@ -58,7 +61,8 @@ vi.mock("../components/views/right_panel/RoomSummaryCardView", async () => {
         default: function RoomSummaryStub(props: Record<string, unknown>) {
             const store = R.useContext(SDKContext).rightPanelStore;
             h.summaryProps.push(props);
-            const btn = (label: string, onClick: () => void) => R.createElement("button", { key: label, onClick }, label);
+            const btn = (label: string, onClick: () => void) =>
+                R.createElement("button", { key: label, onClick }, label);
             const push = (label: string, phase: RightPanelPhases) => btn(label, () => store.pushCard({ phase }, true));
             return R.createElement("div", { "data-testid": "card-info" }, [
                 push("People", RightPanelPhases.MemberList),
@@ -168,7 +172,8 @@ describe("CardPanelOverlay", () => {
             </SDKContext.Provider>,
         );
     };
-    const dispatch = (payload: Record<string, unknown>) => act(async () => void defaultDispatcher.dispatch(payload as never, true));
+    const dispatch = (payload: Record<string, unknown>) =>
+        act(async () => void defaultDispatcher.dispatch(payload as never, true));
     const noStoreWrites = () => {
         const s = sdk.rightPanelStore;
         for (const fn of [s.popCard, s.pushCard, s.setCard, s.setCards, s.showOrHidePhase, s.togglePanel]) {
@@ -211,7 +216,9 @@ describe("CardPanelOverlay", () => {
         mount("info");
         fireEvent.click(await screen.findByText("People"));
         const members = await screen.findByTestId("card-members");
-        expect(members.getAttribute("data-history")).toBe(`${RightPanelPhases.RoomSummary}>${RightPanelPhases.MemberList}`);
+        expect(members.getAttribute("data-history")).toBe(
+            `${RightPanelPhases.RoomSummary}>${RightPanelPhases.MemberList}`,
+        );
         fireEvent.click(screen.getByText("back"));
         expect(await screen.findByTestId("card-info")).toBeTruthy();
         expect(screen.queryByText("back")).toBeNull();
@@ -229,7 +236,9 @@ describe("CardPanelOverlay", () => {
         for (const name of ["Threads", "Ext", "toggle"]) fireEvent.click(await screen.findByText(name));
         expect(screen.getByTestId("card-info")).toBeTruthy();
         fireEvent.click(screen.getByText("setFiles"));
-        expect((await screen.findByTestId("card-files")).getAttribute("data-history")).toBe(`${RightPanelPhases.FilePanel}`);
+        expect((await screen.findByTestId("card-files")).getAttribute("data-history")).toBe(
+            `${RightPanelPhases.FilePanel}`,
+        );
         fireEvent.click(screen.getByText("close"));
         expect(req.finish).toHaveBeenCalledTimes(1);
         noStoreWrites();
@@ -259,7 +268,9 @@ describe("CardPanelOverlay", () => {
         expect(req.openThreadOn).toHaveBeenCalledWith(root);
 
         // the host's own dispatches: none of its own ViewRoom (the two above are the test's)
-        expect(dispatchSpy.mock.calls.filter(([p]) => (p as { action: string }).action === Action.ViewRoom)).toHaveLength(1);
+        expect(
+            dispatchSpy.mock.calls.filter(([p]) => (p as { action: string }).action === Action.ViewRoom),
+        ).toHaveLength(1);
         noStoreWrites();
     });
 
@@ -300,7 +311,9 @@ describe("CardPanelOverlay", () => {
         await dispatch({ action: Action.ViewRoom, room_id: "local+1", metricsTrigger: "MessageUser" });
         expect(req.openRoom).toHaveBeenCalledWith("local+1");
         expect(create).not.toHaveBeenCalled();
-        expect(needsStockUi({ action: Action.ViewRoom, room_id: "local+1", metricsTrigger: "MessageUser" })).toBe(false);
+        expect(needsStockUi({ action: Action.ViewRoom, room_id: "local+1", metricsTrigger: "MessageUser" })).toBe(
+            false,
+        );
     });
 
     it("Escape closes (a prevented one does not); a listener is gone after unmount", async () => {
@@ -329,7 +342,7 @@ describe("HostPanelSlot", () => {
         expect(isHostPanelSlotMounted()).toBe(false);
         const { unmount } = render(
             <SDKContext.Provider value={sdk}>
-                <HostPanelSlot client={sdk.client} bridge={bridge} />
+                <HostPanelSlot client={sdk.client!} bridge={bridge} />
             </SDKContext.Provider>,
         );
         expect(isHostPanelSlotMounted()).toBe(true);

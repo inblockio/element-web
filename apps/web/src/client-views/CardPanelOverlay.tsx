@@ -102,7 +102,9 @@ export function cardStoreOverrides(stack: IRightPanelCard[], ops: CardStackOps):
         },
         setCard,
         setCards: (cards: IRightPanelCard[]) => {
-            const shown = cards.filter((c) => SHOWN.has(c.phase)).map((c) => ({ phase: c.phase, state: c.state ?? {} }));
+            const shown = cards
+                .filter((c) => SHOWN.has(c.phase))
+                .map((c) => ({ phase: c.phase, state: c.state ?? {} }));
             if (shown.length) ops.set(shown);
         },
         showOrHidePhase: (phase: RightPanelPhases, state?: IRightPanelCard["state"]) => {
@@ -300,7 +302,13 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
  * The host panel slot (M9): shows the thread panel (M8) or a card panel, whichever the kit asked for last (the bridge
  * keeps at most one). While mounted, MatrixChat's ShowThread arm writes no right-panel store (F5).
  */
-export function HostPanelSlot({ client, bridge }: { client: MatrixClient; bridge: ViewModelBridge }): JSX.Element | null {
+export function HostPanelSlot({
+    client,
+    bridge,
+}: {
+    client: MatrixClient;
+    bridge: ViewModelBridge;
+}): JSX.Element | null {
     const [thread, setThread] = useState<ThreadPanelRequest | null>(null);
     const [card, setCard] = useState<CardPanelRequest | null>(null);
     useEffect(() => markHostPanelSlotMounted(), []);

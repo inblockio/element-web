@@ -2165,7 +2165,9 @@ describe("ViewModelBridge", () => {
             const membership = vi.spyOn(h.room, "getMyMembership").mockReturnValue("invite");
             await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
             membership.mockRestore();
-            const dm = vi.spyOn(DMRoomMap, "shared").mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const dm = vi
+                .spyOn(DMRoomMap, "shared")
+                .mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
             const member = vi.spyOn(h.room, "getMember").mockReturnValue(null as never);
             await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
             member.mockRestore();
@@ -2174,7 +2176,9 @@ describe("ViewModelBridge", () => {
 
         it("a DM's info card carries the other member (user info), a plain room's does not", async () => {
             const shown = watch();
-            const dm = vi.spyOn(DMRoomMap, "shared").mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const dm = vi
+                .spyOn(DMRoomMap, "shared")
+                .mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
             const call = bridge.openPanel("!a", "info");
             expect(shown[0]!.dmMember).toMatchObject({ userId: "@bob:example.org" });
             bridge.closePanel();

@@ -1964,7 +1964,9 @@ export class ViewModelBridge implements ClientViewBridge {
             return Promise.reject(new ClientViewActionError("unsupported", `no ${card} card yet`));
         }
         if (room.getMyMembership() !== KnownMembership.Join) {
-            return Promise.reject(new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"));
+            return Promise.reject(
+                new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"),
+            );
         }
         let dmMember: RoomMember | undefined;
         if (card === "info") {
@@ -1977,7 +1979,9 @@ export class ViewModelBridge implements ClientViewBridge {
             if (otherId) {
                 dmMember = room.getMember(otherId) ?? undefined;
                 if (!dmMember) {
-                    return Promise.reject(new ClientViewActionError("unsupported", "the other member of this chat is unknown"));
+                    return Promise.reject(
+                        new ClientViewActionError("unsupported", "the other member of this chat is unknown"),
+                    );
                 }
             }
         }
