@@ -85,7 +85,13 @@ import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewU
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import UserProvider from "../autocomplete/UserProvider";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
-import { createRoomViaDialog, forwardViaDialog, leaveViaDialog, startChatViaDialog, viewSourceViaDialog } from "./RoomActions";
+import {
+    createRoomViaDialog,
+    forwardViaDialog,
+    leaveViaDialog,
+    startChatViaDialog,
+    viewSourceViaDialog,
+} from "./RoomActions";
 import Modal from "../Modal";
 import ForwardDialog from "../components/views/dialogs/ForwardDialog";
 import ViewSource from "../components/structures/ViewSource";
