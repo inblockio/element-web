@@ -58,14 +58,20 @@ interface IProps {
     onSearchCancel?: () => void;
     focusRoomSearch?: boolean;
     searchTerm?: string;
+    /**
+     * inblock D39 panel: the card is hosted over a client view (client-views/CardPanelOverlay). Threads, Extensions,
+     * Settings and the topic's Edit link are not offered (they reach the stock room view or the right-panel store).
+     */
+    hostPanel?: boolean;
 }
 
-const RoomTopic: React.FC<Pick<IProps, "room">> = ({ room }): JSX.Element | null => {
+const RoomTopic: React.FC<Pick<IProps, "room" | "hostPanel">> = ({ room, hostPanel }): JSX.Element | null => {
     const vm = useRoomTopicViewModel(room);
+    const canEditTopic = vm.canEditTopic && !hostPanel;
 
     const body = topicToHtml(vm.topic?.text, vm.topic?.html);
 
-    if (!body && !vm.canEditTopic) {
+    if (!body && !canEditTopic) {
         return null;
     }
 
@@ -109,7 +115,7 @@ const RoomTopic: React.FC<Pick<IProps, "room">> = ({ room }): JSX.Element | null
                     <ChevronDownIcon />
                 </IconButton>
             </Box>
-            {vm.expanded && vm.canEditTopic && (
+            {vm.expanded && canEditTopic && (
                 <Box flex="1" className="mx_RoomSummaryCard_topic_edit">
                     <Link kind="primary" onClick={vm.onEditClick}>
                         <Text size="sm" weight="regular">
@@ -129,6 +135,7 @@ const RoomSummaryCardView: React.FC<IProps> = ({
     onSearchCancel,
     focusRoomSearch,
     searchTerm = "",
+    hostPanel,
 }) => {
     const vm = useRoomSummaryCardViewModel(room, permalinkCreator, onSearchCancel);
     // XXX: this name should be part of the view model
@@ -202,7 +209,7 @@ const RoomSummaryCardView: React.FC<IProps> = ({
                 <HistoryVisibilityBadge historyVisibility={vm.historyVisibility} />
             </Flex>
 
-            <RoomTopic room={room} />
+            <RoomTopic room={room} hostPanel={hostPanel} />
         </header>
     );
 
@@ -253,7 +260,9 @@ const RoomSummaryCardView: React.FC<IProps> = ({
                 <Separator />
 
                 <MenuItem Icon={UserProfileIcon} label={_t("common|people")} onSelect={vm.onRoomMembersClick} />
-                <MenuItem Icon={ThreadsIcon} label={_t("common|threads")} onSelect={vm.onRoomThreadsClick} />
+                {!hostPanel && (
+                    <MenuItem Icon={ThreadsIcon} label={_t("common|threads")} onSelect={vm.onRoomThreadsClick} />
+                )}
                 {!vm.isVideoRoom && (
                     <>
                         <MenuItem
@@ -270,11 +279,13 @@ const RoomSummaryCardView: React.FC<IProps> = ({
                             label={_t("right_panel|files_button")}
                             onSelect={vm.onRoomFilesClick}
                         />
-                        <MenuItem
-                            Icon={ExtensionsIcon}
-                            label={_t("right_panel|extensions_button")}
-                            onSelect={vm.onRoomExtensionsClick}
-                        />
+                        {!hostPanel && (
+                            <MenuItem
+                                Icon={ExtensionsIcon}
+                                label={_t("right_panel|extensions_button")}
+                                onSelect={vm.onRoomExtensionsClick}
+                            />
+                        )}
                     </>
                 )}
 
@@ -297,7 +308,9 @@ const RoomSummaryCardView: React.FC<IProps> = ({
                     </>
                 )}
 
-                <MenuItem Icon={SettingsIcon} label={_t("common|settings")} onSelect={vm.onRoomSettingsClick} />
+                {!hostPanel && (
+                    <MenuItem Icon={SettingsIcon} label={_t("common|settings")} onSelect={vm.onRoomSettingsClick} />
+                )}
 
                 <Separator />
                 <div className="mx_RoomSummaryCard_bottomOptions">

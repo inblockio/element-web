@@ -40,6 +40,7 @@ import { MatrixClientPeg } from "../../MatrixClientPeg";
 import PlatformPeg from "../../PlatformPeg";
 import SdkConfig, { type ConfigOptions } from "../../SdkConfig";
 import dis from "../../dispatcher/dispatcher";
+import { isHostPanelSlotMounted } from "../../client-views/hostPanelSlot";
 import Modal from "../../Modal";
 import { showRoomInviteDialog, showStartChatInviteDialog } from "../../RoomInvite";
 import * as Rooms from "../../Rooms";
@@ -903,6 +904,8 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
                 void SettingsStore.setValue("pseudonymousAnalyticsOptIn", null, SettingLevel.ACCOUNT, false);
                 break;
             case Action.ShowThread: {
+                // inblock D39 panel (F5): a client view's host panel slot is the only consumer; no store write under a kit.
+                if (isHostPanelSlotMounted()) break;
                 const { rootEvent, initialEvent, highlighted, scrollIntoView, push } = payload as ShowThreadPayload;
 
                 const threadViewCard = {

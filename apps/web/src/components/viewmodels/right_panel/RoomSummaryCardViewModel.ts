@@ -4,7 +4,7 @@ SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only
 Please see LICENSE files in the repository root for full details.
 */
 
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import {
     EventType,
     type HistoryVisibility,
@@ -29,6 +29,7 @@ import { canInviteTo } from "../../../utils/room/canInviteTo";
 import { DefaultTagID } from "../../../stores/room-list-v3/skip-list/tag";
 import { useEventEmitterState } from "../../../hooks/useEventEmitter";
 import RightPanelStore from "../../../stores/right-panel/RightPanelStore";
+import { SDKContext } from "../../../contexts/SDKContext";
 import { RightPanelPhases } from "../../../stores/right-panel/RightPanelStorePhases";
 import PosthogTrackers from "../../../PosthogTrackers";
 import { PollHistoryDialog } from "../../views/dialogs/PollHistoryDialog";
@@ -171,6 +172,8 @@ export function useRoomSummaryCardViewModel(
     onSearchCancel?: () => void,
 ): RoomSummaryCardState {
     const cli = useMatrixClientContext();
+    // inblock D39 panel: the store comes from the SDK context (the stock one unless a client-view panel hosts the card).
+    const rightPanelStore = useContext(SDKContext)?.rightPanelStore ?? RightPanelStore.instance;
 
     const isRoomEncrypted = useIsEncrypted(cli, room) ?? false;
     const roomContext = useScopedRoomContext("e2eStatus", "timelineRenderingType");
@@ -194,24 +197,24 @@ export function useRoomSummaryCardViewModel(
     const userStatus = useUserStatus(dmMember?.userId);
 
     const onRoomMembersClick = (): void => {
-        RightPanelStore.instance.pushCard({ phase: RightPanelPhases.MemberList }, true);
+        rightPanelStore.pushCard({ phase: RightPanelPhases.MemberList }, true);
     };
 
     const onRoomThreadsClick = (): void => {
-        RightPanelStore.instance.pushCard({ phase: RightPanelPhases.ThreadPanel }, true);
+        rightPanelStore.pushCard({ phase: RightPanelPhases.ThreadPanel }, true);
     };
 
     const onRoomFilesClick = (): void => {
-        RightPanelStore.instance.pushCard({ phase: RightPanelPhases.FilePanel }, true);
+        rightPanelStore.pushCard({ phase: RightPanelPhases.FilePanel }, true);
     };
 
     const onRoomExtensionsClick = (): void => {
-        RightPanelStore.instance.pushCard({ phase: RightPanelPhases.Extensions }, true);
+        rightPanelStore.pushCard({ phase: RightPanelPhases.Extensions }, true);
     };
 
     const onRoomPinsClick = (): void => {
         PosthogTrackers.trackInteraction("PinnedMessageRoomInfoButton");
-        RightPanelStore.instance.pushCard({ phase: RightPanelPhases.PinnedMessages }, true);
+        rightPanelStore.pushCard({ phase: RightPanelPhases.PinnedMessages }, true);
     };
 
     const onRoomSettingsClick = (ev: Event): void => {
