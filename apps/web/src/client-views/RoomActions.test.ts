@@ -17,6 +17,7 @@ import {
     createRoomViaDialog,
     forwardDialogClient,
     forwardViaDialog,
+    viewSourceViaDialog,
     leaveViaDialog,
     startChatViaDialog,
     LEAVE_SETTLE_MS,
@@ -24,7 +25,17 @@ import {
 } from "./RoomActions";
 import { ClientViewActionError } from "./types";
 
-vi.mock("../Modal", () => ({ default: { createDialog: vi.fn() } }));
+vi.mock("../Modal", async () => {
+    // A fake ModalManager: an emitter with the three private places Element keeps its dialogs in.
+    const { EventEmitter } = await import("events");
+    const manager = Object.assign(new EventEmitter(), {
+        createDialog: vi.fn(),
+        modals: [] as object[],
+        priorityModal: null as object | null,
+        staticModal: null as object | null,
+    });
+    return { default: manager, ModalManagerEvent: { Opened: "opened", Closed: "closed" } };
+});
 
 /** A dialog the fake Modal opens: `finish` is the dialog's own result (`[]` = closed without an answer). */
 function openDialogOnStart(): {
@@ -652,5 +663,131 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
         } finally {
             vi.useRealTimers();
         }
+    });
+});
+
+describe("E5 view source (Element's ViewSource dialog over the kit)", () => {
+    it("is done with the message when the dialog closes", async () => {
+        const d = openDialogOnStart();
+        const outcome = viewSourceViaDialog("!a:example.org", "$e", d.start);
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
+    });
+
+    it("fails when the dialog never opens", async () => {
+        vi.useFakeTimers();
+        try {
+            const outcome = viewSourceViaDialog("!a:example.org", "$e", () => {});
+            const code = codeOf(outcome);
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await code).toBe("failed");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
+describe("E5 view source released when Element drops the dialog (Modal.tsx wipes the stack on a priority close)", () => {
+    it("ends done when a priority dialog closes over it, and the next dialog action is not refused", async () => {
+        const fake = Modal as unknown as {
+            createDialog: unknown;
+            modals: object[];
+            emit: (e: string) => void;
+        };
+        // A dialog that never reports `finished`, as ViewSource under a priority dialog that closed.
+        fake.createDialog = vi.fn(() => {
+            fake.modals.unshift({});
+            return { close: vi.fn(), finished: new Promise<unknown[]>(() => {}) };
+        });
+        const start = () =>
+            void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+        const outcome = viewSourceViaDialog("!a:example.org", "$e", start);
+        await Promise.resolve();
+        // The priority dialog opened over it and was dismissed: Modal.tsx sets `modals = []` and emits `closed`.
+        fake.modals = [];
+        fake.emit("closed");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
+
+        const d = openDialogOnStart();
+        const next = viewSourceViaDialog("!a:example.org", "$f", d.start);
+        d.finish();
+        await expect(next).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$f" });
+    });
+});
+
+describe("a confirmed dialog answer wins over the drop signal (Modal.tsx resolves `finished`, then emits `closed`, on one stack)", () => {
+    /** A dialog held in the fake modal stack; `confirm` does what ModalManager.getCloseFn does: resolve, remove, emit. */
+    function stackedDialog(): { confirm: (...result: unknown[]) => void; start: () => void } {
+        const fake = Modal as unknown as { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+        const modal = {};
+        let resolve: (r: unknown[]) => void = () => {};
+        const finished = new Promise<unknown[]>((r) => (resolve = r));
+        fake.createDialog = vi.fn(() => {
+            fake.modals.unshift(modal);
+            return { close: vi.fn(), finished };
+        });
+        return {
+            confirm: (...result) => {
+                resolve(result);
+                fake.modals = fake.modals.filter((m) => m !== modal);
+                fake.emit("closed");
+            },
+            start: () =>
+                void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {}),
+        };
+    }
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it("create room: the confirmed dialog is not answered as cancelled", async () => {
+        const d = stackedDialog();
+        const outcome = createRoomViaDialog(d.start);
+        await vi.advanceTimersByTimeAsync(0);
+        d.confirm(true, { name: "x" });
+        await vi.advanceTimersByTimeAsync(0);
+        viewRoom("!new:example.org", "Created");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
+    });
+
+    it("start chat: the confirmed dialog is not answered as cancelled", async () => {
+        const d = stackedDialog();
+        const outcome = startChatViaDialog(() => {
+            d.start();
+            viewRoom("!dm:example.org", "MessageUser");
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        d.confirm(true);
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+    });
+
+    it("leave: the confirmed dialog is not answered as cancelled", async () => {
+        let membership = "join";
+        const client = { getRoom: () => ({ getMyMembership: () => membership }) } as unknown as MatrixClient;
+        const d = stackedDialog();
+        const outcome = leaveViaDialog(client, "!a:example.org", d.start);
+        await vi.advanceTimersByTimeAsync(0);
+        d.confirm(true);
+        await vi.advanceTimersByTimeAsync(0);
+        membership = "leave";
+        defaultDispatcher.dispatch({ action: Action.AfterLeaveRoom, room_id: "!a:example.org" }, true);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org" });
+    });
+
+    it("a dialog wiped without an answer still ends as closed (the timer is cleared once settled)", async () => {
+        const fake = Modal as unknown as { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+        const d = stackedDialog();
+        const outcome = createRoomViaDialog(d.start);
+        await vi.advanceTimersByTimeAsync(0);
+        fake.modals = [];
+        fake.emit("closed");
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        expect(vi.getTimerCount()).toBe(0);
     });
 });

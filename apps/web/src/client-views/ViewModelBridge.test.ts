@@ -164,6 +164,8 @@ const h = vi.hoisted(() => {
         redact: vi.fn(),
         downloadMedia: vi.fn(),
         forwardViaDialog: vi.fn(),
+        viewSourceViaDialog: vi.fn(),
+        createDialog: vi.fn(),
         actionBars,
         eventUtils,
         pins,
@@ -449,7 +451,10 @@ vi.mock("./DownloadAction", () => ({
 vi.mock("./RoomActions", async (orig) => ({
     ...(await orig<typeof import("./RoomActions")>()),
     forwardViaDialog: (...args: unknown[]) => h.forwardViaDialog(...args),
+    viewSourceViaDialog: (...args: unknown[]) => h.viewSourceViaDialog(...args),
 }));
+vi.mock("../Modal", () => ({ default: { createDialog: (...args: unknown[]) => h.createDialog(...args) } }));
+vi.mock("../components/structures/ViewSource", () => ({ default: class ViewSourceStub {} }));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
     getMeetUrl: vi.fn(() => "https://meet.example.org"),
@@ -532,6 +537,8 @@ describe("ViewModelBridge", () => {
         h.eventUtils.canDownload = true;
         h.downloadMedia.mockReset();
         h.forwardViaDialog.mockReset();
+        h.viewSourceViaDialog.mockReset();
+        h.createDialog.mockReset();
         h.sdkContext.roomViewStore = { getRoomId: () => null };
     });
 
@@ -1831,6 +1838,16 @@ describe("ViewModelBridge", () => {
             });
         });
 
+        it("reports through Element's dialog for others' messages (M7 E4), forbidden for an own one, names unknowns", async () => {
+            // $1 is bob's (the picker tests above), $mine is the user's own message
+            h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
+            const own = fakeEvent("$mine", { getSender: () => "@me:example.org" });
+            read(fakeEvent("$1"), own);
+            await expect(bridge.openReport("!a", "$mine")).rejects.toMatchObject({ code: "forbidden" });
+            await expect(bridge.openReport("!nope", "$1")).rejects.toMatchObject({ code: "unknown_room" });
+            await expect(bridge.openReport("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
+        });
+
         it("does not count a redacted own reaction as selected and drops an emptied key", () => {
             const mine = reaction("@me:example.org", "👍", { isRedacted: () => true });
             h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(
@@ -1896,6 +1913,41 @@ describe("ViewModelBridge", () => {
             expect(h.reactionButtons[0].dispose).toHaveBeenCalledTimes(1);
         });
     });
+    describe("openViewSource (E5)", () => {
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+
+        it("opens Element's ViewSource dialog for the event, the way the message context menu does, and answers when it closes", async () => {
+            const event = fakeEvent("$1");
+            read(event);
+            h.viewSourceViaDialog.mockImplementation((roomId: string, eventId: string, start: () => void) => {
+                start();
+                return Promise.resolve({ status: "done", roomId, eventId });
+            });
+            await expect(bridge.openViewSource("!a", "$1")).resolves.toEqual({
+                status: "done",
+                roomId: "!a",
+                eventId: "$1",
+            });
+            expect(h.viewSourceViaDialog).toHaveBeenCalledWith("!a", "$1", expect.any(Function));
+            expect(h.createDialog).toHaveBeenCalledTimes(1);
+            expect(h.createDialog).toHaveBeenCalledWith(expect.anything(), { mxEvent: event }, "mx_Dialog_viewsource");
+        });
+
+        it("names an unknown room or event and opens nothing", async () => {
+            read(fakeEvent("$1"));
+            await expect(bridge.openViewSource("!nope", "$1")).rejects.toMatchObject({ code: "unknown_room" });
+            await expect(bridge.openViewSource("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
+            expect(h.viewSourceViaDialog).not.toHaveBeenCalled();
+            expect(h.createDialog).not.toHaveBeenCalled();
+        });
+    });
+
     describe("thread summary", () => {
         const read = (...events: ReturnType<typeof fakeEvent>[]) => {
             h.timeline.snapshot = {

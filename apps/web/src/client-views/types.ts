@@ -323,8 +323,15 @@ export interface ClientViewBridge {
      * `opts.txnId` is the transaction id the sent event carries (`ViewMessage.txnId`); `opts.replyTo` is the event id
      * of the replied message. In a local (not yet created) room the first send creates the room and `roomId` is the
      * real one. Interim (D16): Element's own client call, until a composer send view-model ships.
+     * Version 2, additive (M7 E1): `opts.markdown` builds the content as Element's composer does for that text
+     * (`createMessageContent`, Markdown forced): `body` is the text serialize, `format` + `formatted_body` are set only
+     * when Markdown yields HTML. `opts.mentions` (E2) is accepted, an empty list changes nothing.
      */
-    sendText(roomId: string, text: string, opts?: { txnId?: string; replyTo?: string }): Promise<ActionOutcome>;
+    sendText(
+        roomId: string,
+        text: string,
+        opts?: { txnId?: string; replyTo?: string; markdown?: boolean; mentions?: string[] },
+    ): Promise<ActionOutcome>;
     /**
      * Loads the next page of older messages of a room and resolves when the page is in (the room's `timeline` has
      * changed by then). Concurrent calls for a room share one load. Backed by the timeline view-model's
@@ -363,9 +370,15 @@ export interface ClientViewBridge {
      * the ORIGINAL event id once the homeserver holds the replacement. `forbidden` for another user's message or one
      * Element does not let the user edit (`ViewMessage.canEdit`), `unknown_event` when it cannot be loaded, `failed`
      * for a blank text (nothing is sent). Interim (D16/D20): entry through the action bar view-model's `onEditClick`,
-     * the replacement send is Element's own client call.
+     * the replacement send is Element's own client call. Version 2, additive (M7 E1): `opts.markdown` builds the
+     * replacement as Element's edit composer does (`createEditContent`, Markdown forced); `opts.mentions` is E2's.
      */
-    editText(roomId: string, eventId: string, text: string): Promise<ActionOutcome>;
+    editText(
+        roomId: string,
+        eventId: string,
+        text: string,
+        opts?: { markdown?: boolean; mentions?: string[] },
+    ): Promise<ActionOutcome>;
     /**
      * M6 B2: pins (`on`) or unpins the message `eventId` (the Matrix event id): `m.room.pinned_events` of the room. `done` once
      * the homeserver accepted the new list and the room's state shows it (`ViewMessage.pinned` equals `on`); already as asked is
@@ -457,6 +470,21 @@ export interface ClientViewBridge {
      * forward action on a shared message view-model.
      */
     openForward(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * E5: Element's own View source dialog over the kit (what the message context menu opens): the event id and the event
+     * JSON of a message the kit shows, for an encrypted event the decrypted and the original source. `done` when the dialog
+     * closes (it changes nothing; `roomId` + `eventId` are the message). `unknown_room` / `unknown_event` as the other
+     * message actions; `failed` when the dialog does not open or another Element dialog action is running. Interim (D31):
+     * awaits a view-source action on a shared message view-model.
+     */
+    openViewSource(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * M7 E4: Element's own report dialog over the kit (`Action.OpenReportEventDialog`, as the message context menu opens
+     * it). `done` when the dialog closes (a report sent, cancelled or dismissed alike: Element shows the result itself,
+     * the kit keeps no state), `forbidden` for an own message (Element offers Report only on others'), `unknown_room` /
+     * `unknown_event` for a message the bridge does not hold. Interim (D31): no report action on a shared view-model.
+     */
+    openReport(roomId: string, eventId: string): Promise<ActionOutcome>;
 }
 
 /** A kit that runs in a same-origin iframe loaded from `url`. */

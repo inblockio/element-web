@@ -41,6 +41,10 @@ import { createRoomFromLocalRoom } from "../utils/direct-messages";
 import { doMaybeLocalRoomAction } from "../utils/local-room";
 import { toActionError } from "./actions";
 import { type ActionOutcome, ClientViewActionError } from "./types";
+import EditorModel from "../editor/model";
+import { type Part, PartCreator } from "../editor/parts";
+import { createMessageContent } from "../components/views/rooms/SendMessageComposer";
+import { createEditContent } from "../components/views/rooms/EditMessageComposer";
 
 /**
  * A1 send: a composer send view-model. Today `vm/composer` ships only `MessageComposerUrlPreviewViewModel`, which
@@ -142,6 +146,20 @@ function localRoomCreationFailure(
 }
 
 /**
+ * M7 E1: the editor model Element's composer holds for a typed text: one plain part per line, a newline part between.
+ * No autocomplete pills (E2 adds the mentions) and no `@room` detection: the text is what the user typed.
+ */
+function markdownModel(client: MatrixClient, room: Room, text: string): EditorModel {
+    const pc = new PartCreator(room, client);
+    const parts: Part[] = [];
+    text.split(/\r\n|\r|\n/).forEach((line, i) => {
+        if (i > 0) parts.push(pc.newline());
+        if (line) parts.push(pc.plain(line));
+    });
+    return new EditorModel(parts, pc);
+}
+
+/**
  * Sends a plain `m.text` the way `SendMessageComposer` does (`SendMessageComposer.tsx`, `sendMessage`):
  * `doMaybeLocalRoomAction` + `client.sendMessage`, then the `message_sent` dispatch. A local room (a new DM that has
  * no real room yet) is turned into the real one by `createRoomFromLocalRoom`, as `RoomView.onLocalRoomEvent` does
@@ -154,7 +172,7 @@ export async function sendText(
     client: MatrixClient,
     roomId: string,
     text: string,
-    opts: { txnId?: string; replyTo?: string } = {},
+    opts: { txnId?: string; replyTo?: string; markdown?: boolean; mentions?: string[] } = {},
     hooks: { onReplyTarget?: (target: MatrixEvent) => void } = {},
 ): Promise<ActionOutcome> {
     // AWAITS: see AWAITS_SEND_TEXT.
@@ -163,12 +181,24 @@ export async function sendText(
     if (!text.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
     // A3: the replied event is loaded first (`unknown_event` before anything is sent), the view-model entry follows.
     const replyTo = opts.replyTo ? withSender(room, await loadEvent(client, room, opts.replyTo)) : undefined;
-    const content: RoomMessageEventContent = { msgtype: MsgType.Text, body: text };
-    if (replyTo) {
-        // As `createMessageContent` (SendMessageComposer): the mentions (the replied sender), then the reply relation.
-        attachMentions(client.getSafeUserId(), content, null, replyTo);
-        addReplyToMessageContent(content, replyTo);
-        hooks.onReplyTarget?.(replyTo);
+    let content: RoomMessageEventContent;
+    if (opts.markdown) {
+        // M7 E1: the content Element's composer builds for this text (Markdown forced, `createMessageContent` also
+        // attaches the mentions, the reply relation and the reply fallback). `opts.mentions` is E2's.
+        content = createMessageContent(client.getSafeUserId(), markdownModel(client, room, text), replyTo, undefined, {
+            useMarkdown: true,
+        });
+        // As `SendMessageComposer.sendMessage`: a body left blank (`/me ` and whitespace) is not sent.
+        if (!content.body.trim()) throw new ClientViewActionError("failed", "an empty message is not sent");
+        if (replyTo) hooks.onReplyTarget?.(replyTo);
+    } else {
+        content = { msgtype: MsgType.Text, body: text };
+        if (replyTo) {
+            // As `createMessageContent` (SendMessageComposer): the mentions (the replied sender), then the reply relation.
+            attachMentions(client.getSafeUserId(), content, null, replyTo);
+            addReplyToMessageContent(content, replyTo);
+            hooks.onReplyTarget?.(replyTo);
+        }
     }
     // Always our own transaction id: the cancel of a failed send finds exactly this pending event.
     const txnId = opts.txnId ?? client.makeTxnId();
@@ -289,6 +319,7 @@ export async function editText(
     eventId: string,
     text: string,
     hooks: { onEnter?: (ev: MatrixEvent) => boolean | void } = {},
+    opts: { markdown?: boolean; mentions?: string[] } = {},
 ): Promise<ActionOutcome> {
     const { room, ev } = await loadOwnEvent(client, roomId, eventId);
     if (!canEditContent(client, ev)) throw new ClientViewActionError("forbidden", "this message cannot be edited");
@@ -299,25 +330,41 @@ export async function editText(
     }
     if (!text.trim()) throw new ClientViewActionError("failed", "an empty edit is not sent");
     const original = ev.getOriginalContent();
-    const newContent: Record<string, unknown> = { msgtype: original.msgtype, body: text };
+    const repliedTo = ev.replyEventId ? room.findEventById(ev.replyEventId) : undefined;
+    let content: Record<string, unknown>;
+    let newContent: Record<string, unknown>;
+    if (opts.markdown) {
+        // M7 E1: the replacement Element's edit composer builds for this text (Markdown forced; an emote is edited
+        // with its `/me ` prefix, as the editor holds it, from the type on screen: a replacement can have changed it,
+        // `ev.getContent()` is the aggregated content `parseEvent` reads). `createEditContent` attaches mentions and the relation.
+        const prefix = ev.getContent().msgtype === MsgType.Emote ? "/me " : "";
+        content = createEditContent(
+            markdownModel(client, room, prefix + text),
+            withSender(room, ev), // `createEditContent` reads `editedEvent.sender.userId`
+            repliedTo ? withSender(room, repliedTo) : undefined,
+            { useMarkdown: true },
+        ) as unknown as Record<string, unknown>;
+        newContent = content["m.new_content"] as Record<string, unknown>;
+    } else {
+        newContent = { msgtype: original.msgtype, body: text };
+        content = {
+            "msgtype": original.msgtype,
+            "body": `* ${text}`,
+            "m.new_content": newContent,
+        };
+        attachMentions(
+            client.getSafeUserId(),
+            content,
+            null,
+            repliedTo ? withSender(room, repliedTo) : undefined,
+            ev.getContent(),
+        );
+        attachRelation(content, { rel_type: RelationType.Replace, event_id: eventId });
+    }
     // The bundle on screen (a replacement's `m.new_content` once edited), as the edit composer restores it.
     // Only the previews of URLs the new text still has (the composer keeps just those); none left, no key.
-    const kept = keepPreviewsIn(ev.getContent()["com.beeper.linkpreviews"], text);
+    const kept = keepPreviewsIn(ev.getContent()["com.beeper.linkpreviews"], newContent["body"] as string);
     if (kept !== undefined) newContent["com.beeper.linkpreviews"] = kept;
-    const content: Record<string, unknown> = {
-        "msgtype": original.msgtype,
-        "body": `* ${text}`,
-        "m.new_content": newContent,
-    };
-    const repliedTo = ev.replyEventId ? room.findEventById(ev.replyEventId) : undefined;
-    attachMentions(
-        client.getSafeUserId(),
-        content,
-        null,
-        repliedTo ? withSender(room, repliedTo) : undefined,
-        ev.getContent(),
-    );
-    attachRelation(content, { rel_type: RelationType.Replace, event_id: eventId });
 
     const previous = ev.replacingEvent();
     if (previous && (previous.status === EventStatus.QUEUED || previous.status === EventStatus.NOT_SENT)) {

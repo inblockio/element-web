@@ -16,7 +16,7 @@
 
 import { EventStatus, type MatrixClient } from "matrix-js-sdk/src/matrix";
 
-import Modal from "../Modal";
+import Modal, { ModalManagerEvent } from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { type ActionPayload } from "../dispatcher/payloads";
@@ -40,6 +40,39 @@ export interface DialogHandle {
 }
 
 let dialogActionRunning = false;
+
+/** The dialogs Element's modal manager holds now (its private lists; `ModalManager` offers no query for one dialog). */
+function modalStack(): Set<object> {
+    const m = Modal as unknown as { modals?: object[]; priorityModal?: object | null; staticModal?: object | null };
+    return new Set([...(m.modals ?? []), m.priorityModal, m.staticModal].filter((x): x is object => !!x));
+}
+
+/**
+ * The result of `handle`, or `[]` (closed without an answer) once its dialog has left the modal stack without it:
+ * Modal.tsx wipes `modals` on a priority or static close without resolving the dropped dialogs' `finished`.
+ */
+function finishedOrDropped(handle: DialogHandle, mine: object | undefined): Promise<unknown[]> {
+    if (!mine) return handle.finished;
+    return new Promise<unknown[]>((resolve, reject) => {
+        let dropped: ReturnType<typeof setTimeout> | undefined;
+        const release = (): void => {
+            clearTimeout(dropped);
+            Modal.off(ModalManagerEvent.Closed, check);
+            Modal.off(ModalManagerEvent.Opened, check);
+        };
+        const check = (): void => {
+            if (modalStack().has(mine) || dropped !== undefined) return;
+            // Modal.tsx resolves `finished` and then emits Closed on one stack: one macrotask lets that answer win over the drop.
+            dropped = setTimeout(() => (release(), resolve([])), 0);
+        };
+        Modal.on(ModalManagerEvent.Closed, check);
+        Modal.on(ModalManagerEvent.Opened, check);
+        handle.finished.then(
+            (r) => (release(), resolve(r)),
+            (e) => (release(), reject(e)),
+        );
+    });
+}
 
 /** The dispatched payloads of one action, newest last, until `stop`. */
 export function recordPayloads(): {
@@ -99,15 +132,17 @@ export function openedDialog(start: () => void, onFinished?: () => void): Promis
         }, DIALOG_OPEN_MS);
         // A pass-through wrapper: the dialog opens exactly as it would, its handle is read on the way out.
         Modal.createDialog = function (this: unknown, ...args: Parameters<typeof original>) {
+            const stackBefore = modalStack();
             const handle = original.apply(Modal, args);
             if (!settled) {
+                const mine = [...modalStack()].find((m) => !stackBefore.has(m));
                 // Registered before the caller of `createDialog` can await the result, so it runs before whatever Element
                 // does after the answer: the mark it takes separates what came before the answer from what follows.
                 if (onFinished) void Promise.resolve(handle.finished).then(onFinished, () => {});
                 settled = true;
                 clearTimeout(timer);
                 restore();
-                resolve(handle);
+                resolve({ finished: finishedOrDropped(handle, mine) });
             }
             return handle;
         };
@@ -315,5 +350,18 @@ export function leaveViaDialog(client: MatrixClient, roomId: string, start: () =
         } finally {
             seen.stop();
         }
+    });
+}
+
+/**
+ * E5 view source: Element's own ViewSource dialog (`MessageContextMenu.onViewSourceClick`'s `Modal.createDialog`). It
+ * only shows the event (and the original of a decrypted one) and changes nothing, so the kit keeps no state from this
+ * action: `done` + the message when the dialog closes. `start` is that `createDialog` call.
+ */
+export function viewSourceViaDialog(roomId: string, eventId: string, start: () => void): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        const dialog = await openedDialog(start);
+        await dialog.finished;
+        return { status: "done", roomId, eventId };
     });
 }
