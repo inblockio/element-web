@@ -14,7 +14,7 @@
  * `ViewRoom` Element dispatches after a create, the membership that drops after a leave. No `ViewRoom` of our own.
  */
 
-import { type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { EventStatus, type MatrixClient, type MatrixEvent } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -212,12 +212,20 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
  * `WebForwardShortcut`, then the dialog closes): `done` + that room's id, so the kit follows to it (H5); without a jump
  * `done` + the source room and event. `start` is the dispatch of `OpenForwardDialog`.
  */
-export function forwardViaDialog(sourceRoomId: string, eventId: string, start: () => void): Promise<ActionOutcome> {
+export function forwardViaDialog(
+    client: MatrixClient,
+    sourceRoomId: string,
+    eventId: string,
+    start: () => void,
+): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
+        const pendingBefore = pendingEventsByRoom(client);
         try {
             const dialog = await openedDialog(start);
             await dialog.finished;
+            // Stock ForwardDialog never cancels a failed copy's NOT_SENT echo; it would block that room.
+            cancelNewUnsent(client, pendingBefore);
             // Element dispatches the jump before it closes the dialog; one tick covers a queued dispatch.
             await new Promise((resolve) => setTimeout(resolve, 0));
             const jump = [...seen.payloads].reverse().find(isForwardJump);
@@ -226,6 +234,18 @@ export function forwardViaDialog(sourceRoomId: string, eventId: string, start: (
             seen.stop();
         }
     });
+}
+
+const pendingEventsByRoom = (client: MatrixClient): Map<string, Set<MatrixEvent>> =>
+    new Map(client.getRooms().map((room) => [room.roomId, new Set(room.getPendingEvents())]));
+
+/** Cancels each NOT_SENT pending event that was not there in `before` (the copy a failed forward left behind). */
+function cancelNewUnsent(client: MatrixClient, before: Map<string, Set<MatrixEvent>>): void {
+    for (const room of client.getRooms()) {
+        for (const ev of room.getPendingEvents()) {
+            if (ev.status === EventStatus.NOT_SENT && !before.get(room.roomId)?.has(ev)) client.cancelPendingEvent(ev);
+        }
+    }
 }
 
 const isForwardJump = (p: ActionPayload): p is ViewRoomPayload =>

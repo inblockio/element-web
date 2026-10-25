@@ -1783,16 +1783,23 @@ describe("ViewModelBridge", () => {
                 try {
                     const event = fakeEvent("$1");
                     read(event);
-                    h.forwardViaDialog.mockImplementation((roomId: string, eventId: string, start: () => void) => {
-                        start();
-                        return Promise.resolve({ status: "done", roomId, eventId });
-                    });
+                    h.forwardViaDialog.mockImplementation(
+                        (_c: unknown, roomId: string, eventId: string, start: () => void) => {
+                            start();
+                            return Promise.resolve({ status: "done", roomId, eventId });
+                        },
+                    );
                     await expect(bridge.openForward("!a", "$1")).resolves.toEqual({
                         status: "done",
                         roomId: "!a",
                         eventId: "$1",
                     });
-                    expect(h.forwardViaDialog).toHaveBeenCalledWith("!a", "$1", expect.any(Function));
+                    expect(h.forwardViaDialog).toHaveBeenCalledWith(
+                        expect.anything(),
+                        "!a",
+                        "$1",
+                        expect.any(Function),
+                    );
                     expect(dispatch).toHaveBeenCalledTimes(1);
                     expect(dispatch.mock.calls[0][0]).toMatchObject({ action: Action.OpenForwardDialog, event });
                 } finally {

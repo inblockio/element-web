@@ -8,7 +8,7 @@
 // @vitest-environment happy-dom
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { EventStatus, type MatrixClient, type MatrixEvent } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -332,17 +332,32 @@ describe("A7 leave (RoomListItemViewModel.onLeaveRoom -> Element's confirm)", ()
     });
 });
 
+/** A client whose rooms keep a detached pending list, as Element's do: `cancelPendingEvent` removes from it. */
+function forwardClient(rooms: Record<string, MatrixEvent[]> = {}): MatrixClient {
+    return {
+        getRooms: () => Object.keys(rooms).map((roomId) => ({ roomId, getPendingEvents: () => rooms[roomId] })),
+        cancelPendingEvent: vi.fn((ev: MatrixEvent) => {
+            for (const list of Object.values(rooms)) {
+                const i = list.indexOf(ev);
+                if (i >= 0) list.splice(i, 1);
+            }
+        }),
+    } as unknown as MatrixClient;
+}
+
+const pendingEvent = (status: EventStatus): MatrixEvent => ({ status }) as unknown as MatrixEvent;
+
 describe("E3 forward (Element's forward dialog over the kit)", () => {
     it("is done with the source room and event when the dialog closes without a jump", async () => {
         const d = openDialogOnStart();
-        const outcome = forwardViaDialog("!a:example.org", "$e", d.start);
+        const outcome = forwardViaDialog(forwardClient(), "!a:example.org", "$e", d.start);
         d.finish();
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
     });
 
     it("is done with the jumped-to room when the dialog's room name dispatched ViewRoom (H5)", async () => {
         const d = openDialogOnStart();
-        const outcome = forwardViaDialog("!a:example.org", "$e", d.start);
+        const outcome = forwardViaDialog(forwardClient(), "!a:example.org", "$e", d.start);
         viewRoom("!b:example.org", "WebForwardShortcut");
         d.finish();
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!b:example.org" });
@@ -350,22 +365,49 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
 
     it("takes a jump dispatched one tick after the dialog closed, and ignores other ViewRoom triggers", async () => {
         const d = openDialogOnStart();
-        const outcome = forwardViaDialog("!a:example.org", "$e", d.start);
+        const outcome = forwardViaDialog(forwardClient(), "!a:example.org", "$e", d.start);
         viewRoom("!other:example.org", "MessageUser");
         d.finish();
         setTimeout(() => viewRoom("!b:example.org", "WebForwardShortcut"), 0);
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!b:example.org" });
         const d2 = openDialogOnStart();
-        const second = forwardViaDialog("!a:example.org", "$e", d2.start);
+        const second = forwardViaDialog(forwardClient(), "!a:example.org", "$e", d2.start);
         viewRoom("!other:example.org", "MessageUser");
         d2.finish();
         await expect(second).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
     });
 
+    it("cancels the NOT_SENT echo a failed send left in the target room (a later send is not blocked)", async () => {
+        const failed = pendingEvent(EventStatus.NOT_SENT);
+        const rooms: Record<string, MatrixEvent[]> = { "!a:example.org": [], "!b:example.org": [] };
+        const c = forwardClient(rooms);
+        const d = openDialogOnStart();
+        const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+        rooms["!b:example.org"].push(failed); // what Entry.send's rejected sendEvent leaves behind
+        d.finish();
+        await expect(outcome).resolves.toMatchObject({ status: "done" });
+        expect(c.cancelPendingEvent).toHaveBeenCalledWith(failed);
+        expect(rooms["!b:example.org"].filter((e) => e.status === EventStatus.NOT_SENT)).toEqual([]);
+    });
+
+    it("leaves alone a NOT_SENT echo that existed before the dialog and one that is still sending", async () => {
+        const before = pendingEvent(EventStatus.NOT_SENT);
+        const sending = pendingEvent(EventStatus.SENDING);
+        const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [before] };
+        const c = forwardClient(rooms);
+        const d = openDialogOnStart();
+        const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+        rooms["!b:example.org"].push(sending);
+        d.finish();
+        await outcome;
+        expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+        expect(rooms["!b:example.org"]).toEqual([before, sending]);
+    });
+
     it("fails when the dialog never opens", async () => {
         vi.useFakeTimers();
         try {
-            const outcome = forwardViaDialog("!a:example.org", "$e", () => {});
+            const outcome = forwardViaDialog(forwardClient(), "!a:example.org", "$e", () => {});
             const code = codeOf(outcome);
             await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
             expect(await code).toBe("failed");

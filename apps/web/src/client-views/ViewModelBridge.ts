@@ -1737,7 +1737,7 @@ export class ViewModelBridge implements ClientViewBridge {
             return Promise.reject(new ClientViewActionError("unsupported", "this message cannot be forwarded"));
         }
         const permalinkCreator = this.permalinkCreatorOf(roomId);
-        return forwardViaDialog(roomId, eventId, () =>
+        return forwardViaDialog(this.client, roomId, eventId, () =>
             defaultDispatcher.dispatch<OpenForwardDialogPayload>({
                 action: Action.OpenForwardDialog,
                 event: forwardable,
