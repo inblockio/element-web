@@ -493,6 +493,18 @@ export interface ClientViewBridge {
      */
     openViewSource(roomId: string, eventId: string): Promise<ActionOutcome>;
     /**
+     * M8 T1: Element's own thread view (`ThreadView`) in a host panel at the right of the kit, on the thread of `eventId`
+     * (a thread root, or a reply of one: then its root's thread; root only, no highlight or scroll). `done` (`eventId` =
+     * the root) when the panel closes: its close button, Escape in the panel, a later `openThread`, `closeThread`, the room
+     * left, the bridge disposed. `unknown_room` / `unknown_event` as the other message actions; `unsupported` where
+     * Element offers no Reply in thread (not actionable content, a key verification request, a beacon, or the user may not
+     * send). Thread replies are sent by the panel's own composer; the kit row's `thread` summary updates as a timeline
+     * change. Interim (D37): awaits a thread view-model (`ThreadViewModel` / shared `ThreadViewActions`).
+     */
+    openThread(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /** M8 T1: closes an open thread panel (its `openThread` resolves `done`); a no-op when none is open. */
+    closeThread(): void;
+    /**
      * M7 E4: Element's own report dialog over the kit (`Action.OpenReportEventDialog`, as the message context menu opens
      * it). `done` when the dialog closes (a report sent, cancelled or dismissed alike: Element shows the result itself,
      * the kit keeps no state), `forbidden` for an own message (Element offers Report only on others'), `unknown_room` /

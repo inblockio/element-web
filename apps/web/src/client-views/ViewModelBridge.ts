@@ -15,6 +15,8 @@ import {
     EventType,
     KnownMembership,
     ClientEvent,
+    M_BEACON_INFO,
+    RoomEvent,
     MatrixEventEvent,
     MsgType,
     RelationsEvent,
@@ -163,6 +165,17 @@ export interface ReactionPickerRequest {
     reactions: Relations | null | undefined;
     permissions: ReactionPermissions;
     anchor: ViewAnchor;
+    finish: () => void;
+}
+
+/** Element's thread view over the kit (M8 T1): what the host renders (ThreadPanelOverlay) until `finish`. */
+export interface ThreadPanelRequest {
+    /** Unique per request (root id plus a counter): the host keys the panel by it so a replacement remounts (F3). */
+    key: string;
+    room: Room;
+    /** The thread root (F1: the panel opens on the root, no initial event). */
+    mxEvent: MatrixEvent;
+    permalinkCreator?: RoomPermalinkCreator;
     finish: () => void;
 }
 
@@ -1093,6 +1106,10 @@ export class ViewModelBridge implements ClientViewBridge {
     private pickerCount = 0;
     private picker?: { request: ReactionPickerRequest; resolve: (o: ActionOutcome) => void };
     private readonly pickerListeners = new Set<(request: ReactionPickerRequest | null) => void>();
+    /** The thread panel the host shows over the kit, with the call that waits for its close. */
+    private threadCount = 0;
+    private thread?: { request: ThreadPanelRequest };
+    private readonly threadListeners = new Set<(request: ThreadPanelRequest | null) => void>();
     private isUsed = false;
     /** Called when a kit document first reads the bridge, from inside its scripts (before its DOMContentLoaded). */
     public onUse?: () => void;
@@ -1790,6 +1807,81 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     /**
+     * M8 T1: Element's own ThreadView in a host panel over the kit, on the thread of `eventId` (the root, or a reply of
+     * a thread: then its root's thread). Root only: no initial event, so ThreadView never dispatches `ViewRoom` (F1).
+     * `unsupported` where Element offers no thread (its action bar's own condition: actionable content, not a key
+     * verification request or a beacon, and the user may send). `done` (`eventId` = the root) when the panel closes: its
+     * close button, Escape, a later `openThread`, `closeThread`, the room left, the bridge disposed. The reply itself is
+     * ThreadView's composer's (Element's send path); the kit row's summary follows through `ThreadEvent.Update`.
+     * Interim (D37): there is no thread view-model; awaits a `ThreadViewModel` / shared `ThreadViewActions`.
+     */
+    public openThread(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        const room = this.client.getRoom(roomId)!;
+        const event = row.event;
+        const content = event.getContent();
+        if (
+            !row.actionable() ||
+            content.msgtype === MsgType.KeyVerificationRequest ||
+            M_BEACON_INFO.matches(event.getType()) ||
+            !room.maySendMessage()
+        ) {
+            return Promise.reject(new ClientViewActionError("unsupported", "this message cannot start a thread"));
+        }
+        const rootId = event.isRelation(THREAD_RELATION_TYPE.name) ? event.threadRootId : eventId;
+        const root = rootId === eventId ? event : (room.findEventById(rootId!) ?? event.getThread()?.rootEvent);
+        if (!root) return Promise.reject(new ClientViewActionError("unknown_event", `unknown thread root ${rootId}`));
+        this.closeThread();
+        return new Promise<ActionOutcome>((resolve) => {
+            const stop = (): void => {
+                this.client.off(RoomEvent.MyMembership, onMembership);
+                this.client.off(ClientEvent.DeleteRoom, onDeleted);
+            };
+            const onMembership = (r: Room, membership: string): void => {
+                if (r.roomId === roomId && membership !== KnownMembership.Join) request.finish();
+            };
+            const onDeleted = (id: string): void => {
+                if (id === roomId) request.finish();
+            };
+            const request: ThreadPanelRequest = {
+                key: `${root.getId()}#${++this.threadCount}`,
+                room,
+                mxEvent: root,
+                permalinkCreator: this.permalinkCreatorOf(roomId) ?? undefined,
+                finish: () => {
+                    if (this.thread?.request !== request) return;
+                    stop();
+                    this.thread = undefined;
+                    this.threadListeners.forEach((cb) => cb(null));
+                    resolve({ status: "done", roomId, eventId: root.getId()! });
+                },
+            };
+            this.client.on(RoomEvent.MyMembership, onMembership);
+            this.client.on(ClientEvent.DeleteRoom, onDeleted);
+            this.thread = { request };
+            this.threadListeners.forEach((cb) => cb(request));
+        });
+    }
+
+    /** M8 T1: closes the open thread panel (its `openThread` resolves `done`); a no-op when none is open. */
+    public closeThread(): void {
+        this.thread?.request.finish();
+    }
+
+    /** The host's hook: called with the thread panel to show, and with null when it is gone. Returns the unsubscribe. */
+    public onThreadPanel(cb: (request: ThreadPanelRequest | null) => void): () => void {
+        this.threadListeners.add(cb);
+        if (this.thread) cb(this.thread.request);
+        return () => this.threadListeners.delete(cb);
+    }
+
+    /**
      * M7 E4: Element's report dialog over the kit, as the message context menu opens it (interim D31, see `ReportAction`).
      * `forbidden` for an own event; `done` when the dialog closes (a report, a cancel or a dismissal alike).
      */
@@ -2256,6 +2348,7 @@ export class ViewModelBridge implements ClientViewBridge {
     public dispose(): void {
         this.disposed = true;
         this.closeReactionPicker();
+        this.closeThread();
         this.filePicker?.cancel();
         [...this.reactionWaits].forEach((cancel) => cancel());
         this.watchedItems.forEach((w) => w.off());
