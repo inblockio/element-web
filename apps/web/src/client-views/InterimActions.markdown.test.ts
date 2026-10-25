@@ -100,6 +100,16 @@ describe("M7 E1 markdown send and edit (H1: the content Element's composer build
         );
     });
 
+    it("H1 ruling pinned: with Markdown on, a leading `/me ` goes out as an emote and a leading `//` loses one slash (as Element's composer does)", async () => {
+        await sendText(client, room.roomId, "/me waves", { markdown: true });
+        expect(vi.mocked(client.sendMessage).mock.calls[0][2]).toMatchObject({ msgtype: "m.emote", body: "waves" });
+        await sendText(client, room.roomId, "//not a command", { markdown: true });
+        expect(vi.mocked(client.sendMessage).mock.calls[1][2]).toMatchObject({
+            msgtype: "m.text",
+            body: "/not a command",
+        });
+    });
+
     it("an empty mentions list changes nothing and the plain path (no markdown) keeps the raw text", async () => {
         await sendText(client, room.roomId, "a **b**", { markdown: true, mentions: [] });
         await sendText(client, room.roomId, "a **b**", { markdown: true });
