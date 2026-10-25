@@ -241,3 +241,16 @@ export function leaveViaDialog(client: MatrixClient, roomId: string, start: () =
         }
     });
 }
+
+/**
+ * E5 view source: Element's own ViewSource dialog (`MessageContextMenu.onViewSourceClick`'s `Modal.createDialog`). It
+ * only shows the event (and the original of a decrypted one) and changes nothing, so the kit keeps no state from this
+ * action: `done` + the message when the dialog closes. `start` is that `createDialog` call.
+ */
+export function viewSourceViaDialog(roomId: string, eventId: string, start: () => void): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        const dialog = await openedDialog(start);
+        await dialog.finished;
+        return { status: "done", roomId, eventId };
+    });
+}

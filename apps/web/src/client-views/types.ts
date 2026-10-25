@@ -447,6 +447,14 @@ export interface ClientViewBridge {
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
     openReactionPicker(roomId: string, eventId: string, anchor: ViewAnchor): Promise<ActionOutcome>;
+    /**
+     * E5: Element's own View source dialog over the kit (what the message context menu opens): the event id and the event
+     * JSON of a message the kit shows, for an encrypted event the decrypted and the original source. `done` when the dialog
+     * closes (it changes nothing; `roomId` + `eventId` are the message). `unknown_room` / `unknown_event` as the other
+     * message actions; `failed` when the dialog does not open or another Element dialog action is running. Interim (D31):
+     * awaits a view-source action on a shared message view-model.
+     */
+    openViewSource(roomId: string, eventId: string): Promise<ActionOutcome>;
 }
 
 /** A kit that runs in a same-origin iframe loaded from `url`. */

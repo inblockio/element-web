@@ -83,7 +83,9 @@ import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
-import { createRoomViaDialog, leaveViaDialog, startChatViaDialog } from "./RoomActions";
+import { createRoomViaDialog, leaveViaDialog, startChatViaDialog, viewSourceViaDialog } from "./RoomActions";
+import Modal from "../Modal";
+import ViewSource from "../components/structures/ViewSource";
 import { openFilePicker, rewrapFiles, uploadFiles } from "./UploadAction";
 import { RoomUploadViewModel } from "../viewmodels/room/RoomUploadViewModel";
 import { EchoChamber } from "../stores/local-echo/EchoChamber";
@@ -1708,6 +1710,24 @@ export class ViewModelBridge implements ClientViewBridge {
             };
             this.picker = { request, resolve };
             this.pickerListeners.forEach((cb) => cb(request));
+        });
+    }
+
+    /**
+     * E5: Element's own ViewSource dialog over the kit, opened the way the message context menu opens it (event id, the
+     * event JSON, and for an encrypted event the decrypted and the original source). `done` when it closes; it changes
+     * nothing. Interim (D31): there is no view-source action on a shared message view-model.
+     */
+    public openViewSource(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        return viewSourceViaDialog(roomId, eventId, () => {
+            Modal.createDialog(ViewSource, { mxEvent: row.event }, "mx_Dialog_viewsource");
         });
     }
 

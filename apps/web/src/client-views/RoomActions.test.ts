@@ -17,6 +17,7 @@ import {
     createRoomViaDialog,
     leaveViaDialog,
     startChatViaDialog,
+    viewSourceViaDialog,
     LEAVE_SETTLE_MS,
     ROOM_ACTION_TIMEOUT_MS,
 } from "./RoomActions";
@@ -328,5 +329,26 @@ describe("A7 leave (RoomListItemViewModel.onLeaveRoom -> Element's confirm)", ()
         const code = codeOf(outcome);
         await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
         expect(await code).toBe("failed");
+    });
+});
+
+describe("E5 view source (Element's ViewSource dialog over the kit)", () => {
+    it("is done with the message when the dialog closes", async () => {
+        const d = openDialogOnStart();
+        const outcome = viewSourceViaDialog("!a:example.org", "$e", d.start);
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
+    });
+
+    it("fails when the dialog never opens", async () => {
+        vi.useFakeTimers();
+        try {
+            const outcome = viewSourceViaDialog("!a:example.org", "$e", () => {});
+            const code = codeOf(outcome);
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await code).toBe("failed");
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
