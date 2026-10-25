@@ -16,6 +16,8 @@ import { selectClientView } from "./registry";
 import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
+import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
 
 /*
  * The bridge only wires view-models together; the view-models themselves are replaced by small fakes here so the
@@ -160,6 +162,7 @@ const h = vi.hoisted(() => {
         editText: vi.fn(),
         redact: vi.fn(),
         downloadMedia: vi.fn(),
+        forwardViaDialog: vi.fn(),
         actionBars,
         eventUtils,
         pins,
@@ -442,6 +445,10 @@ vi.mock("./DownloadAction", () => ({
     canDownloadMedia: () => h.eventUtils.canDownload,
     downloadMedia: (...args: unknown[]) => h.downloadMedia(...args),
 }));
+vi.mock("./RoomActions", async (orig) => ({
+    ...(await orig<typeof import("./RoomActions")>()),
+    forwardViaDialog: (...args: unknown[]) => h.forwardViaDialog(...args),
+}));
 vi.mock("./registry", () => ({
     getClientViews: () => [{ id: "fixture", name: "Fixture", url: "/kits/fixture/" }],
     getMeetUrl: vi.fn(() => "https://meet.example.org"),
@@ -523,6 +530,7 @@ describe("ViewModelBridge", () => {
         h.pins.press = undefined;
         h.eventUtils.canDownload = true;
         h.downloadMedia.mockReset();
+        h.forwardViaDialog.mockReset();
         h.sdkContext.roomViewStore = { getRoomId: () => null };
     });
 
@@ -1766,6 +1774,45 @@ describe("ViewModelBridge", () => {
                 ).rejects.toMatchObject({
                     code: "forbidden",
                 });
+            });
+        });
+
+        describe("openForward (E3)", () => {
+            it("dispatches Element's OpenForwardDialog with the event and answers what the dialog action answers", async () => {
+                const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
+                try {
+                    const event = fakeEvent("$1");
+                    read(event);
+                    h.forwardViaDialog.mockImplementation((roomId: string, eventId: string, start: () => void) => {
+                        start();
+                        return Promise.resolve({ status: "done", roomId, eventId });
+                    });
+                    await expect(bridge.openForward("!a", "$1")).resolves.toEqual({
+                        status: "done",
+                        roomId: "!a",
+                        eventId: "$1",
+                    });
+                    expect(h.forwardViaDialog).toHaveBeenCalledWith("!a", "$1", expect.any(Function));
+                    expect(dispatch).toHaveBeenCalledTimes(1);
+                    expect(dispatch.mock.calls[0][0]).toMatchObject({ action: Action.OpenForwardDialog, event });
+                } finally {
+                    dispatch.mockRestore();
+                }
+            });
+
+            it("is unsupported for a poll, for content that is not actionable, and opens nothing", async () => {
+                read(fakeEvent("$poll", { getType: () => "org.matrix.msc3381.poll.start", getContent: () => ({}) }));
+                read(fakeEvent("$gone", { isRedacted: () => true }));
+                await expect(bridge.openForward("!a", "$poll")).rejects.toMatchObject({ code: "unsupported" });
+                await expect(bridge.openForward("!a", "$gone")).rejects.toMatchObject({ code: "unsupported" });
+                expect(h.forwardViaDialog).not.toHaveBeenCalled();
+            });
+
+            it("names an unknown room or event", async () => {
+                read(fakeEvent("$1"));
+                await expect(bridge.openForward("!nope", "$1")).rejects.toMatchObject({ code: "unknown_room" });
+                await expect(bridge.openForward("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
+                expect(h.forwardViaDialog).not.toHaveBeenCalled();
             });
         });
 

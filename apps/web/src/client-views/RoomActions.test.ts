@@ -15,6 +15,7 @@ import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import {
     createRoomViaDialog,
+    forwardViaDialog,
     leaveViaDialog,
     startChatViaDialog,
     LEAVE_SETTLE_MS,
@@ -328,5 +329,48 @@ describe("A7 leave (RoomListItemViewModel.onLeaveRoom -> Element's confirm)", ()
         const code = codeOf(outcome);
         await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
         expect(await code).toBe("failed");
+    });
+});
+
+describe("E3 forward (Element's forward dialog over the kit)", () => {
+    it("is done with the source room and event when the dialog closes without a jump", async () => {
+        const d = openDialogOnStart();
+        const outcome = forwardViaDialog("!a:example.org", "$e", d.start);
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
+    });
+
+    it("is done with the jumped-to room when the dialog's room name dispatched ViewRoom (H5)", async () => {
+        const d = openDialogOnStart();
+        const outcome = forwardViaDialog("!a:example.org", "$e", d.start);
+        viewRoom("!b:example.org", "WebForwardShortcut");
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!b:example.org" });
+    });
+
+    it("takes a jump dispatched one tick after the dialog closed, and ignores other ViewRoom triggers", async () => {
+        const d = openDialogOnStart();
+        const outcome = forwardViaDialog("!a:example.org", "$e", d.start);
+        viewRoom("!other:example.org", "MessageUser");
+        d.finish();
+        setTimeout(() => viewRoom("!b:example.org", "WebForwardShortcut"), 0);
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!b:example.org" });
+        const d2 = openDialogOnStart();
+        const second = forwardViaDialog("!a:example.org", "$e", d2.start);
+        viewRoom("!other:example.org", "MessageUser");
+        d2.finish();
+        await expect(second).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
+    });
+
+    it("fails when the dialog never opens", async () => {
+        vi.useFakeTimers();
+        try {
+            const outcome = forwardViaDialog("!a:example.org", "$e", () => {});
+            const code = codeOf(outcome);
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await code).toBe("failed");
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
