@@ -56,6 +56,7 @@ import { ConnectionState, ElementCall } from "../models/Call";
 import { isVideoRoom } from "../utils/video-rooms";
 import { ModuleApi } from "../modules/Api";
 import ActiveWidgetStore from "./ActiveWidgetStore";
+import { isHostPanelSlotMounted } from "../client-views/hostPanelSlot";
 
 const NUM_JOIN_RETRY = 5;
 
@@ -369,7 +370,8 @@ export class RoomViewStore extends EventEmitter {
                 // Default behavior: keep the same call state as before if viewing the same room
                 if (payload.room_id === this.state.roomId) viewingCall = this.state.viewingCall;
                 // Always view the call in video rooms
-                else if (room && isVideoRoom(room)) viewingCall = true;
+                // (D39 panel: not while a client view's host panel slot is mounted, a card jump must not start a call there)
+                else if (room && isVideoRoom(room) && !isHostPanelSlotMounted()) viewingCall = true;
                 // Otherwise, only view if actively connected
                 else viewingCall = CallStore.instance.getActiveCall(payload.room_id) !== null;
             }

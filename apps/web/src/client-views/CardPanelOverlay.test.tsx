@@ -27,6 +27,7 @@ import { type CardPanelRequest, type ThreadPanelRequest, type ViewModelBridge } 
 const h = vi.hoisted(() => ({
     fetched: new Map<string, unknown>(),
     summaryProps: [] as Array<Record<string, unknown>>,
+    verification: undefined as unknown,
     cardStub: async (
         testId: string,
         extra?: (props: Record<string, unknown>, R: typeof import("react")) => unknown,
@@ -70,6 +71,18 @@ vi.mock("../components/views/right_panel/RoomSummaryCardView", async () => {
                 push("Ext", RightPanelPhases.Extensions),
                 push("Files", RightPanelPhases.FilePanel),
                 push("Pins", RightPanelPhases.PinnedMessages),
+                btn("verify", () =>
+                    store.pushCard(
+                        {
+                            phase: RightPanelPhases.EncryptionPanel,
+                            state: {
+                                member: { userId: "@bob:example.org", roomId: "!a" },
+                                verificationRequest: h.verification,
+                            },
+                        } as never,
+                        true,
+                    ),
+                ),
                 btn("setFiles", () => store.setCard({ phase: RightPanelPhases.FilePanel })),
                 btn("togglePins", () => store.showOrHidePhase(RightPanelPhases.PinnedMessages)),
                 btn("toggle", () => store.togglePanel(null)),
@@ -186,6 +199,7 @@ describe("CardPanelOverlay", () => {
         events.clear();
         h.fetched.clear();
         h.summaryProps.length = 0;
+        h.verification = undefined;
     });
     afterEach(() => vi.restoreAllMocks());
 
@@ -242,6 +256,22 @@ describe("CardPanelOverlay", () => {
         fireEvent.click(screen.getByText("close"));
         expect(req.finish).toHaveBeenCalledTimes(1);
         noStoreWrites();
+    });
+
+    it("a pending verification: the header Cancel cancels the request and keeps the panel; otherwise it closes (stock RightPanel.onClose)", async () => {
+        const cancel = vi.fn(async () => undefined);
+        h.verification = { pending: true, cancel };
+        mount("info");
+        fireEvent.click(await screen.findByText("verify"));
+        fireEvent.click(await screen.findByText("close"));
+        expect(cancel).toHaveBeenCalledTimes(1);
+        expect(req.finish).not.toHaveBeenCalled();
+        expect(screen.getByTestId("card-user")).toBeTruthy();
+        // no longer pending: Cancel closes as before
+        (h.verification as { pending: boolean }).pending = false;
+        fireEvent.click(screen.getByText("close"));
+        expect(req.finish).toHaveBeenCalledTimes(1);
+        expect(cancel).toHaveBeenCalledTimes(1);
     });
 
     it("ViewUser pushes user info (back returns), View3pidInvite pushes the 3pid card, the stock store is not written", async () => {

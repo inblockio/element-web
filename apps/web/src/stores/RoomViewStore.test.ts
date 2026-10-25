@@ -46,7 +46,8 @@ import { CallStore } from "./CallStore";
 import { MatrixClientPeg } from "../MatrixClientPeg";
 import MediaDeviceHandler, { MediaDeviceKindEnum } from "../MediaDeviceHandler";
 import { storeRoomAliasInCache } from "../RoomAliasCache.ts";
-import { type Call, ConnectionState } from "../models/Call.ts";
+import { type Call, ConnectionState, ElementCall } from "../models/Call.ts";
+import { markHostPanelSlotMounted } from "../client-views/hostPanelSlot";
 import ActiveWidgetStore from "./ActiveWidgetStore";
 import { ModuleApi } from "../modules/Api";
 import { type JoinRoomPayload } from "../dispatcher/payloads/JoinRoomPayload.ts";
@@ -456,6 +457,39 @@ describe("RoomViewStore", function () {
         await untilDispatch(Action.ViewRoom, dis);
 
         expect(call.presented).toEqual(true);
+    });
+
+    it("D39 panel (A1): a video room is not viewed as a call while a host panel slot is mounted, unless view_call asks", async () => {
+        vi.spyOn(room, "isElementVideoRoom").mockReturnValue(true);
+        vi.spyOn(CallStore.instance, "getActiveCall").mockReturnValue(null);
+        const call = { presented: false, connectionState: ConnectionState.Connected, widget: { id: "w" } } as Call;
+        const getCall = vi.spyOn(CallStore.instance, "getCall").mockReturnValue(null);
+        const create = vi.spyOn(ElementCall, "create").mockImplementation(() => void getCall.mockReturnValue(call));
+        await setupAsyncStoreWithClient(CallStore.instance, MatrixClientPeg.safeGet());
+
+        const unmount = markHostPanelSlotMounted();
+        dis.dispatch<ViewRoomPayload>({ action: Action.ViewRoom, room_id: roomId, metricsTrigger: undefined });
+        await untilDispatch(Action.ViewRoom, dis);
+        expect(create).not.toHaveBeenCalled();
+        expect(roomViewStore.isViewingCall()).toBe(false);
+
+        // an explicit view_call still hands over (needsStockUi)
+        dis.dispatch<ViewRoomPayload>({
+            action: Action.ViewRoom,
+            room_id: roomId,
+            view_call: true,
+            metricsTrigger: undefined,
+        });
+        await untilDispatch(Action.ViewRoom, dis);
+        expect(create).toHaveBeenCalledTimes(1);
+
+        // without a slot a video room defaults to the call, as stock
+        unmount();
+        getCall.mockReturnValue(null);
+        dis.dispatch<ViewRoomPayload>({ action: Action.ViewRoom, room_id: roomId2, metricsTrigger: undefined });
+        vi.spyOn(room2, "isElementVideoRoom").mockReturnValue(true);
+        await untilDispatch(Action.ViewRoom, dis);
+        expect(create).toHaveBeenCalledTimes(2);
     });
 
     it("opens a voice-intent call directly in picture-in-picture rather than maximised", async () => {

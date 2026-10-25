@@ -240,7 +240,13 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
                         user={member}
                         room={memberRoom}
                         key={`${stack.length}/${member.userId}`}
-                        onClose={finish}
+                        onClose={() => {
+                            // Stock RightPanel.onClose: Cancel on a pending verification cancels the request and keeps the panel.
+                            const pending = current.state?.verificationRequest;
+                            if (current.phase === RightPanelPhases.EncryptionPanel && pending?.pending)
+                                void pending.cancel();
+                            else finish();
+                        }}
                         phase={current.phase}
                         verificationRequest={current.state?.verificationRequest}
                         verificationRequestPromise={current.state?.verificationRequestPromise}

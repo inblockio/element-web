@@ -2174,6 +2174,48 @@ describe("ViewModelBridge", () => {
             dm.mockRestore();
         });
 
+        it("a DM partner with no member object yet: loads the members first, opens user info; a slow load cannot replace a newer panel; still unknown rejects", async () => {
+            const shown = watch();
+            const dm = vi
+                .spyOn(DMRoomMap, "shared")
+                .mockReturnValue({ getUserIdForRoomId: () => "@bob:example.org" } as never);
+            const bob = { userId: "@bob:example.org" };
+            let loaded = false;
+            const getMember = vi.spyOn(h.room, "getMember").mockImplementation((() => (loaded ? bob : null)) as never);
+            h.room.loadMembersIfNeeded.mockClear();
+            h.room.loadMembersIfNeeded.mockImplementationOnce(async () => ((loaded = true), true));
+            const call = bridge.openPanel("!a", "info");
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            await vi.waitFor(() => expect(shown.at(-1)?.dmMember).toMatchObject({ userId: "@bob:example.org" }));
+            bridge.closePanel();
+            await call;
+
+            // a slow load, and a newer panel opened meanwhile: the slow one resolves done without installing
+            loaded = false;
+            let release!: () => void;
+            h.room.loadMembersIfNeeded.mockImplementationOnce(
+                () => new Promise<boolean>((r) => (release = () => ((loaded = true), r(true)))),
+            );
+            const slow = bridge.openPanel("!a", "info");
+            const newer = bridge.openPanel("!a", "members");
+            const countBefore = shown.length;
+            release();
+            await expect(slow).resolves.toMatchObject({ status: "done" });
+            expect(shown.length).toBe(countBefore);
+            expect(shown.at(-1)?.card).toBe("members");
+            bridge.closePanel();
+            await newer;
+
+            // still null after the load: unsupported as before
+            loaded = false;
+            h.room.loadMembersIfNeeded.mockResolvedValueOnce(true);
+            await expect(bridge.openPanel("!a", "info")).rejects.toMatchObject({ code: "unsupported" });
+            getMember.mockRestore();
+            dm.mockRestore();
+        });
+
         it("a DM's info card carries the other member (user info), a plain room's does not", async () => {
             const shown = watch();
             const dm = vi

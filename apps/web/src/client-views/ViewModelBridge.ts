@@ -1947,6 +1947,7 @@ export class ViewModelBridge implements ClientViewBridge {
 
     /** M9: closes whatever the host panel slot shows (thread or card panel; each open call resolves `done`). */
     public closePanel(): void {
+        this.panelCount++; // an openPanel still loading members must not install its panel afterwards
         this.thread?.request.finish();
         this.panel?.request.finish();
     }
@@ -1958,6 +1959,7 @@ export class ViewModelBridge implements ClientViewBridge {
      */
     public openPanel(roomId: string, card: PanelCardName | "search"): Promise<ActionOutcome> {
         this.used = true;
+        const seq = ++this.panelCount;
         const room = this.client.getRoom(roomId);
         if (!room) return Promise.reject(new ClientViewActionError("unknown_room", `unknown room ${roomId}`));
         if (card !== "info" && card !== "members" && card !== "files" && card !== "pinned") {
@@ -1979,18 +1981,41 @@ export class ViewModelBridge implements ClientViewBridge {
             if (otherId) {
                 dmMember = room.getMember(otherId) ?? undefined;
                 if (!dmMember) {
-                    return Promise.reject(
-                        new ClientViewActionError("unsupported", "the other member of this chat is unknown"),
-                    );
+                    // Lazy-loaded members: the partner of a DM with no event in the loaded window has no member object yet.
+                    const unknown = (): Promise<ActionOutcome> =>
+                        Promise.reject(
+                            new ClientViewActionError("unsupported", "the other member of this chat is unknown"),
+                        );
+                    return (async (): Promise<ActionOutcome> => {
+                        try {
+                            await room.loadMembersIfNeeded();
+                        } catch {
+                            // offline: the re-check below decides
+                        }
+                        // A later openPanel / closePanel bumped the counter while the members loaded: that one wins.
+                        if (seq !== this.panelCount) return { status: "done", roomId };
+                        const member = room.getMember(otherId) ?? undefined;
+                        if (!member) return unknown();
+                        return this.mountCardPanel(room, roomId, card, member);
+                    })();
                 }
             }
         }
+        return this.mountCardPanel(room, roomId, card, dmMember);
+    }
+
+    private mountCardPanel(
+        room: Room,
+        roomId: string,
+        card: PanelCardName,
+        dmMember: RoomMember | undefined,
+    ): Promise<ActionOutcome> {
         this.closePanel();
         return new Promise<ActionOutcome>((resolve) => {
             const stop = this.watchRoomGone(roomId, () => request.finish());
             const current = (): boolean => this.panel?.request === request;
             const request: CardPanelRequest = {
-                key: `${roomId}/${card}#${++this.panelCount}`,
+                key: `${roomId}/${card}#${this.panelCount}`,
                 room,
                 card,
                 dmMember,
