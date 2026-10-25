@@ -14,7 +14,7 @@
  * `ViewRoom` Element dispatches after a create, the membership that drops after a leave. No `ViewRoom` of our own.
  */
 
-import { EventStatus, type MatrixClient, type MatrixEvent } from "matrix-js-sdk/src/matrix";
+import { EventStatus, type MatrixClient } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -220,32 +220,56 @@ export function forwardViaDialog(
 ): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
-        const pendingBefore = pendingEventsByRoom(client);
+        const unwrap = cancelOwnFailedSends(client);
         try {
             const dialog = await openedDialog(start);
             await dialog.finished;
-            // Stock ForwardDialog never cancels a failed copy's NOT_SENT echo; it would block that room.
-            cancelNewUnsent(client, pendingBefore);
+            unwrap();
             // Element dispatches the jump before it closes the dialog; one tick covers a queued dispatch.
             await new Promise((resolve) => setTimeout(resolve, 0));
             const jump = [...seen.payloads].reverse().find(isForwardJump);
             return jump ? { status: "done", roomId: jump.room_id } : { status: "done", roomId: sourceRoomId, eventId };
         } finally {
+            unwrap();
             seen.stop();
         }
     });
 }
 
-const pendingEventsByRoom = (client: MatrixClient): Map<string, Set<MatrixEvent>> =>
-    new Map(client.getRooms().map((room) => [room.roomId, new Set(room.getPendingEvents())]));
-
-/** Cancels each NOT_SENT pending event that was not there in `before` (the copy a failed forward left behind). */
-function cancelNewUnsent(client: MatrixClient, before: Map<string, Set<MatrixEvent>>): void {
-    for (const room of client.getRooms()) {
-        for (const ev of room.getPendingEvents()) {
-            if (ev.status === EventStatus.NOT_SENT && !before.get(room.roomId)?.has(ev)) client.cancelPendingEvent(ev);
-        }
-    }
+/**
+ * ForwardDialog never cancels the NOT_SENT echo of a copy that failed, and the kit hides NOT_SENT echoes, so it would block
+ * that room for good. While the dialog is open `client.sendEvent` is wrapped pass-through: each call carries a txnId, and
+ * when its promise rejects (also after the dialog closed) the pending event with that txnId is cancelled. Returns the
+ * function that puts `sendEvent` back (the wrapper already handed out keeps working for its in-flight sends).
+ */
+function cancelOwnFailedSends(client: MatrixClient): () => void {
+    const ownBefore = Object.prototype.hasOwnProperty.call(client, "sendEvent");
+    // oxlint-disable-next-line typescript/unbound-method -- called with `client` as `this` below, put back as it was
+    const original = client.sendEvent;
+    const wrapper = function (this: unknown, ...args: unknown[]): Promise<unknown> {
+        // Overloads: (roomId, eventType, content, txnId?) and (roomId, threadId | null, eventType, content, txnId?).
+        const threaded = args[1] === null || (typeof args[1] === "string" && args[1].startsWith("$"));
+        const txnIndex = threaded ? 4 : 3;
+        const call = args.slice();
+        if (call[txnIndex] === undefined) call[txnIndex] = client.makeTxnId();
+        const txnId = call[txnIndex] as string;
+        const roomId = call[0] as string;
+        const promise = (original as (...a: unknown[]) => Promise<unknown>).apply(client, call);
+        promise.then(undefined, () => {
+            const pending = [...(client.getRoom(roomId)?.getPendingEvents() ?? [])];
+            const echo = pending.find((ev) => ev.getTxnId() === txnId);
+            if (echo?.status === EventStatus.NOT_SENT) client.cancelPendingEvent(echo);
+        });
+        return promise;
+    };
+    client.sendEvent = wrapper as unknown as typeof client.sendEvent;
+    let done = false;
+    return () => {
+        if (done) return;
+        done = true;
+        if (ownBefore) client.sendEvent = original;
+        else delete (client as { sendEvent?: unknown }).sendEvent;
+    };
 }
 
 const isForwardJump = (p: ActionPayload): p is ViewRoomPayload =>

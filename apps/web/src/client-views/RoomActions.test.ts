@@ -332,9 +332,23 @@ describe("A7 leave (RoomListItemViewModel.onLeaveRoom -> Element's confirm)", ()
     });
 });
 
-/** A client whose rooms keep a detached pending list, as Element's do: `cancelPendingEvent` removes from it. */
-function forwardClient(rooms: Record<string, MatrixEvent[]> = {}): MatrixClient {
+/**
+ * A client whose rooms keep a detached pending list, as Element's do: `cancelPendingEvent` removes from it. Its
+ * `sendEvent` leaves a NOT_SENT echo with the call's txnId in the target room and rejects, as a failed send does.
+ */
+function forwardClient(
+    rooms: Record<string, MatrixEvent[]> = {},
+): MatrixClient & { rawSend: ReturnType<typeof vi.fn> } {
+    let n = 0;
+    const rawSend = vi.fn((roomId: string, _type: string, _content: unknown, txnId?: string) => {
+        rooms[roomId].push(pendingEvent(EventStatus.NOT_SENT, txnId));
+        return Promise.reject(new Error("send failed"));
+    });
     return {
+        rawSend,
+        sendEvent: rawSend,
+        makeTxnId: () => `txn${++n}`,
+        getRoom: (roomId: string) => (rooms[roomId] ? { roomId, getPendingEvents: () => rooms[roomId] } : null),
         getRooms: () => Object.keys(rooms).map((roomId) => ({ roomId, getPendingEvents: () => rooms[roomId] })),
         cancelPendingEvent: vi.fn((ev: MatrixEvent) => {
             for (const list of Object.values(rooms)) {
@@ -342,10 +356,13 @@ function forwardClient(rooms: Record<string, MatrixEvent[]> = {}): MatrixClient 
                 if (i >= 0) list.splice(i, 1);
             }
         }),
-    } as unknown as MatrixClient;
+    } as unknown as MatrixClient & { rawSend: ReturnType<typeof vi.fn> };
 }
 
-const pendingEvent = (status: EventStatus): MatrixEvent => ({ status }) as unknown as MatrixEvent;
+const pendingEvent = (status: EventStatus, txnId?: string): MatrixEvent =>
+    ({ status, getTxnId: () => txnId }) as unknown as MatrixEvent;
+
+const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("E3 forward (Element's forward dialog over the kit)", () => {
     it("is done with the source room and event when the dialog closes without a jump", async () => {
@@ -377,31 +394,119 @@ describe("E3 forward (Element's forward dialog over the kit)", () => {
         await expect(second).resolves.toEqual({ status: "done", roomId: "!a:example.org", eventId: "$e" });
     });
 
-    it("cancels the NOT_SENT echo a failed send left in the target room (a later send is not blocked)", async () => {
-        const failed = pendingEvent(EventStatus.NOT_SENT);
-        const rooms: Record<string, MatrixEvent[]> = { "!a:example.org": [], "!b:example.org": [] };
-        const c = forwardClient(rooms);
-        const d = openDialogOnStart();
-        const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
-        rooms["!b:example.org"].push(failed); // what Entry.send's rejected sendEvent leaves behind
-        d.finish();
-        await expect(outcome).resolves.toMatchObject({ status: "done" });
-        expect(c.cancelPendingEvent).toHaveBeenCalledWith(failed);
-        expect(rooms["!b:example.org"].filter((e) => e.status === EventStatus.NOT_SENT)).toEqual([]);
-    });
+    describe("cancels exactly the echo of the dialog's own failed send", () => {
+        const dialogSend = async (c: MatrixClient, roomId: string): Promise<unknown> => {
+            // What ForwardDialog's Entry.send calls: no thread id, no txnId.
+            const send = c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>;
+            return send.call(c, roomId, "m.room.message", { body: "x" }).catch((e: Error) => e);
+        };
 
-    it("leaves alone a NOT_SENT echo that existed before the dialog and one that is still sending", async () => {
-        const before = pendingEvent(EventStatus.NOT_SENT);
-        const sending = pendingEvent(EventStatus.SENDING);
-        const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [before] };
-        const c = forwardClient(rooms);
-        const d = openDialogOnStart();
-        const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
-        rooms["!b:example.org"].push(sending);
-        d.finish();
-        await outcome;
-        expect(c.cancelPendingEvent).not.toHaveBeenCalled();
-        expect(rooms["!b:example.org"]).toEqual([before, sending]);
+        it("a send failing while the dialog is open: its echo is cancelled, the rejection still reaches the dialog", async () => {
+            const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+            const c = forwardClient(rooms);
+            const d = openDialogOnStart();
+            const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+            await tick();
+            const result = await dialogSend(c, "!b:example.org");
+            expect(result).toBeInstanceOf(Error);
+            expect(c.rawSend).toHaveBeenCalledWith("!b:example.org", "m.room.message", { body: "x" }, "txn1");
+            expect(c.cancelPendingEvent).toHaveBeenCalledTimes(1);
+            expect(rooms["!b:example.org"]).toEqual([]);
+            d.finish();
+            await outcome;
+        });
+
+        it("a send failing after the dialog closed: its echo is cancelled", async () => {
+            const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+            const c = forwardClient(rooms);
+            let fail: (e: Error) => void = () => {};
+            c.rawSend.mockImplementation((roomId: string, _t: string, _c: unknown, txnId?: string) => {
+                rooms[roomId].push(pendingEvent(EventStatus.SENDING, txnId));
+                return new Promise((_, reject) => (fail = reject));
+            });
+            const d = openDialogOnStart();
+            const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+            await tick();
+            const sent = (c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>)(
+                "!b:example.org",
+                "m.room.message",
+                {},
+            ).catch(() => {});
+            d.finish();
+            await outcome;
+            expect(c.cancelPendingEvent).not.toHaveBeenCalled();
+            (rooms["!b:example.org"][0] as { status: EventStatus }).status = EventStatus.NOT_SENT; // the SDK's catch
+            fail(new Error("late failure"));
+            await sent;
+            expect(c.cancelPendingEvent).toHaveBeenCalledTimes(1);
+            expect(rooms["!b:example.org"]).toEqual([]);
+        });
+
+        it("a NOT_SENT echo the dialog did not send (restored by the store meanwhile) is untouched", async () => {
+            const restored = pendingEvent(EventStatus.NOT_SENT, "stored-txn");
+            const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+            const c = forwardClient(rooms);
+            const d = openDialogOnStart();
+            const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+            await tick();
+            rooms["!b:example.org"].push(restored);
+            await dialogSend(c, "!b:example.org");
+            d.finish();
+            await outcome;
+            expect(c.cancelPendingEvent).toHaveBeenCalledTimes(1);
+            expect(c.cancelPendingEvent).not.toHaveBeenCalledWith(restored);
+            expect(rooms["!b:example.org"]).toEqual([restored]);
+        });
+
+        it("two failed sends in one room: both echoes are cancelled", async () => {
+            const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+            const c = forwardClient(rooms);
+            const d = openDialogOnStart();
+            const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+            await tick();
+            await Promise.all([dialogSend(c, "!b:example.org"), dialogSend(c, "!b:example.org")]);
+            expect(c.cancelPendingEvent).toHaveBeenCalledTimes(2);
+            expect(rooms["!b:example.org"]).toEqual([]);
+            d.finish();
+            await outcome;
+        });
+
+        it("keeps the txnId and the thread id of a call that carries them, and leaves a still-sending echo alone", async () => {
+            const rooms: Record<string, MatrixEvent[]> = { "!b:example.org": [] };
+            const c = forwardClient(rooms);
+            c.rawSend.mockImplementation(() => Promise.resolve({ event_id: "$ok" }));
+            const d = openDialogOnStart();
+            const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+            await tick();
+            const send = c.sendEvent as unknown as (...a: unknown[]) => Promise<unknown>;
+            await send("!b:example.org", "m.room.message", {}, "mine");
+            await send("!b:example.org", "$thread", "m.room.message", {});
+            expect(c.rawSend).toHaveBeenNthCalledWith(1, "!b:example.org", "m.room.message", {}, "mine");
+            expect(c.rawSend).toHaveBeenNthCalledWith(2, "!b:example.org", "$thread", "m.room.message", {}, "txn1");
+            d.finish();
+            await outcome;
+        });
+
+        it("puts sendEvent back when the dialog closes, and when it never opens", async () => {
+            const c = forwardClient({});
+            const original = c.sendEvent;
+            const d = openDialogOnStart();
+            const outcome = forwardViaDialog(c, "!a:example.org", "$e", d.start);
+            await tick();
+            expect(c.sendEvent).not.toBe(original);
+            d.finish();
+            await outcome;
+            expect(c.sendEvent).toBe(original);
+            vi.useFakeTimers();
+            try {
+                const never = codeOf(forwardViaDialog(c, "!a:example.org", "$e", () => {}));
+                await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+                expect(await never).toBe("failed");
+            } finally {
+                vi.useRealTimers();
+            }
+            expect(c.sendEvent).toBe(original);
+        });
     });
 
     it("fails when the dialog never opens", async () => {
