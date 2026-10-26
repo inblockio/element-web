@@ -22,6 +22,7 @@ import { RightPanelPhases } from "../stores/right-panel/RightPanelStorePhases";
 import { ElementCall } from "../models/Call";
 import { isHostPanelSlotMounted } from "./hostPanelSlot";
 import { needsStockUi } from "./ClientViewGate";
+import { fetchInitialEvent } from "../utils/EventUtils";
 import { CardPanelOverlay, HostPanelSlot, rootCard, SEARCH_PHASE } from "./CardPanelOverlay";
 import { type CardPanelRequest, type ThreadPanelRequest, type ViewModelBridge } from "./ViewModelBridge";
 
@@ -398,6 +399,14 @@ describe("CardPanelOverlay", () => {
         expect(req.openRoom).toHaveBeenLastCalledWith("!other");
         expect(req.jump).not.toHaveBeenCalled();
         expect(req.openThreadOn).not.toHaveBeenCalled();
+    });
+
+    it("r3 F1: an all-rooms hit whose root fetch rejects still opens its room at the hit", async () => {
+        mount("search");
+        vi.mocked(fetchInitialEvent).mockRejectedValueOnce(new Error("fetch failed"));
+        await dispatch({ action: Action.ViewRoom, room_id: "!other", event_id: "$reply" });
+        expect(req.openRoom).toHaveBeenCalledTimes(1);
+        expect(req.openRoom).toHaveBeenCalledWith("!other", "$reply");
     });
 
     it("F4: another room (Message from user info) asks the kit to open it, starts no call and does not hand over to Element's UI", async () => {

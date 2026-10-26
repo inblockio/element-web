@@ -176,7 +176,15 @@ export function CardPanelOverlay({ request }: { request: CardPanelRequest }): JS
                     request.openRoom(roomId);
                     return;
                 }
-                const hit = await fetchInitialEvent(client, roomId, hitId);
+                let hit: MatrixEvent | null;
+                try {
+                    hit = await fetchInitialEvent(client, roomId, hitId);
+                } catch {
+                    // r3 F1: the root fetch can throw; the room still opens at the hit.
+                    if (!live) return;
+                    request.openRoom(roomId, hitId);
+                    return;
+                }
                 if (!live) return;
                 const rootId =
                     hit && !hit.isThreadRoot
