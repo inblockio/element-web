@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vite
 import { type Room } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
+import SettingsStore from "../settings/SettingsStore";
 import { createSection, editSection, removeSection, setSection, type RoomSectionVm } from "./RoomSectionActions";
 import { setFavourite } from "./RoomItemActions";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
@@ -537,8 +538,14 @@ describe("createSection: a dialog dropped by Modal.tsx's priority/static wipe (g
 });
 
 describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dialogs, answered from the dialog result)", () => {
+    type Fake = { createDialog: unknown; modals: object[]; emit: (e: string) => void };
+    type Stored = Record<string, { tag: string; name: string }>;
+
     let finish: (...result: unknown[]) => void;
     let storeResult: (error?: Error) => void;
+    /** `RoomList.CustomSectionData` as the account data holds it (what `SettingsStore.getValue` reads once the local echo expired). */
+    let stored: Stored;
+    let getValue: ReturnType<typeof vi.spyOn>;
     const open = (fn: typeof store.editSection): void => {
         fn.mockReset();
         fn.mockImplementation(() => {
@@ -546,9 +553,15 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
             return new Promise<void>((resolve, reject) => (storeResult = (e) => (e ? reject(e) : resolve())));
         });
     };
+    const rename = (tag: string, name: string): void => void (stored[tag] = { tag, name });
 
     beforeEach(() => {
         vi.useFakeTimers();
+        stored = { [A]: { tag: A, name: "Work" }, [B]: { tag: B, name: "Home" } };
+        getValue = vi
+            .spyOn(SettingsStore, "getValue")
+            .mockImplementation(((name: string) =>
+                name === "RoomList.CustomSectionData" ? stored : undefined) as never);
         const finished = new Promise<unknown[]>((resolve) => {
             finish = (...result) => resolve(result);
         });
@@ -558,6 +571,8 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
     });
     afterEach(() => {
         vi.useRealTimers();
+        getValue.mockRestore();
+        (Modal as unknown as Fake).modals = [];
     });
 
     it("editSection: a returned name is done with the tag once the store has written", async () => {
@@ -565,15 +580,35 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
         await vi.advanceTimersByTimeAsync(0);
         finish("Renamed", [], []);
         await vi.advanceTimersByTimeAsync(0);
+        rename(A, "Renamed");
         storeResult();
         await expect(outcome).resolves.toEqual({ status: "done", section: A });
         expect(store.editSection).toHaveBeenCalledExactlyOnceWith(A);
     });
 
-    it("editSection: an unchanged name with room changes, or a cancel at the rooms step that returns the name, is done too", async () => {
+    it("editSection: an unchanged name with room changes is done too (Element writes no name, the stored one is the dialog's)", async () => {
         const outcome = editSection(A);
         await vi.advanceTimersByTimeAsync(0);
         finish("Work", ["!a:example.org"], undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+    });
+
+    it("editSection: a cancel at the rooms step returns (name, undefined) and still commits the rename: done (F3)", async () => {
+        const outcome = editSection(A);
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Renamed", undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        rename(A, "Renamed");
+        storeResult();
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+    });
+
+    it("editSection: a cancel at the rooms step with the name unchanged, (name, undefined), is done", async () => {
+        const outcome = editSection(A);
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Work", undefined);
         await vi.advanceTimersByTimeAsync(0);
         storeResult();
         await expect(outcome).resolves.toEqual({ status: "done", section: A });
@@ -588,7 +623,7 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
         await expect(outcome).resolves.toEqual({ status: "cancelled" });
     });
 
-    it("editSection: a store that has not written in time is network, and a refusal is failed", async () => {
+    it("editSection: a store that has not written in time is network", async () => {
         const slow = codeOf(editSection(A));
         await vi.advanceTimersByTimeAsync(0);
         finish("Renamed", [], []);
@@ -596,7 +631,7 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
         expect(await slow).toBe("network");
     });
 
-    it("editSection: a store write that fails maps to the contract's error", async () => {
+    it("editSection: a store write that rejects maps to the contract's error", async () => {
         const outcome = codeOf(editSection(A));
         await vi.advanceTimersByTimeAsync(0);
         finish("Renamed", [], []);
@@ -605,12 +640,24 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
         expect(await outcome).toBe("failed");
     });
 
-    it("removeSection: confirmed is done once the section is no longer listed (and not before)", async () => {
+    it("editSection: a refused account-data write (the store's promise fulfils, the stored name is the old one) is failed (F1, D21)", async () => {
+        const outcome = codeOf(editSection(A));
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Renamed", [], []);
+        await vi.advanceTimersByTimeAsync(0);
+        // LocalEchoWrapper swallows the refusal: the promise fulfils and the local echo expires with the old name behind it.
+        storeResult();
+        expect(await outcome).toBe("failed");
+        expect(stored[A].name).toBe("Work");
+    });
+
+    it("removeSection: confirmed is done once the section is gone from the account data and no longer listed (and not before)", async () => {
         let listed = true;
         const outcome = removeSection(A, false, () => listed);
         await vi.advanceTimersByTimeAsync(0);
         finish(true);
         await vi.advanceTimersByTimeAsync(0);
+        delete stored[A];
         storeResult();
         let settled = false;
         void outcome.then(() => (settled = true));
@@ -637,8 +684,109 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
         await vi.advanceTimersByTimeAsync(0);
         finish(true);
         await vi.advanceTimersByTimeAsync(0);
+        delete stored[A];
         storeResult();
         await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
         expect(await outcome).toBe("network");
+    });
+
+    it("removeSection: a refused account-data write (the store's promise fulfils, the account data still holds the section) is failed even when listed() is already false (F1, D21)", async () => {
+        // The item snapshots were rebuilt from the local echo, so the bridge's sections() no longer lists the tag.
+        const outcome = codeOf(removeSection(A, false, () => false));
+        await vi.advanceTimersByTimeAsync(0);
+        finish(true);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        expect(await outcome).toBe("failed");
+        expect(stored[A]).toBeDefined();
+    });
+
+    it("editSection: the dialog lock is free after a network answer (the next dialog action is not refused; the first write may still apply, LIMIT F2)", async () => {
+        const first = codeOf(editSection(A));
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Renamed", [], []);
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        expect(await first).toBe("network");
+
+        // A refused start rejects at once: keep the rejection as the value so a regression is a failed assertion, not a crash.
+        const next = editSection(A).catch((e: unknown) => e);
+        await vi.advanceTimersByTimeAsync(0);
+        rename(A, "Renamed");
+        storeResult();
+        await expect(next).resolves.toEqual({ status: "done", section: A });
+        expect(store.editSection).toHaveBeenCalledTimes(2);
+    });
+
+    it("removeSection: the dialog lock is free after a network answer (the next dialog action is not refused)", async () => {
+        const first = codeOf(removeSection(A, false, () => true));
+        await vi.advanceTimersByTimeAsync(0);
+        finish(true);
+        await vi.advanceTimersByTimeAsync(0);
+        delete stored[A];
+        storeResult();
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        expect(await first).toBe("network");
+
+        const next = removeSection(B, false, () => false).catch((e: unknown) => e);
+        await vi.advanceTimersByTimeAsync(0);
+        delete stored[B];
+        storeResult();
+        await expect(next).resolves.toEqual({ status: "done", section: B });
+        expect(store.removeSection).toHaveBeenCalledTimes(2);
+    });
+
+    /** Opens `run`, then drops its dialog the way Modal.tsx's priority/static wipe does: `finished` never settles, nor the store's promise. */
+    async function openAndDrop(
+        run: () => Promise<unknown>,
+        fn: typeof store.editSection,
+    ): Promise<{ outcome: Promise<unknown> }> {
+        const fake = Modal as unknown as Fake;
+        const modal = {};
+        fake.createDialog = vi.fn(() => {
+            fake.modals.unshift(modal);
+            return { close: vi.fn(), finished: new Promise<unknown[]>(() => {}) };
+        });
+        fn.mockReset();
+        fn.mockImplementation(() => {
+            (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+            return new Promise<void>(() => {});
+        });
+        const outcome = run();
+        await vi.advanceTimersByTimeAsync(0);
+        fake.modals = fake.modals.filter((m) => m !== modal);
+        fake.emit("closed");
+        return { outcome };
+    }
+
+    it("editSection: a dialog dropped by the modal wipe answers cancelled in bounded time and frees the lock", async () => {
+        const { outcome } = await openAndDrop(() => editSection(A), store.editSection);
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+
+        (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({
+            close: vi.fn(),
+            finished: Promise.resolve([undefined, undefined]),
+        }));
+        open(store.editSection);
+        const next = editSection(A);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(next).resolves.toEqual({ status: "cancelled" });
+    });
+
+    it("removeSection: a dialog dropped by the modal wipe answers cancelled in bounded time and frees the lock", async () => {
+        const { outcome } = await openAndDrop(() => removeSection(A, false, () => true), store.removeSection);
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+
+        (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({
+            close: vi.fn(),
+            finished: Promise.resolve([false]),
+        }));
+        open(store.removeSection);
+        const next = removeSection(A, false, () => true);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(next).resolves.toEqual({ status: "cancelled" });
     });
 });
