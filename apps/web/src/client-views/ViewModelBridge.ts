@@ -1712,8 +1712,13 @@ export class ViewModelBridge implements ClientViewBridge {
     private localRoomTimeline(roomId: string): ViewMessage[] {
         const seen = new Set<string>();
         const messages: ViewMessage[] = [];
-        const room = this.client.getRoom(roomId);
-        const event = room?.currentState.getStateEvents(EventType.RoomEncryption)[0];
+        // A CREATED local room stays in the client store (only its state flips), so it counts as gone: its card is disposed
+        // here and no later read builds one (the server room carries the entry from then on).
+        const room = this.client.getRoom(roomId) as LocalRoom | null;
+        const event =
+            room && room.state !== LocalRoomState.CREATED
+                ? room.currentState.getStateEvents(EventType.RoomEncryption)[0]
+                : undefined;
         const message = event && this.encryptionMessage(event, roomId);
         if (event && message) {
             seen.add(event.getId()!);

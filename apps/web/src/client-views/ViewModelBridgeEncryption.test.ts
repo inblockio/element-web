@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 
 import { ViewModelBridge } from "./ViewModelBridge";
+import { LocalRoomState } from "../models/LocalRoom";
 
 /*
  * M12 Z4: `ViewMessage.encryption` on the entry of an `m.room.encryption` state event. The bridge asks Element's
@@ -130,6 +131,7 @@ describe("ViewModelBridge: ViewMessage.encryption (M12 Z4, the encryption event 
     let bridge: ViewModelBridge;
     let localEvents: unknown[];
     let localRoomKnown: boolean;
+    let localRoomState: LocalRoomState;
     let emitted: unknown[];
 
     beforeEach(() => {
@@ -138,6 +140,7 @@ describe("ViewModelBridge: ViewMessage.encryption (M12 Z4, the encryption event 
         h.timeline.set({ items: [] });
         localEvents = [];
         localRoomKnown = true;
+        localRoomState = LocalRoomState.NEW;
         const room = {
             roomId: "!a:example.org",
             getMyMembership: () => "join",
@@ -148,6 +151,9 @@ describe("ViewModelBridge: ViewMessage.encryption (M12 Z4, the encryption event 
         };
         const localRoom = {
             roomId: LOCAL,
+            get state() {
+                return localRoomState;
+            },
             getMember: () => ({ userId: "@me:example.org", roomId: LOCAL }),
             currentState: { getStateEvents: vi.fn(() => localEvents) },
         };
@@ -292,6 +298,21 @@ describe("ViewModelBridge: ViewMessage.encryption (M12 Z4, the encryption event 
             emitted.length = 0;
             h.cards[0].set({ state: "ENABLED_DM", userName: "Bob" });
             expect(emitted).toEqual([{ kind: "timeline", roomId: LOCAL }]);
+        });
+
+        it("a local room in state CREATED that is still in the client store has no entry, its view-model is disposed, and a later read builds none", () => {
+            localEvents = [encryptionEvent("~!local+bob:txn", { roomId: LOCAL })];
+            expect(bridge.timeline(LOCAL)).toHaveLength(1);
+            const card = h.cards[0];
+            // the real flow: createRoomFromLocalRoom only sets the state and emits ClientEvent.Room, the room stays in the store
+            localRoomState = LocalRoomState.CREATED;
+            expect(localRoomKnown).toBe(true);
+            expect(bridge.timeline(LOCAL)).toEqual([]);
+            expect(card.dispose).toHaveBeenCalledTimes(1);
+            expect(card.listeners.size).toBe(0);
+            expect(h.cards).toHaveLength(1);
+            expect(bridge.timeline(LOCAL)).toEqual([]);
+            expect(h.cards).toHaveLength(1);
         });
 
         it("the view-model is disposed once the local room is gone (the server room replaced it), and with the bridge", () => {
