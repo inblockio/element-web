@@ -878,21 +878,21 @@ describe("M11 Y3 moveSection (RoomListStoreV3.reorderSection, answered from the 
         expect(store.reorderSection).not.toHaveBeenCalled();
     });
 
-    it("a refused account-data write (the store's promise fulfils, the stored order is unchanged) is network, also when sections() already shows the move", async () => {
+    it("a refused account-data write (the store's promise fulfils, the stored order is unchanged) is failed, also when sections() already shows the move", async () => {
         store.reorderSection.mockImplementation(async () => {
             listed = [B, A, C]; // the local echo moved the list, the PUT was refused and the echo expired
         });
         const outcome = codeOf(moveSection(A, "down", order));
         await vi.advanceTimersByTimeAsync(0);
-        expect(await outcome).toBe("network");
+        expect(await outcome).toBe("failed");
         expect(stored).toEqual(["chats", A, B, "People", C]);
     });
 
-    it("a store that has not written in time is failed, and the next move still takes its turn", async () => {
+    it("a store that has not written in time is network, and the next move still takes its turn", async () => {
         store.reorderSection.mockImplementationOnce(() => new Promise<void>(() => undefined));
         const outcome = codeOf(moveSection(A, "down", order));
         await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
-        expect(await outcome).toBe("failed");
+        expect(await outcome).toBe("network");
 
         store.reorderSection.mockImplementation(async (tag: string, neighbour: string) => apply(tag, neighbour));
         const next = moveSection(B, "down", order);

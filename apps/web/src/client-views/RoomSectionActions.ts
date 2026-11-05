@@ -250,9 +250,9 @@ function isMoved(order: readonly string[], tag: string, neighbour: string, direc
  * second click sees the first one's result). `failed` at once for a tag it does not list and for the first / last custom
  * (no neighbour in that direction). `done` + `section` once the stored `RoomList.OrderedCustomSections` AND `order()` both
  * show `tag` on the neighbour's side (D21: a refused account-data write is swallowed by the store, only the re-read tells).
- * Codes (orchestrator ruling, N-Y3-codes, as M10 `removeSection`): `failed` for an unknown tag, no neighbour and a store that
- * has not settled within `ROOM_ACTION_TIMEOUT_MS`; `network` for a refused write (the stored order did not change) and for
- * `sections()` still lagging after `ROOM_ACTION_TIMEOUT_MS` (the write may still apply). Only the relative order of the
+ * Codes (orchestrator ruling, card note N10, as M10 `removeSection` for the same kinds): `failed` for an unknown tag, no
+ * neighbour and a refused write (the stored order did not change); `network` for a store that has not settled within
+ * `ROOM_ACTION_TIMEOUT_MS` and for `sections()` still lagging after it (the write may still apply). Only the relative order of the
  * customs moves: Element keeps `chats` and `People` in the same stored order and the move may jump over them (LIMIT).
  */
 export function moveSection(
@@ -281,14 +281,14 @@ export function moveSection(
                     timer = setTimeout(() => resolve(false), ROOM_ACTION_TIMEOUT_MS);
                 }),
             ]);
-            if (!written) throw new ClientViewActionError("failed", "the section order was not written in time");
+            if (!written) throw new ClientViewActionError("network", "the section order was not written in time");
         } catch (e) {
             throw toActionError(e);
         } finally {
             clearTimeout(timer);
         }
         if (!isMoved(storedOrder(), tag, neighbour, direction))
-            throw new ClientViewActionError("network", "the section order was not changed in the account data");
+            throw new ClientViewActionError("failed", "the section order was not changed in the account data");
         while (!isMoved(order(), tag, neighbour, direction)) {
             if (Date.now() >= until)
                 throw new ClientViewActionError("network", "the sections were not reordered after the move");
