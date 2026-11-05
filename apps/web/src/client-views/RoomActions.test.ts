@@ -1538,6 +1538,20 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
                 expect(targetOf(0).name).toBe("Bob Builder");
             });
 
+            it("F1 round 3: an invite room passed as fromRoomId is not used (our own membership there is invite): the scan of joined rooms titles the DM", async () => {
+                const invite = roomWith(
+                    BOB,
+                    member("join", "Bob the Inviter's Pick", "mxc://example.org/inv"),
+                    "invite",
+                );
+                const joined = roomWith(BOB, member("join", "Bob Builder", "mxc://example.org/bob"));
+                rooms = [invite, joined];
+                roomsById = { "!inv": invite, "!joined:example.org": joined };
+                await startDmWithUser(client, BOB, undefined, "!inv");
+                expect(targetOf(0).name).toBe("Bob Builder");
+                expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+            });
+
             it("an invite room alone names nobody: the id stays the title", async () => {
                 rooms = [roomWith(BOB, member("join", "Bob the Inviter's Pick", "mxc://example.org/inv"), "invite")];
                 await startDmWithUser(client, BOB);

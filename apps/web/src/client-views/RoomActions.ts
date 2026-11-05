@@ -321,7 +321,8 @@ export const DM_LOCK_CAP_MS = 60_000;
  *
  * `fromRoomId` is the room of the message the user replied to ("Reply directly" is only offered on a message): that room's
  * member is the person on the message, copied as stock copies it (F1 round 1; a per-room name in some other room, or the
- * name an inviter chose in an invitation's stripped state, is not them). Without it, or when that room has no such member,
+ * name an inviter chose in an invitation's stripped state, is not them) but only when the client's own membership in that
+ * room is `join` (F1 round 3). Without it, or when that room is not joined or has no such member,
  * the first joined member of a room of ours that names them, else the client's own `User` (a profile it was told of); only
  * rooms the client itself has joined count, never an invitation. Nothing known gives `{}` and the id stays the title. No
  * server call: only what the client holds.
@@ -332,7 +333,9 @@ export function knownProfile(
     fromRoomId?: string,
 ): { display_name?: string; avatar_url?: string } {
     if (typeof fromRoomId === "string" && fromRoomId) {
-        const member = client.getRoom(fromRoomId)?.getMember(userId);
+        const room = client.getRoom(fromRoomId);
+        // Only a room we have joined: an invitation's stripped state holds the member the inviter chose (F1 round 3).
+        const member = room?.getMyMembership() === KnownMembership.Join ? room.getMember(userId) : null;
         if (member) return { display_name: member.rawDisplayName, avatar_url: member.getMxcAvatarUrl() ?? undefined };
     }
     let avatar: string | undefined;
