@@ -257,8 +257,9 @@ const isDirectoryPick = (p: ActionPayload): boolean => isDirectoryRoomPick(p) ||
  * `auto_join` is `done` once the room is listed (`failed` on `JoinRoomError` for it, or after 15 s); a room only
  * peeked (`should_peek`, world-readable) is `done` with `peek: true`; an alias-only `ViewRoom` waits for the re-dispatch
  * that carries the id (`ViewRoomError` is `failed`). A person row runs `startDmOnFirstMessage`, which dispatches the
- * chat's `ViewRoom` after `resolveThreePids`, i.e. after the dialog closed: for `people` that is awaited as in
- * `startChatViaDialog` (an existing DM, or the local room of a new one). Closed with no such `ViewRoom` is `cancelled`.
+ * chat's `ViewRoom` after `resolveThreePids`, i.e. after the dialog closed: that is awaited as in `startChatViaDialog`
+ * (an existing DM, or the local room of a new one) for either filter, as the rooms filter lists people too. Closed with
+ * no such `ViewRoom` is `cancelled`.
  */
 export function directoryViaDialog(
     filter: "rooms" | "people",
@@ -273,7 +274,7 @@ export function directoryViaDialog(
             // A room row dispatches before it closes; one tick covers a queued dispatch. A person row's follows the close.
             await new Promise((resolve) => setTimeout(resolve, 0));
             let at = seen.payloads.findIndex(isDirectoryPick);
-            if (at < 0 && filter === "people") {
+            if (at < 0) {
                 try {
                     await seen.wait<true>((p) => (isDirectoryPick(p) ? true : undefined), CHAT_SHOWN_MS);
                 } catch {

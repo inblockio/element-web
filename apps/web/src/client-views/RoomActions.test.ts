@@ -957,17 +957,37 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
     });
 
     it("is cancelled when the dialog closes without a pick (an earlier or foreign ViewRoom is not one)", async () => {
-        const d = openDialogOnStart();
-        const outcome = directoryViaDialog(
-            "rooms",
-            () => {
-                d.start();
-                viewRoom("!notification:example.org", "Notification");
-            },
-            roomList(),
-        );
-        d.finish();
-        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    viewRoom("!notification:example.org", "Notification");
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("rooms: a person row's new chat, dispatched 2 s after the dialog closed, is awaited (the rooms filter lists people too)", async () => {
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog("rooms", d.start, roomList());
+            d.finish();
+            await vi.advanceTimersByTimeAsync(2_000);
+            viewRoom("local+late:example.org", undefined, [{}]);
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+late:example.org" });
+        } finally {
+            vi.useRealTimers();
+        }
     });
 
     it("people: waits for the chat's ViewRoom after the dialog closed (startDmOnFirstMessage dispatches after resolveThreePids)", async () => {
@@ -1012,14 +1032,21 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
     });
 
     it("runs one dialog action at a time and frees the lock after a cancel", async () => {
-        const d = openDialogOnStart();
-        const first = directoryViaDialog("rooms", d.start, roomList());
-        expect(await codeOf(directoryViaDialog("rooms", () => {}, roomList()))).toBe("failed");
-        d.finish();
-        await expect(first).resolves.toEqual({ status: "cancelled" });
-        const d2 = openDialogOnStart();
-        const second = directoryViaDialog("rooms", d2.start, roomList());
-        d2.finish();
-        await expect(second).resolves.toEqual({ status: "cancelled" });
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const first = directoryViaDialog("rooms", d.start, roomList());
+            expect(await codeOf(directoryViaDialog("rooms", () => {}, roomList()))).toBe("failed");
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(first).resolves.toEqual({ status: "cancelled" });
+            const d2 = openDialogOnStart();
+            const second = directoryViaDialog("rooms", d2.start, roomList());
+            d2.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(second).resolves.toEqual({ status: "cancelled" });
+        } finally {
+            vi.useRealTimers();
+        }
     });
 });
