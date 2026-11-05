@@ -310,8 +310,8 @@ const isPersonPick = (p: ActionPayload): boolean =>
  * peeked (`should_peek`, world-readable) is `done` with `peek: true`; an alias-only `ViewRoom` waits for the re-dispatch
  * that carries the id (`ViewRoomError` is `failed`). A person row runs `startDmOnFirstMessage`, which dispatches the
  * chat's `ViewRoom` after `resolveThreePids`, i.e. after the dialog closed: that is awaited as in `startChatViaDialog`
- * (an existing DM, or the local room of a new one) for either filter, as the rooms filter lists people too. Closed with
- * no such `ViewRoom` is `cancelled`.
+ * (an existing DM, or the local room of a new one) for either filter, as the rooms filter lists people too, or the
+ * room the dialog's Create new room made. Closed with no such `ViewRoom` is `cancelled`.
  */
 export function directoryViaDialog(
     filter: "rooms" | "people",
@@ -325,8 +325,14 @@ export function directoryViaDialog(
         let openedAt = 0;
         // A person pick is `isPersonPick`; after a followed replacement (the invite dialog) `Created` is one too.
         let followed = false;
+        // Spotlight's "Create new room" button dispatches `CreateRoom` (Spotlight stays open); the room it makes is then
+        // viewed with `Created`. That is the pick only when the `CreateRoom` came from this dialog: any other `Created`
+        // is somebody else's room.
+        const createdHere = (): boolean => seen.payloads.slice(openedAt).some((p) => p.action === Action.CreateRoom);
         const isPick = (p: ActionPayload): boolean =>
-            isDirectoryRoomPick(p) || (followed ? isChatViewRoom(p) : isPersonPick(p));
+            isDirectoryRoomPick(p) ||
+            (followed ? isChatViewRoom(p) : isPersonPick(p)) ||
+            (createdHere() && isViewRoom(p) && p.metricsTrigger === "Created");
         const pickFrom = (from: number): number => {
             const at = seen.payloads.slice(from).findIndex(isPick);
             return at < 0 ? at : at + from;

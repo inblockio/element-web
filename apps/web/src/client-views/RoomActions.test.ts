@@ -1179,6 +1179,70 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
         });
     });
 
+    describe("Spotlight's Create new room button (F2 round 2: CreateRoom, then the Created ViewRoom)", () => {
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+        const created = (roomId: string): void =>
+            defaultDispatcher.dispatch(
+                { action: Action.ViewRoom, room_id: roomId, metricsTrigger: "Created", joining: true },
+                true,
+            );
+
+        it("is done with the room the dialog's Create new room made", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    defaultDispatcher.dispatch({ action: Action.CreateRoom, public: true }, true);
+                    created("!new:example.org");
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(0);
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!new:example.org" });
+        });
+
+        it("is done when the room is created up to 5 s after the user closed Spotlight during the create", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    defaultDispatcher.dispatch({ action: Action.CreateRoom, public: true }, true);
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(4_000);
+            created("!late:example.org");
+            await vi.advanceTimersByTimeAsync(0);
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!late:example.org" });
+        });
+
+        it("does not take a Created ViewRoom as the pick when no CreateRoom was dispatched after the dialog opened", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    // dispatched while `start` ran, before the dialog opened: not the dialog's create
+                    defaultDispatcher.dispatch({ action: Action.CreateRoom, public: true }, true);
+                    d.start();
+                    created("!other:example.org");
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        });
+    });
+
     it("clears the join-error timer once the picked room is listed (no 15 s timer is left behind)", async () => {
         vi.useFakeTimers();
         try {
