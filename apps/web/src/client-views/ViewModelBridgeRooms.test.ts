@@ -117,6 +117,7 @@ const actions = vi.hoisted(() => ({
     createRoomViaDialog: vi.fn(),
     directoryViaDialog: vi.fn(),
     startChatViaDialog: vi.fn(),
+    startDmWithUser: vi.fn(),
     leaveViaDialog: vi.fn(),
 }));
 vi.mock("./RoomActions", () => actions);
@@ -362,6 +363,105 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         actions.startChatViaDialog.mockResolvedValue({ status: "done", roomId: "!dm:example.org" });
         await bridge.createChat();
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("starts a DM through startDmWithUser and lists the local room of a new DM before the kit gets done (M11 Y4)", async () => {
+        const local = {
+            roomId: LOCAL_ROOM_ID_PREFIX + "reply",
+            name: "Bob",
+            state: LocalRoomState.NEW,
+            tags: {},
+            targets: [{ userId: "@bob:example.org" }],
+        };
+        rooms[local.roomId] = local;
+        actions.startDmWithUser.mockResolvedValue({ status: "done", roomId: local.roomId });
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        let listedAtDone: string[] = [];
+        const outcome = await bridge.startDm("@bob:example.org").then((o) => {
+            listedAtDone = bridge.rooms().map((r) => r.id);
+            return o;
+        });
+        expect(outcome).toEqual({ status: "done", roomId: local.roomId });
+        expect(actions.startDmWithUser).toHaveBeenCalledWith(client, "@bob:example.org", expect.any(Function));
+        expect(listedAtDone).toEqual([local.roomId, "!a:example.org", "!inv:example.org"]);
+        expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
+        // Element creates the real room on the first send: the local one leaves the list.
+        local.state = LocalRoomState.CREATED;
+        handlers.forEach((cb) => cb(local as unknown as Room));
+        expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("lists nothing new for an existing DM, a failed start (the error reaches the kit) or the own id (M11 Y4)", async () => {
+        actions.startDmWithUser.mockResolvedValue({ status: "done", roomId: "!dm:example.org" });
+        await expect(bridge.startDm("@bob:example.org")).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+        actions.startDmWithUser.mockRejectedValue(new Error("a direct chat with yourself is not started"));
+        await expect(bridge.startDm("@me:example.org")).rejects.toThrow("yourself");
+        expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("lists the local room of a DM that Element opens after startDm answered failed (late chat, M11 Y4 F1)", async () => {
+        const local = {
+            roomId: LOCAL_ROOM_ID_PREFIX + "dm4",
+            name: "Eve",
+            state: LocalRoomState.NEW,
+            tags: {},
+            targets: [{ userId: "@eve:example.org" }],
+        };
+        rooms[local.roomId] = local;
+        let late: (id: string) => void = () => {};
+        actions.startDmWithUser.mockImplementation(
+            async (_c: unknown, _u: string, onLateChat: (id: string) => void) => {
+                late = onLateChat;
+                throw new ClientViewActionError("failed", "Element did not open the chat in time");
+            },
+        );
+        await expect(bridge.startDm("@eve:example.org")).rejects.toThrow("in time");
+        expect(bridge.rooms().map((r) => r.id)).not.toContain(local.roomId);
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        late(local.roomId);
+        expect(bridge.rooms().map((r) => r.id)).toContain(local.roomId);
+        expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
+    });
+
+    it("a retry after a late-settled start answers done with the listed local room and starts no second one; another user starts a new chat (M11 Y4 F2)", async () => {
+        const mk = (suffix: string, name: string, userId: string) => ({
+            roomId: LOCAL_ROOM_ID_PREFIX + suffix,
+            name,
+            state: LocalRoomState.NEW,
+            tags: {},
+            targets: [{ userId }],
+        });
+        const eve = mk("dm5", "Eve", "@eve:example.org");
+        const fay = mk("dm6", "Fay", "@fay:example.org");
+        rooms[eve.roomId] = eve;
+        rooms[fay.roomId] = fay;
+        let late: (id: string) => void = () => {};
+        actions.startDmWithUser.mockImplementationOnce(
+            async (_c: unknown, _u: string, onLateChat: (id: string) => void) => {
+                late = onLateChat;
+                throw new ClientViewActionError("failed", "Element did not open the chat in time");
+            },
+        );
+        await expect(bridge.startDm("@eve:example.org")).rejects.toThrow("in time");
+        late(eve.roomId);
+        expect(actions.startDmWithUser).toHaveBeenCalledTimes(1);
+        // The retry: same room, Element's start is not called again, one chat with Eve is listed.
+        await expect(bridge.startDm("@eve:example.org")).resolves.toEqual({ status: "done", roomId: eve.roomId });
+        expect(actions.startDmWithUser).toHaveBeenCalledTimes(1);
+        expect(bridge.rooms().filter((r) => r.id === eve.roomId)).toHaveLength(1);
+        expect(bridge.rooms().filter((r) => r.name === "Eve")).toHaveLength(1);
+        // Another user still starts a new chat through Element.
+        actions.startDmWithUser.mockResolvedValueOnce({ status: "done", roomId: fay.roomId });
+        await expect(bridge.startDm("@fay:example.org")).resolves.toEqual({ status: "done", roomId: fay.roomId });
+        expect(actions.startDmWithUser).toHaveBeenCalledTimes(2);
+        expect(bridge.rooms().map((r) => r.id)).toEqual(expect.arrayContaining([eve.roomId, fay.roomId]));
+        // Once Element created the real room, the local one is no longer reused: the next start goes to Element again.
+        eve.state = LocalRoomState.CREATED;
+        actions.startDmWithUser.mockResolvedValueOnce({ status: "done", roomId: "!real:example.org" });
+        await expect(bridge.startDm("@eve:example.org")).resolves.toEqual({ status: "done", roomId: "!real:example.org" });
+        expect(actions.startDmWithUser).toHaveBeenCalledTimes(3);
     });
 
     it("leaves through the room list item view-model's onLeaveRoom (Element's confirm)", async () => {

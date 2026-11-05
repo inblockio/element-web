@@ -97,6 +97,7 @@ import {
     forwardViaDialog,
     leaveViaDialog,
     startChatViaDialog,
+    startDmWithUser,
     viewSourceViaDialog,
 } from "./RoomActions";
 import Modal from "../Modal";
@@ -2522,6 +2523,33 @@ export class ViewModelBridge implements ClientViewBridge {
             },
         );
         // A new chat's local room is listed (and opened) by the kit like any room until the first send creates it (as createChat).
+        if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
+            this.localChats.add(outcome.roomId);
+            this.syncRooms();
+        }
+        return outcome;
+    }
+
+    /** The listed local chat whose only target is `userId` (Element's `findDMRoom` skips local rooms), if any. */
+    private localChatWith(userId: string): string | undefined {
+        for (const id of this.localChats) {
+            const room = this.client.getRoom(id) as LocalRoom | null;
+            if (!room || !isLocalRoom(id) || room.state === LocalRoomState.CREATED) continue;
+            if (room.targets.length === 1 && room.targets[0].userId === userId) return id;
+        }
+        return undefined;
+    }
+
+    public async startDm(userId: string): Promise<ActionOutcome> {
+        // A chat Element opened after the 15 s answer (`failed`), or an earlier start, is listed already: Element's
+        // `findDMRoom` does not see local rooms, so a retry would make a second one. Answer with the listed room.
+        const existing = this.localChatWith(userId);
+        if (existing) return { status: "done", roomId: existing };
+        const outcome = await startDmWithUser(this.client, userId, (roomId) => {
+            this.localChats.add(roomId);
+            this.syncRooms();
+        });
+        // A new DM's local room is listed (and opened) by the kit like any room until the first send creates it (as createChat).
         if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
             this.localChats.add(outcome.roomId);
             this.syncRooms();

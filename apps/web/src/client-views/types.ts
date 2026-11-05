@@ -397,6 +397,14 @@ export interface ClientViewBridge {
      */
     openDirectory(opts?: { term?: string; filter?: "rooms" | "people" }): Promise<ActionOutcome>;
     /**
+     * M11 Y4 (version 4, additive): start a direct chat with `userId` (a Matrix user id; the message menu's "Reply directly")
+     * through Element's own DM path (`startDmOnFirstMessage`, as the user-info "Message" button): `done` + the chat's room id
+     * (an existing DM, or the local room of a new one, listed in `rooms()` like `createChat`'s before `done`). `failed` at once
+     * for a malformed or the own user id, for a start that gives no room, or none within 15 s. One Element dialog action at a
+     * time (`failed` while another runs). Interim (D41): no shared DM view-model. A kit feature-checks the method.
+     */
+    startDm(userId: string): Promise<ActionOutcome>;
+    /**
      * A7: Element's leave confirm (`RoomListItemViewModel.onLeaveRoom`). `done` once the user is no longer in the room,
      * `cancelled` when the confirm says no, `unsupported` for an archived room, `failed` when the leave did not happen.
      */
