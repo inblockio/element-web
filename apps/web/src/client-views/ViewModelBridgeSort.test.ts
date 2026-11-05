@@ -9,7 +9,7 @@
 
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { type MatrixClient, type Room } from "matrix-js-sdk/src/matrix";
-import { createTestClient, flushPromises, mkStubRoom } from "test-utils";
+import { stubClient, flushPromises, mkStubRoom } from "test-utils";
 
 import { ViewModelBridge } from "./ViewModelBridge";
 import RoomListStoreV3, { RoomListStoreV3Event } from "../stores/room-list-v3/RoomListStoreV3";
@@ -40,7 +40,7 @@ describe("ViewModelBridge: the room order after a resort (W6)", () => {
     };
 
     beforeEach(() => {
-        client = createTestClient();
+        client = stubClient();
         vi.spyOn(client, "getCrypto").mockReturnValue(undefined);
         rooms = ["Alpha", "Bravo", "Charlie"].map((n) => mkStubRoom(`!${n.toLowerCase()}:server`, n, client));
         const [alpha, bravo, charlie] = rooms;
