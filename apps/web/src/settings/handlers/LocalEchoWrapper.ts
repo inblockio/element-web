@@ -58,6 +58,11 @@ export default class LocalEchoWrapper extends SettingsHandler {
         try {
             await handlerPromise;
         } catch {
+            // Expire the echo BEFORE the rollback notify: watchers re-read getValue() (they ignore the notified value),
+            // so a still-cached echo would hand them the refused value and nobody would be notified again (M10 W23 F2, D21).
+            if (bySetting[cacheRoomId] === newValue) {
+                delete bySetting[cacheRoomId];
+            }
             // notify of a rollback
             this.handler.watchers?.notifyUpdate(settingName, roomId, this.level, currentValue);
         } finally {

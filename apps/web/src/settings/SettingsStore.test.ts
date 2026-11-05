@@ -251,4 +251,38 @@ describe("SettingsStore", () => {
             });
         });
     });
+    describe("a refused ACCOUNT write (M10 W23 F2, Element bug, D21: the homeserver is the truth)", () => {
+        const name = "RoomList.OrderedCustomSections";
+        const stored = [{ tag: "element.io.section.s1" }];
+        let client: MatrixClient;
+
+        beforeEach(() => {
+            client = stubClient();
+            MatrixClientBackedController.matrixClient = client;
+            // The homeserver keeps `stored`; the PUT is refused.
+            client.getAccountData = vi
+                .fn()
+                .mockImplementation((type) =>
+                    type === "im.vector.web.settings" ? { getContent: () => ({ [name]: stored }) } : undefined,
+                );
+            client.setAccountData = vi.fn().mockRejectedValue(new Error("M_FORBIDDEN"));
+        });
+
+        afterEach(() => {
+            vi.restoreAllMocks();
+        });
+
+        it("a watcher re-reading SettingsStore.getValue in the rollback notify reads the stored value, not the echo", async () => {
+            const reads: unknown[] = [];
+            const ref = SettingsStore.watchSetting(name, null, () => reads.push(SettingsStore.getValue(name)));
+
+            await SettingsStore.setValue(name, null, SettingLevel.ACCOUNT, []);
+            SettingsStore.unwatchSetting(ref);
+
+            expect(client.setAccountData).toHaveBeenCalledTimes(1);
+            // [optimistic notify (the echo: no section), rollback notify (the account data: still has it)]
+            expect(reads).toEqual([[], stored]);
+            expect(SettingsStore.getValue(name)).toEqual(stored);
+        });
+    });
 });
