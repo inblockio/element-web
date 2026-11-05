@@ -16,12 +16,14 @@
  * (`this.context.liveTimeline`, `this.props.room`), so it cannot be called without a composer; the file is not edited
  * (upstream conflict surface). Parity is the point: no status filter, no key normalisation, no kit-side selection.
  * Re-check this mirror on every Element bump. Differences, all deliberate: the send is awaited (stock fires and
- * forgets), and the composer-only `message_sent` dispatch is dropped (the kit composer does its own clearing).
+ * forgets), a refused send's pending echo is cancelled (stock's RoomView offers cancel/resend, the kit has none), and
+ * the composer-only `message_sent` dispatch is dropped (the kit composer does its own clearing).
  */
 
 import { EventType, RelationType, type MatrixClient, type MatrixEvent } from "matrix-js-sdk/src/matrix";
 
 import { toActionError } from "./actions";
+import { cancelFailedPendingEvents } from "./InterimActions";
 import { type ActionOutcome, ClientViewActionError } from "./types";
 
 export async function quickReact(client: MatrixClient, roomId: string, key: string): Promise<ActionOutcome> {
@@ -41,11 +43,19 @@ export async function quickReact(client: MatrixClient, roomId: string, key: stri
             const keys = [...mine].filter((e) => !e.isRedacted()).map((e) => e.getRelation()?.key);
             if (keys.includes(key)) return { status: "done", roomId, eventId };
         }
+        // A refused send leaves a NOT_SENT echo (it blocks the room's later sends and counts as "already reacted" for a
+        // retry); the kit replaces RoomView, so no unsent-messages bar can cancel it. The bridge cancels it as it does for
+        // text and forwards (`cancelFailedPendingEvents`, by this call's own transaction id).
+        const txnId = client.makeTxnId();
         try {
-            await client.sendEvent(roomId, EventType.Reaction, {
-                "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key },
-            });
+            await client.sendEvent(
+                roomId,
+                EventType.Reaction,
+                { "m.relates_to": { rel_type: RelationType.Annotation, event_id: eventId, key } },
+                txnId,
+            );
         } catch (e) {
+            cancelFailedPendingEvents(client, roomId, txnId);
             throw toActionError(e);
         }
         return { status: "done", roomId, eventId };

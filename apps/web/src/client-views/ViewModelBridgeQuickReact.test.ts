@@ -8,7 +8,15 @@
 // @vitest-environment happy-dom
 
 import { vi, describe, it, expect, beforeEach, afterEach } from "vitest";
-import { ConnectionError, MatrixError, MatrixEvent, Room, type MatrixClient } from "matrix-js-sdk/src/matrix";
+import {
+    ConnectionError,
+    EventStatus,
+    MatrixError,
+    MatrixEvent,
+    PendingEventOrdering,
+    Room,
+    type MatrixClient,
+} from "matrix-js-sdk/src/matrix";
 import { stubClient, flushPromises } from "test-utils";
 
 import { ViewModelBridge } from "./ViewModelBridge";
@@ -89,12 +97,37 @@ describe("ViewModelBridge.quickReact (M13 U6)", () => {
         { "m.relates_to": { rel_type: "m.annotation", event_id: target, key } },
     ];
 
+    /**
+     * A refused send as the real client leaves it: a local echo with the call's transaction id in the room's detached
+     * pending list and in the relations, status NOT_SENT, and the promise rejected. `cancelPendingEvent` is the real
+     * one's effect on the room (CANCELLED removes the echo from both).
+     */
+    const refuseSends = (error: Error): void => {
+        sendEvent.mockImplementation(async (roomId: string, type: string, content: object, txnId: string) => {
+            const echo = new MatrixEvent({
+                event_id: `~${roomId}:${txnId}`,
+                room_id: roomId,
+                sender: ME,
+                type,
+                content,
+            });
+            echo.setTxnId(txnId);
+            echo.setStatus(EventStatus.SENDING);
+            room.addPendingEvent(echo, txnId);
+            room.updatePendingEvent(echo, EventStatus.NOT_SENT);
+            throw error;
+        });
+        vi.spyOn(client, "cancelPendingEvent").mockImplementation((ev) => {
+            room.updatePendingEvent(ev, EventStatus.CANCELLED);
+        });
+    };
+
     beforeEach(() => {
         client = stubClient();
         vi.spyOn(client, "getCrypto").mockReturnValue(undefined);
         vi.spyOn(client, "getSafeUserId").mockReturnValue(ME);
         vi.spyOn(client, "getUserId").mockReturnValue(ME);
-        room = new Room(ROOM, client, ME);
+        room = new Room(ROOM, client, ME, { pendingEventOrdering: PendingEventOrdering.Detached });
         vi.spyOn(client, "getRoom").mockImplementation((id) => (id === ROOM ? room : null));
         sendEvent = vi.fn(async () => ({ event_id: "$sent" }));
         (client as unknown as { sendEvent: unknown }).sendEvent = sendEvent;
@@ -202,5 +235,32 @@ describe("ViewModelBridge.quickReact (M13 U6)", () => {
         sendEvent.mockRejectedValueOnce(new Error("boom"));
         await expect(bridge.quickReact(ROOM, KEY)).rejects.toMatchObject({ code: "failed" });
         await flushPromises();
+    });
+
+    it("cancels the pending echo of a refused reaction: no NOT_SENT event left in the pending list or the relations", async () => {
+        timeline(message("$last"));
+        refuseSends(new MatrixError({ errcode: "M_FORBIDDEN", error: "no" }, 403));
+
+        await expect(bridge.quickReact(ROOM, KEY)).rejects.toMatchObject({ code: "forbidden" });
+
+        expect(room.getPendingEvents()).toEqual([]);
+        const annotations = room.relations.getChildEventsForEvent("$last", "m.annotation", "m.reaction");
+        expect(annotations?.getRelations() ?? []).toEqual([]);
+        expect(vi.mocked(client.cancelPendingEvent)).toHaveBeenCalledTimes(1);
+    });
+
+    it("sends again on a second quickReact with the same key after a refusal (the echo no longer counts as sent)", async () => {
+        timeline(message("$last"));
+        refuseSends(new ConnectionError("offline"));
+        await expect(bridge.quickReact(ROOM, KEY)).rejects.toMatchObject({ code: "network" });
+        expect(sendEvent).toHaveBeenCalledTimes(1);
+
+        sendEvent.mockImplementation(async () => ({ event_id: "$sent" }));
+        const outcome = await bridge.quickReact(ROOM, KEY);
+
+        expect(outcome).toEqual({ status: "done", roomId: ROOM, eventId: "$last" });
+        expect(sendEvent).toHaveBeenCalledTimes(2);
+        expect(sentReactions()[1]).toEqual(annotation("$last"));
+        expect(room.getPendingEvents()).toEqual([]);
     });
 });

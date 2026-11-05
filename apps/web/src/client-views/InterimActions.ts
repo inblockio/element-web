@@ -76,7 +76,7 @@ function pendingEventsOf(client: MatrixClient, roomId: string): MatrixEvent[] {
  * id would throw before any request. Called only for a transaction id that had no local echo before the send, so the
  * event found is this call's own and an echo that existed before is never touched.
  */
-function cancelFailedPendingEvents(client: MatrixClient, roomId: string, txnId: string): void {
+export function cancelFailedPendingEvents(client: MatrixClient, roomId: string, txnId: string): void {
     try {
         // By transaction id only: a pending event restored from a reload is never ours.
         for (const ev of pendingEventsOf(client, roomId)) {
