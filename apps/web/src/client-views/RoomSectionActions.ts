@@ -21,7 +21,7 @@ import { isCustomSectionTag } from "../stores/room-list-v3/section";
 import RoomListStoreV3 from "../stores/room-list-v3/RoomListStoreV3";
 import SettingsStore from "../settings/SettingsStore";
 import { toActionError } from "./actions";
-import { dialogAction, openedDialog, ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
+import { DM_LOCK_CAP_MS, dialogAction, openedDialog, ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import {
     assertSingleSection,
     awaitLateLanding,
@@ -223,9 +223,6 @@ export function removeSection(tag: string, isEmpty: boolean, listed: () => boole
     });
 }
 
-/** The queue key of the section-order writes (`serialTagWrite` only keys its chains; this is no room id). */
-const SECTION_ORDER_QUEUE = "section-order";
-
 /**
  * `RoomList.OrderedCustomSections` as the account data holds it right now (D21). Once the store's write has settled,
  * Element's local echo has expired, so this is the stored value, also when the PUT was refused (the wrapper swallows the
@@ -246,13 +243,18 @@ function isMoved(order: readonly string[], tag: string, neighbour: string, direc
 /**
  * Y3: moves the custom section `tag` one place up or down among the custom sections, as Element's own drag does
  * (`RoomListViewModel.changeSectionOrder` -> `RoomListStoreV3.reorderSection(tag, neighbour)`, not a dialog). `order` is the
- * bridge's `sections()` as tags (customs only), read when the call takes its turn (moves run one after the other, so a
- * second click sees the first one's result). `failed` at once for a tag it does not list and for the first / last custom
+ * bridge's `sections()` as tags (customs only), read when the call takes the dialog lock. It runs inside `dialogAction`,
+ * the one lock of every section-list write (create / edit / remove / move), so a second section write during a move
+ * answers the busy `failed` instead of building its PUT from a `im.vector.web.settings` clone the move is about to
+ * replace. `failed` at once for a tag it does not list and for the first / last custom
  * (no neighbour in that direction). `done` + `section` once the stored `RoomList.OrderedCustomSections` AND `order()` both
  * show `tag` on the neighbour's side (D21: a refused account-data write is swallowed by the store, only the re-read tells).
  * Codes (orchestrator ruling, card note N10, as M10 `removeSection` for the same kinds): `failed` for an unknown tag, no
  * neighbour and a refused write (the stored order did not change); `network` for a store that has not settled within
- * `ROOM_ACTION_TIMEOUT_MS` and for `sections()` still lagging after it (the write may still apply). Only the relative order of the
+ * `ROOM_ACTION_TIMEOUT_MS` and for `sections()` still lagging after it (the write may still apply). On the store timeout the
+ * caller gets `network` but the lock stays held until `reorderSection` settles, at most `DM_LOCK_CAP_MS` (the PUT is still
+ * in flight: another section write or move meanwhile could be overwritten by it, last PUT wins); a late rejection is
+ * swallowed (the caller has its answer). Only the relative order of the
  * customs moves: Element keeps `chats` and `People` in the same stored order and the move may jump over them (LIMIT).
  */
 export function moveSection(
@@ -260,7 +262,7 @@ export function moveSection(
     direction: "up" | "down",
     order: () => readonly string[],
 ): Promise<ActionOutcome> {
-    return serialTagWrite(SECTION_ORDER_QUEUE, async () => {
+    return dialogAction(async (holdLock) => {
         const listed = order();
         const at = listed.indexOf(tag);
         const neighbour = at === -1 ? undefined : listed[direction === "up" ? at - 1 : at + 1];
@@ -275,13 +277,18 @@ export function moveSection(
         const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
+            const store = RoomListStoreV3.instance.reorderSection(tag, neighbour);
             const written = await Promise.race([
-                RoomListStoreV3.instance.reorderSection(tag, neighbour).then(() => true),
+                store.then(() => true),
                 new Promise<false>((resolve) => {
                     timer = setTimeout(() => resolve(false), ROOM_ACTION_TIMEOUT_MS);
                 }),
             ]);
-            if (!written) throw new ClientViewActionError("network", "the section order was not written in time");
+            if (!written) {
+                // The write is still in flight: keep the section lock until it settles (a rejection then is swallowed).
+                holdLock(store, DM_LOCK_CAP_MS);
+                throw new ClientViewActionError("network", "the section order was not written in time");
+            }
         } catch (e) {
             throw toActionError(e);
         } finally {
