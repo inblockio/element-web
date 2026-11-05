@@ -145,9 +145,10 @@ export function recordPayloads(): {
 
 /**
  * Runs `start` (a view-model action that makes `MatrixChat` open a dialog) and resolves with the handle of the first
- * dialog that opens, so the dialog's own result can be read. Only one such action runs at a time.
+ * dialog that opens, so the dialog's own result can be read. Only one such action runs at a time. `onOpened` runs right
+ * after the dialog opened (before any later dispatch), `onFinished` once its result is in.
  */
-export function openedDialog(start: () => void, onFinished?: () => void): Promise<DialogHandle> {
+export function openedDialog(start: () => void, onFinished?: () => void, onOpened?: () => void): Promise<DialogHandle> {
     return new Promise<DialogHandle>((resolve, reject) => {
         // oxlint-disable-next-line typescript/unbound-method -- put back as it was; called with `Modal` as `this` below
         const original = Modal.createDialog;
@@ -168,6 +169,8 @@ export function openedDialog(start: () => void, onFinished?: () => void): Promis
             const stackBefore = modalStack();
             const handle = original.apply(Modal, args);
             if (!settled) {
+                // The mark of this dialog's opening: what the caller records after it belongs to the dialog.
+                onOpened?.();
                 const mine = [...modalStack()].find((m) => !stackBefore.has(m));
                 // Registered before the caller of `createDialog` can await the result, so it runs before whatever Element
                 // does after the answer: the mark it takes separates what came before the answer from what follows.
@@ -285,9 +288,17 @@ export interface DirectoryRooms {
     onLateChat?: (roomId: string) => void;
 }
 
-/** What Spotlight dispatches for a picked room (`SpotlightDialog.viewRoom`); a person row's is `isChatViewRoom`. */
+/** What Spotlight dispatches for a picked room (`SpotlightDialog.viewRoom`); a person row's is `isPersonPick`. */
 const isDirectoryRoomPick = (p: ActionPayload): boolean => isViewRoom(p) && p.metricsTrigger === "WebUnifiedSearch";
-const isDirectoryPick = (p: ActionPayload): boolean => isDirectoryRoomPick(p) || isChatViewRoom(p);
+/**
+ * What a person row of Spotlight dispatches (`startDmOnFirstMessage`): an existing DM (`MessageUser`) or the new chat's
+ * local room. Not `Created`: that is the room `startDm` makes for a single 3rd-party invite, which only the invite dialog
+ * that replaces Spotlight (a followed replacement) can lead to; any other `Created` is somebody else's room.
+ */
+const isPersonPick = (p: ActionPayload): boolean =>
+    isViewRoom(p) &&
+    (p.metricsTrigger === "MessageUser" ||
+        (isLocalRoom(p.room_id) && (p as { targets?: unknown }).targets !== undefined));
 
 /**
  * W1 / W5 directory and server search: Element's Spotlight dialog (`Action.ViewRoomDirectory`, or `OpenSpotlight` on the
@@ -307,26 +318,40 @@ export function directoryViaDialog(
 ): Promise<ActionOutcome> {
     return dialogAction(async () => {
         const seen = recordPayloads();
+        // Only what Spotlight dispatches once it is open is its result: an earlier ViewRoom (a notification click, an
+        // answered call, one dispatched while `start` ran) is not the pick.
+        let openedAt = 0;
+        // A person pick is `isPersonPick`; after a followed replacement (the invite dialog) `Created` is one too.
+        let followed = false;
+        const isPick = (p: ActionPayload): boolean =>
+            isDirectoryRoomPick(p) || (followed ? isChatViewRoom(p) : isPersonPick(p));
+        const pickFrom = (from: number): number => {
+            const at = seen.payloads.slice(from).findIndex(isPick);
+            return at < 0 ? at : at + from;
+        };
         try {
-            const dialog = await openedDialog(start);
+            const dialog = await openedDialog(start, undefined, () => (openedAt = seen.payloads.length));
             await dialog.finished;
             // The group-chat button replaces Spotlight with Element's invite dialog (static over static: Spotlight's `finished`
             // never resolves, it is answered as dropped). That dialog is the rest of the action: hold the lock until it is gone.
             // A room pick already made is not followed (an error dialog after a join is not part of the action).
-            if (!seen.payloads.some(isDirectoryRoomPick)) {
-                for (let next = dialog.replacedBy?.(); next; next = dialog.replacedBy?.()) await leftStack(next);
+            if (!seen.payloads.slice(openedAt).some(isDirectoryRoomPick)) {
+                for (let next = dialog.replacedBy?.(); next; next = dialog.replacedBy?.()) {
+                    followed = true;
+                    await leftStack(next);
+                }
             }
             // A room row dispatches before it closes; one tick covers a queued dispatch. A person row's follows the close.
             await new Promise((resolve) => setTimeout(resolve, 0));
-            let at = seen.payloads.findIndex(isDirectoryPick);
+            let at = pickFrom(openedAt);
             if (at < 0) {
                 try {
-                    await seen.wait<true>((p) => (isDirectoryPick(p) ? true : undefined), CHAT_SHOWN_MS);
+                    await seen.wait<true>((p) => (isPick(p) ? true : undefined), CHAT_SHOWN_MS, openedAt);
                 } catch {
                     watchLateChat(rooms);
                     return { status: "cancelled" };
                 }
-                at = seen.payloads.findIndex(isDirectoryPick);
+                at = pickFrom(openedAt);
             }
             if (at < 0) return { status: "cancelled" };
             const first = seen.payloads[at] as ViewRoomPayload;

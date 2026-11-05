@@ -1066,6 +1066,62 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
         });
     });
 
+    describe("only a ViewRoom after the dialog opened is its pick", () => {
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+
+        it("ignores a room or person ViewRoom dispatched while `start` ran, before the dialog opened", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    pickRoom({ room_id: "!old:example.org", auto_join: true });
+                    viewRoom("!olddm:example.org", "MessageUser");
+                    d.start();
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        });
+
+        it("still takes the person pick dispatched after the dialog opened", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "people",
+                () => {
+                    viewRoom("!olddm:example.org", "MessageUser");
+                    d.start();
+                    viewRoom("!newdm:example.org", "MessageUser");
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(0);
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!newdm:example.org" });
+        });
+
+        it("does not take a Created ViewRoom (another room's creation) as a pick without a followed replacement", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    viewRoom("!other:example.org", "Created");
+                },
+                roomList(),
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        });
+    });
+
     it("clears the join-error timer once the picked room is listed (no 15 s timer is left behind)", async () => {
         vi.useFakeTimers();
         try {
