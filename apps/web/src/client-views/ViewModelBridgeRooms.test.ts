@@ -432,19 +432,34 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         sectionActions.editSection.mockResolvedValue({ status: "done", section: "element.io.section.s1" });
         sectionActions.removeSection.mockResolvedValue({ status: "done", section: "element.io.section.s1" });
         // The room is in s2, so s1 is empty and s2 is not.
-        h.item.set({ sections: [sec("element.io.section.s1", "Work", false), sec("element.io.section.s2", "Home", true)] });
+        h.item.set({
+            sections: [sec("element.io.section.s1", "Work", false), sec("element.io.section.s2", "Home", true)],
+        });
         await expect(bridge.editSection("element.io.section.s1")).resolves.toMatchObject({ status: "done" });
         expect(sectionActions.editSection).toHaveBeenCalledExactlyOnceWith("element.io.section.s1");
         await bridge.removeSection("element.io.section.s1");
         await bridge.removeSection("element.io.section.s2");
-        expect(sectionActions.removeSection).toHaveBeenNthCalledWith(1, "element.io.section.s1", true, expect.any(Function));
-        expect(sectionActions.removeSection).toHaveBeenNthCalledWith(2, "element.io.section.s2", false, expect.any(Function));
+        expect(sectionActions.removeSection).toHaveBeenNthCalledWith(
+            1,
+            "element.io.section.s1",
+            true,
+            expect.any(Function),
+        );
+        expect(sectionActions.removeSection).toHaveBeenNthCalledWith(
+            2,
+            "element.io.section.s2",
+            false,
+            expect.any(Function),
+        );
         // The `listed` probe reads the bridge's own sections(): true while the tag is listed, false once it is gone.
         const listed = sectionActions.removeSection.mock.calls[0][2] as () => boolean;
         expect(listed()).toBe(true);
         h.item.set({ sections: [sec("element.io.section.s2", "Home", true)] });
         expect(listed()).toBe(false);
-        for (const call of [() => bridge.editSection("element.io.section.nope"), () => bridge.removeSection("element.io.section.nope")])
+        for (const call of [
+            () => bridge.editSection("element.io.section.nope"),
+            () => bridge.removeSection("element.io.section.nope"),
+        ])
             await expect(call()).rejects.toMatchObject({ code: "failed" });
         expect(sectionActions.editSection).toHaveBeenCalledTimes(1);
         expect(sectionActions.removeSection).toHaveBeenCalledTimes(2);
