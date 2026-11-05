@@ -37,6 +37,8 @@ const DIALOG_OPEN_MS = 5_000;
 
 export interface DialogHandle {
     finished: Promise<unknown[]>;
+    /** A dialog that took this one's place on the stack (Element's static modals overwrite each other), if any. */
+    replacedBy?: () => object | undefined;
 }
 
 let dialogActionRunning = false;
@@ -74,11 +76,31 @@ function finishedOrDropped(handle: DialogHandle, mine: object | undefined): Prom
     });
 }
 
+/** Resolves once `modal` is no longer in Element's modal stack (closed, or another dialog took its place). */
+function leftStack(modal: object): Promise<void> {
+    return new Promise<void>((resolve) => {
+        const check = (): void => {
+            if (modalStack().has(modal)) return;
+            Modal.off(ModalManagerEvent.Closed, check);
+            Modal.off(ModalManagerEvent.Opened, check);
+            resolve();
+        };
+        Modal.on(ModalManagerEvent.Closed, check);
+        Modal.on(ModalManagerEvent.Opened, check);
+        check();
+    });
+}
+
 /** The dispatched payloads of one action, newest last, until `stop`. */
 export function recordPayloads(): {
     payloads: ActionPayload[];
     stop: () => void;
-    wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since?: number) => Promise<T>;
+    wait: <T>(
+        pick: (p: ActionPayload) => T | Error | undefined,
+        ms: number,
+        since?: number,
+        signal?: AbortSignal,
+    ) => Promise<T>;
 } {
     const payloads: ActionPayload[] = [];
     const waiters = new Set<(p: ActionPayload) => void>();
@@ -89,12 +111,23 @@ export function recordPayloads(): {
     return {
         payloads,
         stop: () => defaultDispatcher.unregister(token),
-        wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since = 0): Promise<T> =>
+        wait: <T>(
+            pick: (p: ActionPayload) => T | Error | undefined,
+            ms: number,
+            since = 0,
+            signal?: AbortSignal,
+        ): Promise<T> =>
             new Promise<T>((resolve, reject) => {
                 const timer = setTimeout(() => {
                     waiters.delete(check);
                     reject(new ClientViewActionError("failed", "Element did not finish the action in time"));
                 }, ms);
+                // An abort drops the timer and the waiter (the caller no longer needs the answer) and rejects, unheard.
+                signal?.addEventListener("abort", () => {
+                    clearTimeout(timer);
+                    waiters.delete(check);
+                    reject(new ClientViewActionError("failed", "The wait was stopped"));
+                });
                 const check = (p: ActionPayload): void => {
                     const hit = pick(p);
                     if (hit === undefined) return;
@@ -112,9 +145,10 @@ export function recordPayloads(): {
 
 /**
  * Runs `start` (a view-model action that makes `MatrixChat` open a dialog) and resolves with the handle of the first
- * dialog that opens, so the dialog's own result can be read. Only one such action runs at a time.
+ * dialog that opens, so the dialog's own result can be read. Only one such action runs at a time. `onOpened` runs right
+ * after the dialog opened (before any later dispatch), `onFinished` once its result is in.
  */
-export function openedDialog(start: () => void, onFinished?: () => void): Promise<DialogHandle> {
+export function openedDialog(start: () => void, onFinished?: () => void, onOpened?: () => void): Promise<DialogHandle> {
     return new Promise<DialogHandle>((resolve, reject) => {
         // oxlint-disable-next-line typescript/unbound-method -- put back as it was; called with `Modal` as `this` below
         const original = Modal.createDialog;
@@ -135,6 +169,8 @@ export function openedDialog(start: () => void, onFinished?: () => void): Promis
             const stackBefore = modalStack();
             const handle = original.apply(Modal, args);
             if (!settled) {
+                // The mark of this dialog's opening: what the caller records after it belongs to the dialog.
+                onOpened?.();
                 const mine = [...modalStack()].find((m) => !stackBefore.has(m));
                 // Registered before the caller of `createDialog` can await the result, so it runs before whatever Element
                 // does after the answer: the mark it takes separates what came before the answer from what follows.
@@ -142,7 +178,10 @@ export function openedDialog(start: () => void, onFinished?: () => void): Promis
                 settled = true;
                 clearTimeout(timer);
                 restore();
-                resolve({ finished: finishedOrDropped(handle, mine) });
+                resolve({
+                    finished: finishedOrDropped(handle, mine),
+                    replacedBy: () => [...modalStack()].find((m) => m !== mine && !stackBefore.has(m)),
+                });
             }
             return handle;
         };
@@ -238,6 +277,170 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
             seen.stop();
         }
     });
+}
+
+/** What the directory needs of the bridge's room list: whether a room is listed in `rooms()`, and when that list changes. */
+export interface DirectoryRooms {
+    /** The room is in the kit's list and joined (an invitation is listed too, but is not a join). */
+    isListed: (roomId: string) => boolean;
+    onRooms: (cb: () => void) => () => void;
+    /** A new chat's local room that Element opened after the action had answered `cancelled` (within 15 s of it). */
+    onLateChat?: (roomId: string) => void;
+}
+
+/** What Spotlight dispatches for a picked room (`SpotlightDialog.viewRoom`); a person row's is `isPersonPick`. */
+const isDirectoryRoomPick = (p: ActionPayload): boolean => isViewRoom(p) && p.metricsTrigger === "WebUnifiedSearch";
+/**
+ * What a person row of Spotlight dispatches (`startDmOnFirstMessage`): an existing DM (`MessageUser`) or the new chat's
+ * local room. Not `Created`: that is the room `startDm` makes for a single 3rd-party invite, which only the invite dialog
+ * that replaces Spotlight (a followed replacement) can lead to; any other `Created` is somebody else's room.
+ */
+const isPersonPick = (p: ActionPayload): boolean =>
+    isViewRoom(p) &&
+    (p.metricsTrigger === "MessageUser" ||
+        (isLocalRoom(p.room_id) && (p as { targets?: unknown }).targets !== undefined));
+
+/**
+ * W1 / W5 directory and server search: Element's Spotlight dialog (`Action.ViewRoomDirectory`, or `OpenSpotlight` on the
+ * People filter), opened by `start`. The dialog's `finished` is `[]` on every close, so the result is read from the
+ * `ViewRoom` the dialog dispatched. A room row dispatches it before the dialog closes: a joined room (listed) is `done`;
+ * `auto_join` is `done` once the room is listed (`failed` on `JoinRoomError` for it, or after 15 s); a room only
+ * peeked (`should_peek`, world-readable) is `done` with `peek: true`; an alias-only `ViewRoom` waits for the re-dispatch
+ * that carries the id (`ViewRoomError` is `failed`). A person row runs `startDmOnFirstMessage`, which dispatches the
+ * chat's `ViewRoom` after `resolveThreePids`, i.e. after the dialog closed: that is awaited as in `startChatViaDialog`
+ * (an existing DM, or the local room of a new one) for either filter, as the rooms filter lists people too. Closed with
+ * no such `ViewRoom` is `cancelled`.
+ */
+export function directoryViaDialog(
+    filter: "rooms" | "people",
+    start: () => void,
+    rooms: DirectoryRooms,
+): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        const seen = recordPayloads();
+        // Only what Spotlight dispatches once it is open is its result: an earlier ViewRoom (a notification click, an
+        // answered call, one dispatched while `start` ran) is not the pick.
+        let openedAt = 0;
+        // A person pick is `isPersonPick`; after a followed replacement (the invite dialog) `Created` is one too.
+        let followed = false;
+        const isPick = (p: ActionPayload): boolean =>
+            isDirectoryRoomPick(p) || (followed ? isChatViewRoom(p) : isPersonPick(p));
+        const pickFrom = (from: number): number => {
+            const at = seen.payloads.slice(from).findIndex(isPick);
+            return at < 0 ? at : at + from;
+        };
+        try {
+            const dialog = await openedDialog(start, undefined, () => (openedAt = seen.payloads.length));
+            await dialog.finished;
+            // The group-chat button replaces Spotlight with Element's invite dialog (static over static: Spotlight's `finished`
+            // never resolves, it is answered as dropped). That dialog is the rest of the action: hold the lock until it is gone.
+            // A room pick already made is not followed (an error dialog after a join is not part of the action).
+            if (!seen.payloads.slice(openedAt).some(isDirectoryRoomPick)) {
+                for (let next = dialog.replacedBy?.(); next; next = dialog.replacedBy?.()) {
+                    followed = true;
+                    await leftStack(next);
+                }
+            }
+            // A room row dispatches before it closes; one tick covers a queued dispatch. A person row's follows the close.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            let at = pickFrom(openedAt);
+            if (at < 0) {
+                try {
+                    await seen.wait<true>((p) => (isPick(p) ? true : undefined), CHAT_SHOWN_MS, openedAt);
+                } catch {
+                    watchLateChat(rooms);
+                    return { status: "cancelled" };
+                }
+                at = pickFrom(openedAt);
+            }
+            if (at < 0) return { status: "cancelled" };
+            const first = seen.payloads[at] as ViewRoomPayload;
+            if (!isDirectoryRoomPick(first)) return { status: "done", roomId: first.room_id };
+            let pick = first;
+
+            if (!pick.room_id) {
+                // Alias-only: RoomViewStore resolves it and dispatches the same payload again with the room id.
+                const alias = pick.room_alias;
+                pick = await seen.wait<ViewRoomPayload>(
+                    (p) => {
+                        if (p.action === Action.ViewRoomError && (p as { room_alias?: string }).room_alias === alias)
+                            return new ClientViewActionError("failed", "Element could not resolve the room alias");
+                        return isViewRoom(p) && p.room_alias === alias && !!p.room_id ? p : undefined;
+                    },
+                    ROOM_ACTION_TIMEOUT_MS,
+                    at,
+                );
+                at = seen.payloads.length;
+            }
+            const roomId = pick.room_id as string;
+            if (rooms.isListed(roomId)) return { status: "done", roomId };
+            if (pick.auto_join) {
+                await listedOrJoinError(roomId, rooms, seen, at);
+                return { status: "done", roomId };
+            }
+            // `should_peek` (a world-readable room) is the only peek; a room Element opens without joining or peeking
+            // (ask to join) is not one the kit can show.
+            if (pick.should_peek) return { status: "done", roomId, peek: true };
+            throw new ClientViewActionError("failed", "Element opened the room without joining or previewing it");
+        } finally {
+            seen.stop();
+        }
+    });
+}
+
+/**
+ * `startDmOnFirstMessage` dispatches the chat's `ViewRoom` after `resolveThreePids`, which can outlast the wait: Element
+ * then opens a local room the kit has not been told about. For 15 s more, hand a local-room chat to `onLateChat`.
+ */
+function watchLateChat(rooms: DirectoryRooms): void {
+    if (!rooms.onLateChat) return;
+    const late = recordPayloads();
+    late.wait<string>(
+        (p) => (isChatViewRoom(p) && p.room_id && isLocalRoom(p.room_id) ? p.room_id : undefined),
+        ROOM_ACTION_TIMEOUT_MS,
+    )
+        .then(
+            (roomId) => rooms.onLateChat?.(roomId),
+            () => {},
+        )
+        .finally(late.stop);
+}
+
+/** Resolves once the room is joined and in `rooms()`; rejects on `JoinRoomError` for it (after `since`) or after 15 s. */
+async function listedOrJoinError(
+    roomId: string,
+    rooms: DirectoryRooms,
+    seen: ReturnType<typeof recordPayloads>,
+    since: number,
+): Promise<void> {
+    const stopWaiting = new AbortController();
+    const failed = seen.wait<never>(
+        (p) =>
+            p.action === Action.JoinRoomError && (p as { roomId?: string | null }).roomId === roomId
+                ? toActionError((p as { err?: unknown }).err)
+                : undefined,
+        ROOM_ACTION_TIMEOUT_MS,
+        since,
+        stopWaiting.signal,
+    );
+    failed.catch(() => {});
+    let off = (): void => {};
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const listed = new Promise<void>((resolve) => {
+        const check = (): void => {
+            if (rooms.isListed(roomId)) resolve();
+        };
+        off = rooms.onRooms(check);
+        poll = setInterval(check, 250);
+        check();
+    });
+    try {
+        await Promise.race([listed, failed]);
+    } finally {
+        off();
+        clearInterval(poll);
+        stopWaiting.abort();
+    }
 }
 
 /**

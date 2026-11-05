@@ -45,6 +45,8 @@ import { TimelineRenderingType } from "../contexts/RoomContext";
 import SettingsStore from "../settings/SettingsStore";
 import { OwnProfileStore } from "../stores/OwnProfileStore";
 import defaultDispatcher from "../dispatcher/dispatcher";
+import { Action } from "../dispatcher/actions";
+import { Filter } from "../components/views/dialogs/spotlight/Filter";
 import { avatarUrlForRoom } from "../Avatar";
 import { resolveRoomMemberProfile, roomMemberToMemberInfo } from "../hooks/room/useRoomMemberProfile";
 import { RoomListViewModel } from "../viewmodels/room-list/RoomListViewModel";
@@ -91,6 +93,7 @@ import UserProvider from "../autocomplete/UserProvider";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import {
     createRoomViaDialog,
+    directoryViaDialog,
     forwardViaDialog,
     leaveViaDialog,
     startChatViaDialog,
@@ -1105,7 +1108,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 3;
+    public readonly version = 4;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -2446,6 +2449,40 @@ export class ViewModelBridge implements ClientViewBridge {
     public async createChat(): Promise<ActionOutcome> {
         const outcome = await startChatViaDialog(() => this.roomList.createChatRoom());
         // The local room of a new chat is listed (and opened) by the kit like any room until the first send creates it.
+        if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
+            this.localChats.add(outcome.roomId);
+            this.syncRooms();
+        }
+        return outcome;
+    }
+
+    public async openDirectory(opts: { term?: string; filter?: "rooms" | "people" } = {}): Promise<ActionOutcome> {
+        this.used = true;
+        const people = opts.filter === "people";
+        const initialText = opts.term;
+        const outcome = await directoryViaDialog(
+            people ? "people" : "rooms",
+            () =>
+                people
+                    ? defaultDispatcher.dispatch(
+                          { action: Action.OpenSpotlight, initialText, initialFilter: Filter.People },
+                          true,
+                      )
+                    : defaultDispatcher.dispatch({ action: Action.ViewRoomDirectory, initialText }, true),
+            {
+                // Joined: an invitation is in the list too, but picking its public-directory row still has to join it.
+                isListed: (roomId) => this.roomCache.some((r) => r.id === roomId && r.membership !== "invite"),
+                onRooms: (cb) =>
+                    this.onChange((e) => {
+                        if (e.kind === "rooms") cb();
+                    }),
+                onLateChat: (roomId) => {
+                    this.localChats.add(roomId);
+                    this.syncRooms();
+                },
+            },
+        );
+        // A new chat's local room is listed (and opened) by the kit like any room until the first send creates it (as createChat).
         if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
             this.localChats.add(outcome.roomId);
             this.syncRooms();

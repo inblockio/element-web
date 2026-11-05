@@ -257,7 +257,7 @@ export type ViewConnection = "online" | "connecting" | "offline";
  * returned). `cancelled`: the user dismissed Element's own dialog or picker (never an error).
  */
 export type ActionOutcome =
-    | { status: "done"; roomId?: string; eventId?: string; section?: string }
+    | { status: "done"; roomId?: string; eventId?: string; section?: string; peek?: boolean }
     | { status: "cancelled" };
 
 export type ClientViewActionErrorCode =
@@ -301,7 +301,7 @@ export interface LoadOlderResult {
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 3;
+    readonly version: 4;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -373,6 +373,16 @@ export interface ClientViewBridge {
      * `cancelled` when the dialog closes without a chat.
      */
     createChat(): Promise<ActionOutcome>;
+    /**
+     * M10 W1 / W5 (version 4): Element's Spotlight over the kit, to browse the server's public rooms (`filter: "rooms"`, the
+     * default; `Action.ViewRoomDirectory`) or search its people (`filter: "people"`; `Action.OpenSpotlight` on the People
+     * filter), starting at `term`. Rooms: `done` + the room's id once it is listed in `rooms()` (the pick joined it, or
+     * it already was), `done` + `peek: true` for a world-readable room Element only previews (it is not in `rooms()`),
+     * `failed` when the join fails or the room is not listed within 15 s. People: `done` + the chat's room id (an existing DM,
+     * or the local room of a new one, listed in `rooms()` like `createChat`'s). `cancelled` when the dialog closes without a pick.
+     * One Element dialog action at a time (`failed` while another runs). Interim (D41): no shared directory view-model.
+     */
+    openDirectory(opts?: { term?: string; filter?: "rooms" | "people" }): Promise<ActionOutcome>;
     /**
      * A7: Element's leave confirm (`RoomListItemViewModel.onLeaveRoom`). `done` once the user is no longer in the room,
      * `cancelled` when the confirm says no, `unsupported` for an archived room, `failed` when the leave did not happen.
