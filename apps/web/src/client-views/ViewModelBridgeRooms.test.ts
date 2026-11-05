@@ -312,6 +312,22 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
     });
 
+    it("lists a new chat's local room that Element opens after the directory gave up (late chat)", async () => {
+        const local = { roomId: LOCAL_ROOM_ID_PREFIX + "dm3", name: "Dora", state: LocalRoomState.NEW, tags: {} };
+        rooms[local.roomId] = local;
+        let late: (id: string) => void = () => {};
+        actions.directoryViaDialog.mockImplementation(
+            async (_filter: string, _start: () => void, r: { onLateChat?: (id: string) => void }) => {
+                late = r.onLateChat ?? late;
+                return { status: "cancelled" };
+            },
+        );
+        await expect(bridge.openDirectory({ filter: "people" })).resolves.toEqual({ status: "cancelled" });
+        expect(bridge.rooms().map((r) => r.id)).not.toContain(local.roomId);
+        late(local.roomId);
+        expect(bridge.rooms().map((r) => r.id)).toContain(local.roomId);
+    });
+
     it("tells the directory an invitation is not a joined room (the kit lists it, but the join has not happened)", async () => {
         const seen: Array<(id: string) => boolean> = [];
         actions.directoryViaDialog.mockImplementation(

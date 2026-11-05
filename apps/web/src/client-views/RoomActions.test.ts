@@ -1031,6 +1031,41 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
         }
     });
 
+    describe("a chat that Element opens after the wait gave up (resolveThreePids can be slow)", () => {
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+        afterEach(() => {
+            vi.useRealTimers();
+        });
+        /** Closed with no pick, the wait over: the action has answered cancelled. */
+        const cancelledDirectory = async (onLateChat: (id: string) => void): Promise<void> => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog("people", d.start, { ...roomList(), onLateChat });
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        };
+
+        it("tells the bridge the new chat's local room (only that, only within the window), so the kit can list it", async () => {
+            const late = vi.fn();
+            await cancelledDirectory(late);
+            expect(late).not.toHaveBeenCalled();
+            await vi.advanceTimersByTimeAsync(3_000);
+            viewRoom("!dm:example.org", "MessageUser");
+            viewRoom("!n:example.org", "Notification");
+            expect(late).not.toHaveBeenCalled();
+            viewRoom("local+late:example.org", undefined, [{}]);
+            await vi.advanceTimersByTimeAsync(0);
+            expect(late).toHaveBeenCalledExactlyOnceWith("local+late:example.org");
+            await vi.advanceTimersByTimeAsync(15_001);
+            viewRoom("local+toolate:example.org", undefined, [{}]);
+            await vi.advanceTimersByTimeAsync(0);
+            expect(late).toHaveBeenCalledTimes(1);
+            expect(vi.getTimerCount()).toBe(0);
+        });
+    });
+
     it("clears the join-error timer once the picked room is listed (no 15 s timer is left behind)", async () => {
         vi.useFakeTimers();
         try {

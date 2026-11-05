@@ -281,6 +281,8 @@ export interface DirectoryRooms {
     /** The room is in the kit's list and joined (an invitation is listed too, but is not a join). */
     isListed: (roomId: string) => boolean;
     onRooms: (cb: () => void) => () => void;
+    /** A new chat's local room that Element opened after the action had answered `cancelled` (within 15 s of it). */
+    onLateChat?: (roomId: string) => void;
 }
 
 /** What Spotlight dispatches for a picked room (`SpotlightDialog.viewRoom`); a person row's is `isChatViewRoom`. */
@@ -321,6 +323,7 @@ export function directoryViaDialog(
                 try {
                     await seen.wait<true>((p) => (isDirectoryPick(p) ? true : undefined), CHAT_SHOWN_MS);
                 } catch {
+                    watchLateChat(rooms);
                     return { status: "cancelled" };
                 }
                 at = seen.payloads.findIndex(isDirectoryPick);
@@ -358,6 +361,24 @@ export function directoryViaDialog(
             seen.stop();
         }
     });
+}
+
+/**
+ * `startDmOnFirstMessage` dispatches the chat's `ViewRoom` after `resolveThreePids`, which can outlast the wait: Element
+ * then opens a local room the kit has not been told about. For 15 s more, hand a local-room chat to `onLateChat`.
+ */
+function watchLateChat(rooms: DirectoryRooms): void {
+    if (!rooms.onLateChat) return;
+    const late = recordPayloads();
+    late.wait<string>(
+        (p) => (isChatViewRoom(p) && p.room_id && isLocalRoom(p.room_id) ? p.room_id : undefined),
+        ROOM_ACTION_TIMEOUT_MS,
+    )
+        .then(
+            (roomId) => rooms.onLateChat?.(roomId),
+            () => {},
+        )
+        .finally(late.stop);
 }
 
 /** Resolves once the room is joined and in `rooms()`; rejects on `JoinRoomError` for it (after `since`) or after 15 s. */

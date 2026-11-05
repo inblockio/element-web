@@ -2476,6 +2476,10 @@ export class ViewModelBridge implements ClientViewBridge {
                     this.onChange((e) => {
                         if (e.kind === "rooms") cb();
                     }),
+                onLateChat: (roomId) => {
+                    this.localChats.add(roomId);
+                    this.syncRooms();
+                },
             },
         );
         // A new chat's local room is listed (and opened) by the kit like any room until the first send creates it (as createChat).
