@@ -1566,10 +1566,10 @@ export class ViewModelBridge implements ClientViewBridge {
         return { userId: s.userId, displayName: s.displayName, avatarUrl: s.avatarUrl, roomSort: currentRoomSort() };
     }
 
-    /** M10 W4: Element's settings dialog on the Account tab (name, avatar); `done` when it closes. */
+    /** M10 W4: Element's settings dialog on the Account tab (name, avatar); `done` when it closes, `failed` for a guest. */
     public openUserSettings(): Promise<ActionOutcome> {
         this.used = true;
-        return openUserSettings();
+        return openUserSettings(this.client);
     }
 
     /** M10 W6: the room list sort as `RoomListHeaderViewModel.sort` sets it; `done` once the setting reads it. */

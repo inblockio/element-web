@@ -10,12 +10,16 @@
  *
  * `openUserSettings`: Element's own settings dialog on its Account tab (`Action.ViewUserSettings`, answered by MatrixChat
  * with `UserSettingsDialog`; name and avatar are `UserProfileSettings`). `UserMenuViewModel.openSettings` takes no tab, so
- * the action is dispatched as the view-model does, with the tab. `done` when the dialog closes.
+ * the action is dispatched as the view-model does, with the tab. `done` when the dialog closes. A guest gets `failed`:
+ * `MatrixChat` answers a guest's `ViewUserSettings` with a stored deferred action and Element's sign-in question, not the
+ * settings dialog, so nothing is dispatched.
  *
  * `setRoomSort`: the store call `RoomListHeaderViewModel.sort(option)` runs, with its option -> `SortingAlgorithm` switch.
  * `RoomListStoreV3.resort` re-sorts, emits `ListsUpdate` (the bridge's `rooms` follow) and writes the device setting
  * `RoomList.preferredSorting`; no own sort here. `done` once the setting reads the new value.
  */
+
+import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
@@ -55,8 +59,9 @@ export function roomSortOf(value: unknown): ViewRoomSort | undefined {
 /** The room list sort the device setting holds now. */
 export const currentRoomSort = (): ViewRoomSort | undefined => roomSortOf(SettingsStore.getValue(SORT_SETTING));
 
-export function openUserSettings(): Promise<ActionOutcome> {
+export function openUserSettings(client: Pick<MatrixClient, "isGuest">): Promise<ActionOutcome> {
     return dialogAction(async () => {
+        if (client.isGuest()) throw new ClientViewActionError("failed", "a guest has no settings: sign in first");
         const dialog = await openedDialog(() => {
             defaultDispatcher.dispatch<OpenToTabPayload>({
                 action: Action.ViewUserSettings,

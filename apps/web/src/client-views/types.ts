@@ -534,7 +534,8 @@ export interface ClientViewBridge {
      * M10 W4 (additive, kit feature-checks it): Element's own settings dialog on its Account tab over the kit
      * (`Action.ViewUserSettings`, `UserTab.Account`: name and avatar are `UserProfileSettings`; Element's other tabs show
      * too, D17). `done` when the dialog closes (Element saves the profile itself; the kit follows `me()`), `failed` when
-     * the dialog does not open or another Element dialog action is running.
+     * the dialog does not open, another Element dialog action is running, or the session is a guest's (Element would
+     * show its sign-in question and keep the action for after sign-in: nothing is dispatched).
      */
     openUserSettings(): Promise<ActionOutcome>;
     /**

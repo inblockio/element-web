@@ -523,6 +523,7 @@ describe("ViewModelBridge", () => {
         bridge = new ViewModelBridge({
             getRoom: (id: string) => (id === "!a" ? h.room : null),
             getUserId: () => "@me:example.org",
+            isGuest: () => false,
             isRoomEncrypted: () => h.roomEncrypted.value,
             hasLazyLoadMembersEnabled: () => h.lazyLoad.value,
             getCrypto: () => undefined,
@@ -3442,10 +3443,11 @@ describe("ViewModelBridge", () => {
     describe("M10 room sort and user settings", () => {
         const SORT = "RoomList.preferredSorting";
         // The harness clears `h.watchers` after it builds `bridge`: a bridge built in the test keeps its constructor watchers.
-        const fresh = (): ViewModelBridge =>
+        const fresh = (guest = false): ViewModelBridge =>
             new ViewModelBridge({
                 getRoom: (id: string) => (id === "!a" ? h.room : null),
                 getUserId: () => "@me:example.org",
+                isGuest: () => guest,
                 isRoomEncrypted: () => h.roomEncrypted.value,
                 hasLazyLoadMembersEnabled: () => h.lazyLoad.value,
                 getCrypto: () => undefined,
@@ -3515,6 +3517,19 @@ describe("ViewModelBridge", () => {
 
         it("setRoomSort refuses unread-first as unsupported", async () => {
             await expect(bridge.setRoomSort("unread-first" as never)).rejects.toMatchObject({ code: "unsupported" });
+        });
+
+        it("openUserSettings answers failed for a guest session and dispatches nothing", async () => {
+            const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
+            try {
+                const b = fresh(true);
+                await expect(b.openUserSettings()).rejects.toMatchObject({ code: "failed" });
+                expect(dispatch).not.toHaveBeenCalled();
+                expect(h.createDialog).not.toHaveBeenCalled();
+                b.dispose();
+            } finally {
+                dispatch.mockRestore();
+            }
         });
 
         it("openUserSettings dispatches ViewUserSettings on the Account tab and is done when Element's dialog closes", async () => {

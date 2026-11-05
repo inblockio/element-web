@@ -156,6 +156,8 @@ describe("M10 W6 setRoomSort (RoomListStoreV3.resort, the call RoomListHeaderVie
 
 describe("M10 W4 openUserSettings (Action.ViewUserSettings on the Account tab)", () => {
     type Mockable = { createDialog: unknown };
+    const member = { isGuest: () => false };
+    const guest = { isGuest: () => true };
     let finish!: (r: unknown[]) => void;
     let dispatch: ReturnType<typeof vi.spyOn>;
 
@@ -179,7 +181,7 @@ describe("M10 W4 openUserSettings (Action.ViewUserSettings on the Account tab)",
     it("dispatches ViewUserSettings with the Account tab and is done when the dialog closes", async () => {
         elementOpensTheDialog();
         let done = false;
-        const outcome = openUserSettings().then((o) => {
+        const outcome = openUserSettings(member).then((o) => {
             done = true;
             return o;
         });
@@ -195,25 +197,41 @@ describe("M10 W4 openUserSettings (Action.ViewUserSettings on the Account tab)",
 
     it("answers failed while another Element dialog action runs, and accepts the next call after the first closes", async () => {
         elementOpensTheDialog();
-        const first = openUserSettings();
+        const first = openUserSettings(member);
         await new Promise((r) => setTimeout(r, 0));
-        const second = openUserSettings();
+        const second = openUserSettings(member);
         await expect(second).rejects.toMatchObject({ code: "failed" });
         expect(dispatch).toHaveBeenCalledOnce();
         finish([]);
         await expect(first).resolves.toEqual({ status: "done" });
 
         elementOpensTheDialog();
-        const third = openUserSettings();
+        const third = openUserSettings(member);
         await new Promise((r) => setTimeout(r, 0));
         finish([]);
         await expect(third).resolves.toEqual({ status: "done" });
     });
 
+    it("answers failed for a guest and dispatches nothing: Element would show its sign-in question and keep the action", async () => {
+        elementOpensTheDialog();
+        const outcome = openUserSettings(guest);
+        await expect(outcome).rejects.toBeInstanceOf(ClientViewActionError);
+        await expect(outcome).rejects.toMatchObject({ code: "failed", message: expect.stringContaining("sign in") });
+        expect(dispatch).not.toHaveBeenCalled();
+        expect((Modal as unknown as Mockable).createDialog).not.toHaveBeenCalled();
+
+        // The refusal leaves no running dialog action behind: a member's call right after works.
+        const next = openUserSettings(member);
+        await new Promise((r) => setTimeout(r, 0));
+        expect(dispatch).toHaveBeenCalledOnce();
+        finish([]);
+        await expect(next).resolves.toEqual({ status: "done" });
+    });
+
     it("fails when Element's dialog does not open", async () => {
         vi.useFakeTimers();
         dispatch.mockImplementation(() => {});
-        const code = codeOf(openUserSettings());
+        const code = codeOf(openUserSettings(member));
         await vi.advanceTimersByTimeAsync(5_001);
         expect(await code).toBe("failed");
     });
