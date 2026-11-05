@@ -32,9 +32,15 @@ import { ClientViewActionError } from "./types";
 vi.mock("../utils/direct-messages", () => ({
     startDmOnFirstMessage: vi.fn(),
     DirectoryMember: class {
-        public constructor(private readonly result: { user_id: string }) {}
+        public constructor(private readonly result: { user_id: string; display_name?: string; avatar_url?: string }) {}
         public get userId(): string {
             return this.result.user_id;
+        }
+        public get name(): string {
+            return this.result.display_name || this.result.user_id;
+        }
+        public getMxcAvatarUrl(): string | undefined {
+            return this.result.avatar_url;
         }
     },
 }));
@@ -1389,12 +1395,34 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
 });
 
 describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the message menu's Reply directly)", () => {
-    const client = { getUserId: () => "@me:example.org" } as unknown as MatrixClient;
+    // The client holds no rooms and no users unless a test says so (`rooms`, `users`).
+    let rooms: unknown[] = [];
+    let users: Record<string, unknown> = {};
+    const client = {
+        getUserId: () => "@me:example.org",
+        getRooms: () => rooms,
+        getUser: (id: string) => users[id] ?? null,
+    } as unknown as MatrixClient;
     const startDm = vi.mocked(startDmOnFirstMessage);
     const targetsOf = (call: number): string[] =>
         (startDm.mock.calls[call][1] as unknown as Array<{ userId: string }>).map((t) => t.userId);
+    const targetOf = (call: number): { userId: string; name: string; getMxcAvatarUrl: () => string | undefined } =>
+        (startDm.mock.calls[call][1] as unknown as Array<ReturnType<typeof targetOf>>)[0];
+    const member = (membership: string, rawDisplayName: string, mxc: string | null = null): unknown => ({
+        membership,
+        rawDisplayName,
+        getMxcAvatarUrl: () => mxc,
+    });
+    /** A room of ours in which `userId` is the given member. */
+    const roomWith = (userId: string, m: unknown): unknown => ({
+        getMember: (id: string) => (id === userId ? m : null),
+    });
 
-    beforeEach(() => startDm.mockReset());
+    beforeEach(() => {
+        startDm.mockReset();
+        rooms = [];
+        users = {};
+    });
 
     it("is done with the room of an existing DM that Element returns", async () => {
         startDm.mockResolvedValue("!dm:example.org");
@@ -1412,6 +1440,65 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
         await expect(startDmWithUser(client, "@carol:example.org")).resolves.toEqual({
             status: "done",
             roomId: "local+abc:example.org",
+        });
+    });
+
+    describe("M12 Z2 the new chat is titled with the person's name (stock passes display_name + avatar_url)", () => {
+        beforeEach(() => startDm.mockResolvedValue("local+abc:example.org"));
+
+        it("hands over the display name and avatar of the joined member of a shared room, as stock does", async () => {
+            rooms = [roomWith("@bob:example.org", member("join", "Bob Builder", "mxc://example.org/bob"))];
+            await startDmWithUser(client, "@bob:example.org");
+            expect(targetOf(0).userId).toBe("@bob:example.org");
+            expect(targetOf(0).name).toBe("Bob Builder");
+            expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+        });
+
+        it("takes the first room that names the user, skipping rooms where they are unknown, left, or only the id", async () => {
+            rooms = [
+                { getMember: () => null },
+                roomWith("@bob:example.org", member("leave", "Bob Left", "mxc://example.org/left")),
+                roomWith("@bob:example.org", member("join", "@bob:example.org")),
+                roomWith("@bob:example.org", member("join", "Bob Builder", "mxc://example.org/bob")),
+                roomWith("@bob:example.org", member("join", "Bobby", "mxc://example.org/other")),
+            ];
+            await startDmWithUser(client, "@bob:example.org");
+            expect(targetOf(0).name).toBe("Bob Builder");
+            expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+        });
+
+        it("falls back to the client's own User when no shared room names them", async () => {
+            rooms = [roomWith("@bob:example.org", member("join", "@bob:example.org"))];
+            users = { "@bob:example.org": { rawDisplayName: "Bob Builder", avatarUrl: "mxc://example.org/user" } };
+            await startDmWithUser(client, "@bob:example.org");
+            expect(targetOf(0).name).toBe("Bob Builder");
+            expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/user");
+        });
+
+        it("keeps an avatar the member has when only the id is known as a name", async () => {
+            rooms = [roomWith("@bob:example.org", member("join", "@bob:example.org", "mxc://example.org/bob"))];
+            await startDmWithUser(client, "@bob:example.org");
+            expect(targetOf(0).name).toBe("@bob:example.org");
+            expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+        });
+
+        it("an unknown user still starts with the id as the name and no avatar", async () => {
+            rooms = [roomWith("@dave:example.org", member("join", "Dave"))];
+            await expect(startDmWithUser(client, "@bob:example.org")).resolves.toEqual({
+                status: "done",
+                roomId: "local+abc:example.org",
+            });
+            expect(targetsOf(0)).toEqual(["@bob:example.org"]);
+            expect(targetOf(0).name).toBe("@bob:example.org");
+            expect(targetOf(0).getMxcAvatarUrl()).toBeUndefined();
+        });
+
+        it("makes no server call: only the rooms and users the client already holds are read", async () => {
+            const getProfileInfo = vi.fn();
+            const spy = { ...client, getProfileInfo } as unknown as MatrixClient;
+            rooms = [roomWith("@bob:example.org", member("join", "Bob Builder"))];
+            await startDmWithUser(spy, "@bob:example.org");
+            expect(getProfileInfo).not.toHaveBeenCalled();
         });
     });
 

@@ -14,7 +14,7 @@
  * `ViewRoom` Element dispatches after a create, the membership that drops after a leave. No `ViewRoom` of our own.
  */
 
-import { EventStatus, type MatrixClient } from "matrix-js-sdk/src/matrix";
+import { EventStatus, KnownMembership, type MatrixClient } from "matrix-js-sdk/src/matrix";
 
 import Modal, { ModalManagerEvent } from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
@@ -314,6 +314,30 @@ const MATRIX_USER_ID = /^@[^\s:]+:\S+$/;
 export const DM_LOCK_CAP_MS = 60_000;
 
 /**
+ * M12 Z2 the display name and avatar (mxc) that Element's client already holds for a user, for the `DirectoryMember` of a new
+ * DM. Stock hands both over (`UserInfoBasicOptionsViewModel.onOpenDmForUser`: `rawDisplayName` + the member's or user's
+ * avatar); `createDmLocalRoom` titles the local room from them, so a member without a name titles the chat with the user id
+ * until the first send. "Reply directly" is only offered on another sender's message, so the user is a joined member of a room
+ * we share (the first one that names them), else the client's own `User` (a profile it was told of). Nothing known gives `{}`
+ * and the id stays the title. No server call: only what the client holds.
+ */
+export function knownProfile(client: MatrixClient, userId: string): { display_name?: string; avatar_url?: string } {
+    let avatar: string | undefined;
+    for (const room of client.getRooms()) {
+        const member = room.getMember(userId);
+        if (member?.membership !== KnownMembership.Join) continue;
+        const memberAvatar = member.getMxcAvatarUrl() ?? undefined;
+        if (member.rawDisplayName && member.rawDisplayName !== userId)
+            return { display_name: member.rawDisplayName, avatar_url: memberAvatar };
+        avatar ??= memberAvatar;
+    }
+    const user = client.getUser(userId);
+    if (user?.rawDisplayName && user.rawDisplayName !== userId)
+        return { display_name: user.rawDisplayName, avatar_url: user.avatarUrl || avatar };
+    return avatar ? { avatar_url: avatar } : {};
+}
+
+/**
  * M11 Y4 start a DM with a user (the message menu's "Reply directly"): not a dialog. Element's own DM path
  * (`startDmOnFirstMessage`, the one the user-info "Message" button and the start-chat dialog call) dispatches the `ViewRoom`
  * itself: an existing DM opens, else a local DM room (nothing sent) that the first send turns into the real room. `done` +
@@ -340,7 +364,10 @@ export function startDmWithUser(
         let answered = false;
         let timer: ReturnType<typeof setTimeout> | undefined;
         // An async wrapper: a synchronous throw of Element's call is a rejection too.
-        const start = (async () => startDmOnFirstMessage(client, [new DirectoryMember({ user_id: userId })]))().then(
+        const start = (async () =>
+            startDmOnFirstMessage(client, [
+                new DirectoryMember({ user_id: userId, ...knownProfile(client, userId) }),
+            ]))().then(
             (roomId) => {
                 // The caller has been told `failed`: the chat Element opened is not reported to it, but it is listed.
                 if (answered && roomId && isLocalRoom(roomId)) onLateChat?.(roomId);
