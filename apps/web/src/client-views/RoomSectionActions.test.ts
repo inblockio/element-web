@@ -1022,4 +1022,26 @@ describe("M11 Y3 moveSection (RoomListStoreV3.reorderSection, answered from the 
         ]);
         expect(listed).toEqual([B, C, A]);
     });
+
+    it("F3: the neighbour comes from the stored order when sections() lags (the move already landed): the retry is failed, no reorder call", async () => {
+        stored = ["chats", B, A, "People"]; // A was moved down earlier, the bridge still lists [A, B]
+        listed = [A, B];
+        const outcome = moveSection(A, "down", order).catch((e: unknown) => e);
+        await vi.advanceTimersByTimeAsync(0);
+        const error = await outcome;
+        expect(error).toBeInstanceOf(ClientViewActionError);
+        expect((error as ClientViewActionError).code).toBe("failed");
+        expect((error as ClientViewActionError).message).toContain("is the last section");
+        expect(store.reorderSection).not.toHaveBeenCalled();
+    });
+
+    it("F3: a stored order that lists every custom (with chats between) gives the same neighbour as sections()", async () => {
+        stored = [A, "chats", B, C, "People"];
+        listed = [A, B, C];
+        store.reorderSection.mockImplementation(async (tag: string, neighbour: string) => apply(tag, neighbour));
+        const outcome = moveSection(A, "down", order);
+        await vi.advanceTimersByTimeAsync(300);
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+        expect(store.reorderSection).toHaveBeenCalledExactlyOnceWith(A, B);
+    });
 });

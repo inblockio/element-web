@@ -243,7 +243,10 @@ function isMoved(order: readonly string[], tag: string, neighbour: string, direc
 /**
  * Y3: moves the custom section `tag` one place up or down among the custom sections, as Element's own drag does
  * (`RoomListViewModel.changeSectionOrder` -> `RoomListStoreV3.reorderSection(tag, neighbour)`, not a dialog). `order` is the
- * bridge's `sections()` as tags (customs only), read when the call takes the dialog lock. It runs inside `dialogAction`,
+ * bridge's `sections()` as tags (customs only), read when the call takes the dialog lock; the neighbour comes from the stored
+ * order when that lists every custom of `order()` (after a `network` answer `sections()` can lag the store), else from
+ * `order()`. A retry whose earlier move already landed therefore targets the next neighbour: one more step, the user's
+ * intent. It runs inside `dialogAction`,
  * the one lock of every section-list write (create / edit / remove / move), so a second section write during a move
  * answers the busy `failed` instead of building its PUT from a `im.vector.web.settings` clone the move is about to
  * replace. `failed` at once for a tag it does not list and for the first / last custom
@@ -264,8 +267,10 @@ export function moveSection(
 ): Promise<ActionOutcome> {
     return dialogAction(async (holdLock) => {
         const listed = order();
-        const at = listed.indexOf(tag);
-        const neighbour = at === -1 ? undefined : listed[direction === "up" ? at - 1 : at + 1];
+        const stored = storedOrder().filter((t) => listed.includes(t));
+        const customs = stored.length === listed.length ? stored : listed; // stored order wins when it holds every listed custom
+        const at = customs.indexOf(tag);
+        const neighbour = at === -1 ? undefined : customs[direction === "up" ? at - 1 : at + 1];
         if (neighbour === undefined) {
             throw new ClientViewActionError(
                 "failed",
