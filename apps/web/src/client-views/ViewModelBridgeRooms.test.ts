@@ -312,6 +312,20 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
     });
 
+    it("tells the directory an invitation is not a joined room (the kit lists it, but the join has not happened)", async () => {
+        const seen: Array<(id: string) => boolean> = [];
+        actions.directoryViaDialog.mockImplementation(
+            async (_filter: string, _start: () => void, r: { isListed: (id: string) => boolean }) => {
+                seen.push(r.isListed);
+                return { status: "cancelled" };
+            },
+        );
+        await bridge.openDirectory();
+        expect(bridge.rooms().map((r) => [r.id, r.membership])).toContainEqual(["!inv:example.org", "invite"]);
+        expect(seen[0]("!inv:example.org")).toBe(false);
+        expect(seen[0]("!a:example.org")).toBe(true);
+    });
+
     it("does not list the room of a chat that was cancelled or that is an existing DM", async () => {
         actions.startChatViaDialog.mockResolvedValue({ status: "cancelled" });
         await bridge.createChat();

@@ -278,6 +278,7 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
 
 /** What the directory needs of the bridge's room list: whether a room is listed in `rooms()`, and when that list changes. */
 export interface DirectoryRooms {
+    /** The room is in the kit's list and joined (an invitation is listed too, but is not a join). */
     isListed: (roomId: string) => boolean;
     onRooms: (cb: () => void) => () => void;
 }
@@ -359,7 +360,7 @@ export function directoryViaDialog(
     });
 }
 
-/** Resolves once the room is in `rooms()`; rejects on `JoinRoomError` for it (after `since`) or after 15 s. */
+/** Resolves once the room is joined and in `rooms()`; rejects on `JoinRoomError` for it (after `since`) or after 15 s. */
 async function listedOrJoinError(
     roomId: string,
     rooms: DirectoryRooms,
