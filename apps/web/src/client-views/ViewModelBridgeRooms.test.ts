@@ -263,8 +263,8 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
     });
 
-    it("is bridge version 5 (openDirectory is an additive method)", () => {
-        expect(bridge.version).toBe(5);
+    it("is bridge version 6 (openDirectory is an additive method)", () => {
+        expect(bridge.version).toBe(6);
         expect(typeof bridge.openDirectory).toBe("function");
     });
 

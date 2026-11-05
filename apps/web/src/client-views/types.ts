@@ -329,7 +329,7 @@ export interface LoadOlderResult {
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 5;
+    readonly version: 6;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -467,6 +467,16 @@ export interface ClientViewBridge {
      * `failed` when it stays undecrypted, `forbidden` when the view-model does not offer the download.
      */
     download(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * M12 Z3 (version 6, additive): reveals the hidden image or video of the message `eventId` the way a click on Element's
+     * "Show image" / video preview button does (the shared body view-model action, which writes the device-level
+     * `showMediaEventIds` setting; no server write). The id is checked against the room's CURRENT timeline snapshot before
+     * anything is written. `done` once the body is no longer hidden, also for a message that is already shown (nothing is
+     * written then); the media itself arrives through the next `timeline` snapshot. `unknown_room` for a room the client
+     * does not hold, `unknown_event` for an id outside the loaded window, `unsupported` for a message without an image or
+     * video body, `failed` when the body stays hidden after 5 s (the reveal stays: Element's device semantics, no rollback).
+     */
+    showMedia(roomId: string, eventId: string): Promise<ActionOutcome>;
     /**
      * A10: marks the room unread (the room list item's `onMarkAsUnread`: the room account data `m.marked_unread`). `done`
      * once the homeserver holds it, also for a room that already shows unread; `unsupported` for an invite or an archived
