@@ -106,6 +106,7 @@ import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { setPinned } from "./PinAction";
 import { openReport } from "./ReportAction";
+import { currentRoomSort, openUserSettings, setRoomSort } from "./RoomSortAction";
 import { createSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import DMRoomMap from "../utils/DMRoomMap";
@@ -1204,6 +1205,15 @@ export class ViewModelBridge implements ClientViewBridge {
             false,
         );
         this.disposers.push(this.userMenu.subscribe(() => this.emit({ kind: "me" })));
+        // M10 W6: `me().roomSort` follows the device setting; only a changed value fires `me`.
+        let roomSort = currentRoomSort();
+        const sortRef = SettingsStore.watchSetting("RoomList.preferredSorting", null, () => {
+            const next = currentRoomSort();
+            if (next === roomSort) return;
+            roomSort = next;
+            this.emit({ kind: "me" });
+        });
+        this.disposers.push(() => SettingsStore.unwatchSetting(sortRef));
         this.watchLocalVerification();
         this.watchEncryption();
         this.watchPins();
@@ -1553,7 +1563,19 @@ export class ViewModelBridge implements ClientViewBridge {
     public me(): ViewMe {
         this.used = true;
         const s = this.userMenu.getSnapshot();
-        return { userId: s.userId, displayName: s.displayName, avatarUrl: s.avatarUrl };
+        return { userId: s.userId, displayName: s.displayName, avatarUrl: s.avatarUrl, roomSort: currentRoomSort() };
+    }
+
+    /** M10 W4: Element's settings dialog on the Account tab (name, avatar); `done` when it closes. */
+    public openUserSettings(): Promise<ActionOutcome> {
+        this.used = true;
+        return openUserSettings();
+    }
+
+    /** M10 W6: the room list sort as `RoomListHeaderViewModel.sort` sets it; `done` once the setting reads it. */
+    public setRoomSort(option: "recent" | "alphabetical"): Promise<ActionOutcome> {
+        this.used = true;
+        return setRoomSort(option);
     }
 
     public rooms(): ViewRoom[] {
