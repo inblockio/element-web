@@ -37,6 +37,8 @@ const DIALOG_OPEN_MS = 5_000;
 
 export interface DialogHandle {
     finished: Promise<unknown[]>;
+    /** A dialog that took this one's place on the stack (Element's static modals overwrite each other), if any. */
+    replacedBy?: () => object | undefined;
 }
 
 let dialogActionRunning = false;
@@ -71,6 +73,21 @@ function finishedOrDropped(handle: DialogHandle, mine: object | undefined): Prom
             (r) => (release(), resolve(r)),
             (e) => (release(), reject(e)),
         );
+    });
+}
+
+/** Resolves once `modal` is no longer in Element's modal stack (closed, or another dialog took its place). */
+function leftStack(modal: object): Promise<void> {
+    return new Promise<void>((resolve) => {
+        const check = (): void => {
+            if (modalStack().has(modal)) return;
+            Modal.off(ModalManagerEvent.Closed, check);
+            Modal.off(ModalManagerEvent.Opened, check);
+            resolve();
+        };
+        Modal.on(ModalManagerEvent.Closed, check);
+        Modal.on(ModalManagerEvent.Opened, check);
+        check();
     });
 }
 
@@ -142,7 +159,10 @@ export function openedDialog(start: () => void, onFinished?: () => void): Promis
                 settled = true;
                 clearTimeout(timer);
                 restore();
-                resolve({ finished: finishedOrDropped(handle, mine) });
+                resolve({
+                    finished: finishedOrDropped(handle, mine),
+                    replacedBy: () => [...modalStack()].find((m) => m !== mine && !stackBefore.has(m)),
+                });
             }
             return handle;
         };
@@ -271,6 +291,12 @@ export function directoryViaDialog(
         try {
             const dialog = await openedDialog(start);
             await dialog.finished;
+            // The group-chat button replaces Spotlight with Element's invite dialog (static over static: Spotlight's `finished`
+            // never resolves, it is answered as dropped). That dialog is the rest of the action: hold the lock until it is gone.
+            // A room pick already made is not followed (an error dialog after a join is not part of the action).
+            if (!seen.payloads.some(isDirectoryRoomPick)) {
+                for (let next = dialog.replacedBy?.(); next; next = dialog.replacedBy?.()) await leftStack(next);
+            }
             // A room row dispatches before it closes; one tick covers a queued dispatch. A person row's follows the close.
             await new Promise((resolve) => setTimeout(resolve, 0));
             let at = seen.payloads.findIndex(isDirectoryPick);

@@ -1031,6 +1031,95 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
         }
     });
 
+    describe("follows the group-chat dialog that replaces Spotlight (a static modal over a static modal)", () => {
+        const fake = Modal as unknown as {
+            createDialog: unknown;
+            modals: object[];
+            staticModal: object | null;
+            emit: (e: string) => void;
+        };
+        const spotlight = {};
+        const invite = {};
+        /** Spotlight is static and its `finished` never resolves once the group-chat dialog overwrites it. */
+        const spotlightOnStart = (): (() => void) => {
+            fake.createDialog = vi.fn(() => {
+                fake.staticModal = spotlight;
+                return { close: vi.fn(), finished: new Promise<unknown[]>(() => {}) };
+            });
+            return () =>
+                void (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+        };
+        const replaceWithInvite = (): void => {
+            fake.staticModal = invite;
+            fake.emit("closed");
+        };
+        const closeInvite = (): void => {
+            fake.staticModal = null;
+            fake.emit("closed");
+        };
+
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+        afterEach(() => {
+            fake.staticModal = null;
+            fake.modals = [];
+            vi.useRealTimers();
+        });
+
+        it("holds the lock while the invite dialog is open, then awaits the new chat's ViewRoom", async () => {
+            const outcome = directoryViaDialog("rooms", spotlightOnStart(), roomList());
+            let settled = false;
+            void outcome.then(
+                () => (settled = true),
+                () => (settled = true),
+            );
+            await vi.advanceTimersByTimeAsync(0);
+            replaceWithInvite();
+            // Past the post-close wait: Element still shows the invite dialog, so nothing is answered and the lock is held.
+            await vi.advanceTimersByTimeAsync(6_000);
+            expect(settled).toBe(false);
+            expect(await codeOf(directoryViaDialog("rooms", () => {}, roomList()))).toBe("failed");
+            // Go closes the dialog; `startDmOnFirstMessage` dispatches the chat after `resolveThreePids`.
+            closeInvite();
+            await vi.advanceTimersByTimeAsync(2_000);
+            viewRoom("local+grp:example.org", undefined, [{}]);
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+grp:example.org" });
+        });
+
+        it("a single threepid invite ends in the real room (trigger Created): done", async () => {
+            const outcome = directoryViaDialog("rooms", spotlightOnStart(), roomList());
+            await vi.advanceTimersByTimeAsync(0);
+            replaceWithInvite();
+            await vi.advanceTimersByTimeAsync(6_000);
+            closeInvite();
+            await vi.advanceTimersByTimeAsync(1_000);
+            viewRoom("!made:example.org", "Created");
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!made:example.org" });
+        });
+
+        it("the invite dialog closed with no chat is cancelled, and frees the lock", async () => {
+            const outcome = directoryViaDialog("rooms", spotlightOnStart(), roomList());
+            let settled = false;
+            void outcome.then(
+                () => (settled = true),
+                () => (settled = true),
+            );
+            await vi.advanceTimersByTimeAsync(0);
+            replaceWithInvite();
+            await vi.advanceTimersByTimeAsync(6_000);
+            expect(settled).toBe(false);
+            closeInvite();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+            const d = openDialogOnStart();
+            const next = directoryViaDialog("rooms", d.start, roomList());
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(next).resolves.toEqual({ status: "cancelled" });
+        });
+    });
+
     it("runs one dialog action at a time and frees the lock after a cancel", async () => {
         vi.useFakeTimers();
         try {
