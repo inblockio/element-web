@@ -296,11 +296,16 @@ export type ClientViewActionErrorCode =
     | "unsupported"
     | "failed";
 
-/** What a rejected action carries: a code a kit maps to its own error, and Element's message. */
+/**
+ * What a rejected action carries: a code a kit maps to its own error, and Element's message. `roomId` (additive,
+ * optional; M13 U3) is the room the action actually ran in when it is not the one the caller named: a failed first
+ * send to a new DM (a local room) happens after its real room was created, and the kit follows that room.
+ */
 export class ClientViewActionError extends Error {
     public constructor(
         public readonly code: ClientViewActionErrorCode,
         message?: string,
+        public readonly roomId?: string,
     ) {
         super(message ?? code);
         this.name = "ClientViewActionError";

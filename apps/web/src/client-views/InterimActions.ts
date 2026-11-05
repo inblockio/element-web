@@ -237,8 +237,9 @@ export async function sendText(
     let queued: ((roomId: string) => void) | undefined;
     let stopWatching = (): void => {};
     const local = isLocalRoom(roomId) ? (room as LocalRoom) : undefined;
+    // The room the send runs in: the real room once a local room's creation succeeded (set by the queued callback).
+    let sentRoomId = roomId;
     try {
-        let sentRoomId = roomId;
         // A room in ERROR is reset to NEW, which makes the creation below run again (Element's own retry).
         if (local?.isError) local.state = LocalRoomState.NEW;
         const known = new Set(local?.afterCreateCallbacks);
@@ -299,7 +300,12 @@ export async function sendText(
         }
         return { status: "done", roomId: sentRoomId, eventId: response.event_id };
     } catch (e) {
-        throw toActionError(e);
+        const err = toActionError(e);
+        // M13 U3: the creation ran (the callback saw the real room) and only the send failed: the real room exists and
+        // the local one left `rooms`, so the caller learns where it is (Element views the real room here too). A
+        // creation failure never ran the callback: no roomId, the local room stays listed in ERROR.
+        if (sentRoomId !== roomId && !err.roomId) throw new ClientViewActionError(err.code, err.message, sentRoomId);
+        throw err;
     } finally {
         stopWatching();
         if (local && queued) local.afterCreateCallbacks = local.afterCreateCallbacks.filter((cb) => cb !== queued);

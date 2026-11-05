@@ -104,6 +104,37 @@ describe("sendText (interim action, D16)", () => {
             expect(outcome).toEqual({ status: "done", roomId: "!real:example.org", eventId: "$sent" });
         });
 
+        it("M13 U3: a send that fails after the room was created carries the real room id", async () => {
+            vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, local) => {
+                local.state = LocalRoomState.CREATED;
+                local.actualRoomId = "!real:example.org";
+                local.afterCreateCallbacks.forEach((cb) => cb("!real:example.org"));
+                return "!real:example.org";
+            });
+            vi.mocked(client.sendMessage).mockRejectedValue(new Error("boom"));
+            const err = await sendText(client, localRoom.roomId, "first", { txnId: "t1" }).catch((e) => e);
+            expect(err).toBeInstanceOf(ClientViewActionError);
+            expect(err.code).toBe("failed");
+            expect(err.message).toBe("boom");
+            expect(err.roomId).toBe("!real:example.org");
+        });
+
+        it("M13 U3: a creation failure carries no room id (the local room stays the caller's room)", async () => {
+            vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, local) => {
+                local.state = LocalRoomState.ERROR;
+            });
+            const err = await sendText(client, localRoom.roomId, "first").catch((e) => e);
+            expect(err).toBeInstanceOf(ClientViewActionError);
+            expect(err.roomId).toBeUndefined();
+        });
+
+        it("M13 U3: a send in an ordinary room that fails carries no room id", async () => {
+            vi.mocked(client.sendMessage).mockRejectedValue(new Error("boom"));
+            const err = await sendText(client, "!a:example.org", "hi").catch((e) => e);
+            expect(err).toBeInstanceOf(ClientViewActionError);
+            expect(err.roomId).toBeUndefined();
+        });
+
         it("rejects `failed` when the room cannot be created, instead of waiting forever", async () => {
             vi.mocked(createRoomFromLocalRoom).mockImplementation(async (_c, local) => {
                 local.state = LocalRoomState.ERROR;
