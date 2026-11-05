@@ -78,8 +78,8 @@ const SETTINGS_TABS: Record<ViewSettingsTab, UserTab> = {
 export function labsTabListed(): boolean {
     return Boolean(
         SdkConfig.get("show_labs_settings") ||
-            SettingsStore.getValue("developerMode") ||
-            SettingsStore.getFeatureSettingNames().some((k) => SettingsStore.getBetaInfo(k)),
+        SettingsStore.getValue("developerMode") ||
+        SettingsStore.getFeatureSettingNames().some((k) => SettingsStore.getBetaInfo(k)),
     );
 }
 

@@ -3576,7 +3576,7 @@ describe("ViewModelBridge", () => {
             b.dispose();
         });
 
-        it("M11 Y2: openUserSettings({ tab: \"labs\" }) is failed with no dialog while Element lists no Labs tab", async () => {
+        it('M11 Y2: openUserSettings({ tab: "labs" }) is failed with no dialog while Element lists no Labs tab', async () => {
             const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
             try {
                 await expect(bridge.openUserSettings({ tab: "labs" })).rejects.toMatchObject({ code: "failed" });
