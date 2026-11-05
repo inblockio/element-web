@@ -335,9 +335,15 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
 
     it("tells the directory an invitation is not a joined room (the kit lists it, but the join has not happened)", async () => {
         const seen: Array<(id: string) => boolean> = [];
+        const isInvited: Array<((id: string) => boolean) | undefined> = [];
         actions.directoryViaDialog.mockImplementation(
-            async (_filter: string, _start: () => void, r: { isListed: (id: string) => boolean }) => {
+            async (
+                _filter: string,
+                _start: () => void,
+                r: { isListed: (id: string) => boolean; isInvited?: (id: string) => boolean },
+            ) => {
                 seen.push(r.isListed);
+                isInvited.push(r.isInvited);
                 return { status: "cancelled" };
             },
         );
@@ -345,6 +351,9 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         expect(bridge.rooms().map((r) => [r.id, r.membership])).toContainEqual(["!inv:example.org", "invite"]);
         expect(seen[0]("!inv:example.org")).toBe(false);
         expect(seen[0]("!a:example.org")).toBe(true);
+        // ... and says which room is an invitation, so a plain row picked for it is the room Element opened.
+        expect(isInvited[0]?.("!inv:example.org")).toBe(true);
+        expect(isInvited[0]?.("!a:example.org")).toBe(false);
     });
 
     it("does not list the room of a chat that was cancelled or that is an existing DM", async () => {

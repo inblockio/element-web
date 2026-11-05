@@ -2494,6 +2494,7 @@ export class ViewModelBridge implements ClientViewBridge {
             {
                 // Joined: an invitation is in the list too, but picking its public-directory row still has to join it.
                 isListed: (roomId) => this.roomCache.some((r) => r.id === roomId && r.membership !== "invite"),
+                isInvited: (roomId) => this.roomCache.some((r) => r.id === roomId && r.membership === "invite"),
                 onRooms: (cb) =>
                     this.onChange((e) => {
                         if (e.kind === "rooms") cb();

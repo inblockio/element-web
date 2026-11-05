@@ -283,6 +283,8 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
 export interface DirectoryRooms {
     /** The room is in the kit's list and joined (an invitation is listed too, but is not a join). */
     isListed: (roomId: string) => boolean;
+    /** The room is an invitation of the user's (listed too): a plain row picked for it opens the invitation, which is the pick. */
+    isInvited?: (roomId: string) => boolean;
     onRooms: (cb: () => void) => () => void;
     /** A new chat's local room that Element opened after the action had answered `cancelled` (within 15 s of it). */
     onLateChat?: (roomId: string) => void;
@@ -308,8 +310,8 @@ const isPersonPick = (p: ActionPayload): boolean =>
  * peeked (`should_peek`, world-readable) is `done` with `peek: true`; an alias-only `ViewRoom` waits for the re-dispatch
  * that carries the id (`ViewRoomError` is `failed`). A person row runs `startDmOnFirstMessage`, which dispatches the
  * chat's `ViewRoom` after `resolveThreePids`, i.e. after the dialog closed: that is awaited as in `startChatViaDialog`
- * (an existing DM, or the local room of a new one) for either filter, as the rooms filter lists people too. Closed with
- * no such `ViewRoom` is `cancelled`.
+ * (an existing DM, or the local room of a new one) for either filter, as the rooms filter lists people too, or the
+ * room the dialog's Create new room made. Closed with no such `ViewRoom` is `cancelled`.
  */
 export function directoryViaDialog(
     filter: "rooms" | "people",
@@ -323,8 +325,14 @@ export function directoryViaDialog(
         let openedAt = 0;
         // A person pick is `isPersonPick`; after a followed replacement (the invite dialog) `Created` is one too.
         let followed = false;
+        // Spotlight's "Create new room" button dispatches `CreateRoom` (Spotlight stays open); the room it makes is then
+        // viewed with `Created`. That is the pick only when the `CreateRoom` came from this dialog: any other `Created`
+        // is somebody else's room.
+        const createdHere = (): boolean => seen.payloads.slice(openedAt).some((p) => p.action === Action.CreateRoom);
         const isPick = (p: ActionPayload): boolean =>
-            isDirectoryRoomPick(p) || (followed ? isChatViewRoom(p) : isPersonPick(p));
+            isDirectoryRoomPick(p) ||
+            (followed ? isChatViewRoom(p) : isPersonPick(p)) ||
+            (createdHere() && isViewRoom(p) && p.metricsTrigger === "Created");
         const pickFrom = (from: number): number => {
             const at = seen.payloads.slice(from).findIndex(isPick);
             return at < 0 ? at : at + from;
@@ -374,6 +382,8 @@ export function directoryViaDialog(
             }
             const roomId = pick.room_id as string;
             if (rooms.isListed(roomId)) return { status: "done", roomId };
+            // An invitation picked from a plain row (`auto_join` waits for the join below) is the room Element opened.
+            if (!pick.auto_join && rooms.isInvited?.(roomId)) return { status: "done", roomId };
             if (pick.auto_join) {
                 await listedOrJoinError(roomId, rooms, seen, at);
                 return { status: "done", roomId };
