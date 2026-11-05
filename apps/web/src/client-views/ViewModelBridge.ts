@@ -111,6 +111,7 @@ import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { setPinned } from "./PinAction";
 import { openReport } from "./ReportAction";
+import { quickReact } from "./QuickReactAction";
 import { currentRoomSort, labsTabListed, openUserSettings, setRoomSort } from "./RoomSortAction";
 import {
     createSection,
@@ -1140,7 +1141,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 6;
+    public readonly version = 7;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -1880,6 +1881,12 @@ export class ViewModelBridge implements ClientViewBridge {
     private ownTxnId(event: MatrixEvent): string | undefined {
         if (event.getSender() !== this.client.getUserId()) return undefined;
         return event.getTxnId() ?? event.getUnsigned().transaction_id;
+    }
+
+    /** M13 U6: the composer's `+:emoji:` as Element runs it (the host picks the target message, see `QuickReactAction`). */
+    public quickReact(roomId: string, key: string): Promise<ActionOutcome> {
+        this.used = true;
+        return quickReact(this.client, roomId, key);
     }
 
     /**

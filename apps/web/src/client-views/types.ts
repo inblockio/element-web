@@ -334,7 +334,7 @@ export interface LoadOlderResult {
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 6;
+    readonly version: 7;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -563,6 +563,15 @@ export interface ClientViewBridge {
     logout(): Promise<ActionOutcome>;
     /** A2: toggles the user's reaction `key` on a message (the reactions row button view-model's click). */
     react(roomId: string, eventId: string, key: string): Promise<ActionOutcome>;
+    /**
+     * M13 U6 (version 7, additive: a kit feature-checks it): the composer's `+:emoji:` the way Element runs it
+     * (`SendMessageComposer.sendQuickReaction`, mirrored on the host, see `QuickReactAction`). The host picks the target:
+     * the newest `m.room.message` of the room's live timeline, an undecryptable one included. `key` is the emoji's
+     * unicode. `done` with the target's `eventId` once the reaction is sent, or when the user already reacted with `key`
+     * (nothing is sent, it never toggles off); `done` without `eventId` in a room with no message (nothing happens).
+     * `unknown_room` for a room the client does not hold, `forbidden` / `network` / `failed` as the homeserver answers.
+     */
+    quickReact(roomId: string, key: string): Promise<ActionOutcome>;
     /** A2: Element's own reaction picker over the kit; `done` when it closes, a chosen reaction arrives as a change. */
     openReactionPicker(roomId: string, eventId: string, anchor: ViewAnchor): Promise<ActionOutcome>;
     /**
