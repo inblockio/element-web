@@ -2912,6 +2912,18 @@ describe("ViewModelBridge", () => {
             expect(bridge.timeline("!a")[0].media?.state).not.toBe("hidden");
         });
 
+        it("resolves done when the body already left hidden during the reveal, even if disposed at once", async () => {
+            hiddenMedia("$img", "m.image");
+            // The setting write takes effect synchronously inside the press (before any poll or timeline event).
+            h.setMediaVisibility.mockImplementationOnce((_ev, visible) => {
+                h.mediaVisible.value = visible;
+                return Promise.resolve();
+            });
+            const call = bridge.showMedia("!a", "$img");
+            bridge.dispose();
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$img" });
+        });
+
         it("cancels a waiting call as failed when the bridge is disposed", async () => {
             hiddenMedia("$img", "m.image");
             h.setMediaVisibility.mockImplementationOnce(async () => {});

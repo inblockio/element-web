@@ -2556,6 +2556,9 @@ export class ViewModelBridge implements ClientViewBridge {
             };
             this.listeners.add(onChange);
             this.revealWaits.add(cancel);
+            // As `react` does: the reveal may already have taken effect (the settings write notifies before it yields), so a
+            // dispose within the first poll must not answer failed for a body that has left the hidden state.
+            check();
         });
     }
 
