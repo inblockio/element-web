@@ -223,6 +223,73 @@ export function removeSection(tag: string, isEmpty: boolean, listed: () => boole
     });
 }
 
+/** The queue key of the section-order writes (`serialTagWrite` only keys its chains; this is no room id). */
+const SECTION_ORDER_QUEUE = "section-order";
+
+/**
+ * `RoomList.OrderedCustomSections` as the account data holds it right now (D21). Once the store's write has settled,
+ * Element's local echo has expired, so this is the stored value, also when the PUT was refused (the wrapper swallows the
+ * refusal and the store's promise still fulfils). It also holds the `chats` and `People` tags between the customs.
+ */
+function storedOrder(): string[] {
+    const raw: unknown = SettingsStore.getValue("RoomList.OrderedCustomSections");
+    return Array.isArray(raw) ? raw.filter((t): t is string => typeof t === "string") : [];
+}
+
+/** `tag` is on the `direction` side of `neighbour` in `order` (both present). */
+function isMoved(order: readonly string[], tag: string, neighbour: string, direction: "up" | "down"): boolean {
+    const at = order.indexOf(tag);
+    const next = order.indexOf(neighbour);
+    return at !== -1 && next !== -1 && (direction === "up" ? at < next : at > next);
+}
+
+/**
+ * Y3: moves the custom section `tag` one place up or down among the custom sections, as Element's own drag does
+ * (`RoomListViewModel.changeSectionOrder` -> `RoomListStoreV3.reorderSection(tag, neighbour)`, not a dialog). `order` is the
+ * bridge's `sections()` as tags (customs only), read when the call takes its turn (moves run one after the other, so a
+ * second click sees the first one's result). `failed` at once for a tag it does not list and for the first / last custom
+ * (no neighbour in that direction). `done` + `section` once the stored `RoomList.OrderedCustomSections` AND `order()` both
+ * show `tag` on the neighbour's side (D21: a refused account-data write is swallowed by the store, only the re-read tells);
+ * else, within `ROOM_ACTION_TIMEOUT_MS`, `failed`. Only the relative order of the customs moves: Element keeps `chats` and
+ * `People` in the same stored order and the move may jump over them (LIMIT).
+ */
+export function moveSection(tag: string, direction: "up" | "down", order: () => readonly string[]): Promise<ActionOutcome> {
+    return serialTagWrite(SECTION_ORDER_QUEUE, async () => {
+        const listed = order();
+        const at = listed.indexOf(tag);
+        const neighbour = at === -1 ? undefined : listed[direction === "up" ? at - 1 : at + 1];
+        if (neighbour === undefined) {
+            throw new ClientViewActionError(
+                "failed",
+                at === -1 ? `${tag} is not one of the sections` : `${tag} is the ${direction === "up" ? "first" : "last"} section`,
+            );
+        }
+        const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const written = await Promise.race([
+                RoomListStoreV3.instance.reorderSection(tag, neighbour).then(() => true),
+                new Promise<false>((resolve) => {
+                    timer = setTimeout(() => resolve(false), ROOM_ACTION_TIMEOUT_MS);
+                }),
+            ]);
+            if (!written) throw new ClientViewActionError("failed", "the section order was not written in time");
+        } catch (e) {
+            throw toActionError(e);
+        } finally {
+            clearTimeout(timer);
+        }
+        if (!isMoved(storedOrder(), tag, neighbour, direction))
+            throw new ClientViewActionError("failed", "the section order was not changed in the account data");
+        while (!isMoved(order(), tag, neighbour, direction)) {
+            if (Date.now() >= until)
+                throw new ClientViewActionError("failed", "the sections were not reordered after the move");
+            await new Promise((r) => setTimeout(r, POLL_MS));
+        }
+        return { status: "done", section: tag };
+    });
+}
+
 async function within<T>(p: Promise<T> | undefined, ms: number): Promise<T | undefined> {
     if (!p) return undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;

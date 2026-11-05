@@ -110,7 +110,14 @@ import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel 
 import { setPinned } from "./PinAction";
 import { openReport } from "./ReportAction";
 import { currentRoomSort, openUserSettings, setRoomSort } from "./RoomSortAction";
-import { createSection, editSection, removeSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
+import {
+    createSection,
+    editSection,
+    moveSection,
+    removeSection,
+    type RoomSectionVm,
+    setSection,
+} from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import DMRoomMap from "../utils/DMRoomMap";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
@@ -2611,6 +2618,14 @@ export class ViewModelBridge implements ClientViewBridge {
         // Element's own `isEmpty` is "no room in the section"; the bridged rooms carry their section tag.
         const isEmpty = !this.roomCache.some((r) => r.section === tag);
         return removeSection(tag, isEmpty, () => this.sectionCache.some((s) => s.tag === tag));
+    }
+
+    public async moveSection(tag: string, direction: "up" | "down"): Promise<ActionOutcome> {
+        this.assertListedSection(tag);
+        if (direction !== "up" && direction !== "down")
+            throw new ClientViewActionError("failed", `${String(direction)} is not a direction`);
+        // The neighbour is read from `sections()` when the move takes its turn (moves run one after the other).
+        return moveSection(tag, direction, () => this.sectionCache.map((s) => s.tag));
     }
 
     /** A section action's tag must be one of `sections()`: the store opens no dialog for any other (the contract's `failed`). */
