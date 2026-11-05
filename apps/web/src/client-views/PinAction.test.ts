@@ -11,6 +11,18 @@ import { ConnectionError, MatrixError } from "matrix-js-sdk/src/matrix";
 import { setPinned, type PinTarget } from "./PinAction";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 
+/* M11 Y4: RoomActions statically imports the DM helper, whose chain loads FileBodyViewModel (module-level window.btoa,
+   absent in this test's env). The pin press never starts a DM, so the helper is mocked as RoomActions.test.ts does. */
+vi.mock("../utils/direct-messages", () => ({
+    startDmOnFirstMessage: vi.fn(),
+    DirectoryMember: class {
+        public constructor(private readonly result: { user_id: string }) {}
+        public get userId(): string {
+            return this.result.user_id;
+        }
+    },
+}));
+
 /* M6 B2: the pin press is the homeserver's answer, `done` needs the state to show it, calls for a room run in turn. */
 function target(
     over: Partial<PinTarget> & { state?: { pinned: boolean } } = {},
