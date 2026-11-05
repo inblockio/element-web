@@ -13,6 +13,7 @@ import { EventStatus, type MatrixClient, type MatrixEvent } from "matrix-js-sdk/
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
+import { startDmOnFirstMessage } from "../utils/direct-messages";
 import {
     createRoomViaDialog,
     forwardDialogClient,
@@ -21,10 +22,21 @@ import {
     leaveViaDialog,
     startChatViaDialog,
     directoryViaDialog,
+    startDmWithUser,
     LEAVE_SETTLE_MS,
     ROOM_ACTION_TIMEOUT_MS,
 } from "./RoomActions";
 import { ClientViewActionError } from "./types";
+
+vi.mock("../utils/direct-messages", () => ({
+    startDmOnFirstMessage: vi.fn(),
+    DirectoryMember: class {
+        public constructor(private readonly result: { user_id: string }) {}
+        public get userId(): string {
+            return this.result.user_id;
+        }
+    },
+}));
 
 vi.mock("../Modal", async () => {
     // A fake ModalManager: an emitter with the three private places Element keeps its dialogs in.
@@ -1369,6 +1381,85 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
             d2.finish();
             await vi.advanceTimersByTimeAsync(5_001);
             await expect(second).resolves.toEqual({ status: "cancelled" });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
+describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the message menu's Reply directly)", () => {
+    const client = { getUserId: () => "@me:example.org" } as unknown as MatrixClient;
+    const startDm = vi.mocked(startDmOnFirstMessage);
+    const targetsOf = (call: number): string[] =>
+        (startDm.mock.calls[call][1] as unknown as Array<{ userId: string }>).map((t) => t.userId);
+
+    beforeEach(() => startDm.mockReset());
+
+    it("is done with the room of an existing DM that Element returns", async () => {
+        startDm.mockResolvedValue("!dm:example.org");
+        await expect(startDmWithUser(client, "@bob:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "!dm:example.org",
+        });
+        expect(startDm).toHaveBeenCalledTimes(1);
+        expect(startDm.mock.calls[0][0]).toBe(client);
+        expect(targetsOf(0)).toEqual(["@bob:example.org"]);
+    });
+
+    it("is done with the local room of a new DM that Element returns (nothing sent yet)", async () => {
+        startDm.mockResolvedValue("local+abc:example.org");
+        await expect(startDmWithUser(client, "@carol:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "local+abc:example.org",
+        });
+    });
+
+    it("fails at once for the own user id: no Element call, no self-DM", async () => {
+        expect(await codeOf(startDmWithUser(client, "@me:example.org"))).toBe("failed");
+        expect(startDm).not.toHaveBeenCalled();
+    });
+
+    it("fails at once for a malformed user id (empty, a display name, no server part, whitespace, not a string)", async () => {
+        for (const bad of ["", "bob", "@bob", "@:example.org", "@bob :example.org", "!room:example.org", undefined, 7]) {
+            expect(await codeOf(startDmWithUser(client, bad as unknown as string))).toBe("failed");
+        }
+        expect(startDm).not.toHaveBeenCalled();
+    });
+
+    it("fails when Element gives no room, and when its start throws", async () => {
+        startDm.mockResolvedValue(null);
+        expect(await codeOf(startDmWithUser(client, "@bob:example.org"))).toBe("failed");
+        startDm.mockRejectedValue(new Error("profile lookup failed"));
+        expect(await codeOf(startDmWithUser(client, "@bob:example.org"))).toBe("failed");
+    });
+
+    it("runs one dialog action at a time: an overlapping call fails busy, the first still finishes, the lock is freed", async () => {
+        let resolveFirst: (roomId: string | null) => void = () => {};
+        startDm.mockImplementationOnce(() => new Promise((resolve) => (resolveFirst = resolve)));
+        const first = startDmWithUser(client, "@bob:example.org");
+        expect(await codeOf(startDmWithUser(client, "@carol:example.org"))).toBe("failed");
+        expect(startDm).toHaveBeenCalledTimes(1);
+        resolveFirst("!dm:example.org");
+        await expect(first).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+        startDm.mockResolvedValue("!dm2:example.org");
+        await expect(startDmWithUser(client, "@carol:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "!dm2:example.org",
+        });
+    });
+
+    it("gives up on a hung lookup after the action timeout and frees the lock", async () => {
+        vi.useFakeTimers();
+        try {
+            startDm.mockImplementationOnce(() => new Promise(() => {}));
+            const hung = codeOf(startDmWithUser(client, "@bob:example.org"));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await hung).toBe("failed");
+            startDm.mockResolvedValue("!dm:example.org");
+            await expect(startDmWithUser(client, "@bob:example.org")).resolves.toEqual({
+                status: "done",
+                roomId: "!dm:example.org",
+            });
         } finally {
             vi.useRealTimers();
         }
