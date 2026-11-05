@@ -23,6 +23,7 @@ import { type ActionPayload } from "../dispatcher/payloads";
 import { type ViewRoomPayload } from "../dispatcher/payloads/ViewRoomPayload";
 import { type AfterLeaveRoomPayload } from "../dispatcher/payloads/AfterLeaveRoomPayload";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
+import { DirectoryMember, startDmOnFirstMessage } from "../utils/direct-messages";
 import { toActionError } from "./actions";
 import { type ActionOutcome, ClientViewActionError } from "./types";
 
@@ -275,6 +276,43 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
             return { status: "done", roomId };
         } finally {
             seen.stop();
+        }
+    });
+}
+
+/** A Matrix user id: `@localpart:server`, no whitespace (the shape Element's own invite dialog accepts as a user id). */
+const MATRIX_USER_ID = /^@[^\s:]+:\S+$/;
+
+/**
+ * M11 Y4 start a DM with a user (the message menu's "Reply directly"): not a dialog. Element's own DM path
+ * (`startDmOnFirstMessage`, the one the user-info "Message" button and the start-chat dialog call) dispatches the `ViewRoom`
+ * itself: an existing DM opens, else a local DM room (nothing sent) that the first send turns into the real room. `done` +
+ * the room id that call RETURNS (an existing DM or the local room), never a `ViewRoom` seen. It runs inside `dialogAction`
+ * so it cannot overlap the directory's chat waits (a busy host answers the same failure as every dialog action). `failed`
+ * at once for a malformed user id or the own id (no self-DM), and for a start that gives no room or none in time (the lock
+ * must not stay held by a hung profile lookup).
+ */
+export function startDmWithUser(client: MatrixClient, userId: string): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        if (typeof userId !== "string" || !MATRIX_USER_ID.test(userId))
+            throw new ClientViewActionError("failed", `${String(userId)} is not a Matrix user id`);
+        if (userId === client.getUserId())
+            throw new ClientViewActionError("failed", "a direct chat with yourself is not started");
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            const roomId = await Promise.race([
+                startDmOnFirstMessage(client, [new DirectoryMember({ user_id: userId })]),
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(
+                        () => reject(new ClientViewActionError("failed", "Element did not open the chat in time")),
+                        ROOM_ACTION_TIMEOUT_MS,
+                    );
+                }),
+            ]);
+            if (!roomId) throw new ClientViewActionError("failed", `Element opened no chat with ${userId}`);
+            return { status: "done", roomId };
+        } finally {
+            clearTimeout(timer);
         }
     });
 }
