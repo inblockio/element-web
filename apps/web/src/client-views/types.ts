@@ -497,6 +497,16 @@ export interface ClientViewBridge {
      */
     removeSection(tag: string): Promise<ActionOutcome>;
     /**
+     * M11 Y3 (additive, no `version` bump: a kit feature-checks it): moves the custom section `tag` one place up or down
+     * among the custom sections, as Element's drag does (`RoomListStoreV3.reorderSection(tag, neighbour)`, no dialog).
+     * `done` + `section` once the stored `RoomList.OrderedCustomSections` and `sections()` both show the tag on the
+     * neighbour's side (15 s); `failed` at once for a tag `sections()` does not list and for the first custom going up or
+     * the last going down (no neighbour), and `failed` when the write is refused (the store swallows it: only the re-read
+     * of the account data tells) or `sections()` did not follow in time. Only the relative order of the customs moves:
+     * Element may order them around Chats and People.
+     */
+    moveSection(tag: string, direction: "up" | "down"): Promise<ActionOutcome>;
+    /**
      * A10: sets the room's notification level (the item's `onSetRoomNotifState`: push rules). `done` once the homeserver
      * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).
      */

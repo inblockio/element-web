@@ -138,6 +138,7 @@ const sectionActions = vi.hoisted(() => ({
     createSection: vi.fn(),
     editSection: vi.fn(),
     removeSection: vi.fn(),
+    moveSection: vi.fn(),
 }));
 vi.mock("./RoomSectionActions", () => sectionActions);
 
@@ -660,5 +661,43 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
             await expect(call()).rejects.toMatchObject({ code: "failed" });
         expect(sectionActions.editSection).toHaveBeenCalledTimes(1);
         expect(sectionActions.removeSection).toHaveBeenCalledTimes(2);
+    });
+
+    it("M11 Y3: moveSection runs the section move for a listed tag with the bridge's own tag order; an unknown tag or a bad direction is failed and calls nothing", async () => {
+        const sec = (tag: string, name: string) => ({ tag, name, isSelected: false });
+        sectionActions.moveSection.mockResolvedValue({ status: "done", section: "element.io.section.s1" });
+        h.item.set({
+            sections: [sec("element.io.section.s1", "Work"), sec("element.io.section.s2", "Home")],
+        });
+        await expect(bridge.moveSection("element.io.section.s1", "down")).resolves.toEqual({
+            status: "done",
+            section: "element.io.section.s1",
+        });
+        await bridge.moveSection("element.io.section.s2", "up");
+        expect(sectionActions.moveSection).toHaveBeenNthCalledWith(
+            1,
+            "element.io.section.s1",
+            "down",
+            expect.any(Function),
+        );
+        expect(sectionActions.moveSection).toHaveBeenNthCalledWith(
+            2,
+            "element.io.section.s2",
+            "up",
+            expect.any(Function),
+        );
+        // The order probe reads the bridge's own sections() when the move takes its turn: the tags, in the listed order.
+        const order = sectionActions.moveSection.mock.calls[0][2] as () => readonly string[];
+        expect(order()).toEqual(["element.io.section.s1", "element.io.section.s2"]);
+        h.item.set({
+            sections: [sec("element.io.section.s2", "Home"), sec("element.io.section.s1", "Work")],
+        });
+        expect(order()).toEqual(["element.io.section.s2", "element.io.section.s1"]);
+        for (const call of [
+            () => bridge.moveSection("element.io.section.nope", "up"),
+            () => bridge.moveSection("element.io.section.s1", "left" as unknown as "up"),
+        ])
+            await expect(call()).rejects.toMatchObject({ code: "failed" });
+        expect(sectionActions.moveSection).toHaveBeenCalledTimes(2);
     });
 });
