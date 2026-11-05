@@ -175,6 +175,21 @@ export interface ViewMessage {
      * Version 2, additive: a kit that does not know the field gets a message with an empty body and no content.
      */
     call?: ViewCall;
+    /**
+     * Set on the entry of an `m.room.encryption` state event (`kind` is "other", `body` is empty): the line Element's
+     * encryption tile draws, from its `EncryptionEventViewModel`. `state` is that view-model's state lower-cased
+     * (`enabled_local` = the pre-send local chat started from the kit, which has no server room yet); `userName` only
+     * for `enabled_dm` (the partner's name). The state can change after the entry first appears (the view-model
+     * refreshes it from the room state and the crypto), a `timeline` event follows.
+     * M12 Z4, additive: a host without the field never sets it (a kit feature-checks, nothing to call).
+     */
+    encryption?: ViewEncryption;
+}
+
+/** The state of an encryption event line (see `ViewMessage.encryption`). */
+export interface ViewEncryption {
+    state: "enabled" | "enabled_dm" | "enabled_local" | "changed" | "disable_attempt" | "unsupported";
+    userName?: string;
 }
 
 /**
