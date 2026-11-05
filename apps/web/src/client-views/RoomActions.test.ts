@@ -1398,9 +1398,11 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
     // The client holds no rooms and no users unless a test says so (`rooms`, `users`).
     let rooms: unknown[] = [];
     let users: Record<string, unknown> = {};
+    let roomsById: Record<string, unknown> = {};
     const client = {
         getUserId: () => "@me:example.org",
         getRooms: () => rooms,
+        getRoom: (id: string) => roomsById[id] ?? null,
         getUser: (id: string) => users[id] ?? null,
     } as unknown as MatrixClient;
     const startDm = vi.mocked(startDmOnFirstMessage);
@@ -1413,8 +1415,9 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
         rawDisplayName,
         getMxcAvatarUrl: () => mxc,
     });
-    /** A room of ours in which `userId` is the given member. */
-    const roomWith = (userId: string, m: unknown): unknown => ({
+    /** A room of ours (our own membership `mine`, joined unless said otherwise) in which `userId` is the given member. */
+    const roomWith = (userId: string, m: unknown, mine = "join"): unknown => ({
+        getMyMembership: () => mine,
         getMember: (id: string) => (id === userId ? m : null),
     });
 
@@ -1422,6 +1425,7 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
         startDm.mockReset();
         rooms = [];
         users = {};
+        roomsById = {};
     });
 
     it("is done with the room of an existing DM that Element returns", async () => {
@@ -1456,7 +1460,7 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
 
         it("takes the first room that names the user, skipping rooms where they are unknown, left, or only the id", async () => {
             rooms = [
-                { getMember: () => null },
+                { getMyMembership: () => "join", getMember: () => null },
                 roomWith("@bob:example.org", member("leave", "Bob Left", "mxc://example.org/left")),
                 roomWith("@bob:example.org", member("join", "@bob:example.org")),
                 roomWith("@bob:example.org", member("join", "Bob Builder", "mxc://example.org/bob")),
@@ -1491,6 +1495,78 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
             expect(targetsOf(0)).toEqual(["@bob:example.org"]);
             expect(targetOf(0).name).toBe("@bob:example.org");
             expect(targetOf(0).getMxcAvatarUrl()).toBeUndefined();
+        });
+
+        describe("F1 round 1: the person on the message, not the first room that names them", () => {
+            const BOB = "@bob:example.org";
+
+            it("takes the member of the room of the message (fromRoomId), not an earlier room's per-room name", async () => {
+                const early = roomWith(BOB, member("join", "Bobby (per-room)", "mxc://example.org/early"));
+                const here = roomWith(BOB, member("join", "Bob Builder", "mxc://example.org/bob"));
+                rooms = [early, here];
+                roomsById = { "!early:example.org": early, "!here:example.org": here };
+                await startDmWithUser(client, BOB, undefined, "!here:example.org");
+                expect(targetOf(0).userId).toBe(BOB);
+                expect(targetOf(0).name).toBe("Bob Builder");
+                expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+            });
+
+            it("copies the member exactly as stock does, also when it is only the id (no scan of other rooms)", async () => {
+                const early = roomWith(BOB, member("join", "Bobby (per-room)", "mxc://example.org/early"));
+                const here = roomWith(BOB, member("join", BOB, "mxc://example.org/bob"));
+                rooms = [early, here];
+                roomsById = { "!here:example.org": here };
+                await startDmWithUser(client, BOB, undefined, "!here:example.org");
+                expect(targetOf(0).name).toBe(BOB);
+                expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+            });
+
+            it("never uses the stripped member of an invite room (the inviter chose that name), with or without fromRoomId", async () => {
+                const invite = roomWith(
+                    BOB,
+                    member("join", "Bob the Inviter's Pick", "mxc://example.org/inv"),
+                    "invite",
+                );
+                const joined = roomWith(BOB, member("join", "Bob Builder", "mxc://example.org/bob"));
+                rooms = [invite, joined];
+                roomsById = { "!inv:example.org": invite, "!joined:example.org": joined };
+                await startDmWithUser(client, BOB);
+                expect(targetOf(0).name).toBe("Bob Builder");
+                expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+                startDm.mockClear();
+                await startDmWithUser(client, BOB, undefined, "!joined:example.org");
+                expect(targetOf(0).name).toBe("Bob Builder");
+            });
+
+            it("an invite room alone names nobody: the id stays the title", async () => {
+                rooms = [roomWith(BOB, member("join", "Bob the Inviter's Pick", "mxc://example.org/inv"), "invite")];
+                await startDmWithUser(client, BOB);
+                expect(targetOf(0).name).toBe(BOB);
+                expect(targetOf(0).getMxcAvatarUrl()).toBeUndefined();
+            });
+
+            it("falls back to the scan of joined rooms when fromRoomId is absent, unknown, or holds no such member", async () => {
+                const other = roomWith("@carol:example.org", member("join", "Carol"));
+                rooms = [other, roomWith(BOB, member("join", "Bob Builder", "mxc://example.org/bob"))];
+                roomsById = { "!other:example.org": other };
+                for (const from of [undefined, "!gone:example.org", "!other:example.org", ""]) {
+                    startDm.mockClear();
+                    await startDmWithUser(client, BOB, undefined, from);
+                    expect(targetOf(0).name).toBe("Bob Builder");
+                    expect(targetOf(0).getMxcAvatarUrl()).toBe("mxc://example.org/bob");
+                }
+            });
+
+            it("ignores a fromRoomId that is not a string", async () => {
+                const throws = vi.fn(() => {
+                    throw new Error("getRoom must not be asked");
+                });
+                const strict = { ...client, getRoom: throws } as unknown as MatrixClient;
+                rooms = [roomWith(BOB, member("join", "Bob Builder"))];
+                await startDmWithUser(strict, BOB, undefined, 42 as unknown as string);
+                expect(throws).not.toHaveBeenCalled();
+                expect(targetOf(0).name).toBe("Bob Builder");
+            });
         });
 
         it("makes no server call: only the rooms and users the client already holds are read", async () => {

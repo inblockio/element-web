@@ -315,15 +315,29 @@ export const DM_LOCK_CAP_MS = 60_000;
 
 /**
  * M12 Z2 the display name and avatar (mxc) that Element's client already holds for a user, for the `DirectoryMember` of a new
- * DM. Stock hands both over (`UserInfoBasicOptionsViewModel.onOpenDmForUser`: `rawDisplayName` + the member's or user's
- * avatar); `createDmLocalRoom` titles the local room from them, so a member without a name titles the chat with the user id
- * until the first send. "Reply directly" is only offered on another sender's message, so the user is a joined member of a room
- * we share (the first one that names them), else the client's own `User` (a profile it was told of). Nothing known gives `{}`
- * and the id stays the title. No server call: only what the client holds.
+ * DM. Stock hands both over (`UserInfoBasicOptionsViewModel.onOpenDmForUser`: the `RoomMember` it already has in hand,
+ * `rawDisplayName` + `getMxcAvatarUrl()`); `createDmLocalRoom` titles the local room from them, so a member without a name
+ * titles the chat with the user id until the first send.
+ *
+ * `fromRoomId` is the room of the message the user replied to ("Reply directly" is only offered on a message): that room's
+ * member is the person on the message, copied as stock copies it (F1 round 1; a per-room name in some other room, or the
+ * name an inviter chose in an invitation's stripped state, is not them). Without it, or when that room has no such member,
+ * the first joined member of a room of ours that names them, else the client's own `User` (a profile it was told of); only
+ * rooms the client itself has joined count, never an invitation. Nothing known gives `{}` and the id stays the title. No
+ * server call: only what the client holds.
  */
-export function knownProfile(client: MatrixClient, userId: string): { display_name?: string; avatar_url?: string } {
+export function knownProfile(
+    client: MatrixClient,
+    userId: string,
+    fromRoomId?: string,
+): { display_name?: string; avatar_url?: string } {
+    if (typeof fromRoomId === "string" && fromRoomId) {
+        const member = client.getRoom(fromRoomId)?.getMember(userId);
+        if (member) return { display_name: member.rawDisplayName, avatar_url: member.getMxcAvatarUrl() ?? undefined };
+    }
     let avatar: string | undefined;
     for (const room of client.getRooms()) {
+        if (room.getMyMembership() !== KnownMembership.Join) continue;
         const member = room.getMember(userId);
         if (member?.membership !== KnownMembership.Join) continue;
         const memberAvatar = member.getMxcAvatarUrl() ?? undefined;
@@ -346,6 +360,9 @@ export function knownProfile(client: MatrixClient, userId: string): { display_na
  * at once for a malformed user id or the own id (no self-DM), for a start that gives no room, for a start that rejects
  * (a plain sentence, not Element's error) and for one that gives none within 15 s.
  *
+ * `fromRoomId` (optional, the room of the message replied to) names where the person's display name and avatar come from
+ * (`knownProfile`).
+ *
  * The caller is answered at 15 s, but the start keeps running in Element (the encrypted default path awaits device lists).
  * The dialog lock stays held until it settles, at most `DM_LOCK_CAP_MS`, so no other dialog action starts meanwhile and
  * mistakes this chat's late `ViewRoom` for its own. A local room that arrives after the answer is handed to `onLateChat`
@@ -355,6 +372,7 @@ export function startDmWithUser(
     client: MatrixClient,
     userId: string,
     onLateChat?: (roomId: string) => void,
+    fromRoomId?: string,
 ): Promise<ActionOutcome> {
     return dialogAction(async (holdLock) => {
         if (typeof userId !== "string" || !MATRIX_USER_ID.test(userId))
@@ -366,7 +384,7 @@ export function startDmWithUser(
         // An async wrapper: a synchronous throw of Element's call is a rejection too.
         const start = (async () =>
             startDmOnFirstMessage(client, [
-                new DirectoryMember({ user_id: userId, ...knownProfile(client, userId) }),
+                new DirectoryMember({ user_id: userId, ...knownProfile(client, userId, fromRoomId) }),
             ]))().then(
             (roomId) => {
                 // The caller has been told `failed`: the chat Element opened is not reported to it, but it is listed.

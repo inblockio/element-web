@@ -384,13 +384,29 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
             return o;
         });
         expect(outcome).toEqual({ status: "done", roomId: local.roomId });
-        expect(actions.startDmWithUser).toHaveBeenCalledWith(client, "@bob:example.org", expect.any(Function));
+        expect(actions.startDmWithUser).toHaveBeenCalledWith(
+            client,
+            "@bob:example.org",
+            expect.any(Function),
+            undefined,
+        );
         expect(listedAtDone).toEqual([local.roomId, "!a:example.org", "!inv:example.org"]);
         expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
         // Element creates the real room on the first send: the local one leaves the list.
         local.state = LocalRoomState.CREATED;
         handlers.forEach((cb) => cb(local as unknown as Room));
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("passes the room of the message (the optional second argument) on to startDmWithUser (M12 Z2 F1)", async () => {
+        actions.startDmWithUser.mockResolvedValue({ status: "done", roomId: "!dm:example.org" });
+        await bridge.startDm("@bob:example.org", "!a:example.org");
+        expect(actions.startDmWithUser).toHaveBeenCalledWith(
+            client,
+            "@bob:example.org",
+            expect.any(Function),
+            "!a:example.org",
+        );
     });
 
     it("lists nothing new for an existing DM, a failed start (the error reaches the kit) or the own id (M11 Y4)", async () => {
