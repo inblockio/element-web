@@ -42,7 +42,11 @@ export interface DialogHandle {
     replacedBy?: () => object | undefined;
 }
 
-let dialogActionRunning = false;
+/** Who holds the dialog lock now (a token per action, so a late release never frees a later holder's lock). */
+let dialogLock: object | undefined;
+
+/** Keeps the dialog lock past the action's own answer until `until` settles, at most `capMs` (see `dialogAction`). */
+type HoldLock = (until: Promise<unknown>, capMs: number) => void;
 
 /** The dialogs Element's modal manager holds now (its private lists; `ModalManager` offers no query for one dialog). */
 function modalStack(): Set<object> {
@@ -199,15 +203,38 @@ export function openedDialog(start: () => void, onFinished?: () => void, onOpene
     });
 }
 
-export async function dialogAction(run: () => Promise<ActionOutcome>): Promise<ActionOutcome> {
-    if (dialogActionRunning) throw new ClientViewActionError("failed", "another Element dialog action is running");
-    dialogActionRunning = true;
+export async function dialogAction(run: (holdLock: HoldLock) => Promise<ActionOutcome>): Promise<ActionOutcome> {
+    if (dialogLock) throw new ClientViewActionError("failed", "another Element dialog action is running");
+    const token = {};
+    dialogLock = token;
+    const release = (): void => {
+        if (dialogLock === token) dialogLock = undefined;
+    };
+    // `run` may keep the lock past its answer (`holdLock`): the work it started is still running in Element, and another
+    // dialog action must not overlap it. The hold ends when that work settles or at the cap, whichever is first.
+    let returned = false;
+    let held = false;
+    let holdOver = true;
+    const holdLock: HoldLock = (until, capMs) => {
+        if (held) return;
+        held = true;
+        holdOver = false;
+        let cap: ReturnType<typeof setTimeout> | undefined;
+        const end = (): void => {
+            holdOver = true;
+            clearTimeout(cap);
+            if (returned) release();
+        };
+        cap = setTimeout(end, capMs);
+        until.then(end, end);
+    };
     try {
-        return await run();
+        return await run(holdLock);
     } catch (e) {
         throw toActionError(e);
     } finally {
-        dialogActionRunning = false;
+        returned = true;
+        if (holdOver) release();
     }
 }
 
@@ -283,30 +310,57 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
 /** A Matrix user id: `@localpart:server`, no whitespace (the shape Element's own invite dialog accepts as a user id). */
 const MATRIX_USER_ID = /^@[^\s:]+:\S+$/;
 
+/** How long a start that has not settled may keep the dialog lock after the caller was answered `failed`. */
+export const DM_LOCK_CAP_MS = 60_000;
+
 /**
  * M11 Y4 start a DM with a user (the message menu's "Reply directly"): not a dialog. Element's own DM path
  * (`startDmOnFirstMessage`, the one the user-info "Message" button and the start-chat dialog call) dispatches the `ViewRoom`
  * itself: an existing DM opens, else a local DM room (nothing sent) that the first send turns into the real room. `done` +
  * the room id that call RETURNS (an existing DM or the local room), never a `ViewRoom` seen. It runs inside `dialogAction`
  * so it cannot overlap the directory's chat waits (a busy host answers the same failure as every dialog action). `failed`
- * at once for a malformed user id or the own id (no self-DM), and for a start that gives no room or none in time (the lock
- * must not stay held by a hung profile lookup).
+ * at once for a malformed user id or the own id (no self-DM), for a start that gives no room, for a start that rejects
+ * (a plain sentence, not Element's error) and for one that gives none within 15 s.
+ *
+ * The caller is answered at 15 s, but the start keeps running in Element (the encrypted default path awaits device lists).
+ * The dialog lock stays held until it settles, at most `DM_LOCK_CAP_MS`, so no other dialog action starts meanwhile and
+ * mistakes this chat's late `ViewRoom` for its own. A local room that arrives after the answer is handed to `onLateChat`
+ * (the bridge lists it, as for the directory), and a late rejection is caught.
  */
-export function startDmWithUser(client: MatrixClient, userId: string): Promise<ActionOutcome> {
-    return dialogAction(async () => {
+export function startDmWithUser(
+    client: MatrixClient,
+    userId: string,
+    onLateChat?: (roomId: string) => void,
+): Promise<ActionOutcome> {
+    return dialogAction(async (holdLock) => {
         if (typeof userId !== "string" || !MATRIX_USER_ID.test(userId))
             throw new ClientViewActionError("failed", `${String(userId)} is not a Matrix user id`);
         if (userId === client.getUserId())
             throw new ClientViewActionError("failed", "a direct chat with yourself is not started");
+        let answered = false;
         let timer: ReturnType<typeof setTimeout> | undefined;
+        // An async wrapper: a synchronous throw of Element's call is a rejection too.
+        const start = (async () => startDmOnFirstMessage(client, [new DirectoryMember({ user_id: userId })]))().then(
+            (roomId) => {
+                // The caller has been told `failed`: the chat Element opened is not reported to it, but it is listed.
+                if (answered && roomId && isLocalRoom(roomId)) onLateChat?.(roomId);
+                return roomId;
+            },
+            () => {
+                if (!answered)
+                    throw new ClientViewActionError("failed", `Element could not open a chat with ${userId}`);
+                return null;
+            },
+        );
+        holdLock(start, DM_LOCK_CAP_MS);
         try {
             const roomId = await Promise.race([
-                startDmOnFirstMessage(client, [new DirectoryMember({ user_id: userId })]),
+                start,
                 new Promise<never>((_, reject) => {
-                    timer = setTimeout(
-                        () => reject(new ClientViewActionError("failed", "Element did not open the chat in time")),
-                        ROOM_ACTION_TIMEOUT_MS,
-                    );
+                    timer = setTimeout(() => {
+                        answered = true;
+                        reject(new ClientViewActionError("failed", "Element did not open the chat in time"));
+                    }, ROOM_ACTION_TIMEOUT_MS);
                 }),
             ]);
             if (!roomId) throw new ClientViewActionError("failed", `Element opened no chat with ${userId}`);

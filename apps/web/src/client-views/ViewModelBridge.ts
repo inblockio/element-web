@@ -2515,7 +2515,11 @@ export class ViewModelBridge implements ClientViewBridge {
     }
 
     public async startDm(userId: string): Promise<ActionOutcome> {
-        const outcome = await startDmWithUser(this.client, userId);
+        // A room Element opens after the 15 s answer (`failed`) is listed all the same, so a retry does not make a second one.
+        const outcome = await startDmWithUser(this.client, userId, (roomId) => {
+            this.localChats.add(roomId);
+            this.syncRooms();
+        });
         // A new DM's local room is listed (and opened) by the kit like any room until the first send creates it (as createChat).
         if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
             this.localChats.add(outcome.roomId);

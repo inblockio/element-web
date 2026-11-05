@@ -23,6 +23,7 @@ import {
     startChatViaDialog,
     directoryViaDialog,
     startDmWithUser,
+    DM_LOCK_CAP_MS,
     LEAVE_SETTLE_MS,
     ROOM_ACTION_TIMEOUT_MS,
 } from "./RoomActions";
@@ -1446,20 +1447,161 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
         });
     });
 
-    it("gives up on a hung lookup after the action timeout and frees the lock", async () => {
-        vi.useFakeTimers();
-        try {
-            startDm.mockImplementationOnce(() => new Promise(() => {}));
-            const hung = codeOf(startDmWithUser(client, "@bob:example.org"));
-            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
-            expect(await hung).toBe("failed");
+    describe("a start that outlasts the 15 s answer (F1: the late ViewRoom must not meet an unlocked host)", () => {
+        const nativeTimeout = setTimeout;
+        const flushNode = (): Promise<void> => new Promise((resolve) => nativeTimeout(resolve, 0));
+        const messageOf = async (p: Promise<unknown>): Promise<string> => {
+            try {
+                await p;
+            } catch (e) {
+                return (e as Error).message;
+            }
+            return "";
+        };
+        let unhandled: unknown[];
+        const onUnhandled = (reason: unknown): void => {
+            unhandled.push(reason);
+        };
+        beforeEach(() => {
+            unhandled = [];
+            process.on("unhandledRejection", onUnhandled);
+            vi.useFakeTimers();
+        });
+        afterEach(() => {
+            vi.useRealTimers();
+            process.off("unhandledRejection", onUnhandled);
+        });
+
+        it("fails a rejecting start with a plain sentence, not Element's error, and frees the lock", async () => {
+            startDm.mockRejectedValueOnce(new Error("M_UNKNOWN: boom at /_matrix/client/v3/createRoom"));
+            expect(await codeOf(startDmWithUser(client, "@bob:example.org"))).toBe("failed");
+            startDm.mockRejectedValueOnce(new Error("secret internals"));
+            const message = await messageOf(startDmWithUser(client, "@bob:example.org"));
+            expect(message).toBe("Element could not open a chat with @bob:example.org");
+            expect(message).not.toContain("secret internals");
+            startDm.mockImplementationOnce(() => {
+                throw new Error("sync internals");
+            });
+            expect(await messageOf(startDmWithUser(client, "@bob:example.org"))).toBe(
+                "Element could not open a chat with @bob:example.org",
+            );
             startDm.mockResolvedValue("!dm:example.org");
             await expect(startDmWithUser(client, "@bob:example.org")).resolves.toEqual({
                 status: "done",
                 roomId: "!dm:example.org",
             });
-        } finally {
-            vi.useRealTimers();
-        }
+            await flushNode();
+            expect(unhandled).toEqual([]);
+        });
+
+        it("answers failed at 15 s, holds the lock until the start settles, then lists the late local room and frees the lock", async () => {
+            let resolveStart: (roomId: string | null) => void = () => {};
+            startDm.mockImplementationOnce(() => new Promise((resolve) => (resolveStart = resolve)));
+            const onLateChat = vi.fn();
+            const first = startDmWithUser(client, "@bob:example.org", onLateChat);
+            const firstMessage = messageOf(first);
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await firstMessage).toBe("Element did not open the chat in time");
+            expect(onLateChat).not.toHaveBeenCalled();
+
+            // Held: every dialog action (a second DM, the start-chat dialog) answers the busy failure and starts nothing.
+            await vi.advanceTimersByTimeAsync(20_000);
+            const start = vi.fn();
+            expect(await messageOf(startDmWithUser(client, "@carol:example.org"))).toBe(
+                "another Element dialog action is running",
+            );
+            expect(await messageOf(startChatViaDialog(start))).toBe("another Element dialog action is running");
+            expect(start).not.toHaveBeenCalled();
+            expect(startDm).toHaveBeenCalledTimes(1);
+
+            // The late room: listed through the late-chat path, the caller is not told; the lock is freed.
+            resolveStart("local+late:example.org");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(onLateChat).toHaveBeenCalledTimes(1);
+            expect(onLateChat).toHaveBeenCalledWith("local+late:example.org");
+            startDm.mockResolvedValue("!dm2:example.org");
+            await expect(startDmWithUser(client, "@carol:example.org")).resolves.toEqual({
+                status: "done",
+                roomId: "!dm2:example.org",
+            });
+            await flushNode();
+            expect(unhandled).toEqual([]);
+        });
+
+        it("does not list a late room that is not a local one (an existing DM is listed already)", async () => {
+            let resolveStart: (roomId: string | null) => void = () => {};
+            startDm.mockImplementationOnce(() => new Promise((resolve) => (resolveStart = resolve)));
+            const onLateChat = vi.fn();
+            const late = messageOf(startDmWithUser(client, "@bob:example.org", onLateChat));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            await late;
+            resolveStart("!existing:example.org");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(onLateChat).not.toHaveBeenCalled();
+        });
+
+        it("a late rejection frees the lock and is not an unhandled rejection", async () => {
+            let rejectStart: (e: unknown) => void = () => {};
+            startDm.mockImplementationOnce(() => new Promise((_, reject) => (rejectStart = reject)));
+            const onLateChat = vi.fn();
+            const late = messageOf(startDmWithUser(client, "@bob:example.org", onLateChat));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await late).toBe("Element did not open the chat in time");
+            expect(await messageOf(startDmWithUser(client, "@carol:example.org"))).toBe(
+                "another Element dialog action is running",
+            );
+            rejectStart(new Error("device lookup failed"));
+            await vi.advanceTimersByTimeAsync(0);
+            await flushNode();
+            expect(unhandled).toEqual([]);
+            expect(onLateChat).not.toHaveBeenCalled();
+            startDm.mockResolvedValue("!dm:example.org");
+            await expect(startDmWithUser(client, "@carol:example.org")).resolves.toEqual({
+                status: "done",
+                roomId: "!dm:example.org",
+            });
+        });
+
+        it("frees the lock at the 60 s cap for a start that never settles, and lists a room that arrives after it", async () => {
+            let resolveStart: (roomId: string | null) => void = () => {};
+            startDm.mockImplementationOnce(() => new Promise((resolve) => (resolveStart = resolve)));
+            const onLateChat = vi.fn();
+            const hung = messageOf(startDmWithUser(client, "@bob:example.org", onLateChat));
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await hung).toBe("Element did not open the chat in time");
+            await vi.advanceTimersByTimeAsync(DM_LOCK_CAP_MS - ROOM_ACTION_TIMEOUT_MS - 2);
+            expect(await messageOf(startDmWithUser(client, "@carol:example.org"))).toBe(
+                "another Element dialog action is running",
+            );
+            await vi.advanceTimersByTimeAsync(2);
+            startDm.mockResolvedValue("!dm:example.org");
+            await expect(startDmWithUser(client, "@carol:example.org")).resolves.toEqual({
+                status: "done",
+                roomId: "!dm:example.org",
+            });
+            // Released at the cap does not mean forgotten: the room that still arrives is listed.
+            resolveStart("local+verylate:example.org");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(onLateChat).toHaveBeenCalledWith("local+verylate:example.org");
+        });
+
+        it("a late release never frees a later holder's lock", async () => {
+            let resolveFirst: (roomId: string | null) => void = () => {};
+            startDm.mockImplementationOnce(() => new Promise((resolve) => (resolveFirst = resolve)));
+            const first = messageOf(startDmWithUser(client, "@bob:example.org"));
+            await vi.advanceTimersByTimeAsync(DM_LOCK_CAP_MS + 1);
+            await first;
+            let resolveSecond: (roomId: string | null) => void = () => {};
+            startDm.mockImplementationOnce(() => new Promise((resolve) => (resolveSecond = resolve)));
+            const second = startDmWithUser(client, "@carol:example.org");
+            await vi.advanceTimersByTimeAsync(0);
+            resolveFirst("local+first:example.org");
+            await vi.advanceTimersByTimeAsync(0);
+            expect(await messageOf(startDmWithUser(client, "@dave:example.org"))).toBe(
+                "another Element dialog action is running",
+            );
+            resolveSecond("!dm:example.org");
+            await expect(second).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+        });
     });
 });
