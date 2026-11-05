@@ -2514,8 +2514,21 @@ export class ViewModelBridge implements ClientViewBridge {
         return outcome;
     }
 
+    /** The listed local chat whose only target is `userId` (Element's `findDMRoom` skips local rooms), if any. */
+    private localChatWith(userId: string): string | undefined {
+        for (const id of this.localChats) {
+            const room = this.client.getRoom(id) as LocalRoom | null;
+            if (!room || !isLocalRoom(id) || room.state === LocalRoomState.CREATED) continue;
+            if (room.targets.length === 1 && room.targets[0].userId === userId) return id;
+        }
+        return undefined;
+    }
+
     public async startDm(userId: string): Promise<ActionOutcome> {
-        // A room Element opens after the 15 s answer (`failed`) is listed all the same, so a retry does not make a second one.
+        // A chat Element opened after the 15 s answer (`failed`), or an earlier start, is listed already: Element's
+        // `findDMRoom` does not see local rooms, so a retry would make a second one. Answer with the listed room.
+        const existing = this.localChatWith(userId);
+        if (existing) return { status: "done", roomId: existing };
         const outcome = await startDmWithUser(this.client, userId, (roomId) => {
             this.localChats.add(roomId);
             this.syncRooms();
