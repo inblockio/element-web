@@ -622,8 +622,8 @@ describe("ViewModelBridge", () => {
         h.statusBar.set({ state: null });
     });
 
-    it("is bridge version 3 and hands the send to the interim action", async () => {
-        expect(bridge.version).toBe(3);
+    it("is bridge version 4 and hands the send to the interim action", async () => {
+        expect(bridge.version).toBe(4);
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
         expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));

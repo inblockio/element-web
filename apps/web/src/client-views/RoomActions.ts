@@ -240,6 +240,116 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
     });
 }
 
+/** What the directory needs of the bridge's room list: whether a room is listed in `rooms()`, and when that list changes. */
+export interface DirectoryRooms {
+    isListed: (roomId: string) => boolean;
+    onRooms: (cb: () => void) => () => void;
+}
+
+/** What Spotlight dispatches for a picked room (`SpotlightDialog.viewRoom`); a person row's is `isChatViewRoom`. */
+const isDirectoryRoomPick = (p: ActionPayload): boolean => isViewRoom(p) && p.metricsTrigger === "WebUnifiedSearch";
+const isDirectoryPick = (p: ActionPayload): boolean => isDirectoryRoomPick(p) || isChatViewRoom(p);
+
+/**
+ * W1 / W5 directory and server search: Element's Spotlight dialog (`Action.ViewRoomDirectory`, or `OpenSpotlight` on the
+ * People filter), opened by `start`. The dialog's `finished` is `[]` on every close, so the result is read from the
+ * `ViewRoom` the dialog dispatched. A room row dispatches it before the dialog closes: a joined room (listed) is `done`;
+ * `auto_join` is `done` once the room is listed (`failed` on `JoinRoomError` for it, or after 15 s); a room only
+ * peeked (`should_peek`, world-readable) is `done` with `peek: true`; an alias-only `ViewRoom` waits for the re-dispatch
+ * that carries the id (`ViewRoomError` is `failed`). A person row runs `startDmOnFirstMessage`, which dispatches the
+ * chat's `ViewRoom` after `resolveThreePids`, i.e. after the dialog closed: for `people` that is awaited as in
+ * `startChatViaDialog` (an existing DM, or the local room of a new one). Closed with no such `ViewRoom` is `cancelled`.
+ */
+export function directoryViaDialog(
+    filter: "rooms" | "people",
+    start: () => void,
+    rooms: DirectoryRooms,
+): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        const seen = recordPayloads();
+        try {
+            const dialog = await openedDialog(start);
+            await dialog.finished;
+            // A room row dispatches before it closes; one tick covers a queued dispatch. A person row's follows the close.
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            let at = seen.payloads.findIndex(isDirectoryPick);
+            if (at < 0 && filter === "people") {
+                try {
+                    await seen.wait<true>((p) => (isDirectoryPick(p) ? true : undefined), CHAT_SHOWN_MS);
+                } catch {
+                    return { status: "cancelled" };
+                }
+                at = seen.payloads.findIndex(isDirectoryPick);
+            }
+            if (at < 0) return { status: "cancelled" };
+            const first = seen.payloads[at] as ViewRoomPayload;
+            if (!isDirectoryRoomPick(first)) return { status: "done", roomId: first.room_id };
+            let pick = first;
+
+            if (!pick.room_id) {
+                // Alias-only: RoomViewStore resolves it and dispatches the same payload again with the room id.
+                const alias = pick.room_alias;
+                pick = await seen.wait<ViewRoomPayload>(
+                    (p) => {
+                        if (p.action === Action.ViewRoomError && (p as { room_alias?: string }).room_alias === alias)
+                            return new ClientViewActionError("failed", "Element could not resolve the room alias");
+                        return isViewRoom(p) && p.room_alias === alias && !!p.room_id ? p : undefined;
+                    },
+                    ROOM_ACTION_TIMEOUT_MS,
+                    at,
+                );
+                at = seen.payloads.length;
+            }
+            const roomId = pick.room_id as string;
+            if (rooms.isListed(roomId)) return { status: "done", roomId };
+            if (pick.auto_join) {
+                await listedOrJoinError(roomId, rooms, seen, at);
+                return { status: "done", roomId };
+            }
+            // `should_peek` (a world-readable room) is the only peek; a room Element opens without joining or peeking
+            // (ask to join) is not one the kit can show.
+            if (pick.should_peek) return { status: "done", roomId, peek: true };
+            throw new ClientViewActionError("failed", "Element opened the room without joining or previewing it");
+        } finally {
+            seen.stop();
+        }
+    });
+}
+
+/** Resolves once the room is in `rooms()`; rejects on `JoinRoomError` for it (after `since`) or after 15 s. */
+async function listedOrJoinError(
+    roomId: string,
+    rooms: DirectoryRooms,
+    seen: ReturnType<typeof recordPayloads>,
+    since: number,
+): Promise<void> {
+    const failed = seen.wait<never>(
+        (p) =>
+            p.action === Action.JoinRoomError && (p as { roomId?: string | null }).roomId === roomId
+                ? toActionError((p as { err?: unknown }).err)
+                : undefined,
+        ROOM_ACTION_TIMEOUT_MS,
+        since,
+    );
+    failed.catch(() => {});
+    let off = (): void => {};
+    let poll: ReturnType<typeof setInterval> | undefined;
+    const listed = new Promise<void>((resolve) => {
+        const check = (): void => {
+            if (rooms.isListed(roomId)) resolve();
+        };
+        off = rooms.onRooms(check);
+        poll = setInterval(check, 250);
+        check();
+    });
+    try {
+        await Promise.race([listed, failed]);
+    } finally {
+        off();
+        clearInterval(poll);
+    }
+}
+
 /**
  * E3 forward: Element's forward dialog (`DialogOpener` on `OpenForwardDialog`, the way the message context menu opens it).
  * The dialog sends each copy itself and shows its own sending / sent / failed state (D17), so the kit keeps nothing from

@@ -20,6 +20,7 @@ import {
     viewSourceViaDialog,
     leaveViaDialog,
     startChatViaDialog,
+    directoryViaDialog,
     LEAVE_SETTLE_MS,
     ROOM_ACTION_TIMEOUT_MS,
 } from "./RoomActions";
@@ -789,5 +790,236 @@ describe("a confirmed dialog answer wins over the drop signal (Modal.tsx resolve
         await vi.advanceTimersByTimeAsync(0);
         await expect(outcome).resolves.toEqual({ status: "cancelled" });
         expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+describe("W1 / W5 directory and server search (Element's Spotlight over the kit)", () => {
+    /** The bridge's room list as the directory sees it: `list` adds a room and tells the listeners. */
+    const roomList = (
+        listed: string[] = [],
+    ): { isListed: (id: string) => boolean; onRooms: (cb: () => void) => () => void; list: (id: string) => void } => {
+        const ids = new Set(listed);
+        const cbs = new Set<() => void>();
+        return {
+            isListed: (id) => ids.has(id),
+            onRooms: (cb) => (cbs.add(cb), () => cbs.delete(cb)),
+            list: (id) => (ids.add(id), cbs.forEach((cb) => cb())),
+        };
+    };
+    /** What Spotlight's `viewRoom` dispatches for a public room row. */
+    const pickRoom = (extra: Record<string, unknown>): void =>
+        defaultDispatcher.dispatch(
+            { action: Action.ViewRoom, metricsTrigger: "WebUnifiedSearch", room_alias: "#r:example.org", ...extra },
+            true,
+        );
+
+    it("joins the picked public room: done once the room is listed", async () => {
+        const rooms = roomList();
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ room_id: "!pub:example.org", auto_join: true });
+            },
+            rooms,
+        );
+        d.finish();
+        await tick();
+        await tick();
+        rooms.list("!pub:example.org");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!pub:example.org" });
+    });
+
+    it("is done at once for a room that is already listed, joined or not peeked", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ room_id: "!mine:example.org", should_peek: true });
+            },
+            roomList(["!mine:example.org"]),
+        );
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!mine:example.org" });
+    });
+
+    it("is failed when the join fails (JoinRoomError for that room), and ignores another room's error", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ room_id: "!pub:example.org", auto_join: true });
+            },
+            roomList(),
+        );
+        d.finish();
+        await tick();
+        await tick();
+        defaultDispatcher.dispatch(
+            { action: Action.JoinRoomError, roomId: "!other:example.org", err: new Error("other") },
+            true,
+        );
+        defaultDispatcher.dispatch(
+            { action: Action.JoinRoomError, roomId: "!pub:example.org", err: new Error("no") },
+            true,
+        );
+        expect(await codeOf(outcome)).toBe("failed");
+    });
+
+    it("is failed when the joined room is not listed within 15 s", async () => {
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    pickRoom({ room_id: "!pub:example.org", auto_join: true });
+                },
+                roomList(),
+            );
+            const code = codeOf(outcome);
+            d.finish();
+            await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1);
+            expect(await code).toBe("failed");
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("waits for the re-dispatch that carries the id when only an alias was picked", async () => {
+        const rooms = roomList();
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ auto_join: true });
+            },
+            rooms,
+        );
+        d.finish();
+        await tick();
+        await tick();
+        // RoomViewStore resolved the alias and fires the payload again with the id.
+        pickRoom({ room_id: "!pub:example.org", auto_join: true });
+        await tick();
+        rooms.list("!pub:example.org");
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!pub:example.org" });
+    });
+
+    it("is failed when the alias cannot be resolved (ViewRoomError)", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ auto_join: true });
+            },
+            roomList(),
+        );
+        d.finish();
+        await tick();
+        await tick();
+        defaultDispatcher.dispatch({ action: Action.ViewRoomError, room_id: null, room_alias: "#r:example.org" }, true);
+        expect(await codeOf(outcome)).toBe("failed");
+    });
+
+    it("answers a world-readable room Element only peeks with peek: true", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ room_id: "!open:example.org", should_peek: true });
+            },
+            roomList(),
+        );
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "!open:example.org", peek: true });
+    });
+
+    it("is failed for a room Element opens without joining or peeking it (ask to join)", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                pickRoom({ room_id: "!knock:example.org" });
+            },
+            roomList(),
+        );
+        d.finish();
+        expect(await codeOf(outcome)).toBe("failed");
+    });
+
+    it("is cancelled when the dialog closes without a pick (an earlier or foreign ViewRoom is not one)", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "rooms",
+            () => {
+                d.start();
+                viewRoom("!notification:example.org", "Notification");
+            },
+            roomList(),
+        );
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+    });
+
+    it("people: waits for the chat's ViewRoom after the dialog closed (startDmOnFirstMessage dispatches after resolveThreePids)", async () => {
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog("people", d.start, roomList());
+            d.finish();
+            await vi.advanceTimersByTimeAsync(2_000);
+            viewRoom("!dm:example.org", "MessageUser");
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("people: a new chat is its local room", async () => {
+        const d = openDialogOnStart();
+        const outcome = directoryViaDialog(
+            "people",
+            () => {
+                d.start();
+                viewRoom("local+abc:example.org", undefined, [{}]);
+            },
+            roomList(),
+        );
+        d.finish();
+        await expect(outcome).resolves.toEqual({ status: "done", roomId: "local+abc:example.org" });
+    });
+
+    it("people: closed with no chat within the wait is cancelled", async () => {
+        vi.useFakeTimers();
+        try {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog("people", d.start, roomList());
+            d.finish();
+            await vi.advanceTimersByTimeAsync(5_001);
+            await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("runs one dialog action at a time and frees the lock after a cancel", async () => {
+        const d = openDialogOnStart();
+        const first = directoryViaDialog("rooms", d.start, roomList());
+        expect(await codeOf(directoryViaDialog("rooms", () => {}, roomList()))).toBe("failed");
+        d.finish();
+        await expect(first).resolves.toEqual({ status: "cancelled" });
+        const d2 = openDialogOnStart();
+        const second = directoryViaDialog("rooms", d2.start, roomList());
+        d2.finish();
+        await expect(second).resolves.toEqual({ status: "cancelled" });
     });
 });

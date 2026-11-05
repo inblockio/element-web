@@ -15,6 +15,7 @@ import { ClientViewActionError } from "./types";
 import { LOCAL_ROOM_ID_PREFIX, LocalRoomState } from "../models/LocalRoom";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
+import { Filter } from "../components/views/dialogs/spotlight/Filter";
 
 /* A6 / A7 / A5 on the bridge: which view-model action each method calls and what the room list shows around it. */
 const h = vi.hoisted(() => {
@@ -114,6 +115,7 @@ vi.mock("../Avatar", () => ({ avatarUrlForRoom: () => null }));
 
 const actions = vi.hoisted(() => ({
     createRoomViaDialog: vi.fn(),
+    directoryViaDialog: vi.fn(),
     startChatViaDialog: vi.fn(),
     leaveViaDialog: vi.fn(),
 }));
@@ -251,6 +253,62 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         // Element creates the real room: the local one leaves the list, the real one is the list view-model's.
         local.state = LocalRoomState.CREATED;
         handlers.forEach((cb) => cb(local as unknown as Room));
+        expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("is bridge version 4 (openDirectory is an additive method)", () => {
+        expect(bridge.version).toBe(4);
+        expect(typeof bridge.openDirectory).toBe("function");
+    });
+
+    it("opens the directory on Element's explore path (ViewRoomDirectory with the term) for rooms, the default", async () => {
+        const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
+        actions.directoryViaDialog.mockImplementation(async (_filter: string, start: () => void) => {
+            start();
+            return { status: "done", roomId: "!pub:example.org" };
+        });
+        await expect(bridge.openDirectory({ term: "matrix" })).resolves.toEqual({
+            status: "done",
+            roomId: "!pub:example.org",
+        });
+        await bridge.openDirectory();
+        expect(actions.directoryViaDialog.mock.calls.map((c) => c[0])).toEqual(["rooms", "rooms"]);
+        expect(dispatch.mock.calls.map((c) => c[0])).toEqual([
+            { action: Action.ViewRoomDirectory, initialText: "matrix" },
+            { action: Action.ViewRoomDirectory, initialText: undefined },
+        ]);
+        dispatch.mockRestore();
+    });
+
+    it("opens Spotlight on the People filter (OpenSpotlight with the term) for people, and lists a new chat's local room", async () => {
+        const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {});
+        const local = { roomId: LOCAL_ROOM_ID_PREFIX + "dm2", name: "Carol", state: LocalRoomState.NEW, tags: {} };
+        rooms[local.roomId] = local;
+        actions.directoryViaDialog.mockImplementation(async (_filter: string, start: () => void) => {
+            start();
+            return { status: "done", roomId: local.roomId };
+        });
+        await bridge.openDirectory({ term: "carol", filter: "people" });
+        expect(actions.directoryViaDialog.mock.calls.at(-1)?.[0]).toBe("people");
+        expect(dispatch).toHaveBeenCalledWith(
+            { action: Action.OpenSpotlight, initialText: "carol", initialFilter: Filter.People },
+            true,
+        );
+        expect(bridge.rooms().map((r) => r.id)).toEqual([local.roomId, "!a:example.org", "!inv:example.org"]);
+        dispatch.mockRestore();
+    });
+
+    it("tells the directory which rooms the kit lists, and lists nothing for an existing DM, a peek or a cancel", async () => {
+        const seen: Array<(id: string) => boolean> = [];
+        actions.directoryViaDialog.mockImplementation(
+            async (_filter: string, _start: () => void, r: { isListed: (id: string) => boolean }) => {
+                seen.push(r.isListed);
+                return { status: "done", roomId: "!dm:example.org", peek: true };
+            },
+        );
+        await bridge.openDirectory({ filter: "people" });
+        expect(seen[0]("!a:example.org")).toBe(true);
+        expect(seen[0]("!dm:example.org")).toBe(false);
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
     });
 
