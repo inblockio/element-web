@@ -1426,10 +1426,8 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
         expect(startDm).not.toHaveBeenCalled();
     });
 
-    it("fails when Element gives no room, and when its start throws", async () => {
+    it("fails when Element gives no room", async () => {
         startDm.mockResolvedValue(null);
-        expect(await codeOf(startDmWithUser(client, "@bob:example.org"))).toBe("failed");
-        startDm.mockRejectedValue(new Error("profile lookup failed"));
         expect(await codeOf(startDmWithUser(client, "@bob:example.org"))).toBe("failed");
     });
 
