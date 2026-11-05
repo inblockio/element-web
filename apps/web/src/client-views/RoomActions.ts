@@ -283,6 +283,8 @@ export function startChatViaDialog(start: () => void): Promise<ActionOutcome> {
 export interface DirectoryRooms {
     /** The room is in the kit's list and joined (an invitation is listed too, but is not a join). */
     isListed: (roomId: string) => boolean;
+    /** The room is an invitation of the user's (listed too): a plain row picked for it opens the invitation, which is the pick. */
+    isInvited?: (roomId: string) => boolean;
     onRooms: (cb: () => void) => () => void;
     /** A new chat's local room that Element opened after the action had answered `cancelled` (within 15 s of it). */
     onLateChat?: (roomId: string) => void;
@@ -374,6 +376,8 @@ export function directoryViaDialog(
             }
             const roomId = pick.room_id as string;
             if (rooms.isListed(roomId)) return { status: "done", roomId };
+            // An invitation picked from a plain row (`auto_join` waits for the join below) is the room Element opened.
+            if (!pick.auto_join && rooms.isInvited?.(roomId)) return { status: "done", roomId };
             if (pick.auto_join) {
                 await listedOrJoinError(roomId, rooms, seen, at);
                 return { status: "done", roomId };

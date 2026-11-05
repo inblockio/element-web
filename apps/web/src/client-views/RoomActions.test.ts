@@ -797,11 +797,18 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
     /** The bridge's room list as the directory sees it: `list` adds a room and tells the listeners. */
     const roomList = (
         listed: string[] = [],
-    ): { isListed: (id: string) => boolean; onRooms: (cb: () => void) => () => void; list: (id: string) => void } => {
+        invited: string[] = [],
+    ): {
+        isListed: (id: string) => boolean;
+        isInvited: (id: string) => boolean;
+        onRooms: (cb: () => void) => () => void;
+        list: (id: string) => void;
+    } => {
         const ids = new Set(listed);
         const cbs = new Set<() => void>();
         return {
             isListed: (id) => ids.has(id),
+            isInvited: (id) => invited.includes(id) && !ids.has(id),
             onRooms: (cb) => (cbs.add(cb), () => cbs.delete(cb)),
             list: (id) => (ids.add(id), cbs.forEach((cb) => cb())),
         };
@@ -940,6 +947,56 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
         );
         d.finish();
         await expect(outcome).resolves.toEqual({ status: "done", roomId: "!open:example.org", peek: true });
+    });
+
+    describe("an invited room picked from a plain Spotlight row (F1 round 2)", () => {
+        it("is done with that room: the invitation is the room Element opened (no auto_join, no peek)", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    pickRoom({ room_id: "!inv:example.org" });
+                },
+                roomList([], ["!inv:example.org"]),
+            );
+            d.finish();
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!inv:example.org" });
+        });
+
+        it("still waits for the join when the row has auto_join: done only after the room is listed", async () => {
+            const rooms = roomList([], ["!inv:example.org"]);
+            const d = openDialogOnStart();
+            let settled = false;
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    pickRoom({ room_id: "!inv:example.org", auto_join: true });
+                },
+                rooms,
+            ).finally(() => (settled = true));
+            d.finish();
+            await tick();
+            await tick();
+            expect(settled).toBe(false);
+            rooms.list("!inv:example.org");
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!inv:example.org" });
+        });
+
+        it("keeps a room the user is not in (ask to join) failed", async () => {
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    pickRoom({ room_id: "!knock:example.org" });
+                },
+                roomList([], ["!inv:example.org"]),
+            );
+            d.finish();
+            expect(await codeOf(outcome)).toBe("failed");
+        });
     });
 
     it("is failed for a room Element opens without joining or peeking it (ask to join)", async () => {
