@@ -250,7 +250,15 @@ export interface ViewMe {
     avatarUrl?: string;
     /** M10 W6: the room list sort Element holds (device setting `RoomList.preferredSorting`); a change fires `me`. */
     roomSort?: ViewRoomSort;
+    /**
+     * M11 Y2 (bridge v5): Element's settings dialog lists a Labs tab (`UserSettingsDialog.tsx:232`: `show_labs_settings`, the
+     * developer mode, or any beta feature). A kit offers "Feature preview" only when this is true and passes `tab: "labs"` only then.
+     */
+    settingsLabsTab: boolean;
 }
+
+/** M11 Y2: the tabs of Element's settings dialog a kit can open (`openUserSettings`). */
+export type ViewSettingsTab = "account" | "preferences" | "appearance" | "labs";
 
 /** M10 W6: Element's room list sort options (`RoomListHeaderViewModel`'s `SortOption`). */
 export type ViewRoomSort = "recent" | "alphabetical" | "unread-first";
@@ -306,7 +314,7 @@ export interface LoadOlderResult {
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 4;
+    readonly version: 5;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -562,8 +570,11 @@ export interface ClientViewBridge {
      * too, D17). `done` when the dialog closes (Element saves the profile itself; the kit follows `me()`), `failed` when
      * the dialog does not open, another Element dialog action is running, or the session is a guest's (Element would
      * show its sign-in question and keep the action for after sign-in: nothing is dispatched).
+     * M11 Y2 (bridge v5): the optional `opts.tab` opens the dialog on that tab (`account` = as before, `preferences` =
+     * `UserTab.Preferences`, `appearance` = `UserTab.Appearance`, `labs` = `UserTab.Labs`); `labs` while `ViewMe.settingsLabsTab`
+     * is false is `failed` with no dialog. A v4 host ignores the argument and opens Account.
      */
-    openUserSettings(): Promise<ActionOutcome>;
+    openUserSettings(opts?: { tab?: ViewSettingsTab }): Promise<ActionOutcome>;
     /**
      * M10 W6 (additive, kit feature-checks it): sets the room list sort the way `RoomListHeaderViewModel.sort(option)` does
      * (`RoomListStoreV3.resort`: the store re-sorts and writes the device setting `RoomList.preferredSorting`; no own sort

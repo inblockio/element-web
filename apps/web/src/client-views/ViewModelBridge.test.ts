@@ -18,6 +18,7 @@ import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineV
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
 import { _t } from "../languageHandler";
 import defaultDispatcher from "../dispatcher/dispatcher";
+import SdkConfig from "../SdkConfig";
 import DMRoomMap from "../utils/DMRoomMap";
 import { Action } from "../dispatcher/actions";
 import Modal from "../Modal";
@@ -121,6 +122,8 @@ const h = vi.hoisted(() => {
         rejectUrl: (e: unknown) => void;
     }> = [];
     const settings: Record<string, unknown> = {};
+    /** M11 Y2: the beta features `SettingsStore.getFeatureSettingNames` lists (name -> `getBetaInfo`); none by default. */
+    const betas: Record<string, unknown> = {};
     const roomEncrypted = { value: true };
     /** `client.hasLazyLoadMembersEnabled()`: Element's production client always has it on. */
     const lazyLoad = { value: false };
@@ -184,6 +187,7 @@ const h = vi.hoisted(() => {
         mediaHelpers,
         mediaVisible,
         settings,
+        betas,
         roomEncrypted,
         lazyLoad,
         watchers,
@@ -398,6 +402,8 @@ vi.mock("../utils/media/mediaVisibility", () => ({ getMediaVisibility: () => h.m
 vi.mock("../settings/SettingsStore", () => ({
     default: {
         getValue: (name: string) => h.settings[name] ?? false,
+        getFeatureSettingNames: () => Object.keys(h.betas),
+        getBetaInfo: (name: string) => h.betas[name],
         watchSetting: vi.fn((name: string, roomId: string | null, cb: () => void) => {
             const id = `w${h.watchers.size}_${name}_${Math.random()}`;
             h.watchers.set(id, { name, roomId, cb });
@@ -543,6 +549,7 @@ describe("ViewModelBridge", () => {
         h.urlPreviewVms.length = 0;
         h.watchers.clear();
         for (const k of Object.keys(h.settings)) delete h.settings[k];
+        for (const k of Object.keys(h.betas)) delete h.betas[k];
         h.settings.urlPreviewsEnabled = true;
         h.roomEncrypted.value = true;
         h.timelineSet.relations.getChildEventsForEvent.mockReturnValue(undefined);
@@ -577,7 +584,12 @@ describe("ViewModelBridge", () => {
                 membership: "join",
             },
         ]);
-        expect(bridge.me()).toEqual({ userId: "@me:example.org", displayName: "Me", avatarUrl: "http://avatar/me" });
+        expect(bridge.me()).toEqual({
+            userId: "@me:example.org",
+            displayName: "Me",
+            avatarUrl: "http://avatar/me",
+            settingsLabsTab: false,
+        });
     });
 
     it("emits a rooms change when an item snapshot changes", () => {
@@ -624,8 +636,8 @@ describe("ViewModelBridge", () => {
         h.statusBar.set({ state: null });
     });
 
-    it("is bridge version 4 and hands the send to the interim action", async () => {
-        expect(bridge.version).toBe(4);
+    it("is bridge version 5 and hands the send to the interim action", async () => {
+        expect(bridge.version).toBe(5);
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
         expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));
@@ -3508,6 +3520,70 @@ describe("ViewModelBridge", () => {
             expect(sortWatchers()).toHaveLength(1);
             b.dispose();
             expect(sortWatchers()).toHaveLength(0);
+        });
+
+        const DEV = "developerMode";
+        const devWatchers = (): Array<{ cb: () => void }> => [...h.watchers.values()].filter((w) => w.name === DEV);
+        /** Changes the developer mode and tells its watchers, as `SettingsStore` does after a write. */
+        const writeDev = (value: boolean): void => {
+            h.settings[DEV] = value;
+            for (const w of devWatchers()) w.cb();
+        };
+
+        it("M11 Y2: me().settingsLabsTab is Element's Labs-tab predicate (developer mode, labs config or any beta)", () => {
+            const b = fresh();
+            expect(b.me().settingsLabsTab).toBe(false);
+            h.settings[DEV] = true;
+            expect(b.me().settingsLabsTab).toBe(true);
+            h.settings[DEV] = false;
+            h.betas.feature_video_rooms = { title: "Video rooms" };
+            expect(b.me().settingsLabsTab).toBe(true);
+            delete h.betas.feature_video_rooms;
+            expect(b.me().settingsLabsTab).toBe(false);
+            SdkConfig.put({ show_labs_settings: true } as never);
+            try {
+                expect(b.me().settingsLabsTab).toBe(true);
+            } finally {
+                SdkConfig.reset();
+            }
+            b.dispose();
+        });
+
+        it("M11 Y2: a changed developer mode that flips the Labs tab fires one me event; an unchanged predicate fires none", () => {
+            const b = fresh();
+            const seen: string[] = [];
+            b.onChange((e) => seen.push(e.kind));
+            expect(devWatchers()).toHaveLength(1);
+            writeDev(true);
+            expect(seen).toEqual(["me"]);
+            writeDev(true);
+            expect(seen).toEqual(["me"]);
+            writeDev(false);
+            expect(seen).toEqual(["me", "me"]);
+            b.dispose();
+            expect(devWatchers()).toHaveLength(0);
+        });
+
+        it("M11 Y2: with a beta feature the Labs tab stays listed whatever the developer mode: no me event", () => {
+            h.betas.feature_video_rooms = { title: "Video rooms" };
+            const b = fresh();
+            const seen: string[] = [];
+            b.onChange((e) => seen.push(e.kind));
+            writeDev(true);
+            writeDev(false);
+            expect(seen).toEqual([]);
+            expect(b.me().settingsLabsTab).toBe(true);
+            b.dispose();
+        });
+
+        it("M11 Y2: openUserSettings({ tab: \"labs\" }) is failed with no dialog while Element lists no Labs tab", async () => {
+            const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
+            try {
+                await expect(bridge.openUserSettings({ tab: "labs" })).rejects.toMatchObject({ code: "failed" });
+                expect(dispatch).not.toHaveBeenCalled();
+            } finally {
+                dispatch.mockRestore();
+            }
         });
 
         it("offers openUserSettings and setRoomSort", () => {

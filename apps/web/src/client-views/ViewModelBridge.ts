@@ -109,7 +109,7 @@ import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { setPinned } from "./PinAction";
 import { openReport } from "./ReportAction";
-import { currentRoomSort, openUserSettings, setRoomSort } from "./RoomSortAction";
+import { currentRoomSort, labsTabListed, openUserSettings, setRoomSort } from "./RoomSortAction";
 import { createSection, editSection, removeSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import DMRoomMap from "../utils/DMRoomMap";
@@ -132,6 +132,7 @@ import {
     type ViewNotificationLevel,
     type ViewRoom,
     type ViewSection,
+    type ViewSettingsTab,
     type ViewThread,
     type ViewUrlPreview,
     ClientViewActionError,
@@ -1109,7 +1110,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 4;
+    public readonly version = 5;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -1217,6 +1218,15 @@ export class ViewModelBridge implements ClientViewBridge {
             this.emit({ kind: "me" });
         });
         this.disposers.push(() => SettingsStore.unwatchSetting(sortRef));
+        // M11 Y2: `me().settingsLabsTab` follows the developer mode setting (one of Element's Labs-tab reasons); only a change fires `me`.
+        let labsTab = labsTabListed();
+        const labsRef = SettingsStore.watchSetting("developerMode", null, () => {
+            const next = labsTabListed();
+            if (next === labsTab) return;
+            labsTab = next;
+            this.emit({ kind: "me" });
+        });
+        this.disposers.push(() => SettingsStore.unwatchSetting(labsRef));
         this.watchLocalVerification();
         this.watchEncryption();
         this.watchPins();
@@ -1566,13 +1576,19 @@ export class ViewModelBridge implements ClientViewBridge {
     public me(): ViewMe {
         this.used = true;
         const s = this.userMenu.getSnapshot();
-        return { userId: s.userId, displayName: s.displayName, avatarUrl: s.avatarUrl, roomSort: currentRoomSort() };
+        return {
+            userId: s.userId,
+            displayName: s.displayName,
+            avatarUrl: s.avatarUrl,
+            roomSort: currentRoomSort(),
+            settingsLabsTab: labsTabListed(),
+        };
     }
 
-    /** M10 W4: Element's settings dialog on the Account tab (name, avatar); `done` when it closes, `failed` for a guest. */
-    public openUserSettings(): Promise<ActionOutcome> {
+    /** M10 W4: Element's settings dialog (M11 Y2: on the asked tab); `done` when it closes, `failed` for a guest. */
+    public openUserSettings(opts?: { tab?: ViewSettingsTab }): Promise<ActionOutcome> {
         this.used = true;
-        return openUserSettings(this.client);
+        return openUserSettings(this.client, opts);
     }
 
     /** M10 W6: the room list sort as `RoomListHeaderViewModel.sort` sets it; `done` once the setting reads it. */

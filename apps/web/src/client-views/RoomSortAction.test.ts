@@ -14,7 +14,8 @@ import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
 import { UserTab } from "../components/views/dialogs/UserTab";
 import { SortingAlgorithm } from "../stores/room-list-v3/skip-list/sorters";
-import { currentRoomSort, openUserSettings, roomSortOf, setRoomSort } from "./RoomSortAction";
+import SdkConfig from "../SdkConfig";
+import { currentRoomSort, labsTabListed, openUserSettings, roomSortOf, setRoomSort } from "./RoomSortAction";
 import { ClientViewActionError } from "./types";
 
 vi.mock("../Modal", () => ({
@@ -32,12 +33,16 @@ const store = vi.hoisted(() => ({ resort: vi.fn() }));
 vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({ default: { instance: store } }));
 const settings = vi.hoisted(() => ({
     values: {} as Record<string, unknown>,
+    /** The beta features `getFeatureSettingNames` lists (name -> `getBetaInfo`); none by default. */
+    betas: {} as Record<string, unknown>,
     watchers: new Map<string, { name: string; cb: () => void }>(),
     next: 0,
 }));
 vi.mock("../settings/SettingsStore", () => ({
     default: {
         getValue: (name: string) => settings.values[name],
+        getFeatureSettingNames: () => Object.keys(settings.betas),
+        getBetaInfo: (name: string) => settings.betas[name],
         watchSetting: vi.fn((name: string, _roomId: string | null, cb: () => void) => {
             const id = `w${settings.next++}`;
             settings.watchers.set(id, { name, cb });
@@ -66,7 +71,9 @@ const codeOf = async (p: Promise<unknown>): Promise<string | undefined> => {
 beforeEach(() => {
     store.resort.mockReset();
     settings.values = {};
+    settings.betas = {};
     settings.watchers.clear();
+    SdkConfig.reset();
 });
 
 describe("M10 W6 roomSortOf / currentRoomSort (RoomListHeaderViewModel's algorithm switch)", () => {
@@ -234,5 +241,95 @@ describe("M10 W4 openUserSettings (Action.ViewUserSettings on the Account tab)",
         const code = codeOf(openUserSettings(member));
         await vi.advanceTimersByTimeAsync(5_001);
         expect(await code).toBe("failed");
+    });
+});
+
+describe("M11 Y2 labsTabListed (UserSettingsDialog.tsx:232, the Labs tab's predicate)", () => {
+    it("is false with no labs config, no developer mode and no beta feature", () => {
+        expect(labsTabListed()).toBe(false);
+    });
+
+    it("is true for the config show_labs_settings, the developer mode, or any beta feature, each alone", () => {
+        SdkConfig.put({ show_labs_settings: true } as never);
+        expect(labsTabListed()).toBe(true);
+        SdkConfig.reset();
+        expect(labsTabListed()).toBe(false);
+        settings.values.developerMode = true;
+        expect(labsTabListed()).toBe(true);
+        settings.values.developerMode = false;
+        expect(labsTabListed()).toBe(false);
+        settings.betas.feature_video_rooms = { title: "Video rooms" };
+        expect(labsTabListed()).toBe(true);
+    });
+});
+
+describe("M11 Y2 openUserSettings({ tab }) (Action.ViewUserSettings with the tab's UserTab)", () => {
+    type Mockable = { createDialog: unknown };
+    const member = { isGuest: () => false };
+    let finish!: (r: unknown[]) => void;
+    let dispatch: ReturnType<typeof vi.spyOn>;
+
+    function elementOpensTheDialog(): void {
+        const finished = new Promise<unknown[]>((resolve) => (finish = resolve));
+        (Modal as unknown as Mockable).createDialog = vi.fn(() => ({ close: vi.fn(), finished }));
+        dispatch.mockImplementation(() => {
+            (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+        });
+    }
+    /** Opens the dialog on `tab`, checks the dispatched tab, closes it, and expects `done`. */
+    async function opensOn(tab: Parameters<typeof openUserSettings>[1], expected: UserTab): Promise<void> {
+        elementOpensTheDialog();
+        const outcome = openUserSettings(member, tab);
+        await new Promise((r) => setTimeout(r, 0));
+        expect(dispatch).toHaveBeenCalledExactlyOnceWith({ action: Action.ViewUserSettings, initialTabId: expected });
+        finish([]);
+        await expect(outcome).resolves.toEqual({ status: "done" });
+        dispatch.mockClear();
+    }
+
+    beforeEach(() => {
+        dispatch = vi.spyOn(defaultDispatcher, "dispatch");
+    });
+    afterEach(() => {
+        dispatch.mockRestore();
+        vi.useRealTimers();
+    });
+
+    it("opens Preferences, Appearance and Account on their own UserTab, and Account with no tab or an empty options object", async () => {
+        await opensOn({ tab: "preferences" }, UserTab.Preferences);
+        await opensOn({ tab: "appearance" }, UserTab.Appearance);
+        await opensOn({ tab: "account" }, UserTab.Account);
+        await opensOn(undefined, UserTab.Account);
+        await opensOn({}, UserTab.Account);
+    });
+
+    it("opens Labs on UserTab.Labs when Element lists the tab (developer mode here)", async () => {
+        settings.values.developerMode = true;
+        await opensOn({ tab: "labs" }, UserTab.Labs);
+    });
+
+    it("opens Labs when only a beta feature makes Element list the tab", async () => {
+        settings.betas.feature_video_rooms = { title: "Video rooms" };
+        await opensOn({ tab: "labs" }, UserTab.Labs);
+    });
+
+    it("answers failed, dispatches nothing and opens no dialog for Labs while Element lists no Labs tab", async () => {
+        elementOpensTheDialog();
+        const outcome = openUserSettings(member, { tab: "labs" });
+        await expect(outcome).rejects.toBeInstanceOf(ClientViewActionError);
+        await expect(outcome).rejects.toMatchObject({ code: "failed", message: expect.stringContaining("Labs") });
+        expect(dispatch).not.toHaveBeenCalled();
+        expect((Modal as unknown as Mockable).createDialog).not.toHaveBeenCalled();
+        // The refusal leaves no running dialog action behind: Preferences right after works.
+        await opensOn({ tab: "preferences" }, UserTab.Preferences);
+    });
+
+    it("answers failed for a guest whatever the tab, with nothing dispatched", async () => {
+        elementOpensTheDialog();
+        settings.values.developerMode = true;
+        for (const tab of ["preferences", "appearance", "labs"] as const) {
+            await expect(openUserSettings({ isGuest: () => true }, { tab })).rejects.toMatchObject({ code: "failed" });
+        }
+        expect(dispatch).not.toHaveBeenCalled();
     });
 });
