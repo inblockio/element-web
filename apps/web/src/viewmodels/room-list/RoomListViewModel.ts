@@ -29,6 +29,7 @@ import RoomListStoreV3, {
     type Section,
 } from "../../stores/room-list-v3/RoomListStoreV3";
 import { FilterEnum } from "../../stores/room-list-v3/skip-list/filters";
+import { type SortingAlgorithm } from "../../stores/room-list-v3/skip-list/sorters";
 import {
     RoomNotificationStateStore,
     UPDATE_STATUS_INDICATOR,
@@ -208,6 +209,12 @@ export class RoomListViewModel
      */
     private previewRoom?: Room;
 
+    /**
+     * The sorting algorithm the last list update was computed with, to tell a resort (the user picked another sort)
+     * from a plain update. `undefined` until the store has a skip list.
+     */
+    private lastSortAlgorithm?: SortingAlgorithm;
+
     public constructor(props: RoomListViewModelProps) {
         const activeSpace = props.spaceStore.activeSpaceRoom;
 
@@ -241,6 +248,7 @@ export class RoomListViewModel
 
         this.roomsResult = roomsResult;
         this.sections = sections;
+        this.lastSortAlgorithm = RoomListStoreV3.instance.activeSortAlgorithm;
 
         // Build initial roomsMap from roomsResult
         this.updateRoomsMap(roomsResult);
@@ -834,6 +842,15 @@ export class RoomListViewModel
         this.roomsResult = RoomListStoreV3.instance.getSortedRoomsInActiveSpace(filterKeys);
         const newSpaceId = this.roomsResult.spaceId;
 
+        // A resort is exempt from the sticky room like a room change: the user asked for the new order, so the open
+        // room moves to its place in it instead of keeping its old index.
+        const sortAlgorithm = RoomListStoreV3.instance.activeSortAlgorithm;
+        const sortChanged =
+            sortAlgorithm !== undefined &&
+            this.lastSortAlgorithm !== undefined &&
+            sortAlgorithm !== this.lastSortAlgorithm;
+        if (sortAlgorithm !== undefined) this.lastSortAlgorithm = sortAlgorithm;
+
         // Detect space change
         if (oldSpaceId !== newSpaceId) {
             // Clear view models when the space changes
@@ -860,7 +877,7 @@ export class RoomListViewModel
         this.updateRoomsMap(this.roomsResult);
 
         // Normal room list update (not a space change)
-        void this.updateRoomListData();
+        void this.updateRoomListData(sortChanged);
     };
 
     private onListsLoaded = (): void => {

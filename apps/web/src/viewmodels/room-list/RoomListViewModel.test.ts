@@ -21,6 +21,7 @@ import {
 
 import RoomListStoreV3, { RoomListStoreV3Event } from "../../stores/room-list-v3/RoomListStoreV3";
 import { FilterEnum } from "../../stores/room-list-v3/skip-list/filters";
+import { SortingAlgorithm } from "../../stores/room-list-v3/skip-list/sorters";
 import dispatcher from "../../dispatcher/dispatcher";
 import { Action } from "../../dispatcher/actions";
 import { SDKContextClass } from "../../contexts/SDKContextClass";
@@ -517,6 +518,52 @@ describe("RoomListViewModel", () => {
             // Active room should still be at index 1 (sticky behavior)
             expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(1);
             expect(viewModel.getSnapshot().sections[0].roomIds[1]).toBe("!room2:server");
+        });
+
+        it("should drop the sticky room when the sorting algorithm changes, keep it on a plain update", async () => {
+            const sort = vi
+                .spyOn(RoomListStoreV3.instance, "activeSortAlgorithm", "get")
+                .mockReturnValue(SortingAlgorithm.Recency);
+            viewModel = new RoomListViewModel({
+                client: matrixClient,
+                spaceStore: SDKContextClass.instance.spaceStore,
+                roomViewStore: SDKContextClass.instance.roomViewStore,
+            });
+
+            // Select room at index 1
+            vi.spyOn(SDKContextClass.instance.roomViewStore, "getRoomId").mockReturnValue("!room2:server");
+            dispatcher.dispatch({
+                action: Action.ActiveRoomChanged,
+                newRoomId: "!room2:server",
+            });
+            await flushPromises();
+            expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(1);
+
+            // Plain update, same algorithm: room2 moves to the front, the sticky room stays at index 1
+            vi.spyOn(RoomListStoreV3.instance, "getSortedRoomsInActiveSpace").mockReturnValue({
+                spaceId: "home",
+                sections: [{ tag: CHATS_TAG, rooms: [room2, room1, room3] }],
+            });
+            RoomListStoreV3.instance.emit(RoomListStoreV3Event.ListsUpdate);
+            expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(1);
+
+            // Resort (the user picked another sort): room2 is first in the new order and the list shows it so
+            sort.mockReturnValue(SortingAlgorithm.Alphabetic);
+            vi.spyOn(RoomListStoreV3.instance, "getSortedRoomsInActiveSpace").mockReturnValue({
+                spaceId: "home",
+                sections: [{ tag: CHATS_TAG, rooms: [room2, room3, room1] }],
+            });
+            RoomListStoreV3.instance.emit(RoomListStoreV3Event.ListsUpdate);
+            expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(0);
+            expect(viewModel.getSnapshot().sections[0].roomIds).toEqual([room2, room3, room1].map((r) => r.roomId));
+
+            // The next plain update (same algorithm) is sticky again, at the new index
+            vi.spyOn(RoomListStoreV3.instance, "getSortedRoomsInActiveSpace").mockReturnValue({
+                spaceId: "home",
+                sections: [{ tag: CHATS_TAG, rooms: [room3, room2, room1] }],
+            });
+            RoomListStoreV3.instance.emit(RoomListStoreV3Event.ListsUpdate);
+            expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(0);
         });
 
         it("should not apply sticky behavior when user changes rooms", async () => {
