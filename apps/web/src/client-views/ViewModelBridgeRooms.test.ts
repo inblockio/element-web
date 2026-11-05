@@ -117,6 +117,7 @@ const actions = vi.hoisted(() => ({
     createRoomViaDialog: vi.fn(),
     directoryViaDialog: vi.fn(),
     startChatViaDialog: vi.fn(),
+    startDmWithUser: vi.fn(),
     leaveViaDialog: vi.fn(),
 }));
 vi.mock("./RoomActions", () => actions);
@@ -363,6 +364,59 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         actions.startChatViaDialog.mockResolvedValue({ status: "done", roomId: "!dm:example.org" });
         await bridge.createChat();
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("starts a DM through startDmWithUser and lists the local room of a new DM before the kit gets done (M11 Y4)", async () => {
+        const local = {
+            roomId: LOCAL_ROOM_ID_PREFIX + "reply",
+            name: "Bob",
+            state: LocalRoomState.NEW,
+            tags: {},
+        };
+        rooms[local.roomId] = local;
+        actions.startDmWithUser.mockResolvedValue({ status: "done", roomId: local.roomId });
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        let listedAtDone: string[] = [];
+        const outcome = await bridge.startDm("@bob:example.org").then((o) => {
+            listedAtDone = bridge.rooms().map((r) => r.id);
+            return o;
+        });
+        expect(outcome).toEqual({ status: "done", roomId: local.roomId });
+        expect(actions.startDmWithUser).toHaveBeenCalledWith(client, "@bob:example.org", expect.any(Function));
+        expect(listedAtDone).toEqual([local.roomId, "!a:example.org", "!inv:example.org"]);
+        expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
+        // Element creates the real room on the first send: the local one leaves the list.
+        local.state = LocalRoomState.CREATED;
+        handlers.forEach((cb) => cb(local as unknown as Room));
+        expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("lists nothing new for an existing DM, a failed start (the error reaches the kit) or the own id (M11 Y4)", async () => {
+        actions.startDmWithUser.mockResolvedValue({ status: "done", roomId: "!dm:example.org" });
+        await expect(bridge.startDm("@bob:example.org")).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+        actions.startDmWithUser.mockRejectedValue(new Error("a direct chat with yourself is not started"));
+        await expect(bridge.startDm("@me:example.org")).rejects.toThrow("yourself");
+        expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
+    });
+
+    it("lists the local room of a DM that Element opens after startDm answered failed (late chat, M11 Y4 F1)", async () => {
+        const local = { roomId: LOCAL_ROOM_ID_PREFIX + "dm4", name: "Eve", state: LocalRoomState.NEW, tags: {} };
+        rooms[local.roomId] = local;
+        let late: (id: string) => void = () => {};
+        actions.startDmWithUser.mockImplementation(
+            async (_c: unknown, _u: string, onLateChat: (id: string) => void) => {
+                late = onLateChat;
+                throw new ClientViewActionError("failed", "Element did not open the chat in time");
+            },
+        );
+        await expect(bridge.startDm("@eve:example.org")).rejects.toThrow("in time");
+        expect(bridge.rooms().map((r) => r.id)).not.toContain(local.roomId);
+        const onChange = vi.fn();
+        bridge.onChange(onChange);
+        late(local.roomId);
+        expect(bridge.rooms().map((r) => r.id)).toContain(local.roomId);
+        expect(onChange).toHaveBeenCalledWith({ kind: "rooms" });
     });
 
     it("leaves through the room list item view-model's onLeaveRoom (Element's confirm)", async () => {
