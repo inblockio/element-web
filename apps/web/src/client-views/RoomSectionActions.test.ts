@@ -12,7 +12,14 @@ import { type Room } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
 import SettingsStore from "../settings/SettingsStore";
-import { createSection, editSection, removeSection, setSection, type RoomSectionVm } from "./RoomSectionActions";
+import {
+    createSection,
+    editSection,
+    moveSection,
+    removeSection,
+    setSection,
+    type RoomSectionVm,
+} from "./RoomSectionActions";
 import { setFavourite } from "./RoomItemActions";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import { ClientViewActionError } from "./types";
@@ -27,7 +34,12 @@ vi.mock("../Modal", async () => {
     });
     return { default: manager, ModalManagerEvent: { Opened: "opened", Closed: "closed" } };
 });
-const store = vi.hoisted(() => ({ createSection: vi.fn(), editSection: vi.fn(), removeSection: vi.fn() }));
+const store = vi.hoisted(() => ({
+    createSection: vi.fn(),
+    editSection: vi.fn(),
+    removeSection: vi.fn(),
+    reorderSection: vi.fn(),
+}));
 vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({ default: { instance: store } }));
 
 /* M6 B1: the outcome of each section action is read where the view-model leaves it (the room's own tags, the dialog's answer). */
@@ -788,5 +800,134 @@ describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dial
         await vi.advanceTimersByTimeAsync(0);
         storeResult();
         await expect(next).resolves.toEqual({ status: "cancelled" });
+    });
+});
+
+describe("M11 Y3 moveSection (RoomListStoreV3.reorderSection, answered from the stored order and sections())", () => {
+    const C = "element.io.section.ccc";
+    /** `RoomList.OrderedCustomSections` as the account data holds it: it also carries the `chats` and `People` tags. */
+    let stored: string[];
+    /** The bridge's `sections()` as tags (customs only): what the move waits to see change. */
+    let listed: string[];
+    let getValue: ReturnType<typeof vi.spyOn>;
+    const order = (): readonly string[] => listed;
+    /** Both sides apply the move: `tag` takes the place of `neighbour` in the customs (what Element's reorder stores). */
+    const apply = (tag: string, neighbour: string): void => {
+        const move = (list: string[]): string[] => {
+            const rest = list.filter((t) => t !== tag);
+            const at = rest.indexOf(neighbour);
+            rest.splice(list.indexOf(tag) < list.indexOf(neighbour) ? at + 1 : at, 0, tag);
+            return rest;
+        };
+        stored = move(stored);
+        listed = move(listed);
+    };
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+        stored = ["chats", A, B, "People", C];
+        listed = [A, B, C];
+        store.reorderSection.mockReset();
+        getValue = vi
+            .spyOn(SettingsStore, "getValue")
+            .mockImplementation(((name: string) =>
+                name === "RoomList.OrderedCustomSections" ? stored : undefined) as never);
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+        getValue.mockRestore();
+    });
+
+    it("down: asks the store for the move with the next custom and is done once the stored order and sections() show it (and not before)", async () => {
+        store.reorderSection.mockImplementation(async () => {
+            stored = ["chats", B, A, "People", C];
+        });
+        const outcome = moveSection(A, "down", order);
+        let settled = false;
+        void outcome.then(() => (settled = true));
+        await vi.advanceTimersByTimeAsync(200);
+        expect(store.reorderSection).toHaveBeenCalledExactlyOnceWith(A, B);
+        expect(settled).toBe(false); // the stored order moved, sections() has not caught up yet
+        listed = [B, A, C];
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+    });
+
+    it("up: the neighbour is the previous custom (the one Element's reorder takes)", async () => {
+        store.reorderSection.mockImplementation(async (tag: string, neighbour: string) => apply(tag, neighbour));
+        const outcome = moveSection(C, "up", order);
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(outcome).resolves.toEqual({ status: "done", section: C });
+        expect(store.reorderSection).toHaveBeenCalledExactlyOnceWith(C, B);
+        expect(stored).toEqual(["chats", A, C, B, "People"]);
+    });
+
+    it("an unknown tag is failed at once and the store is not asked", async () => {
+        const outcome = codeOf(moveSection("element.io.section.zzz", "up", order));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await outcome).toBe("failed");
+        expect(store.reorderSection).not.toHaveBeenCalled();
+    });
+
+    it("the first custom up and the last custom down have no neighbour: failed at once, the store is not asked", async () => {
+        const up = codeOf(moveSection(A, "up", order));
+        const down = codeOf(moveSection(C, "down", order));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await up).toBe("failed");
+        expect(await down).toBe("failed");
+        expect(store.reorderSection).not.toHaveBeenCalled();
+    });
+
+    it("a refused account-data write (the store's promise fulfils, the stored order is unchanged) is network, also when sections() already shows the move", async () => {
+        store.reorderSection.mockImplementation(async () => {
+            listed = [B, A, C]; // the local echo moved the list, the PUT was refused and the echo expired
+        });
+        const outcome = codeOf(moveSection(A, "down", order));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await outcome).toBe("network");
+        expect(stored).toEqual(["chats", A, B, "People", C]);
+    });
+
+    it("a store that has not written in time is failed, and the next move still takes its turn", async () => {
+        store.reorderSection.mockImplementationOnce(() => new Promise<void>(() => undefined));
+        const outcome = codeOf(moveSection(A, "down", order));
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        expect(await outcome).toBe("failed");
+
+        store.reorderSection.mockImplementation(async (tag: string, neighbour: string) => apply(tag, neighbour));
+        const next = moveSection(B, "down", order);
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(next).resolves.toEqual({ status: "done", section: B });
+        expect(store.reorderSection).toHaveBeenLastCalledWith(B, C);
+    });
+
+    it("sections() still lagging after the stored order moved is network once the time is up (the write is stored)", async () => {
+        store.reorderSection.mockImplementation(async () => {
+            stored = ["chats", B, A, "People", C];
+        });
+        const outcome = codeOf(moveSection(A, "down", order));
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        expect(await outcome).toBe("network");
+    });
+
+    it("a store write that rejects maps to the contract's error", async () => {
+        store.reorderSection.mockRejectedValue(new Error("boom"));
+        const outcome = codeOf(moveSection(A, "down", order));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(await outcome).toBe("failed");
+    });
+
+    it("two moves run one after the other: the second reads the order the first left", async () => {
+        store.reorderSection.mockImplementation(async (tag: string, neighbour: string) => apply(tag, neighbour));
+        const first = moveSection(A, "down", order);
+        const second = moveSection(A, "down", order);
+        await vi.advanceTimersByTimeAsync(300);
+        await expect(first).resolves.toEqual({ status: "done", section: A });
+        await expect(second).resolves.toEqual({ status: "done", section: A });
+        expect(store.reorderSection.mock.calls).toEqual([
+            [A, B],
+            [A, C],
+        ]);
+        expect(listed).toEqual([B, C, A]);
     });
 });

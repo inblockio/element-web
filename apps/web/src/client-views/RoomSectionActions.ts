@@ -249,11 +249,17 @@ function isMoved(order: readonly string[], tag: string, neighbour: string, direc
  * bridge's `sections()` as tags (customs only), read when the call takes its turn (moves run one after the other, so a
  * second click sees the first one's result). `failed` at once for a tag it does not list and for the first / last custom
  * (no neighbour in that direction). `done` + `section` once the stored `RoomList.OrderedCustomSections` AND `order()` both
- * show `tag` on the neighbour's side (D21: a refused account-data write is swallowed by the store, only the re-read tells);
- * else, within `ROOM_ACTION_TIMEOUT_MS`, `failed`. Only the relative order of the customs moves: Element keeps `chats` and
- * `People` in the same stored order and the move may jump over them (LIMIT).
+ * show `tag` on the neighbour's side (D21: a refused account-data write is swallowed by the store, only the re-read tells).
+ * Codes (orchestrator ruling, N-Y3-codes, as M10 `removeSection`): `failed` for an unknown tag, no neighbour and a store that
+ * has not settled within `ROOM_ACTION_TIMEOUT_MS`; `network` for a refused write (the stored order did not change) and for
+ * `sections()` still lagging after `ROOM_ACTION_TIMEOUT_MS` (the write may still apply). Only the relative order of the
+ * customs moves: Element keeps `chats` and `People` in the same stored order and the move may jump over them (LIMIT).
  */
-export function moveSection(tag: string, direction: "up" | "down", order: () => readonly string[]): Promise<ActionOutcome> {
+export function moveSection(
+    tag: string,
+    direction: "up" | "down",
+    order: () => readonly string[],
+): Promise<ActionOutcome> {
     return serialTagWrite(SECTION_ORDER_QUEUE, async () => {
         const listed = order();
         const at = listed.indexOf(tag);
@@ -261,7 +267,9 @@ export function moveSection(tag: string, direction: "up" | "down", order: () => 
         if (neighbour === undefined) {
             throw new ClientViewActionError(
                 "failed",
-                at === -1 ? `${tag} is not one of the sections` : `${tag} is the ${direction === "up" ? "first" : "last"} section`,
+                at === -1
+                    ? `${tag} is not one of the sections`
+                    : `${tag} is the ${direction === "up" ? "first" : "last"} section`,
             );
         }
         const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
@@ -280,10 +288,10 @@ export function moveSection(tag: string, direction: "up" | "down", order: () => 
             clearTimeout(timer);
         }
         if (!isMoved(storedOrder(), tag, neighbour, direction))
-            throw new ClientViewActionError("failed", "the section order was not changed in the account data");
+            throw new ClientViewActionError("network", "the section order was not changed in the account data");
         while (!isMoved(order(), tag, neighbour, direction)) {
             if (Date.now() >= until)
-                throw new ClientViewActionError("failed", "the sections were not reordered after the move");
+                throw new ClientViewActionError("network", "the sections were not reordered after the move");
             await new Promise((r) => setTimeout(r, POLL_MS));
         }
         return { status: "done", section: tag };
