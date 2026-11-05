@@ -2547,15 +2547,20 @@ export class ViewModelBridge implements ClientViewBridge {
         return undefined;
     }
 
-    public async startDm(userId: string): Promise<ActionOutcome> {
+    public async startDm(userId: string, fromRoomId?: string): Promise<ActionOutcome> {
         // A chat Element opened after the 15 s answer (`failed`), or an earlier start, is listed already: Element's
         // `findDMRoom` does not see local rooms, so a retry would make a second one. Answer with the listed room.
         const existing = this.localChatWith(userId);
         if (existing) return { status: "done", roomId: existing };
-        const outcome = await startDmWithUser(this.client, userId, (roomId) => {
-            this.localChats.add(roomId);
-            this.syncRooms();
-        });
+        const outcome = await startDmWithUser(
+            this.client,
+            userId,
+            (roomId) => {
+                this.localChats.add(roomId);
+                this.syncRooms();
+            },
+            fromRoomId,
+        );
         // A new DM's local room is listed (and opened) by the kit like any room until the first send creates it (as createChat).
         if (outcome.status === "done" && outcome.roomId && isLocalRoom(outcome.roomId)) {
             this.localChats.add(outcome.roomId);

@@ -402,8 +402,12 @@ export interface ClientViewBridge {
      * (an existing DM, or the local room of a new one, listed in `rooms()` like `createChat`'s before `done`). `failed` at once
      * for a malformed or the own user id, for a start that gives no room, or none within 15 s. One Element dialog action at a
      * time (`failed` while another runs). Interim (D41): no shared DM view-model. A kit feature-checks the method.
+     * M12 Z2 (additive, no version change): the optional `fromRoomId` is the room of the message the user replied to; the new
+     * chat is titled with the name and avatar of that room's member (as stock's user-info "Message" copies the member it
+     * holds), else of a joined room's member the client holds (never an invitation's). An older host ignores it, an older kit
+     * omits it.
      */
-    startDm(userId: string): Promise<ActionOutcome>;
+    startDm(userId: string, fromRoomId?: string): Promise<ActionOutcome>;
     /**
      * A7: Element's leave confirm (`RoomListItemViewModel.onLeaveRoom`). `done` once the user is no longer in the room,
      * `cancelled` when the confirm says no, `unsupported` for an archived room, `failed` when the leave did not happen.
