@@ -22,6 +22,7 @@ import DMRoomMap from "../utils/DMRoomMap";
 import { Action } from "../dispatcher/actions";
 import Modal from "../Modal";
 import ForwardDialog from "../components/views/dialogs/ForwardDialog";
+import { UserTab } from "../components/views/dialogs/UserTab";
 
 /*
  * The bridge only wires view-models together; the view-models themselves are replaced by small fakes here so the
@@ -522,6 +523,7 @@ describe("ViewModelBridge", () => {
         bridge = new ViewModelBridge({
             getRoom: (id: string) => (id === "!a" ? h.room : null),
             getUserId: () => "@me:example.org",
+            isGuest: () => false,
             isRoomEncrypted: () => h.roomEncrypted.value,
             hasLazyLoadMembersEnabled: () => h.lazyLoad.value,
             getCrypto: () => undefined,
@@ -3434,6 +3436,116 @@ describe("ViewModelBridge", () => {
 
         it("rejects unknown_room for a room the bridge does not know", async () => {
             await expect(bridge.loadOlder("!nope")).rejects.toMatchObject({ code: "unknown_room" });
+        });
+    });
+
+    /* M10 W4 + W6: `me().roomSort`, its `me` event, and the two new methods (the actions themselves: RoomSortAction.test.ts). */
+    describe("M10 room sort and user settings", () => {
+        const SORT = "RoomList.preferredSorting";
+        // The harness clears `h.watchers` after it builds `bridge`: a bridge built in the test keeps its constructor watchers.
+        const fresh = (guest = false): ViewModelBridge =>
+            new ViewModelBridge({
+                getRoom: (id: string) => (id === "!a" ? h.room : null),
+                getUserId: () => "@me:example.org",
+                isGuest: () => guest,
+                isRoomEncrypted: () => h.roomEncrypted.value,
+                hasLazyLoadMembersEnabled: () => h.lazyLoad.value,
+                getCrypto: () => undefined,
+                getEventTimeline: h.getEventTimeline,
+                on: vi.fn(),
+                off: vi.fn(),
+            } as unknown as MatrixClient);
+        const sortWatchers = (): Array<{ name: string; roomId: string | null; cb: () => void }> =>
+            [...h.watchers.values()].filter((w) => w.name === SORT);
+        /** Changes the setting and tells its watchers, as `SettingsStore` does after a write. */
+        const writeSort = (value: unknown): void => {
+            h.settings[SORT] = value;
+            for (const w of sortWatchers()) w.cb();
+        };
+
+        it("me() carries roomSort for each of the three algorithms", () => {
+            const b = fresh();
+            h.settings[SORT] = "Recency";
+            expect(b.me().roomSort).toBe("recent");
+            h.settings[SORT] = "Alphabetic";
+            expect(b.me().roomSort).toBe("alphabetical");
+            h.settings[SORT] = "Unread";
+            expect(b.me().roomSort).toBe("unread-first");
+            expect(b.me()).toMatchObject({
+                userId: "@me:example.org",
+                displayName: "Me",
+                avatarUrl: "http://avatar/me",
+            });
+            b.dispose();
+        });
+
+        it("me() leaves roomSort out when the setting holds nothing the kit knows", () => {
+            const b = fresh();
+            expect(b.me().roomSort).toBeUndefined();
+            b.dispose();
+        });
+
+        it("a changed sort setting fires one me event; an unchanged value fires none", () => {
+            h.settings[SORT] = "Recency";
+            const b = fresh();
+            const seen: string[] = [];
+            b.onChange((e) => seen.push(e.kind));
+            expect(sortWatchers()).toHaveLength(1);
+            writeSort("Alphabetic");
+            expect(seen).toEqual(["me"]);
+            expect(b.me().roomSort).toBe("alphabetical");
+            // The settings store also notifies for a write of the same value (and for another level): no second event.
+            writeSort("Alphabetic");
+            for (const w of sortWatchers()) w.cb();
+            expect(seen).toEqual(["me"]);
+            writeSort("Recency");
+            expect(seen).toEqual(["me", "me"]);
+            b.dispose();
+        });
+
+        it("stops watching the sort setting when the bridge is disposed", () => {
+            const b = fresh();
+            expect(sortWatchers()).toHaveLength(1);
+            b.dispose();
+            expect(sortWatchers()).toHaveLength(0);
+        });
+
+        it("offers openUserSettings and setRoomSort", () => {
+            expect(typeof bridge.openUserSettings).toBe("function");
+            expect(typeof bridge.setRoomSort).toBe("function");
+        });
+
+        it("setRoomSort refuses unread-first as unsupported", async () => {
+            await expect(bridge.setRoomSort("unread-first" as never)).rejects.toMatchObject({ code: "unsupported" });
+        });
+
+        it("openUserSettings answers failed for a guest session and dispatches nothing", async () => {
+            const dispatch = vi.spyOn(defaultDispatcher, "dispatch");
+            try {
+                const b = fresh(true);
+                await expect(b.openUserSettings()).rejects.toMatchObject({ code: "failed" });
+                expect(dispatch).not.toHaveBeenCalled();
+                expect(h.createDialog).not.toHaveBeenCalled();
+                b.dispose();
+            } finally {
+                dispatch.mockRestore();
+            }
+        });
+
+        it("openUserSettings dispatches ViewUserSettings on the Account tab and is done when Element's dialog closes", async () => {
+            h.createDialog.mockReturnValue({ close: vi.fn(), finished: Promise.resolve([]) });
+            const dispatch = vi.spyOn(defaultDispatcher, "dispatch").mockImplementation(() => {
+                (Modal.createDialog as unknown as (...a: unknown[]) => unknown)(class {});
+            });
+            try {
+                await expect(bridge.openUserSettings()).resolves.toEqual({ status: "done" });
+                expect(dispatch).toHaveBeenCalledExactlyOnceWith({
+                    action: Action.ViewUserSettings,
+                    initialTabId: UserTab.Account,
+                });
+            } finally {
+                dispatch.mockRestore();
+            }
         });
     });
 });

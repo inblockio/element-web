@@ -248,7 +248,12 @@ export interface ViewMe {
     userId: string;
     displayName: string;
     avatarUrl?: string;
+    /** M10 W6: the room list sort Element holds (device setting `RoomList.preferredSorting`); a change fires `me`. */
+    roomSort?: ViewRoomSort;
 }
+
+/** M10 W6: Element's room list sort options (`RoomListHeaderViewModel`'s `SortOption`). */
+export type ViewRoomSort = "recent" | "alphabetical" | "unread-first";
 
 export type ViewConnection = "online" | "connecting" | "offline";
 
@@ -551,6 +556,21 @@ export interface ClientViewBridge {
      * `unknown_event` for a message the bridge does not hold. Interim (D31): no report action on a shared view-model.
      */
     openReport(roomId: string, eventId: string): Promise<ActionOutcome>;
+    /**
+     * M10 W4 (additive, kit feature-checks it): Element's own settings dialog on its Account tab over the kit
+     * (`Action.ViewUserSettings`, `UserTab.Account`: name and avatar are `UserProfileSettings`; Element's other tabs show
+     * too, D17). `done` when the dialog closes (Element saves the profile itself; the kit follows `me()`), `failed` when
+     * the dialog does not open, another Element dialog action is running, or the session is a guest's (Element would
+     * show its sign-in question and keep the action for after sign-in: nothing is dispatched).
+     */
+    openUserSettings(): Promise<ActionOutcome>;
+    /**
+     * M10 W6 (additive, kit feature-checks it): sets the room list sort the way `RoomListHeaderViewModel.sort(option)` does
+     * (`RoomListStoreV3.resort`: the store re-sorts and writes the device setting `RoomList.preferredSorting`; no own sort
+     * here). `done` once the setting reads the new value (the `rooms` event with the new order and the `me` event with
+     * `roomSort` follow); `unsupported` for any other option, `failed` when the store is not ready or the setting stays.
+     */
+    setRoomSort(option: "recent" | "alphabetical"): Promise<ActionOutcome>;
 }
 
 /** A kit that runs in a same-origin iframe loaded from `url`. */
