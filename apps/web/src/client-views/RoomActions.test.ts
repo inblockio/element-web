@@ -1031,6 +1031,29 @@ describe("W1 / W5 directory and server search (Element's Spotlight over the kit)
         }
     });
 
+    it("clears the join-error timer once the picked room is listed (no 15 s timer is left behind)", async () => {
+        vi.useFakeTimers();
+        try {
+            const rooms = roomList();
+            const d = openDialogOnStart();
+            const outcome = directoryViaDialog(
+                "rooms",
+                () => {
+                    d.start();
+                    pickRoom({ room_id: "!pub:example.org", auto_join: true });
+                },
+                rooms,
+            );
+            d.finish();
+            await vi.advanceTimersByTimeAsync(1_000);
+            rooms.list("!pub:example.org");
+            await expect(outcome).resolves.toEqual({ status: "done", roomId: "!pub:example.org" });
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     describe("follows the group-chat dialog that replaces Spotlight (a static modal over a static modal)", () => {
         const fake = Modal as unknown as {
             createDialog: unknown;

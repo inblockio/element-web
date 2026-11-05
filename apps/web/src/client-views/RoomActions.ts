@@ -95,7 +95,12 @@ function leftStack(modal: object): Promise<void> {
 export function recordPayloads(): {
     payloads: ActionPayload[];
     stop: () => void;
-    wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since?: number) => Promise<T>;
+    wait: <T>(
+        pick: (p: ActionPayload) => T | Error | undefined,
+        ms: number,
+        since?: number,
+        signal?: AbortSignal,
+    ) => Promise<T>;
 } {
     const payloads: ActionPayload[] = [];
     const waiters = new Set<(p: ActionPayload) => void>();
@@ -106,12 +111,23 @@ export function recordPayloads(): {
     return {
         payloads,
         stop: () => defaultDispatcher.unregister(token),
-        wait: <T>(pick: (p: ActionPayload) => T | Error | undefined, ms: number, since = 0): Promise<T> =>
+        wait: <T>(
+            pick: (p: ActionPayload) => T | Error | undefined,
+            ms: number,
+            since = 0,
+            signal?: AbortSignal,
+        ): Promise<T> =>
             new Promise<T>((resolve, reject) => {
                 const timer = setTimeout(() => {
                     waiters.delete(check);
                     reject(new ClientViewActionError("failed", "Element did not finish the action in time"));
                 }, ms);
+                // An abort drops the timer and the waiter (the caller no longer needs the answer) and rejects, unheard.
+                signal?.addEventListener("abort", () => {
+                    clearTimeout(timer);
+                    waiters.delete(check);
+                    reject(new ClientViewActionError("failed", "The wait was stopped"));
+                });
                 const check = (p: ActionPayload): void => {
                     const hit = pick(p);
                     if (hit === undefined) return;
@@ -350,6 +366,7 @@ async function listedOrJoinError(
     seen: ReturnType<typeof recordPayloads>,
     since: number,
 ): Promise<void> {
+    const stopWaiting = new AbortController();
     const failed = seen.wait<never>(
         (p) =>
             p.action === Action.JoinRoomError && (p as { roomId?: string | null }).roomId === roomId
@@ -357,6 +374,7 @@ async function listedOrJoinError(
                 : undefined,
         ROOM_ACTION_TIMEOUT_MS,
         since,
+        stopWaiting.signal,
     );
     failed.catch(() => {});
     let off = (): void => {};
@@ -374,6 +392,7 @@ async function listedOrJoinError(
     } finally {
         off();
         clearInterval(poll);
+        stopWaiting.abort();
     }
 }
 
