@@ -147,6 +147,61 @@ function createSectionNow(room: Room | undefined): Promise<ActionOutcome> {
     });
 }
 
+/**
+ * W2: Element's section dialog in edit mode over the view (D17), `RoomListStoreV3.editSection(tag)`: the name step, then the
+ * rooms step. The answer is read from the dialog's result on the way out (`openedDialog`, grok D4): no name (closed at the name
+ * step) = `cancelled`; any returned name = `done` + `section` (the tag), also an unchanged name with room changes (Element
+ * applies the tag changes, `section.ts`) and a cancel at the rooms step, which still commits the rename (F3). `done` once the
+ * store has written (its promise settled); if it has not within `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (the write may
+ * still apply). The rooms the dialog tags or untags are written by Element outside the room queue and not waited for. The
+ * caller has checked that `tag` is listed (the store opens no dialog for a tag it does not hold).
+ */
+export function editSection(tag: string): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        let edited: Promise<void> | undefined;
+        const dialog = await openedDialog(() => {
+            edited = RoomListStoreV3.instance.editSection(tag);
+        });
+        const [name] = await dialog.finished;
+        if (!name) {
+            // A dropped dialog never settles the store's promise (Modal.tsx's wipe): bound the wait, or the dialog lock hangs.
+            await within(edited, ROOM_ACTION_TIMEOUT_MS).catch(() => undefined);
+            return { status: "cancelled" };
+        }
+        await within(edited, ROOM_ACTION_TIMEOUT_MS);
+        return { status: "done", section: tag };
+    });
+}
+
+/**
+ * W3: Element's remove-section confirmation over the view (D17), `RoomListStoreV3.removeSection(tag, isEmpty)`; `isEmpty` is
+ * the caller's (no bridged room is in the section). Declined (or the dialog closed) = `cancelled`. Confirmed, the store drops
+ * the section from the settings (its rooms keep their tag, F3, and fall back to the default group in `rooms()`); `done` +
+ * `section` once `listed()` (the bridge's `sections()`) no longer holds the tag. If the store has not settled, or the section
+ * is still listed, within `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (the write may still apply).
+ */
+export function removeSection(tag: string, isEmpty: boolean, listed: () => boolean): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        let removed: Promise<void> | undefined;
+        const dialog = await openedDialog(() => {
+            removed = RoomListStoreV3.instance.removeSection(tag, isEmpty);
+        });
+        const [confirmed] = await dialog.finished;
+        if (!confirmed) {
+            await within(removed, ROOM_ACTION_TIMEOUT_MS).catch(() => undefined);
+            return { status: "cancelled" };
+        }
+        const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
+        await within(removed, ROOM_ACTION_TIMEOUT_MS);
+        while (listed()) {
+            if (Date.now() >= until)
+                throw new ClientViewActionError("network", "the section was still listed after it was removed");
+            await new Promise((r) => setTimeout(r, POLL_MS));
+        }
+        return { status: "done", section: tag };
+    });
+}
+
 async function within<T>(p: Promise<T> | undefined, ms: number): Promise<T | undefined> {
     if (!p) return undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;

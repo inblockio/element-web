@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vite
 import { type Room } from "matrix-js-sdk/src/matrix";
 
 import Modal from "../Modal";
-import { createSection, setSection, type RoomSectionVm } from "./RoomSectionActions";
+import { createSection, editSection, removeSection, setSection, type RoomSectionVm } from "./RoomSectionActions";
 import { setFavourite } from "./RoomItemActions";
 import { ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import { ClientViewActionError } from "./types";
@@ -26,7 +26,7 @@ vi.mock("../Modal", async () => {
     });
     return { default: manager, ModalManagerEvent: { Opened: "opened", Closed: "closed" } };
 });
-const store = vi.hoisted(() => ({ createSection: vi.fn() }));
+const store = vi.hoisted(() => ({ createSection: vi.fn(), editSection: vi.fn(), removeSection: vi.fn() }));
 vi.mock("../stores/room-list-v3/RoomListStoreV3", () => ({ default: { instance: store } }));
 
 /* M6 B1: the outcome of each section action is read where the view-model leaves it (the room's own tags, the dialog's answer). */
@@ -533,5 +533,112 @@ describe("createSection: a dialog dropped by Modal.tsx's priority/static wipe (g
         await vi.advanceTimersByTimeAsync(500);
         expect(item.onToggleSection).toHaveBeenCalledExactlyOnceWith(A);
         await expect(next).resolves.toMatchObject({ status: "done" });
+    });
+});
+
+describe("M10 W23 editSection / removeSection (RoomListStoreV3 -> Element's dialogs, answered from the dialog result)", () => {
+    let finish: (...result: unknown[]) => void;
+    let storeResult: (error?: Error) => void;
+    const open = (fn: typeof store.editSection): void => {
+        fn.mockReset();
+        fn.mockImplementation(() => {
+            (Modal as unknown as { createDialog: (...a: unknown[]) => unknown }).createDialog(class {});
+            return new Promise<void>((resolve, reject) => (storeResult = (e) => (e ? reject(e) : resolve())));
+        });
+    };
+
+    beforeEach(() => {
+        vi.useFakeTimers();
+        const finished = new Promise<unknown[]>((resolve) => {
+            finish = (...result) => resolve(result);
+        });
+        (Modal as unknown as { createDialog: unknown }).createDialog = vi.fn(() => ({ close: vi.fn(), finished }));
+        open(store.editSection);
+        open(store.removeSection);
+    });
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it("editSection: a returned name is done with the tag once the store has written", async () => {
+        const outcome = editSection(A);
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Renamed", [], []);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+        expect(store.editSection).toHaveBeenCalledExactlyOnceWith(A);
+    });
+
+    it("editSection: an unchanged name with room changes, or a cancel at the rooms step that returns the name, is done too", async () => {
+        const outcome = editSection(A);
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Work", ["!a:example.org"], undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+    });
+
+    it("editSection: closed at the name step (no name) is cancelled", async () => {
+        const outcome = editSection(A);
+        await vi.advanceTimersByTimeAsync(0);
+        finish(undefined, undefined);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+    });
+
+    it("editSection: a store that has not written in time is network, and a refusal is failed", async () => {
+        const slow = codeOf(editSection(A));
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Renamed", [], []);
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        expect(await slow).toBe("network");
+    });
+
+    it("editSection: a store write that fails maps to the contract's error", async () => {
+        const outcome = codeOf(editSection(A));
+        await vi.advanceTimersByTimeAsync(0);
+        finish("Renamed", [], []);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult(new Error("account data refused"));
+        expect(await outcome).toBe("failed");
+    });
+
+    it("removeSection: confirmed is done once the section is no longer listed (and not before)", async () => {
+        let listed = true;
+        const outcome = removeSection(A, false, () => listed);
+        await vi.advanceTimersByTimeAsync(0);
+        finish(true);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        let settled = false;
+        void outcome.then(() => (settled = true));
+        await vi.advanceTimersByTimeAsync(500);
+        expect(settled).toBe(false);
+        listed = false;
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(outcome).resolves.toEqual({ status: "done", section: A });
+        expect(store.removeSection).toHaveBeenCalledExactlyOnceWith(A, false);
+    });
+
+    it("removeSection: passes isEmpty through, and declined is cancelled", async () => {
+        const outcome = removeSection(A, true, () => true);
+        await vi.advanceTimersByTimeAsync(0);
+        finish(false);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await expect(outcome).resolves.toEqual({ status: "cancelled" });
+        expect(store.removeSection).toHaveBeenCalledExactlyOnceWith(A, true);
+    });
+
+    it("removeSection: a section still listed after the store wrote is network", async () => {
+        const outcome = codeOf(removeSection(A, false, () => true));
+        await vi.advanceTimersByTimeAsync(0);
+        finish(true);
+        await vi.advanceTimersByTimeAsync(0);
+        storeResult();
+        await vi.advanceTimersByTimeAsync(ROOM_ACTION_TIMEOUT_MS + 1_000);
+        expect(await outcome).toBe("network");
     });
 });

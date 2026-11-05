@@ -450,6 +450,22 @@ export interface ClientViewBridge {
      */
     createSection(roomId?: string): Promise<ActionOutcome>;
     /**
+     * M10 W2 (additive, no `version` bump: a kit feature-checks it): Element's section dialog in edit mode
+     * (`RoomListStoreV3.editSection(tag)`, D17): the name step, then the rooms step. The answer is the dialog's result: no
+     * name (closed at the name step) = `cancelled`; any returned name = `done` + `section` (the tag), also an unchanged name
+     * with room changes and a cancel at the rooms step, which still commits the rename. `failed` for a tag `sections()` does
+     * not list (no dialog opens); `network` when the store has not written in 15 s (the write may still apply).
+     */
+    editSection(tag: string): Promise<ActionOutcome>;
+    /**
+     * M10 W3 (additive, feature-checked by the kit): Element's remove-section confirmation
+     * (`RoomListStoreV3.removeSection(tag, isEmpty)`, `isEmpty` from the bridged rooms, D17). `done` + `section` once
+     * `sections()` no longer lists the tag; `cancelled` when declined; `failed` for a tag `sections()` does not list;
+     * `network` when the section is still listed after 15 s. The section's rooms keep their tag (Element leaves it) and fall
+     * back to the default group in `rooms()` (`section` absent).
+     */
+    removeSection(tag: string): Promise<ActionOutcome>;
+    /**
      * A10: sets the room's notification level (the item's `onSetRoomNotifState`: push rules). `done` once the homeserver
      * holds it; `failed` when it refuses (the echoed level is dropped, the level stays what the homeserver holds).
      */
