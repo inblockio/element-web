@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from "vite
 import { ConnectionError, EventType, type MatrixClient, MatrixEvent, RoomState } from "matrix-js-sdk/src/matrix";
 import { DecryptionFailureCode } from "matrix-js-sdk/src/crypto-api";
 
-import { ViewModelBridge } from "./ViewModelBridge";
+import { MEDIA_REVEAL_TIMEOUT_MS, ViewModelBridge } from "./ViewModelBridge";
 import { ClientViewActionError } from "./types";
 import { selectClientView } from "./registry";
 import { RoomTimelineViewModel } from "../viewmodels/room/timeline/RoomTimelineViewModel";
@@ -113,6 +113,8 @@ const h = vi.hoisted(() => {
             loadInitialMediaIfVisible: ReturnType<typeof vi.fn>;
             setMediaVisible: ReturnType<typeof vi.fn>;
             onPlay: ReturnType<typeof vi.fn>;
+            onHiddenButtonClick: ReturnType<typeof vi.fn>;
+            onPreviewClick: ReturnType<typeof vi.fn>;
         }
     > = [];
     const mediaHelpers: Array<{
@@ -146,7 +148,14 @@ const h = vi.hoisted(() => {
             public onPlay = vi.fn(async () => {});
             public setMediaVisible = vi.fn((visible: boolean) => {
                 this.props = { ...this.props, mediaVisible: visible };
+                // The real view-model leaves the hidden state once media is visible.
+                if (visible && this.snapshot.state === "HIDDEN") this.set({ state: "READY" });
             });
+            /** The shared actions of the real view-models (ImageBodyViewModel / VideoBodyViewModel). */
+            public onHiddenButtonClick = vi.fn(() =>
+                (this.props.setMediaVisible as ((v: boolean) => void) | undefined)?.(true),
+            );
+            public onPreviewClick = vi.fn(() => (this.props.onPreviewClick as (() => void) | undefined)?.());
             public constructor(public props: Record<string, unknown>) {
                 super(state);
                 mediaVms.push(this as never);
@@ -173,6 +182,12 @@ const h = vi.hoisted(() => {
         editText: vi.fn(),
         redact: vi.fn(),
         downloadMedia: vi.fn(),
+        /** M12 Z3: Element's per-event reveal: async, writes the setting, and the settings watchers fire. */
+        setMediaVisibility: vi.fn(async (_ev: unknown, visible: boolean): Promise<void> => {
+            await Promise.resolve();
+            mediaVisible.value = visible;
+            [...watchers.values()].filter((w) => w.name === "showMediaEventIds").forEach((w) => w.cb());
+        }),
         forwardViaDialog: vi.fn(),
         viewSourceViaDialog: vi.fn(),
         createDialog: vi.fn(),
@@ -398,7 +413,10 @@ vi.mock("../HtmlUtils", () => ({
     }),
 }));
 vi.mock("../modules/Api", () => ({ ModuleApi: { instance: { urlPreviews: { module: "url-preview-api" } } } }));
-vi.mock("../utils/media/mediaVisibility", () => ({ getMediaVisibility: () => h.mediaVisible.value }));
+vi.mock("../utils/media/mediaVisibility", () => ({
+    getMediaVisibility: () => h.mediaVisible.value,
+    setMediaVisibility: (ev: unknown, visible: boolean) => h.setMediaVisibility(ev, visible),
+}));
 vi.mock("../settings/SettingsStore", () => ({
     default: {
         getValue: (name: string) => h.settings[name] ?? false,
@@ -636,8 +654,8 @@ describe("ViewModelBridge", () => {
         h.statusBar.set({ state: null });
     });
 
-    it("is bridge version 5 and hands the send to the interim action", async () => {
-        expect(bridge.version).toBe(5);
+    it("is bridge version 6 and hands the send to the interim action", async () => {
+        expect(bridge.version).toBe(6);
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
         expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));
@@ -2787,6 +2805,120 @@ describe("ViewModelBridge", () => {
             bridge.dispose();
             expect(h.mediaVms[0].dispose).toHaveBeenCalledTimes(1);
             expect(h.mediaHelpers[0].destroy).toHaveBeenCalledTimes(1);
+        });
+    });
+
+    describe("showMedia: reveal hidden media (M12 Z3, FN1)", () => {
+        const mediaEvent = (id: string, msgtype: string) =>
+            fakeEvent(id, { getContent: () => ({ msgtype, body: "x" }) });
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        /** A message whose body is hidden by Element's setting; the view-model shows its hidden state. */
+        const hiddenMedia = (id: string, msgtype: "m.image" | "m.video") => {
+            h.mediaVisible.value = false;
+            const ev = mediaEvent(id, msgtype);
+            read(ev);
+            const vm = h.mediaVms[h.mediaVms.length - 1];
+            vm.set({ state: "HIDDEN", hiddenButtonLabel: "Show" });
+            return { ev, vm };
+        };
+        beforeEach(() => vi.useFakeTimers());
+        afterEach(() => vi.useRealTimers());
+
+        it("presses the image's hidden button and resolves done once the body leaves the hidden state", async () => {
+            const { ev, vm } = hiddenMedia("$img", "m.image");
+            expect(bridge.timeline("!a")[0].media).toMatchObject({ kind: "image", state: "hidden" });
+            const call = bridge.showMedia("!a", "$img");
+            expect(vm.onHiddenButtonClick).toHaveBeenCalledTimes(1);
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$img" });
+            expect(h.setMediaVisibility).toHaveBeenCalledWith(ev, true);
+            expect(bridge.timeline("!a")[0].media?.state).not.toBe("hidden");
+        });
+
+        it("presses the video preview and resolves done the same way", async () => {
+            const { ev, vm } = hiddenMedia("$vid", "m.video");
+            const call = bridge.showMedia("!a", "$vid");
+            expect(vm.onPreviewClick).toHaveBeenCalledTimes(1);
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$vid" });
+            expect(h.setMediaVisibility).toHaveBeenCalledWith(ev, true);
+        });
+
+        it("polls when the setting change emits nothing", async () => {
+            h.setMediaVisibility.mockImplementationOnce(async (_ev, visible) => {
+                h.mediaVisible.value = visible;
+            });
+            hiddenMedia("$img", "m.image");
+            const call = bridge.showMedia("!a", "$img");
+            await vi.advanceTimersByTimeAsync(250);
+            await expect(call).resolves.toMatchObject({ status: "done", eventId: "$img" });
+        });
+
+        it("is idempotent: a message that is already shown answers done and writes nothing", async () => {
+            h.mediaVisible.value = true;
+            read(mediaEvent("$img", "m.image"));
+            const vm = h.mediaVms[0];
+            await expect(bridge.showMedia("!a", "$img")).resolves.toEqual({
+                status: "done",
+                roomId: "!a",
+                eventId: "$img",
+            });
+            expect(vm.onHiddenButtonClick).not.toHaveBeenCalled();
+            expect(h.setMediaVisibility).not.toHaveBeenCalled();
+        });
+
+        it("rejects unknown_room for a room the client does not hold, writing nothing", async () => {
+            hiddenMedia("$img", "m.image");
+            await expect(bridge.showMedia("!nope", "$img")).rejects.toMatchObject({ code: "unknown_room" });
+            expect(h.setMediaVisibility).not.toHaveBeenCalled();
+        });
+
+        it("rejects unknown_event for an id the current window does not hold, even when the row was built earlier", async () => {
+            const { vm } = hiddenMedia("$img", "m.image");
+            await expect(bridge.showMedia("!a", "$never")).rejects.toMatchObject({ code: "unknown_event" });
+            // The row of $img was built and is kept, but the event left the window: no actionRow lookup, no write.
+            h.timeline.snapshot = { items: [], atLiveEnd: true };
+            await expect(bridge.showMedia("!a", "$img")).rejects.toMatchObject({ code: "unknown_event" });
+            expect(vm.onHiddenButtonClick).not.toHaveBeenCalled();
+            expect(h.setMediaVisibility).not.toHaveBeenCalled();
+        });
+
+        it.each([["m.file"], ["m.audio"], ["m.text"]])(
+            "rejects unsupported for a %s message, writing nothing",
+            async (msgtype) => {
+                h.mediaVisible.value = false;
+                read(mediaEvent("$x", msgtype));
+                await expect(bridge.showMedia("!a", "$x")).rejects.toMatchObject({ code: "unsupported" });
+                expect(h.setMediaVisibility).not.toHaveBeenCalled();
+            },
+        );
+
+        it("answers failed after 5 s when the body stays hidden, and keeps the reveal", async () => {
+            const { ev } = hiddenMedia("$img", "m.image");
+            // The setting is written, but the visibility Element reads never turns on within the window.
+            h.setMediaVisibility.mockImplementationOnce(async () => {});
+            const call = bridge.showMedia("!a", "$img");
+            const settled = expect(call).rejects.toMatchObject({ code: "failed" });
+            await vi.advanceTimersByTimeAsync(MEDIA_REVEAL_TIMEOUT_MS);
+            await settled;
+            // No rollback: nothing wrote `false`, and the body shows once Element's setting does.
+            expect(h.setMediaVisibility).toHaveBeenCalledTimes(1);
+            expect(h.setMediaVisibility).toHaveBeenCalledWith(ev, true);
+            h.mediaVisible.value = true;
+            expect(bridge.timeline("!a")[0].media?.state).not.toBe("hidden");
+        });
+
+        it("cancels a waiting call as failed when the bridge is disposed", async () => {
+            hiddenMedia("$img", "m.image");
+            h.setMediaVisibility.mockImplementationOnce(async () => {});
+            const call = bridge.showMedia("!a", "$img");
+            const settled = expect(call).rejects.toMatchObject({ code: "failed" });
+            bridge.dispose();
+            await settled;
         });
     });
 

@@ -68,7 +68,7 @@ import { bodyToNode } from "../HtmlUtils";
 import { presentableTextForFile } from "../utils/FileUtils";
 import { type SettingKey } from "../settings/Settings";
 import { MediaEventHelper } from "../utils/MediaEventHelper";
-import { getMediaVisibility } from "../utils/media/mediaVisibility";
+import { getMediaVisibility, setMediaVisibility } from "../utils/media/mediaVisibility";
 import { ReplyTileViewModel } from "../viewmodels/room/timeline/event-tile/ReplyTileViewModel";
 import { getParentEventId, shouldDisplayReply, stripPlainReply } from "../utils/Reply";
 import { ReactionsRowButtonViewModel } from "../viewmodels/room/timeline/event-tile/reactions/ReactionsRowButtonViewModel";
@@ -168,6 +168,8 @@ const REPLY_RETRY_MS = 30_000;
 export const REACTION_TIMEOUT_MS = 15_000;
 /** How often a waiting reaction press re-reads the row (a first reaction on a message emits nothing of its own). */
 const REACTION_POLL_MS = 200;
+/** M12 Z3: how long `showMedia` waits for the revealed body to leave the hidden state before it answers `failed`. */
+export const MEDIA_REVEAL_TIMEOUT_MS = 5_000;
 
 /** What ReactionsRowAdapter reads from RoomContext for the disabled rule of its buttons (RoomView.updatePermissions). */
 export interface ReactionPermissions {
@@ -879,6 +881,8 @@ class EventRow {
                 mediaVisible: visible,
                 timelineRenderingType: TimelineRenderingType.Room,
                 imageRef: { current: null },
+                // As Element wires it: the reveal is a device-level per-event setting (no server write).
+                setMediaVisible: (show) => void setMediaVisibility(this.ev, show),
             });
         } else if (kind === "video") {
             vm = new VideoBodyViewModel({
@@ -886,6 +890,7 @@ class EventRow {
                 mediaEventHelper: helper,
                 mediaVisible: visible,
                 videoRef: { current: null },
+                onPreviewClick: () => void setMediaVisibility(this.ev, true),
             });
         } else {
             vm = new FileBodyViewModel({
@@ -924,6 +929,21 @@ class EventRow {
     private mediaVm(): ViewModelMediaBody["vm"] | undefined {
         const body = this.mediaBody;
         return body && body.kind !== "audio" ? body.vm : undefined;
+    }
+
+    /**
+     * M12 Z3: presses Element's reveal button of a hidden image (`onHiddenButtonClick`) or video (`onPreviewClick`), which
+     * writes the device-level per-event setting through the wiring in `newMedia`. `visible` when the body is not hidden
+     * (nothing is pressed), `unsupported` for any other message.
+     */
+    public revealMedia(): "unsupported" | "visible" | "pressed" {
+        const view = this.media();
+        if (!view || (view.kind !== "image" && view.kind !== "video")) return "unsupported";
+        if (view.state !== "hidden") return "visible";
+        const vm = this.mediaVm();
+        if (view.kind === "image") (vm as ImageBodyViewModel).onHiddenButtonClick();
+        else (vm as VideoBodyViewModel).onPreviewClick();
+        return "pressed";
     }
 
     /**
@@ -1118,7 +1138,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 5;
+    public readonly version = 6;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -1169,6 +1189,8 @@ export class ViewModelBridge implements ClientViewBridge {
     /** B7: the downloads in flight, by room and event. */
     private readonly downloading = new Map<string, Promise<ActionOutcome>>();
     private readonly reactionWaits = new Set<() => void>();
+    /** M12 Z3: the `showMedia` calls waiting for the body to show, cancelled on dispose. */
+    private readonly revealWaits = new Set<() => void>();
     /** The reaction picker the host shows over the kit, with the call that waits for its close. */
     private pickerCount = 0;
     private picker?: { request: ReactionPickerRequest; resolve: (o: ActionOutcome) => void };
@@ -2476,6 +2498,67 @@ export class ViewModelBridge implements ClientViewBridge {
         return run;
     }
 
+    /**
+     * M12 Z3 (FN1): reveals the hidden image or video of a message. The event id is checked against the room's CURRENT
+     * timeline snapshot (`this.rows` is never pruned) before anything is written; then the shared reveal action runs
+     * (the device-level `showMediaEventIds` setting, no server write) and the call waits until the body is no longer
+     * hidden. A message that is already shown answers `done` without a write. On MEDIA_REVEAL_TIMEOUT_MS it answers
+     * `failed` and keeps the reveal (Element's device semantics, no rollback).
+     */
+    public showMedia(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        if (!this.client.getRoom(roomId)) {
+            return Promise.reject(new ClientViewActionError("unknown_room", `unknown room ${roomId}`));
+        }
+        let found: EventItem | undefined;
+        for (const item of this.ensureTimeline(roomId)?.getSnapshot().items ?? []) {
+            if (item.kind === "event" && (item.event as MatrixEvent).getId() === eventId) found = item;
+        }
+        if (!found) {
+            return Promise.reject(new ClientViewActionError("unknown_event", `unknown event ${eventId} in ${roomId}`));
+        }
+        const row = this.row(found, roomId);
+        const pressed = row.revealMedia();
+        if (pressed === "unsupported") {
+            return Promise.reject(new ClientViewActionError("unsupported", "the message has no image or video body"));
+        }
+        const done: ActionOutcome = { status: "done", roomId, eventId };
+        if (pressed === "visible") return Promise.resolve(done);
+        return new Promise<ActionOutcome>((resolve, reject) => {
+            const timer = setTimeout(() => {
+                end();
+                reject(
+                    new ClientViewActionError(
+                        "failed",
+                        `the media stayed hidden for ${MEDIA_REVEAL_TIMEOUT_MS} ms (the reveal stays)`,
+                    ),
+                );
+            }, MEDIA_REVEAL_TIMEOUT_MS);
+            const poll = setInterval(() => check(), REACTION_POLL_MS);
+            const onChange = (e: ChangeEvent): void => {
+                if (e.kind === "timeline" && e.roomId === roomId) check();
+            };
+            const cancel = (): void => {
+                end();
+                reject(new ClientViewActionError("failed", "the bridge was disposed"));
+            };
+            const end = (): void => {
+                clearTimeout(timer);
+                clearInterval(poll);
+                this.listeners.delete(onChange);
+                this.revealWaits.delete(cancel);
+            };
+            const check = (): void => {
+                const state = row.media()?.state;
+                if (state === undefined || state === "hidden") return;
+                end();
+                resolve(done);
+            };
+            this.listeners.add(onChange);
+            this.revealWaits.add(cancel);
+        });
+    }
+
     public join(roomIdOrAlias: string): Promise<ActionOutcome> {
         return joinRoom(this.client, roomIdOrAlias);
     }
@@ -2695,6 +2778,7 @@ export class ViewModelBridge implements ClientViewBridge {
         this.closePanel();
         this.filePicker?.cancel();
         [...this.reactionWaits].forEach((cancel) => cancel());
+        [...this.revealWaits].forEach((cancel) => cancel());
         this.watchedItems.forEach((w) => w.off());
         this.watchedItems.clear();
         this.disposers.forEach((d) => d());
