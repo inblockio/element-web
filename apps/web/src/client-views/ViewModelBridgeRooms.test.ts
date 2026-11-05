@@ -132,7 +132,12 @@ const echo = vi.hoisted(() => {
 vi.mock("../stores/local-echo/EchoChamber", () => ({ EchoChamber: { forRoom: () => echo.chamber } }));
 const itemActions = vi.hoisted(() => ({ markUnread: vi.fn(), setFavourite: vi.fn(), setNotificationLevel: vi.fn() }));
 vi.mock("./RoomItemActions", () => itemActions);
-const sectionActions = vi.hoisted(() => ({ setSection: vi.fn(), createSection: vi.fn() }));
+const sectionActions = vi.hoisted(() => ({
+    setSection: vi.fn(),
+    createSection: vi.fn(),
+    editSection: vi.fn(),
+    removeSection: vi.fn(),
+}));
 vi.mock("./RoomSectionActions", () => sectionActions);
 
 describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", () => {
@@ -508,5 +513,43 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         await expect(bridge.createSection("!nope:example.org")).rejects.toBeInstanceOf(ClientViewActionError);
         expect(sectionActions.setSection).toHaveBeenCalledTimes(2);
         expect(sectionActions.createSection).toHaveBeenCalledTimes(2);
+    });
+
+    it("M10 W23: editSection and removeSection run the section actions for a listed tag; any other tag is failed and calls nothing", async () => {
+        const sec = (tag: string, name: string, isSelected: boolean) => ({ tag, name, isSelected });
+        sectionActions.editSection.mockResolvedValue({ status: "done", section: "element.io.section.s1" });
+        sectionActions.removeSection.mockResolvedValue({ status: "done", section: "element.io.section.s1" });
+        // The room is in s2, so s1 is empty and s2 is not.
+        h.item.set({
+            sections: [sec("element.io.section.s1", "Work", false), sec("element.io.section.s2", "Home", true)],
+        });
+        await expect(bridge.editSection("element.io.section.s1")).resolves.toMatchObject({ status: "done" });
+        expect(sectionActions.editSection).toHaveBeenCalledExactlyOnceWith("element.io.section.s1");
+        await bridge.removeSection("element.io.section.s1");
+        await bridge.removeSection("element.io.section.s2");
+        expect(sectionActions.removeSection).toHaveBeenNthCalledWith(
+            1,
+            "element.io.section.s1",
+            true,
+            expect.any(Function),
+        );
+        expect(sectionActions.removeSection).toHaveBeenNthCalledWith(
+            2,
+            "element.io.section.s2",
+            false,
+            expect.any(Function),
+        );
+        // The `listed` probe reads the bridge's own sections(): true while the tag is listed, false once it is gone.
+        const listed = sectionActions.removeSection.mock.calls[0][2] as () => boolean;
+        expect(listed()).toBe(true);
+        h.item.set({ sections: [sec("element.io.section.s2", "Home", true)] });
+        expect(listed()).toBe(false);
+        for (const call of [
+            () => bridge.editSection("element.io.section.nope"),
+            () => bridge.removeSection("element.io.section.nope"),
+        ])
+            await expect(call()).rejects.toMatchObject({ code: "failed" });
+        expect(sectionActions.editSection).toHaveBeenCalledTimes(1);
+        expect(sectionActions.removeSection).toHaveBeenCalledTimes(2);
     });
 });

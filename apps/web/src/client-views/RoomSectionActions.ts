@@ -19,6 +19,7 @@ import { type Room } from "matrix-js-sdk/src/matrix";
 import { DefaultTagID } from "../stores/room-list-v3/skip-list/tag";
 import { isCustomSectionTag } from "../stores/room-list-v3/section";
 import RoomListStoreV3 from "../stores/room-list-v3/RoomListStoreV3";
+import SettingsStore from "../settings/SettingsStore";
 import { toActionError } from "./actions";
 import { dialogAction, openedDialog, ROOM_ACTION_TIMEOUT_MS } from "./RoomActions";
 import {
@@ -42,6 +43,18 @@ export interface RoomSectionVm {
 }
 
 const POLL_MS = 50;
+
+/**
+ * The custom sections as the account data holds them right now (D21: the backend is the truth). Once the store's write has
+ * settled, Element's local echo (`LocalEchoWrapper`) has expired, so this is the stored value, also when the PUT was refused:
+ * the wrapper swallows the refusal and the store's promise still fulfils.
+ */
+function storedSections(): Record<string, { name?: unknown } | undefined> {
+    const raw: unknown = SettingsStore.getValue("RoomList.CustomSectionData");
+    return typeof raw === "object" && raw !== null && !Array.isArray(raw)
+        ? (raw as Record<string, { name?: unknown } | undefined>)
+        : {};
+}
 
 /** The room's custom section among the `known` ones, from its own room tags (what `tagRoom` writes). */
 function sectionOf(room: Room, known: ReadonlySet<string>): string | undefined {
@@ -144,6 +157,69 @@ function createSectionNow(room: Room | undefined): Promise<ActionOutcome> {
             }
         }
         return { status: "done", section: tag, ...(room ? { roomId: room.roomId } : {}) };
+    });
+}
+
+/**
+ * W2: Element's section dialog in edit mode over the view (D17), `RoomListStoreV3.editSection(tag)`: the name step, then the
+ * rooms step. The answer is read from the dialog's result on the way out (`openedDialog`, grok D4): no name (closed at the name
+ * step) = `cancelled`; any returned name = `done` + `section` (the tag), also an unchanged name with room changes (Element
+ * applies the tag changes, `section.ts`) and a cancel at the rooms step, which still commits the rename (F3). `done` once the
+ * store has written (its promise settled) and the stored section carries the name (re-read from `RoomList.CustomSectionData`,
+ * D21: a refused account-data write leaves the old name and is `failed`, the store's promise fulfils all the same); if the
+ * store has not settled within `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (the write may still apply). The rooms the
+ * dialog tags or untags are written by Element outside the room queue and not waited for. The caller has checked that `tag`
+ * is listed (the store opens no dialog for a tag it does not hold).
+ */
+export function editSection(tag: string): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        let edited: Promise<void> | undefined;
+        const dialog = await openedDialog(() => {
+            edited = RoomListStoreV3.instance.editSection(tag);
+        });
+        const [name] = await dialog.finished;
+        if (!name) {
+            // A dropped dialog never settles the store's promise (Modal.tsx's wipe): bound the wait, or the dialog lock hangs.
+            await within(edited, ROOM_ACTION_TIMEOUT_MS).catch(() => undefined);
+            return { status: "cancelled" };
+        }
+        await within(edited, ROOM_ACTION_TIMEOUT_MS);
+        if (storedSections()[tag]?.name !== name)
+            throw new ClientViewActionError("failed", "the section was not renamed in the account data");
+        return { status: "done", section: tag };
+    });
+}
+
+/**
+ * W3: Element's remove-section confirmation over the view (D17), `RoomListStoreV3.removeSection(tag, isEmpty)`; `isEmpty` is
+ * the caller's (no bridged room is in the section). Declined (or the dialog closed) = `cancelled`. Confirmed, the store drops
+ * the section from the settings (its rooms keep their tag, F3, and fall back to the default group in `rooms()`); `done` +
+ * `section` once the store has settled, the stored `RoomList.CustomSectionData` no longer holds the tag (re-read, D21: a
+ * refused account-data write leaves it there and is `failed`, the store's promise fulfils all the same) and `listed()` (the
+ * bridge's `sections()`) no longer holds it. If the store has not settled, or the section is still listed, within
+ * `ROOM_ACTION_TIMEOUT_MS` the answer is `network` (the write may still apply).
+ */
+export function removeSection(tag: string, isEmpty: boolean, listed: () => boolean): Promise<ActionOutcome> {
+    return dialogAction(async () => {
+        let removed: Promise<void> | undefined;
+        const dialog = await openedDialog(() => {
+            removed = RoomListStoreV3.instance.removeSection(tag, isEmpty);
+        });
+        const [confirmed] = await dialog.finished;
+        if (!confirmed) {
+            await within(removed, ROOM_ACTION_TIMEOUT_MS).catch(() => undefined);
+            return { status: "cancelled" };
+        }
+        const until = Date.now() + ROOM_ACTION_TIMEOUT_MS;
+        await within(removed, ROOM_ACTION_TIMEOUT_MS);
+        if (storedSections()[tag])
+            throw new ClientViewActionError("failed", "the section was not removed from the account data");
+        while (listed()) {
+            if (Date.now() >= until)
+                throw new ClientViewActionError("network", "the section was still listed after it was removed");
+            await new Promise((r) => setTimeout(r, POLL_MS));
+        }
+        return { status: "done", section: tag };
     });
 }
 

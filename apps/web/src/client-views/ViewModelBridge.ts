@@ -109,7 +109,7 @@ import { PROPERTY_UPDATED } from "../stores/local-echo/GenericEchoChamber";
 import { markUnread, type RoomItemActionsVm, setFavourite, setNotificationLevel } from "./RoomItemActions";
 import { setPinned } from "./PinAction";
 import { openReport } from "./ReportAction";
-import { createSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
+import { createSection, editSection, removeSection, type RoomSectionVm, setSection } from "./RoomSectionActions";
 import { isLocalRoom } from "../utils/localRoom/isLocalRoom";
 import DMRoomMap from "../utils/DMRoomMap";
 import { type LocalRoom, LocalRoomState } from "../models/LocalRoom";
@@ -2576,6 +2576,24 @@ export class ViewModelBridge implements ClientViewBridge {
         if (roomId === undefined) return createSection(undefined);
         const { room } = this.roomItem(roomId);
         return createSection(room);
+    }
+
+    public async editSection(tag: string): Promise<ActionOutcome> {
+        this.assertListedSection(tag);
+        return editSection(tag);
+    }
+
+    public async removeSection(tag: string): Promise<ActionOutcome> {
+        this.assertListedSection(tag);
+        // Element's own `isEmpty` is "no room in the section"; the bridged rooms carry their section tag.
+        const isEmpty = !this.roomCache.some((r) => r.section === tag);
+        return removeSection(tag, isEmpty, () => this.sectionCache.some((s) => s.tag === tag));
+    }
+
+    /** A section action's tag must be one of `sections()`: the store opens no dialog for any other (the contract's `failed`). */
+    private assertListedSection(tag: string): void {
+        if (!this.sectionCache.some((s) => s.tag === tag))
+            throw new ClientViewActionError("failed", `${tag} is not one of the sections`);
     }
 
     public async setNotificationLevel(roomId: string, level: ViewNotificationLevel): Promise<ActionOutcome> {
