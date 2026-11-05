@@ -81,6 +81,7 @@ import { EventTileActionBarViewModel } from "../viewmodels/room/EventTileActionB
 import { RedactedBodyViewModel } from "../viewmodels/message-body/RedactedBodyViewModel";
 import { getRedactedBodyViewModelProps } from "../viewmodels/room/timeline/event-tile/EventTileRedactedBodyState";
 import { getEventTileThread } from "../viewmodels/room/timeline/event-tile/EventTileThreadState";
+import { EncryptionEventViewModel } from "../viewmodels/room/timeline/event-tile/EncryptionEventViewModel";
 import { UserMenuViewModel } from "../viewmodels/menus/UserMenuViewModel";
 import { RoomStatusBarViewModel } from "../viewmodels/room/RoomStatusBar";
 import { MemberAvatarViewModel } from "../components/viewmodels/avatars/MemberAvatarViewModel";
@@ -132,6 +133,7 @@ import {
     type ViewAnchor,
     type ViewConnection,
     type ViewE2e,
+    type ViewEncryption,
     type ViewMe,
     type ViewMedia,
     type ViewMessage,
@@ -1147,6 +1149,14 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly rows = new Map<string, EventRow>();
     /** The call card (Element's RootCallTileViewModel) of each call notification the kit was handed, by event id. */
     private readonly callCards = new Map<string, CallCard>();
+    /**
+     * M12 Z4: the encryption tile view-model (Element's `EncryptionEventViewModel`, built as EventTileFactory builds it)
+     * of each `m.room.encryption` event the kit was handed, by event id, with how to stop following it.
+     */
+    private readonly encryptionCards = new Map<
+        string,
+        { roomId: string; vm: EncryptionEventViewModel; off: () => void }
+    >();
     private readonly senderAvatars = new Map<string, MemberAvatarViewModel>();
     /** Per room: encrypted once either the room state or the crypto store said so (never back to false). */
     private readonly encrypted = new Map<string, boolean>();
@@ -1462,6 +1472,7 @@ export class ViewModelBridge implements ClientViewBridge {
             const room = this.client.getRoom(id) as LocalRoom | null;
             if (!room || !isLocalRoom(id) || room.state === LocalRoomState.CREATED) {
                 this.localChats.delete(id);
+                this.pruneEncryptionCards(id, new Set());
                 continue;
             }
             out.push({
@@ -1617,11 +1628,16 @@ export class ViewModelBridge implements ClientViewBridge {
 
     public timeline(roomId: string): ViewMessage[] {
         this.used = true;
+        // A chat started from the kit that has no server room yet (A6): no timeline view-model, but Element's own view
+        // of it shows the encryption line (`LocalRoomView`), so the kit gets that one entry (M12 Z4, FN2).
+        if (isLocalRoom(roomId)) return this.localRoomTimeline(roomId);
         const vm = this.ensureTimeline(roomId);
         if (!vm) return [];
         const messages: ViewMessage[] = [];
         // Call events of this window, held or not: a card is dropped only when its event is no longer an item.
         const seenCalls = new Set<string>();
+        // Encryption events of this window, same rule as the calls.
+        const seenEncryption = new Set<string>();
         for (const item of vm.getSnapshot().items) {
             if (item.kind !== "event") continue;
             const eventItem = item;
@@ -1632,6 +1648,15 @@ export class ViewModelBridge implements ClientViewBridge {
                 seenCalls.add(id);
                 const call = this.callMessage(eventItem.event as MatrixEvent, roomId);
                 if (call) messages.push(call);
+                continue;
+            }
+            // Element tiles every m.room.encryption event at its place (EventTileFactory); the message filter below would drop it.
+            if ((eventItem.event as MatrixEvent).getType() === EventType.RoomEncryption) {
+                const encryption = this.encryptionMessage(eventItem.event as MatrixEvent, roomId);
+                if (encryption) {
+                    seenEncryption.add(id);
+                    messages.push(encryption);
+                }
                 continue;
             }
             const row = this.row(eventItem, roomId);
@@ -1675,7 +1700,75 @@ export class ViewModelBridge implements ClientViewBridge {
             }
         }
         this.pruneCallCards(roomId, seenCalls);
+        this.pruneEncryptionCards(roomId, seenEncryption);
         return messages.sort((a, b) => a.ts - b.ts);
+    }
+
+    /**
+     * The timeline of a local room (a chat started from the kit before its server room exists): `[]` apart from the one
+     * encryption entry of its `m.room.encryption` state event, which Element's `LocalRoomView` draws above the composer.
+     * Nothing once the room is gone; the server room's own timeline replaces this one.
+     */
+    private localRoomTimeline(roomId: string): ViewMessage[] {
+        const seen = new Set<string>();
+        const messages: ViewMessage[] = [];
+        // A CREATED local room stays in the client store (only its state flips), so it counts as gone: its card is disposed
+        // here and no later read builds one (the server room carries the entry from then on).
+        const room = this.client.getRoom(roomId) as LocalRoom | null;
+        const event =
+            room && room.state !== LocalRoomState.CREATED
+                ? room.currentState.getStateEvents(EventType.RoomEncryption)[0]
+                : undefined;
+        const message = event && this.encryptionMessage(event, roomId);
+        if (event && message) {
+            seen.add(event.getId()!);
+            messages.push(message);
+        }
+        this.pruneEncryptionCards(roomId, seen);
+        return messages;
+    }
+
+    /** Drops the encryption view-models of a room whose event left the timeline window (or whose local room is gone). */
+    private pruneEncryptionCards(roomId: string, seen: Set<string>): void {
+        for (const [id, card] of this.encryptionCards) {
+            if (card.roomId !== roomId || seen.has(id)) continue;
+            card.off();
+            card.vm.dispose();
+            this.encryptionCards.delete(id);
+        }
+    }
+
+    /**
+     * The entry of a room's `m.room.encryption` state event: `kind` "other", no body, and `encryption` from Element's
+     * `EncryptionEventViewModel` (cached per event id; its async refresh of the state fires a `timeline` event).
+     */
+    private encryptionMessage(event: MatrixEvent, roomId: string): ViewMessage | undefined {
+        const id = event.getId();
+        if (!id || event.getStateKey() !== "") return undefined;
+        let card = this.encryptionCards.get(id);
+        if (!card) {
+            const vm = new EncryptionEventViewModel({ cli: this.client, mxEvent: event });
+            card = { roomId, vm, off: vm.subscribe(() => this.emit({ kind: "timeline", roomId })) };
+            this.encryptionCards.set(id, card);
+        }
+        const snapshot = card.vm.getSnapshot();
+        const state = snapshot.state.toLowerCase() as ViewEncryption["state"];
+        const senderId = event.getSender() ?? "";
+        const avatarUrl = senderId ? this.senderAvatarUrl(roomId, senderId) : undefined;
+        return {
+            id,
+            roomId,
+            senderId,
+            senderName: event.sender?.name || senderId,
+            ...(avatarUrl ? { senderAvatarUrl: avatarUrl } : {}),
+            ts: event.getTs(),
+            body: "",
+            kind: "other",
+            encryption: {
+                state,
+                ...(state === "enabled_dm" && snapshot.userName ? { userName: snapshot.userName } : {}),
+            },
+        };
     }
 
     /** Element's permalink of an event (`RoomPermalinkCreator.forEvent`, `via` included), undefined for a room the client does not know. */
@@ -2705,6 +2798,11 @@ export class ViewModelBridge implements ClientViewBridge {
         this.disposers.forEach((d) => d());
         this.rows.forEach((r) => r.dispose());
         this.callCards.forEach((c) => c.dispose());
+        this.encryptionCards.forEach((c) => {
+            c.off();
+            c.vm.dispose();
+        });
+        this.encryptionCards.clear();
         this.senderAvatars.forEach((a) => a.dispose());
         this.timelines.forEach((t) => t.dispose());
         this.permalinkCreators.forEach((c) => c.stop());
