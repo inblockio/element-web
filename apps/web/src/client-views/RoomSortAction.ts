@@ -33,8 +33,8 @@ const SORT_SETTLE_MS = 5000;
 
 /** `RoomListHeaderViewModel`'s switch, option -> algorithm (the kit sends only the first two). */
 const ALGORITHM: Record<ViewRoomSort, SortingAlgorithm> = {
-    recent: SortingAlgorithm.Recency,
-    alphabetical: SortingAlgorithm.Alphabetic,
+    "recent": SortingAlgorithm.Recency,
+    "alphabetical": SortingAlgorithm.Alphabetic,
     "unread-first": SortingAlgorithm.Unread,
 };
 
