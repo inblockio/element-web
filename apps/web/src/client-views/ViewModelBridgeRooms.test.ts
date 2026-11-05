@@ -395,7 +395,10 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
 
     it("lists nothing new for an existing DM, a failed start (the error reaches the kit) or the own id (M11 Y4)", async () => {
         actions.startDmWithUser.mockResolvedValue({ status: "done", roomId: "!dm:example.org" });
-        await expect(bridge.startDm("@bob:example.org")).resolves.toEqual({ status: "done", roomId: "!dm:example.org" });
+        await expect(bridge.startDm("@bob:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "!dm:example.org",
+        });
         actions.startDmWithUser.mockRejectedValue(new Error("a direct chat with yourself is not started"));
         await expect(bridge.startDm("@me:example.org")).rejects.toThrow("yourself");
         expect(bridge.rooms().map((r) => r.id)).toEqual(["!a:example.org", "!inv:example.org"]);
@@ -461,7 +464,10 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
         // Once Element created the real room, the local one is no longer reused: the next start goes to Element again.
         eve.state = LocalRoomState.CREATED;
         actions.startDmWithUser.mockResolvedValueOnce({ status: "done", roomId: "!real:example.org" });
-        await expect(bridge.startDm("@eve:example.org")).resolves.toEqual({ status: "done", roomId: "!real:example.org" });
+        await expect(bridge.startDm("@eve:example.org")).resolves.toEqual({
+            status: "done",
+            roomId: "!real:example.org",
+        });
         expect(actions.startDmWithUser).toHaveBeenCalledTimes(3);
     });
 

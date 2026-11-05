@@ -1421,7 +1421,16 @@ describe("M11 Y4 start a DM with a user (Element's startDmOnFirstMessage, the me
     });
 
     it("fails at once for a malformed user id (empty, a display name, no server part, whitespace, not a string)", async () => {
-        for (const bad of ["", "bob", "@bob", "@:example.org", "@bob :example.org", "!room:example.org", undefined, 7]) {
+        for (const bad of [
+            "",
+            "bob",
+            "@bob",
+            "@:example.org",
+            "@bob :example.org",
+            "!room:example.org",
+            undefined,
+            7,
+        ]) {
             expect(await codeOf(startDmWithUser(client, bad as unknown as string))).toBe("failed");
         }
         expect(startDm).not.toHaveBeenCalled();
