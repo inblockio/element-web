@@ -216,7 +216,6 @@ export interface Settings {
     [Features.NotificationSettings2]: IFeature;
     "feature_msc3531_hide_messages_pending_moderation": IFeature;
     "feature_latex_maths": IFeature;
-    "feature_client_views": IFeature;
     "feature_wysiwyg_composer": IFeature;
     "feature_mjolnir": IFeature;
     "feature_exclude_insecure_devices": IFeature;
@@ -243,6 +242,7 @@ export interface Settings {
     "feature_hidebold": IBaseSetting<boolean>;
 
     "useOnlyCurrentProfiles": IBaseSetting<boolean>;
+    "feature_client_views": IFeature;
     "clientView": IBaseSetting<string>;
     "mjolnirRooms": IBaseSetting<string[]>;
     "mjolnirPersonalRoom": IBaseSetting<string | null>;
@@ -487,15 +487,6 @@ export const SETTINGS: Settings = {
         supportedLevelsAreOrdered: true,
         default: false,
     },
-    "feature_client_views": {
-        isFeature: true,
-        labsGroup: LabGroup.Ui,
-        displayName: _td("labs|client_views"),
-        description: _td("labs|client_views_description"),
-        supportedLevels: LEVELS_DEVICE_ONLY_SETTINGS_WITH_CONFIG_PRIORITISED,
-        supportedLevelsAreOrdered: true,
-        default: false,
-    },
     "feature_wysiwyg_composer": {
         isFeature: true,
         labsGroup: LabGroup.Messaging,
@@ -531,6 +522,15 @@ export const SETTINGS: Settings = {
         supportedLevels: LEVELS_ACCOUNT_SETTINGS,
         displayName: _td("settings|disable_historical_profile"),
         default: true,
+    },
+    "feature_client_views": {
+        isFeature: true,
+        labsGroup: LabGroup.Ui,
+        displayName: _td("labs|client_views"),
+        description: _td("labs|client_views_description"),
+        supportedLevels: LEVELS_DEVICE_ONLY_SETTINGS_WITH_CONFIG_PRIORITISED,
+        supportedLevelsAreOrdered: true,
+        default: false,
     },
     // The client view shown after login on this device ("stock" = Element's own UI), see feature_client_views.
     "clientView": {
