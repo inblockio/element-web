@@ -388,6 +388,29 @@ describe("RoomListViewModel", () => {
                 expect(viewModel.getSnapshot().roomListState.activeRoomIndex).toBe(1);
             });
 
+            it("builds the preview item of a room the user isn't a member of that is already open when the list is created", async () => {
+                // Stock Element builds it at creation, also while the store is still loading its rooms
+                // (updateRoomListData returns early then); the layer's active-room marking must not skip it
+                vi.spyOn(RoomListStoreV3.instance, "isLoadingRooms", "get").mockReturnValue(true);
+                vi.mocked(matrixClient.getRoom).mockReturnValue(null);
+                vi.spyOn(roomViewStore(), "getRoomId").mockReturnValue(previewRoomId);
+                vi.spyOn(roomViewStore(), "getRoomSummary").mockReturnValue({
+                    room_id: previewRoomId,
+                    name: "Knock room",
+                    membership: KnownMembership.Leave,
+                    num_joined_members: 1,
+                    world_readable: false,
+                    guest_can_join: false,
+                });
+                viewModel = createViewModel();
+                await flushPromises();
+
+                const item = viewModel.getRoomItemViewModel(previewRoomId);
+                expect(item).toBeInstanceOf(PreviewRoomListItemViewModel);
+                expect(item?.getSnapshot().name).toBe("Knock room");
+                expect((viewModel as any).previewRoom?.roomId).toBe(previewRoomId);
+            });
+
             it("counts the preview item when scrolling to a room and to unread activity", async () => {
                 stubClient();
                 const leftRoom = mkStubRoom(previewRoomId, "Left room", matrixClient);

@@ -314,9 +314,11 @@ export class RoomListViewModel
         this.disposables.track(() => clearTimeout(this.toastRef));
 
         // A room may already be open when the list is created (Element's UI mounted again after a client view):
-        // mark it as active now, no ActiveRoomChanged follows
-        if (props.roomViewStore.getRoomId()) void this.updateRoomListData();
-        else this.onRoomViewStoreUpdate();
+        // mark it as active now, no ActiveRoomChanged follows. Its preview item is built first, as stock does.
+        if (props.roomViewStore.getRoomId()) {
+            this.updatePreviewItem();
+            void this.updateRoomListData();
+        } else this.onRoomViewStoreUpdate();
     }
 
     private readonly onRoomViewStoreUpdate = (): void => {
