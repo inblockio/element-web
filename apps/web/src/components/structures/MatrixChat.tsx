@@ -46,7 +46,6 @@ import { MatrixClientPeg } from "../../MatrixClientPeg";
 import PlatformPeg from "../../PlatformPeg";
 import SdkConfig, { type ConfigOptions } from "../../SdkConfig";
 import dis from "../../dispatcher/dispatcher";
-import { isHostPanelSlotMounted } from "../../client-views/hostPanelSlot";
 import Modal from "../../Modal";
 import { showRoomInviteDialog, showStartChatInviteDialog } from "../../RoomInvite";
 import * as Rooms from "../../Rooms";
@@ -150,6 +149,7 @@ import { type URLParams } from "../../vector/url_utils.ts";
 import { type QrLoginCredentials } from "../views/auth/LoginWithQR.tsx";
 import { configureFromCompletedOAuthLogin } from "../../Lifecycle";
 import { LegacyCryptoUnsupportedViewModel } from "../../viewmodels/crypto/legacyCryptoUnsupportedViewModel.ts";
+import { isHostPanelSlotMounted } from "../../client-views/hostPanelSlot";
 
 const AUTH_SCREENS = ["register", "mobile_register", "login", "forgot_password", "start_sso", "start_cas", "welcome"];
 
