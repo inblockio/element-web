@@ -10,6 +10,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { type MatrixClient } from "matrix-js-sdk/src/matrix";
 
+// Loaded first: with the registry patch "resolve-did-search" (`DidSearchMember extends DirectoryMember`) a cold
+// `utils/direct-messages` load reaches `InviteDialog` back through `RoomInvite` while still evaluating; entering
+// through `InviteDialog` first evaluates the cycle in the safe order. A no-op in the stock tree.
+import "../components/views/dialogs/InviteDialog";
 import Modal from "../Modal";
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { Action } from "../dispatcher/actions";
