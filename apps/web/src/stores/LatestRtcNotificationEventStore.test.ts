@@ -73,7 +73,7 @@ describe("LatestRtcNotificationEventStore", () => {
 
         const store = new LatestRtcNotificationEventStore(callStore);
         vi.spyOn(store, "matrixClient", "get").mockReturnValue(cli);
-        store.start();
+        await store.start();
         await vi.waitFor(() => {
             expect(store.getLatestEventId("!my-room1:m.org")).toStrictEqual("event-1");
             expect(store.getLatestEventId("!my-room2:m.org")).toStrictEqual("event-2");
@@ -150,18 +150,20 @@ describe("LatestRtcNotificationEventStore", () => {
 
         const store = new LatestRtcNotificationEventStore(callStore);
         vi.spyOn(store, "matrixClient", "get").mockReturnValue(cli);
-        store.start();
+        await store.start();
 
         // No calls in the room yet
         expect(store.getLatestEventId("!my-room1:m.org")).toBeUndefined();
 
         // Let's say a new call starts
-        callStore.emit(CallStoreEvent.Call, call, "!my-room1:m.org");
+        const roomOn = vi.spyOn(room, "on");
+        callStore.emit(CallStoreEvent.Call, call, room.roomId);
 
         // The correct notification event hasn't come in yet, so still undefined.
         expect(store.getLatestEventId("!my-room1:m.org")).toBeUndefined();
 
         // Notification event comes in
+        await vi.waitFor(() => expect(roomOn).toHaveBeenCalledWith(RoomEvent.Timeline, expect.any(Function)));
         room.emit(RoomEvent.Timeline, newNotificationEvent);
 
         // Should update the event id in store

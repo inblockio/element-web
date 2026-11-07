@@ -1463,7 +1463,7 @@ describe("RoomListViewModel", () => {
                 expect(headerVM1).toBe(headerVM2);
             });
 
-            it("should hide room IDs when a section is collapsed", () => {
+            it("should hide room IDs when a section is collapsed", async () => {
                 viewModel = new RoomListViewModel({
                     client: matrixClient,
                     spaceStore: SDKContextClass.instance.spaceStore,
@@ -1472,7 +1472,7 @@ describe("RoomListViewModel", () => {
 
                 // Collapse the favourite section
                 const favHeader = viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite);
-                favHeader.onClick();
+                await favHeader.onClick();
                 expect(favHeader.isExpanded).toBe(false);
 
                 const snapshot = viewModel.getSnapshot();
@@ -1495,7 +1495,7 @@ describe("RoomListViewModel", () => {
 
                 // Collapse the favourite section (which has 2 rooms: fav1, fav2)
                 const favHeader = viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite);
-                favHeader.onClick();
+                await favHeader.onClick();
                 expect(favHeader.isExpanded).toBe(false);
 
                 // Select regularRoom1, which is the first room in the chats section
@@ -1516,7 +1516,7 @@ describe("RoomListViewModel", () => {
                 expect(snapshot.roomListState.activeRoomIndex).toBe(0);
             });
 
-            it("should restore room IDs when a section is re-expanded", () => {
+            it("should restore room IDs when a section is re-expanded", async () => {
                 viewModel = new RoomListViewModel({
                     client: matrixClient,
                     spaceStore: SDKContextClass.instance.spaceStore,
@@ -1526,8 +1526,8 @@ describe("RoomListViewModel", () => {
                 const favHeader = viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite);
 
                 // Collapse then re-expand
-                favHeader.onClick();
-                favHeader.onClick();
+                await favHeader.onClick();
+                await favHeader.onClick();
                 expect(favHeader.isExpanded).toBe(true);
 
                 const snapshot = viewModel.getSnapshot();
@@ -1559,7 +1559,7 @@ describe("RoomListViewModel", () => {
                 expect(snapshot.sections[0].roomIds).toEqual(["!fav1:server", "!fav2:server", "!fav3:server"]);
             });
 
-            it("should preserve section collapse state across list updates", () => {
+            it("should preserve section collapse state across list updates", async () => {
                 viewModel = new RoomListViewModel({
                     client: matrixClient,
                     spaceStore: SDKContextClass.instance.spaceStore,
@@ -1568,7 +1568,7 @@ describe("RoomListViewModel", () => {
 
                 // Collapse favourites
                 const favHeader = viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite);
-                favHeader.onClick();
+                await favHeader.onClick();
 
                 // Trigger a list update
                 RoomListStoreV3.instance.emit(RoomListStoreV3Event.ListsUpdate);
@@ -1578,7 +1578,7 @@ describe("RoomListViewModel", () => {
                 expect(favSection!.roomIds).toEqual([]);
             });
 
-            it("should track section collapse state per space", () => {
+            it("should track section collapse state per space", async () => {
                 viewModel = new RoomListViewModel({
                     client: matrixClient,
                     spaceStore: SDKContextClass.instance.spaceStore,
@@ -1587,7 +1587,7 @@ describe("RoomListViewModel", () => {
 
                 // Collapse favourites in the home space
                 const favHeader = viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite);
-                favHeader.onClick();
+                await favHeader.onClick();
 
                 // Switch to a different space with its own rooms
                 const spaceFav = mkStubRoom("!spacefav:server", "Space Fav", matrixClient);
@@ -1776,7 +1776,7 @@ describe("RoomListViewModel", () => {
 
                     // Collapse first
                     const favHeader = viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite);
-                    favHeader.onClick();
+                    await favHeader.onClick();
                     expect(favHeader.isExpanded).toBe(false);
 
                     dispatcher.dispatch({ action: Action.RoomListExpandAllSections });
@@ -1937,9 +1937,9 @@ describe("RoomListViewModel", () => {
                     }
                 });
 
-                it("should restore the pre-drag expansion state on drag end", () => {
+                it("should restore the pre-drag expansion state on drag end", async () => {
                     // Collapse Favourite before the drag; other sections remain expanded
-                    viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite).onClick();
+                    await viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite).onClick();
 
                     viewModel.onSectionOrRoomDragStart();
                     viewModel.onSectionOrRoomDragEnd();
@@ -1959,14 +1959,14 @@ describe("RoomListViewModel", () => {
                     ]);
                 });
 
-                it("should re-snapshot expansion state on each drag start", () => {
+                it("should re-snapshot expansion state on each drag start", async () => {
                     // First cycle: Favourite is collapsed before the drag
-                    viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite).onClick();
+                    await viewModel.getSectionHeaderViewModel(DefaultTagID.Favourite).onClick();
                     viewModel.onSectionOrRoomDragStart();
                     viewModel.onSectionOrRoomDragEnd();
 
                     // Between cycles: collapse CHATS_TAG as well
-                    viewModel.getSectionHeaderViewModel(CHATS_TAG).onClick();
+                    await viewModel.getSectionHeaderViewModel(CHATS_TAG).onClick();
                     viewModel.onSectionOrRoomDragStart();
                     viewModel.onSectionOrRoomDragEnd();
 
