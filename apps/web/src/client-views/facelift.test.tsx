@@ -15,7 +15,8 @@ import { faceliftClass, useFaceliftClass } from "./facelift";
 vi.mock("./facelift.css", () => ({}));
 
 const ROCKETCHAT = "mx_ClientViewFacelift_rocketchat";
-const faceliftClasses = (): string[] => [...document.body.classList].filter((c) => c.startsWith("mx_ClientViewFacelift_"));
+const faceliftClasses = (): string[] =>
+    [...document.body.classList].filter((c) => c.startsWith("mx_ClientViewFacelift_"));
 
 describe("facelift body class", () => {
     afterEach(() => {
@@ -36,7 +37,9 @@ describe("facelift body class", () => {
     });
 
     it("goes off when the host switches to a view without a look", () => {
-        const { rerender, unmount } = renderHook(({ id }) => useFaceliftClass(id), { initialProps: { id: "rocketchat" } });
+        const { rerender, unmount } = renderHook(({ id }) => useFaceliftClass(id), {
+            initialProps: { id: "rocketchat" },
+        });
         expect(faceliftClasses()).toEqual([ROCKETCHAT]);
         rerender({ id: "fixture" });
         expect(faceliftClasses()).toEqual([]);
