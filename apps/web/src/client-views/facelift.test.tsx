@@ -6,6 +6,8 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// @vitest-environment happy-dom
 import { renderHook } from "test-utils-rtl";
 
 import { faceliftClass, useFaceliftClass } from "./facelift";
