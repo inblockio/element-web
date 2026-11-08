@@ -211,6 +211,13 @@ body.mx_ClientViewFacelift_rocketchat.cpd-theme-dark {
     --cpd-color-bg-success-hovered: #106d4f; /* g900 */
     --cpd-color-bg-success-pressed: #0d5940; /* g1000 */
 
+    /* Compound's tooltip paints text-on-solid-primary (white above) on alpha-gray-1400, which stock dark makes near-white
+       (hsla(214, 78%, 98%, 0.95)) because stock dark on-solid is dark. Keep the white text and give the tooltip (and its
+       arrow, the only other users of this token) the dark background instead. Fuselage: `.rcx-tooltip--dark` background
+       default, surface.light.dark. (Fuselage's own dark theme flips that surface to #e4e7ea with #2f343d text; matching
+       it would need dark on-solid text, which the primary buttons cannot take.) */
+    --cpd-color-alpha-gray-1400: #1f2329; /* surface.light.dark, rcx-tooltip--dark */
+
     --cpd-font-family-sans:
         Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue",
         "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Meiryo UI", Arial, sans-serif;
