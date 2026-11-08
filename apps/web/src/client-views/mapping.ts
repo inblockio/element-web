@@ -188,6 +188,7 @@ export function toViewMessage(
     flags: {
         canEdit?: boolean;
         canDownload?: boolean;
+        canCopyMarkdown?: boolean;
         edited?: boolean;
         editedTs?: number;
         redactedText?: string;
@@ -234,6 +235,7 @@ export function toViewMessage(
         ...(flags.canEdit ? { canEdit: true } : {}),
         ...(flags.permalink ? { permalink: flags.permalink } : {}),
         ...(flags.canDownload ? { canDownload: true } : {}),
+        ...(flags.canCopyMarkdown ? { canCopyMarkdown: true } : {}),
         ...(flags.pinned ? { pinned: true } : {}),
         ...(flags.canPin ? { canPin: true } : {}),
         ...(flags.edited ? { edited: true as const } : {}),
