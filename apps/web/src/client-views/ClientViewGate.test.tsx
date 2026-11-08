@@ -16,6 +16,7 @@ import { TypedEventEmitter } from "matrix-js-sdk/src/matrix";
 import { SDKContext } from "../contexts/SDKContext";
 import { type SDKContextClass } from "../contexts/SDKContextClass";
 import ToastStore from "../stores/ToastStore";
+import SettingsStore from "../settings/SettingsStore";
 import { UPDATE_EVENT } from "../stores/AsyncStore";
 import { LegacyCallHandlerEvent } from "../LegacyCallHandler";
 import ActiveWidgetStore, { ActiveWidgetStoreEvent } from "../stores/ActiveWidgetStore";
@@ -339,6 +340,70 @@ describe("ClientViewGate", () => {
         viewRoom({});
         expect(screen.getByTitle("Fixture")).toBeTruthy();
         expect(screen.queryByText("stock UI")).toBeNull();
+    });
+
+    describe("facelift (K8)", () => {
+        const ROCKETCHAT = "mx_ClientViewFacelift_rocketchat";
+        const rocketchat = { id: "rocketchat", name: "Rocket.Chat", url: "/kits/rocketchat/index.html" };
+        const lookClasses = (): string[] =>
+            [...document.body.classList].filter((c) => c.startsWith("mx_ClientViewFacelift_"));
+
+        afterEach(() => {
+            document.body.className = "";
+        });
+
+        it("puts the Rocket.Chat look on the body while that kit is mounted, and takes it off when the stock UI shows", () => {
+            vi.mocked(getActiveClientView).mockReturnValueOnce(rocketchat);
+            const { unmount } = renderGate();
+            expect(screen.queryByText("stock UI")).toBeNull();
+            expect(lookClasses()).toEqual([ROCKETCHAT]);
+
+            viewRoom({ view_call: true });
+            expect(screen.getByText("stock UI")).toBeTruthy();
+            expect(lookClasses()).toEqual([]);
+            unmount();
+            expect(lookClasses()).toEqual([]);
+        });
+
+        it("takes the look off when the gate unmounts over the kit", () => {
+            vi.mocked(getActiveClientView).mockReturnValueOnce(rocketchat);
+            const { unmount } = renderGate();
+            expect(lookClasses()).toEqual([ROCKETCHAT]);
+            unmount();
+            expect(lookClasses()).toEqual([]);
+        });
+
+        it("takes the look off when the stock view is selected, and puts it back when the kit is selected again", () => {
+            const updates: (() => void)[] = [];
+            const watch = vi.spyOn(SettingsStore, "watchSetting").mockImplementation((_name, _room, cb) => {
+                updates.push(cb as () => void);
+                return "ref";
+            });
+            const unwatch = vi.spyOn(SettingsStore, "unwatchSetting").mockImplementation(() => {});
+            try {
+                vi.mocked(getActiveClientView).mockReturnValueOnce(rocketchat);
+                renderGate();
+                expect(lookClasses()).toEqual([ROCKETCHAT]);
+
+                vi.mocked(getActiveClientView).mockReturnValueOnce(undefined);
+                act(() => updates.forEach((cb) => cb()));
+                expect(screen.getByText("stock UI")).toBeTruthy();
+                expect(lookClasses()).toEqual([]);
+
+                vi.mocked(getActiveClientView).mockReturnValueOnce(rocketchat);
+                act(() => updates.forEach((cb) => cb()));
+                expect(lookClasses()).toEqual([ROCKETCHAT]);
+            } finally {
+                watch.mockRestore();
+                unwatch.mockRestore();
+            }
+        });
+
+        it("sets no look for the stock UI", () => {
+            vi.mocked(getActiveClientView).mockReturnValueOnce(undefined);
+            renderGate();
+            expect(lookClasses()).toEqual([]);
+        });
     });
 
     it("ends a hand-over when the gate unmounts", () => {
