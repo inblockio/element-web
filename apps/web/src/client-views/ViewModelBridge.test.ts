@@ -170,7 +170,7 @@ const h = vi.hoisted(() => {
         showDownload: boolean;
         dispose: Mock;
     }> = [];
-    const eventUtils = { canEdit: true, canDownload: true };
+    const eventUtils = { canEdit: true, canDownload: true, canCopyMarkdown: true };
     const pins = { pinned: false, canPin: true, canUnpin: true, press: undefined as undefined | (() => Promise<void>) };
     const roomLists: Array<InstanceType<typeof FakeVm<{ sections: { roomIds: string[] }[] }>>> = [];
     const sdkContext: { roomViewStore?: { getRoomId: () => string | null } } = {};
@@ -190,6 +190,9 @@ const h = vi.hoisted(() => {
         }),
         forwardViaDialog: vi.fn(),
         viewSourceViaDialog: vi.fn(),
+        /** M14 K6: Element's `eventToMarkdown` and the clipboard write (`copyPlainTextToClipboard`). */
+        eventToMarkdown: vi.fn(),
+        copyPlainText: vi.fn(),
         createDialog: vi.fn(),
         actionBars,
         eventUtils,
@@ -484,6 +487,14 @@ vi.mock("./InterimActions", () => ({
     editText: (...args: unknown[]) => h.editText(...args),
     redact: (...args: unknown[]) => h.redact(...args),
 }));
+vi.mock("../utils/eventToMarkdown", () => ({
+    canCopyMarkdown: () => h.eventUtils.canCopyMarkdown,
+    eventToMarkdown: (...args: unknown[]) => h.eventToMarkdown(...args),
+}));
+vi.mock("@element-hq/element-web-shared-utils", async (orig) => ({
+    ...(await orig<typeof import("@element-hq/element-web-shared-utils")>()),
+    copyPlainTextToClipboard: (...args: unknown[]) => h.copyPlainText(...args),
+}));
 vi.mock("./DownloadAction", () => ({
     canDownloadMedia: () => h.eventUtils.canDownload,
     downloadMedia: (...args: unknown[]) => h.downloadMedia(...args),
@@ -582,6 +593,9 @@ describe("ViewModelBridge", () => {
         h.pins.canUnpin = true;
         h.pins.press = undefined;
         h.eventUtils.canDownload = true;
+        h.eventUtils.canCopyMarkdown = true;
+        h.eventToMarkdown.mockReset();
+        h.copyPlainText.mockReset();
         h.downloadMedia.mockReset();
         h.forwardViaDialog.mockReset();
         h.viewSourceViaDialog.mockReset();
@@ -1151,6 +1165,13 @@ describe("ViewModelBridge", () => {
             expect(message().canDownload).toBe(true);
             h.eventUtils.canDownload = false;
             expect(message().canDownload).toBeUndefined();
+        });
+
+        it("hands over canCopyMarkdown by Element's Copy Markdown rule (M14 K6)", () => {
+            const { message } = readFirst();
+            expect(message().canCopyMarkdown).toBe(true);
+            h.eventUtils.canCopyMarkdown = false;
+            expect(message().canCopyMarkdown).toBeUndefined();
         });
 
         it("hands over editedTs: the replacement's timestamp, only with edited", () => {
@@ -2543,6 +2564,55 @@ describe("ViewModelBridge", () => {
             await expect(bridge.openViewSource("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
             expect(h.viewSourceViaDialog).not.toHaveBeenCalled();
             expect(h.createDialog).not.toHaveBeenCalled();
+        });
+    });
+
+    describe("copyMarkdown (M14 K6, version 8)", () => {
+        const read = (...events: ReturnType<typeof fakeEvent>[]) => {
+            h.timeline.snapshot = {
+                items: events.map((event) => ({ kind: "event", event, continuation: false })),
+                atLiveEnd: true,
+            };
+            return bridge.timeline("!a");
+        };
+        const MD = "**bold** and [link](https://example.org/)";
+
+        it("copies Element's eventToMarkdown of the event through copyPlainTextToClipboard, in the call's own stack, and answers done", async () => {
+            const event = fakeEvent("$1");
+            read(event);
+            h.eventToMarkdown.mockReturnValue(MD);
+            h.copyPlainText.mockResolvedValue(true);
+            const call = bridge.copyMarkdown("!a", "$1");
+            // nothing awaited before the clipboard call: it already ran when the bridge returned (user gesture)
+            expect(h.eventToMarkdown).toHaveBeenCalledWith(event);
+            expect(h.copyPlainText).toHaveBeenCalledWith(MD);
+            await expect(call).resolves.toEqual({ status: "done", roomId: "!a", eventId: "$1" });
+            expect(h.copyPlainText).toHaveBeenCalledTimes(1);
+        });
+
+        it("names an unknown room or event and copies nothing", async () => {
+            read(fakeEvent("$1"));
+            await expect(bridge.copyMarkdown("!nope", "$1")).rejects.toMatchObject({ code: "unknown_room" });
+            await expect(bridge.copyMarkdown("!a", "$nope")).rejects.toMatchObject({ code: "unknown_event" });
+            expect(h.eventToMarkdown).not.toHaveBeenCalled();
+            expect(h.copyPlainText).not.toHaveBeenCalled();
+        });
+
+        it("is unsupported where Element offers no Copy Markdown (an image, a redacted or an undecrypted message) and copies nothing", async () => {
+            read(fakeEvent("$1"));
+            h.eventUtils.canCopyMarkdown = false;
+            await expect(bridge.copyMarkdown("!a", "$1")).rejects.toMatchObject({ code: "unsupported" });
+            expect(h.eventToMarkdown).not.toHaveBeenCalled();
+            expect(h.copyPlainText).not.toHaveBeenCalled();
+        });
+
+        it("fails when the clipboard refuses the text (copyPlainTextToClipboard answers false)", async () => {
+            read(fakeEvent("$1"));
+            h.eventToMarkdown.mockReturnValue(MD);
+            h.copyPlainText.mockResolvedValue(false);
+            const err = await bridge.copyMarkdown("!a", "$1").catch((e: unknown) => e);
+            expect(err).toBeInstanceOf(ClientViewActionError);
+            expect(err).toMatchObject({ code: "failed" });
         });
     });
 

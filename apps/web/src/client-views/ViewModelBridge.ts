@@ -30,6 +30,7 @@ import { uniq, uniqBy } from "lodash";
 import { CryptoEvent } from "matrix-js-sdk/src/crypto-api";
 import { type MediaEventContent } from "matrix-js-sdk/src/types";
 import { logger } from "matrix-js-sdk/src/logger";
+import { copyPlainTextToClipboard } from "@element-hq/element-web-shared-utils";
 import type { RefObject } from "react";
 import {
     type FileBodyViewSnapshot,
@@ -90,6 +91,7 @@ import { CallCard } from "./CallCard";
 import { getClientViews, getMeetUrl, selectClientView } from "./registry";
 import { toViewAudio, toViewE2e, toViewMedia, toViewMessage, toViewRoom, toViewUrlPreviews } from "./mapping";
 import { canDownloadMedia, downloadMedia } from "./DownloadAction";
+import { canCopyMarkdown, eventToMarkdown } from "../utils/eventToMarkdown";
 import UserProvider from "../autocomplete/UserProvider";
 import { acceptInvite, declineInvite, editText, joinRoom, logout, redact, sendText } from "./InterimActions";
 import {
@@ -477,6 +479,11 @@ class EventRow {
     /** Element's rule for the Download action bar button (no view-model per row), see {@link canDownloadMedia}. */
     public canDownload(): boolean {
         return canDownloadMedia(this.ev);
+    }
+
+    /** M14 K6: Element's "Copy Markdown" rule (registry patch `canCopyMarkdown`: cheap, no conversion, never throws). */
+    public canCopyMarkdown(): boolean {
+        return canCopyMarkdown(this.ev);
     }
 
     /** The edited marker's rule (`TextualBodyViewModel`): a replacement event exists. */
@@ -1716,6 +1723,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 {
                     canEdit: row.canEdit(),
                     canDownload: row.canDownload(),
+                    canCopyMarkdown: row.canCopyMarkdown(),
                     edited: row.edited(),
                     editedTs: row.editedTs(),
                     redactedText: row.redactedText(),
@@ -2041,6 +2049,29 @@ export class ViewModelBridge implements ClientViewBridge {
         }
         return viewSourceViaDialog(roomId, eventId, () => {
             Modal.createDialog(ViewSource, { mxEvent: row.event }, "mx_Dialog_viewsource");
+        });
+    }
+
+    /**
+     * M14 K6: Element's "Copy Markdown" (registry patch `copy-markdown`): the message's Markdown through
+     * `eventToMarkdown` to the clipboard through `copyPlainTextToClipboard`, the call Element's own menu item makes.
+     * Nothing is awaited before the clipboard call, so it runs in the click's call stack (user gesture). `unsupported`
+     * where Element offers no such item (`canCopyMarkdown`), `failed` when the clipboard refused.
+     */
+    public copyMarkdown(roomId: string, eventId: string): Promise<ActionOutcome> {
+        this.used = true;
+        let row: EventRow;
+        try {
+            row = this.actionRow(roomId, eventId);
+        } catch (e) {
+            return Promise.reject(e);
+        }
+        if (!row.canCopyMarkdown()) {
+            return Promise.reject(new ClientViewActionError("unsupported", "Element offers no Copy Markdown here"));
+        }
+        return copyPlainTextToClipboard(eventToMarkdown(row.event)).then((copied) => {
+            if (!copied) throw new ClientViewActionError("failed", "the clipboard refused the text");
+            return { status: "done", roomId, eventId } as ActionOutcome;
         });
     }
 

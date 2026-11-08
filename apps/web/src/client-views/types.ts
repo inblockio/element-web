@@ -154,6 +154,12 @@ export interface ViewMessage {
      * read here, `download` reports it as `forbidden`.
      */
     canDownload?: boolean;
+    /**
+     * M14 K6: Element's "Copy Markdown" is offered for this message (the registry patch's `canCopyMarkdown`: a text-like
+     * message whose body can be converted back to Markdown; false or absent for an image, a redacted or an undecrypted
+     * one). The kit shows its "Copy Markdown" item only where this is true; `copyMarkdown` does the copy.
+     */
+    canCopyMarkdown?: boolean;
     /** The message has been edited (the edited marker's rule: a replacement event exists). */
     edited?: true;
     /** When the latest replacement was sent (ms since epoch; `ts` stays the original's). Only with `edited`, when known. */
@@ -621,6 +627,14 @@ export interface ClientViewBridge {
      * no member object for. The card's own writes (invite, ignore, power level ...) are Element's. Awaits a right-panel view-model.
      */
     openUserInfo(roomId: string, userId: string): Promise<ActionOutcome>;
+    /**
+     * M14 K6 (additive, version stays 8): copies the Markdown of a message to the clipboard through Element's own
+     * `eventToMarkdown` and `copyPlainTextToClipboard` (the registry patch's "Copy Markdown" action), in the same call
+     * stack as the click (the clipboard needs the user gesture). `done` (`roomId`, `eventId`) when the clipboard took it;
+     * `unknown_room` / `unknown_event` as the other message actions; `unsupported` where `canCopyMarkdown` is not set;
+     * `failed` when the clipboard refused the text. Changes nothing else.
+     */
+    copyMarkdown(roomId: string, eventId: string): Promise<ActionOutcome>;
     /** M9: closes whatever the host panel slot shows (a card panel or a thread panel); a no-op when it is empty. */
     closePanel(): void;
     /** M9: Element asked, from a card panel, to show an event of the panel's room (a Pinned "View in timeline", a file's jump). */
