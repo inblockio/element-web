@@ -148,7 +148,7 @@ describe("ViewModelBridge.quickReact (M13 U6)", () => {
     });
 
     it("is bridge version 7 and offers quickReact", () => {
-        expect(bridge.version).toBe(7);
+        expect(bridge.version).toBe(8);
         expect(typeof bridge.quickReact).toBe("function");
     });
 

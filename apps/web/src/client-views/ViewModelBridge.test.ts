@@ -655,7 +655,7 @@ describe("ViewModelBridge", () => {
     });
 
     it("is bridge version 7 and hands the send to the interim action", async () => {
-        expect(bridge.version).toBe(7);
+        expect(bridge.version).toBe(8);
         h.sendText.mockResolvedValueOnce({ status: "done", eventId: "$e" });
         await expect(bridge.sendText("!a", "hi", { txnId: "t" })).resolves.toEqual({ status: "done", eventId: "$e" });
         expect(h.sendText).toHaveBeenCalledWith(expect.anything(), "!a", "hi", { txnId: "t" }, expect.any(Object));
@@ -2308,6 +2308,64 @@ describe("ViewModelBridge", () => {
             bridge.closePanel();
             await plain;
             dm.mockRestore();
+        });
+
+        it("openUserInfo (M14 K4, version 8): user info of a room member as the info card, done when it closes; a slow member load cannot replace a newer panel; failures leave no panel", async () => {
+            const shown = watch();
+            const countBefore = shown.length;
+            const carol = { userId: "@carol:example.org" };
+            // a known member: the card carries that member at once, in a room that is no DM
+            const call = bridge.openUserInfo("!a", "@bob:example.org");
+            expect(shown.at(-1)!).toMatchObject({ card: "info", dmMember: { userId: "@bob:example.org" } });
+            bridge.closePanel();
+            await expect(call).resolves.toMatchObject({ status: "done", roomId: "!a" });
+            expect(shown.at(-1)).toBeNull();
+
+            // an unknown room, an empty user, a room not joined: rejected, nothing mounted
+            const before = shown.length;
+            await expect(bridge.openUserInfo("!nope", "@bob:example.org")).rejects.toMatchObject({
+                code: "unknown_room",
+            });
+            await expect(bridge.openUserInfo("!a", "")).rejects.toMatchObject({ code: "unsupported" });
+            const membership = vi.spyOn(h.room, "getMyMembership").mockReturnValue("invite");
+            await expect(bridge.openUserInfo("!a", "@bob:example.org")).rejects.toMatchObject({ code: "unsupported" });
+            membership.mockRestore();
+            expect(shown.length).toBe(before);
+
+            // lazy members: loads first, then opens; a user the room never lists rejects unsupported
+            let loaded = false;
+            const getMember = vi
+                .spyOn(h.room, "getMember")
+                .mockImplementation(((id: string) => (loaded && id === carol.userId ? carol : null)) as never);
+            h.room.loadMembersIfNeeded.mockClear();
+            h.room.loadMembersIfNeeded.mockImplementationOnce(async () => ((loaded = true), true));
+            const lazy = bridge.openUserInfo("!a", carol.userId);
+            await vi.waitFor(() => expect(shown.at(-1)?.dmMember).toMatchObject(carol));
+            expect(h.room.loadMembersIfNeeded).toHaveBeenCalledTimes(1);
+            bridge.closePanel();
+            await lazy;
+            h.room.loadMembersIfNeeded.mockResolvedValueOnce(true);
+            await expect(bridge.openUserInfo("!a", "@nobody:example.org")).rejects.toMatchObject({
+                code: "unsupported",
+            });
+
+            // a slow load and a newer panel meanwhile: the slow one resolves done without installing
+            loaded = false;
+            let release!: () => void;
+            h.room.loadMembersIfNeeded.mockImplementationOnce(
+                () => new Promise<boolean>((r) => (release = () => ((loaded = true), r(true)))),
+            );
+            const slow = bridge.openUserInfo("!a", carol.userId);
+            const newer = bridge.openPanel("!a", "members");
+            const count = shown.length;
+            release();
+            await expect(slow).resolves.toMatchObject({ status: "done" });
+            expect(shown.length).toBe(count);
+            expect(shown.at(-1)?.card).toBe("members");
+            bridge.closePanel();
+            await newer;
+            expect(shown.length).toBeGreaterThan(countBefore);
+            getMember.mockRestore();
         });
 
         it("a card replaces an open thread panel and the other way round; closePanel, closeThread and dispose close either", async () => {

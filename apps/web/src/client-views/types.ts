@@ -334,7 +334,7 @@ export interface LoadOlderResult {
 
 /** What the host hands a kit, as `window.__clientViewBridge`. */
 export interface ClientViewBridge {
-    readonly version: 7;
+    readonly version: 8;
     me(): ViewMe;
     rooms(): ViewRoom[];
     /** starts (idempotent) and returns the timeline of a room */
@@ -612,6 +612,15 @@ export interface ClientViewBridge {
      * (favourite, leave, invite, unpin ...) are Element's. Awaits a right-panel view-model.
      */
     openPanel(roomId: string, card: "info" | "members" | "files" | "pinned" | "search"): Promise<ActionOutcome>;
+    /**
+     * M14 K4 (version 8, additive: a kit feature-checks it): Element's own user info of `userId` in the host panel slot, the
+     * right-panel `MemberInfo` card of a member of `roomId` (the MXID, and under it the DID row). A sender's name or avatar in
+     * the kit opens it. Same slot and lifecycle as `openPanel`: replaces an open panel or thread, `done` (`roomId`) when it
+     * closes (its close button, Escape, a later open, `closePanel`, the room left, another room opened from it, the bridge
+     * disposed). `unknown_room` as `openPanel`; `unsupported` for a room not joined, an empty user id, or a user the room has
+     * no member object for. The card's own writes (invite, ignore, power level ...) are Element's. Awaits a right-panel view-model.
+     */
+    openUserInfo(roomId: string, userId: string): Promise<ActionOutcome>;
     /** M9: closes whatever the host panel slot shows (a card panel or a thread panel); a no-op when it is empty. */
     closePanel(): void;
     /** M9: Element asked, from a card panel, to show an event of the panel's room (a Pinned "View in timeline", a file's jump). */
