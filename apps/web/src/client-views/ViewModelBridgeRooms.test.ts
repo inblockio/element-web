@@ -264,7 +264,7 @@ describe("ViewModelBridge rooms: create, start chat, leave, invites (A5-A7)", ()
     });
 
     it("is bridge version 7 (openDirectory is an additive method)", () => {
-        expect(bridge.version).toBe(7);
+        expect(bridge.version).toBe(8);
         expect(typeof bridge.openDirectory).toBe("function");
     });
 

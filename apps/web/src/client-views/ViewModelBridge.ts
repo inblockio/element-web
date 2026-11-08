@@ -216,7 +216,7 @@ export interface CardPanelRequest {
     key: string;
     room: Room;
     card: PanelCardName;
-    /** `info` in a DM: the other member, whose user info is the card (as the DM header of the kit shows the user). */
+    /** `info` in a DM: the other member, whose user info is the card (as the DM header of the kit shows the user); also the target of `openUserInfo` (M14 K4). */
     dmMember?: RoomMember;
     permalinkCreator: RoomPermalinkCreator;
     finish: () => void;
@@ -1141,7 +1141,7 @@ class EventRow {
 type EventItem = Extract<TimelineItem, { kind: "event" }>;
 
 export class ViewModelBridge implements ClientViewBridge {
-    public readonly version = 7;
+    public readonly version = 8;
 
     private readonly listeners = new Set<(e: ChangeEvent) => void>();
     private readonly disposers: Array<() => void> = [];
@@ -1212,6 +1212,13 @@ export class ViewModelBridge implements ClientViewBridge {
     private readonly threadListeners = new Set<(request: ThreadPanelRequest | null) => void>();
     /** The card panel in the host's slot (M9): at most one of `thread` and `panel` is set. */
     private panelCount = 0;
+    /**
+     * Open order of the card panel (M14 K4 F2): every open call takes a ticket; `panelOwner` is the newest ticket that claimed
+     * the slot (an accepted open, or `closePanel`). A call still loading members is stale when a newer ticket claimed the
+     * slot meanwhile. A call that fails (unknown member) never claims, so it cannot cancel an older valid open.
+     */
+    private openOrder = 0;
+    private panelOwner = 0;
     private panel?: { request: CardPanelRequest };
     private readonly panelListeners = new Set<(request: CardPanelRequest | null) => void>();
     private readonly jumpListeners = new Set<(jump: { roomId: string; eventId: string }) => void>();
@@ -2118,7 +2125,13 @@ export class ViewModelBridge implements ClientViewBridge {
 
     /** M9: closes whatever the host panel slot shows (thread or card panel; each open call resolves `done`). */
     public closePanel(): void {
-        this.panelCount++; // an openPanel still loading members must not install its panel afterwards
+        this.panelOwner = ++this.openOrder; // an open still loading members must not install its panel afterwards
+        this.closeShownPanel();
+    }
+
+    /** Closes the thread or card panel shown (each open call resolves `done`) without claiming the slot. */
+    private closeShownPanel(): void {
+        this.panelCount++;
         this.thread?.request.finish();
         this.panel?.request.finish();
     }
@@ -2140,8 +2153,7 @@ export class ViewModelBridge implements ClientViewBridge {
                 new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"),
             );
         }
-        const seq = ++this.panelCount; // only an accepted call supersedes an in-flight open
-        let dmMember: RoomMember | undefined;
+        const ticket = ++this.openOrder;
         if (card === "info") {
             let otherId: string | null | undefined;
             try {
@@ -2150,38 +2162,71 @@ export class ViewModelBridge implements ClientViewBridge {
                 otherId = undefined; // no DM map (not started): a plain room
             }
             if (otherId) {
-                dmMember = room.getMember(otherId) ?? undefined;
-                if (!dmMember) {
-                    // Lazy-loaded members: the partner of a DM with no event in the loaded window has no member object yet.
-                    const unknown = (): Promise<ActionOutcome> =>
-                        Promise.reject(
-                            new ClientViewActionError("unsupported", "the other member of this chat is unknown"),
-                        );
-                    return (async (): Promise<ActionOutcome> => {
-                        try {
-                            await room.loadMembersIfNeeded();
-                        } catch {
-                            // offline: the re-check below decides
-                        }
-                        // A later openPanel / closePanel bumped the counter while the members loaded: that one wins.
-                        if (seq !== this.panelCount) return { status: "done", roomId };
-                        // Left, kicked or forgotten while the members loaded: no card for a room not joined.
-                        if (this.client.getRoom(roomId) !== room || room.getMyMembership() !== KnownMembership.Join) {
-                            return Promise.reject(
-                                new ClientViewActionError(
-                                    "unsupported",
-                                    "Element offers no cards for a room not joined",
-                                ),
-                            );
-                        }
-                        const member = room.getMember(otherId) ?? undefined;
-                        if (!member) return unknown();
-                        return this.mountCardPanel(room, roomId, card, member);
-                    })();
-                }
+                return this.openMemberCard(room, roomId, otherId, ticket, "the other member of this chat is unknown");
             }
         }
-        return this.mountCardPanel(room, roomId, card, dmMember);
+        this.panelOwner = ticket; // an accepted call supersedes an in-flight open
+        return this.mountCardPanel(room, roomId, card, undefined);
+    }
+
+    /**
+     * M14 K4 (version 8, additive: a kit feature-checks it): Element's own user info of `userId` in the host panel slot, the
+     * `RightPanelPhases.MemberInfo` card (the MXID, and under it the DID row of the user-info patch). A sender's name or
+     * avatar in the kit opens it. Same slot and lifecycle as `openPanel`: replaces an open panel or thread, `done`
+     * (`roomId`) when it closes. `unknown_room` as `openPanel`; `unsupported` for a room not joined, an empty user id or a
+     * user the room has no member object for (after loading its lazy members).
+     */
+    public openUserInfo(roomId: string, userId: string): Promise<ActionOutcome> {
+        this.used = true;
+        const room = this.client.getRoom(roomId);
+        if (!room) return Promise.reject(new ClientViewActionError("unknown_room", `unknown room ${roomId}`));
+        if (typeof userId !== "string" || !userId) {
+            return Promise.reject(new ClientViewActionError("unsupported", "no user to show"));
+        }
+        if (room.getMyMembership() !== KnownMembership.Join) {
+            return Promise.reject(
+                new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"),
+            );
+        }
+        return this.openMemberCard(room, roomId, userId, ++this.openOrder, `${userId} is not a member of this room`);
+    }
+
+    /**
+     * The user-info card of `userId`: mounted at once, or after the room's lazy-loaded members arrived. The call claims the
+     * panel slot only once its member is known (F2): a user the room never lists rejects without superseding an older open.
+     */
+    private openMemberCard(
+        room: Room,
+        roomId: string,
+        userId: string,
+        ticket: number,
+        unknownText: string,
+    ): Promise<ActionOutcome> {
+        const known = room.getMember(userId) ?? undefined;
+        if (known) {
+            this.panelOwner = ticket;
+            return this.mountCardPanel(room, roomId, "info", known);
+        }
+        // Lazy-loaded members: a user with no event in the loaded window has no member object yet.
+        return (async (): Promise<ActionOutcome> => {
+            try {
+                await room.loadMembersIfNeeded();
+            } catch {
+                // offline: the re-check below decides
+            }
+            // A later open that claimed the slot (or a closePanel) while the members loaded: that one wins.
+            if (this.panelOwner > ticket) return { status: "done", roomId };
+            // Left, kicked or forgotten while the members loaded: no card for a room not joined.
+            if (this.client.getRoom(roomId) !== room || room.getMyMembership() !== KnownMembership.Join) {
+                return Promise.reject(
+                    new ClientViewActionError("unsupported", "Element offers no cards for a room not joined"),
+                );
+            }
+            const member = room.getMember(userId) ?? undefined;
+            if (!member) return Promise.reject(new ClientViewActionError("unsupported", unknownText));
+            this.panelOwner = ticket;
+            return this.mountCardPanel(room, roomId, "info", member);
+        })();
     }
 
     private mountCardPanel(
@@ -2190,7 +2235,7 @@ export class ViewModelBridge implements ClientViewBridge {
         card: PanelCardName,
         dmMember: RoomMember | undefined,
     ): Promise<ActionOutcome> {
-        this.closePanel();
+        this.closeShownPanel(); // the caller has claimed the slot
         return new Promise<ActionOutcome>((resolve) => {
             const stop = this.watchRoomGone(roomId, () => request.finish());
             const current = (): boolean => this.panel?.request === request;

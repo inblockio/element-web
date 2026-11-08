@@ -27,7 +27,9 @@ import { LocalRoom, LocalRoomState, LOCAL_ROOM_ID_PREFIX } from "../models/Local
 import defaultDispatcher from "../dispatcher/dispatcher";
 import { createRoomFromLocalRoom } from "../utils/direct-messages";
 
-vi.mock("../utils/direct-messages", () => ({ createRoomFromLocalRoom: vi.fn() }));
+// `DirectoryMember` is the base class of the registry patch "resolve-did-search" `DidSearchMember`, loaded through
+// `InviteDialog`: the mock must export it (unused in the stock tree).
+vi.mock("../utils/direct-messages", () => ({ createRoomFromLocalRoom: vi.fn(), DirectoryMember: class {} }));
 
 const codeOf = async (p: Promise<unknown>): Promise<string | undefined> => {
     try {
