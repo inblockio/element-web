@@ -1,0 +1,210 @@
+/*
+ * Copyright 2026 inblock.io
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Commercial
+ * Please see LICENSE files in the repository root for full details.
+ */
+
+/*
+ * K8 facelift (M14, R4): while the Rocket.Chat kit view is mounted, the host sets `mx_ClientViewFacelift_rocketchat`
+ * on document.body (facelift.ts) and the Element surfaces the kit opens (host panels, Element dialogs, menus, toasts)
+ * take Rocket.Chat's look. Style only: these are Compound token overrides, no selector reaches a component.
+ *
+ * Cascade: Element and Compound CSS sit in `@layer compound-tokens, compound-web, shared-components, app-web, ...`
+ * and Compound's palette is `.cpd-theme-light.cpd-theme-light` (0,2,0). This sheet is unlayered, and an unlayered
+ * rule beats every layered one whatever its specificity; `body.<class>.cpd-theme-light` (0,3,1) also beats the
+ * palette selector if a build ever folds this sheet into a layer. The high-contrast themes (`cpd-theme-light-hc`,
+ * `cpd-theme-dark-hc`) do not match and keep Element's own look.
+ *
+ * Method: override the palette primitives (`--cpd-color-gray-*`, `blue-*`, `red-*`, `green-*`, `orange-*`,
+ * `theme-bg`). Compound's semantic tokens are declared on the same body element and resolve through var(), so they
+ * follow. The few semantic tokens where Fuselage differs from Compound's mapping are then set on top.
+ *
+ * Sources (every value is a Fuselage design token, the same clone the kit bundles; `rocket.chat/node_modules/
+ * @rocket.chat/fuselage-tokens@0.35.0/dist/`): colors.json (n/b/r/g/o scales), surface.json, font.json,
+ * stroke.json, button.json, typography.json. Hex values are annotated with the token name they come from.
+ */
+
+/* ---- light (surface.json light, font.json light, button.json light, stroke.json light) ---- */
+body.mx_ClientViewFacelift_rocketchat.cpd-theme-light {
+    /* palette primitives: gray scale = Fuselage neutrals (colors.json n100..n900) */
+    --cpd-color-theme-bg: #ffffff; /* surface.light, white */
+    --cpd-color-gray-100: #f7f8fa; /* n100, surface.tint */
+    --cpd-color-gray-200: #f7f8fa; /* n100, surface.disabled */
+    --cpd-color-gray-300: #f2f3f5; /* n200, surface.hover */
+    --cpd-color-gray-400: #e4e7ea; /* n400, surface.neutral / sidebar */
+    --cpd-color-gray-500: #d7dbe0; /* n450, surface.selected */
+    --cpd-color-gray-600: #cbced1; /* n500, stroke.light */
+    --cpd-color-gray-700: #9ea2a8; /* n600, font.annotation, stroke.medium */
+    --cpd-color-gray-800: #9ea2a8; /* n600 */
+    --cpd-color-gray-900: #6c737a; /* n700, font.hint, stroke.dark */
+    --cpd-color-gray-1000: #6c737a; /* n700 */
+    --cpd-color-gray-1100: #2f343d; /* n800 */
+    --cpd-color-gray-1200: #2f343d; /* n800 */
+    --cpd-color-gray-1300: #1f2329; /* n900, font.titlesLabels */
+    --cpd-color-gray-1400: #2f343d; /* n800, font.default */
+
+    /* blue = Fuselage primary / info (b100..b900) */
+    --cpd-color-blue-100: #e8f2ff; /* b100 */
+    --cpd-color-blue-200: #e8f2ff; /* b100 */
+    --cpd-color-blue-300: #e8f2ff; /* b100 */
+    --cpd-color-blue-400: #d1ebfe; /* b200, stroke.extraLightHighlight */
+    --cpd-color-blue-500: #d1ebfe; /* b200 */
+    --cpd-color-blue-600: #76b7fc; /* b300 */
+    --cpd-color-blue-700: #76b7fc; /* b300 */
+    --cpd-color-blue-800: #549df9; /* b400 */
+    --cpd-color-blue-900: #156ff5; /* b500, button.backgroundPrimaryDefault, stroke.highlight */
+    --cpd-color-blue-1000: #095ad2; /* b600, button.backgroundPrimaryHover */
+    --cpd-color-blue-1100: #095ad2; /* b600, font.info */
+    --cpd-color-blue-1200: #10529e; /* b700, button.backgroundPrimaryPress */
+    --cpd-color-blue-1300: #01336b; /* b800 */
+    --cpd-color-blue-1400: #012247; /* b900 */
+
+    /* red = Fuselage danger (r100..r1000) */
+    --cpd-color-red-100: #ffe9ec; /* r100 */
+    --cpd-color-red-200: #ffe9ec; /* r100 */
+    --cpd-color-red-300: #ffe9ec; /* r100 */
+    --cpd-color-red-400: #ffc1c9; /* r200, stroke.extraLightError */
+    --cpd-color-red-500: #ffc1c9; /* r200 */
+    --cpd-color-red-600: #f98f9d; /* r300 */
+    --cpd-color-red-700: #f5455c; /* r400 */
+    --cpd-color-red-800: #ec0d2a; /* r500, stroke.error */
+    --cpd-color-red-900: #d40c26; /* r600, font.danger */
+    --cpd-color-red-1000: #bb0b21; /* r700 */
+    --cpd-color-red-1100: #9b1325; /* r800 */
+    --cpd-color-red-1200: #8b0719; /* r900 */
+    --cpd-color-red-1300: #6b0513; /* r1000 */
+    --cpd-color-red-1400: #6b0513; /* r1000 */
+
+    /* green = Fuselage success (g100..g1000) */
+    --cpd-color-green-100: #e5fbf4; /* g100 */
+    --cpd-color-green-200: #e5fbf4; /* g100 */
+    --cpd-color-green-300: #c0f6e4; /* g200 */
+    --cpd-color-green-400: #c0f6e4; /* g200 */
+    --cpd-color-green-500: #96f0d2; /* g300 */
+    --cpd-color-green-600: #6ce9c0; /* g400 */
+    --cpd-color-green-700: #1ecb92; /* g600 */
+    --cpd-color-green-800: #19ac7c; /* g700 */
+    --cpd-color-green-900: #148660; /* g800 */
+    --cpd-color-green-1000: #106d4f; /* g900 */
+    --cpd-color-green-1100: #0d5940; /* g1000 */
+    --cpd-color-green-1200: #0d5940; /* g1000 */
+    --cpd-color-green-1300: #0d5940; /* g1000 */
+    --cpd-color-green-1400: #0d5940; /* g1000 */
+
+    /* orange = Fuselage warning (o100..o1000) */
+    --cpd-color-orange-100: #fde8d7; /* o100 */
+    --cpd-color-orange-200: #fde8d7; /* o100 */
+    --cpd-color-orange-300: #fde8d7; /* o100 */
+    --cpd-color-orange-400: #fad1b0; /* o200 */
+    --cpd-color-orange-500: #f7b27b; /* o300 */
+    --cpd-color-orange-600: #f59b53; /* o400 */
+    --cpd-color-orange-700: #f38c39; /* o500 */
+    --cpd-color-orange-800: #e26d0e; /* o600 */
+    --cpd-color-orange-900: #bd5a0b; /* o700 */
+    --cpd-color-orange-1000: #974809; /* o800 */
+    --cpd-color-orange-1100: #713607; /* o900 */
+    --cpd-color-orange-1200: #5b2c06; /* o1000 */
+    --cpd-color-orange-1300: #5b2c06; /* o1000 */
+    --cpd-color-orange-1400: #5b2c06; /* o1000 */
+
+    /* semantic: where Fuselage differs from Compound's mapping (Compound's primary action is black, its accent green) */
+    --cpd-color-bg-action-primary-rest: #156ff5; /* button.backgroundPrimaryDefault */
+    --cpd-color-bg-action-primary-hovered: #095ad2; /* button.backgroundPrimaryHover */
+    --cpd-color-bg-action-primary-pressed: #10529e; /* button.backgroundPrimaryPress */
+    --cpd-color-bg-action-primary-disabled: #d1ebfe; /* button.backgroundPrimaryDisabled */
+    --cpd-color-text-on-solid-primary: #ffffff; /* button.fontOnPrimary */
+    --cpd-color-icon-on-solid-primary: #ffffff;
+    --cpd-color-text-action-accent: #095ad2; /* font.info; accent is blue in Fuselage */
+    --cpd-color-bg-accent-rest: #156ff5; /* button.backgroundPrimaryDefault */
+    --cpd-color-bg-accent-hovered: #095ad2; /* button.backgroundPrimaryHover */
+    --cpd-color-bg-accent-pressed: #10529e; /* button.backgroundPrimaryPress */
+    --cpd-color-bg-accent-selected: #d1ebfe; /* b200 */
+    --cpd-color-bg-accent-subtle: #e8f2ff; /* b100 */
+    --cpd-color-bg-badge-accent: #d1ebfe; /* b200 */
+    --cpd-color-text-badge-accent: #10529e; /* b700 */
+    --cpd-color-border-accent-primary: #156ff5; /* stroke.highlight */
+    --cpd-color-border-accent-subtle: #76b7fc; /* b300 */
+    --cpd-color-icon-accent-primary: #156ff5; /* stroke.highlight */
+    --cpd-color-icon-accent-tertiary: #549df9; /* b400 */
+    --cpd-color-border-focused: #156ff5; /* stroke.highlight */
+
+    /* typography: Fuselage fontFamily.sans and fontScale c1 12px, p2 14px, p1 16px, h3 20px, h2 24px, h1 32px */
+    --cpd-font-family-sans:
+        Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue",
+        "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Meiryo UI", Arial, sans-serif;
+    --cpd-font-size-body-xs: 0.75rem;
+    --cpd-font-size-body-sm: 0.875rem;
+    --cpd-font-size-body-md: 0.875rem;
+    --cpd-font-size-body-lg: 1rem;
+    --cpd-font-size-heading-sm: 1.25rem;
+    --cpd-font-size-heading-md: 1.5rem;
+    --cpd-font-size-heading-lg: 2rem;
+    --cpd-font-size-heading-xl: 2rem;
+}
+
+/* ---- dark (surface.json dark, font.json dark, button.json dark, stroke.json dark): the kit follows prefers-color-scheme ---- */
+body.mx_ClientViewFacelift_rocketchat.cpd-theme-dark {
+    --cpd-color-theme-bg: #1f2329; /* surface.dark.tint / room */
+    --cpd-color-gray-100: #1a1e23; /* surface.dark.hover */
+    --cpd-color-gray-200: #24272e; /* surface.dark.disabled */
+    --cpd-color-gray-300: #262931; /* surface.dark.light */
+    --cpd-color-gray-400: #2d3039; /* surface.dark.neutral */
+    --cpd-color-gray-500: #333842; /* stroke.dark.extraLight */
+    --cpd-color-gray-600: #404754; /* stroke.dark.light */
+    --cpd-color-gray-700: #4b5362; /* stroke.dark.medium */
+    --cpd-color-gray-800: #60646c; /* font.dark.disabled */
+    --cpd-color-gray-900: #9ea2a8; /* font.dark.hint */
+    --cpd-color-gray-1000: #9ea2a8; /* font.dark.hint */
+    --cpd-color-gray-1100: #c1c7d0; /* font.dark.default */
+    --cpd-color-gray-1200: #c1c7d0; /* font.dark.default */
+    --cpd-color-gray-1300: #f2f3f5; /* font.dark.titlesLabels */
+    --cpd-color-gray-1400: #c1c7d0; /* font.dark.default */
+
+    /* semantic: text and icon colours on the dark surfaces, then the solids (white text on them) */
+    --cpd-color-text-link-external: #739ede; /* font.dark.info */
+    --cpd-color-text-info-primary: #739ede; /* font.dark.info */
+    --cpd-color-text-badge-info: #739ede;
+    --cpd-color-icon-info-primary: #739ede;
+    --cpd-color-text-critical-primary: #d88892; /* font.dark.danger */
+    --cpd-color-icon-critical-primary: #d88892;
+    --cpd-color-text-action-accent: #739ede; /* font.dark.info; accent is blue in Fuselage */
+    --cpd-color-icon-accent-primary: #739ede;
+    --cpd-color-icon-accent-tertiary: #6292da; /* stroke.dark.highlight */
+    --cpd-color-border-accent-primary: #6292da;
+    --cpd-color-border-accent-subtle: #6292da;
+    --cpd-color-border-focused: #6292da;
+    --cpd-color-border-critical-primary: #bb3e4e; /* stroke.dark.error */
+    --cpd-color-border-critical-subtle: #bb3e4e;
+    --cpd-color-bg-action-primary-rest: #095ad2; /* button.dark.backgroundPrimaryDefault */
+    --cpd-color-bg-action-primary-hovered: #10529e; /* button.dark.backgroundPrimaryHover */
+    --cpd-color-bg-action-primary-pressed: #01336b; /* button.dark.backgroundPrimaryPress */
+    --cpd-color-bg-action-primary-disabled: #012247; /* button.dark.backgroundPrimaryDisabled */
+    --cpd-color-text-on-solid-primary: #ffffff; /* button.dark.fontOnPrimary */
+    --cpd-color-icon-on-solid-primary: #ffffff;
+    --cpd-color-bg-accent-rest: #095ad2;
+    --cpd-color-bg-accent-hovered: #10529e;
+    --cpd-color-bg-accent-pressed: #01336b;
+    --cpd-color-bg-accent-selected: #012247; /* b900 */
+    --cpd-color-bg-accent-subtle: #012247; /* b900 */
+    --cpd-color-bg-badge-primary: #095ad2;
+    --cpd-color-bg-badge-accent: #01336b; /* b800 */
+    --cpd-color-text-badge-accent: #739ede;
+    --cpd-color-bg-critical-primary: #bb3e4e; /* stroke.dark.error; white text 5.4:1 */
+    --cpd-color-bg-critical-hovered: #9b1325; /* r800 */
+    --cpd-color-bg-success-rest: #148660; /* g800 */
+    --cpd-color-bg-success-hovered: #106d4f; /* g900 */
+    --cpd-color-bg-success-pressed: #0d5940; /* g1000 */
+
+    --cpd-font-family-sans:
+        Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Helvetica Neue",
+        "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Meiryo UI", Arial, sans-serif;
+    --cpd-font-size-body-xs: 0.75rem;
+    --cpd-font-size-body-sm: 0.875rem;
+    --cpd-font-size-body-md: 0.875rem;
+    --cpd-font-size-body-lg: 1rem;
+    --cpd-font-size-heading-sm: 1.25rem;
+    --cpd-font-size-heading-md: 1.5rem;
+    --cpd-font-size-heading-lg: 2rem;
+    --cpd-font-size-heading-xl: 2rem;
+}

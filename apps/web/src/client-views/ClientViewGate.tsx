@@ -29,6 +29,7 @@ import { getActiveClientView, isHandedOver, selectClientView, setHandedOver, wat
 import { ViewModelBridge } from "./ViewModelBridge";
 import { HostReactionPicker } from "./ReactionPickerOverlay";
 import { HostPanelSlot } from "./CardPanelOverlay";
+import { useFaceliftClass } from "./facelift";
 import { BRIDGE_GLOBAL, type ClientViewDescriptor, STOCK_VIEW } from "./types";
 
 type BridgeHolder = { [BRIDGE_GLOBAL]?: ViewModelBridge };
@@ -151,6 +152,7 @@ export function relayMediaAuth(frame: Window): void {
 function ClientViewHost({ client, view }: { client: MatrixClient; view: ClientViewDescriptor }): JSX.Element {
     const [bridge, setBridge] = useState<ViewModelBridge>();
     const [failed, setFailed] = useState(false);
+    useFaceliftClass(view.id);
     const frameRef = useRef<HTMLIFrameElement | null>(null);
     useEffect(() => {
         const b = new ViewModelBridge(client);
