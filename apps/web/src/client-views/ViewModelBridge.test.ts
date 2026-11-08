@@ -2368,6 +2368,56 @@ describe("ViewModelBridge", () => {
             getMember.mockRestore();
         });
 
+        it("openUserInfo (M14 K4 F2): a user the room never lists does not supersede an older valid open in flight; the later valid open still wins", async () => {
+            const shown = watch();
+            const carol = { userId: "@carol:example.org" };
+            const dave = { userId: "@dave:example.org" };
+            let loaded = false;
+            const getMember = vi
+                .spyOn(h.room, "getMember")
+                .mockImplementation(((id: string) =>
+                    loaded ? ([carol, dave].find((m) => m.userId === id) ?? null) : null) as never);
+            let release!: () => void;
+            const gate = new Promise<boolean>((r) => (release = () => ((loaded = true), r(true))));
+            h.room.loadMembersIfNeeded.mockClear();
+            h.room.loadMembersIfNeeded.mockImplementation(() => gate);
+
+            // valid open in flight, then a ghost open for a user that never gets a member object
+            let validSettled = false;
+            const valid = bridge.openUserInfo("!a", carol.userId).finally(() => (validSettled = true));
+            const ghost = bridge.openUserInfo("!a", "@ghost:example.org");
+            const ghostOutcome = expect(ghost).rejects.toMatchObject({ code: "unsupported" });
+            const count = shown.length;
+            release();
+            await ghostOutcome;
+            // the valid card mounted (it was not reported done without mounting) and stays open until closed
+            await vi.waitFor(() => expect(shown.at(-1)?.dmMember).toMatchObject(carol));
+            expect(shown.length).toBe(count + 1);
+            expect(validSettled).toBe(false);
+            bridge.closePanel();
+            await expect(valid).resolves.toMatchObject({ status: "done", roomId: "!a" });
+            expect(shown.at(-1)).toBeNull();
+
+            // two valid lazy opens: the later call wins (the earlier one's card is replaced and it resolves done)
+            loaded = false;
+            let release2!: () => void;
+            const gate2 = new Promise<boolean>((r) => (release2 = () => ((loaded = true), r(true))));
+            h.room.loadMembersIfNeeded.mockImplementation(() => gate2);
+            const first = bridge.openUserInfo("!a", carol.userId);
+            const second = bridge.openUserInfo("!a", dave.userId);
+            release2();
+            await expect(first).resolves.toMatchObject({ status: "done" });
+            await vi.waitFor(() => expect(shown.at(-1)?.dmMember).toMatchObject(dave));
+            let secondSettled = false;
+            void second.finally(() => (secondSettled = true));
+            await Promise.resolve();
+            expect(secondSettled).toBe(false); // dave's card is the one that stays open
+            bridge.closePanel();
+            await second;
+            getMember.mockRestore();
+            h.room.loadMembersIfNeeded.mockImplementation(async () => true);
+        });
+
         it("a card replaces an open thread panel and the other way round; closePanel, closeThread and dispose close either", async () => {
             const row = fakeEvent("$1");
             h.timeline.snapshot = { items: [{ kind: "event", event: row, continuation: false }], atLiveEnd: true };
