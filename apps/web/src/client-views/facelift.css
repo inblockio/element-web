@@ -37,7 +37,10 @@ body.mx_ClientViewFacelift_rocketchat.cpd-theme-light {
     --cpd-color-gray-600: #cbced1; /* n500, stroke.light */
     --cpd-color-gray-700: #9ea2a8; /* n600, font.annotation, stroke.medium */
     --cpd-color-gray-800: #9ea2a8; /* n600 */
-    --cpd-color-gray-900: #6c737a; /* n700, font.hint, stroke.dark */
+    /* contrast fix (tools/facelift-contrast.mjs): n700 #6c737a (font.hint) is 4.32:1 on n200 and 3.87:1 on n400; n800 is
+       the next Fuselage neutral and passes AA (4.5:1) on every surface. Only text-secondary and icon-secondary use
+       gray-900. */
+    --cpd-color-gray-900: #2f343d; /* n800, font.default */
     --cpd-color-gray-1000: #6c737a; /* n700 */
     --cpd-color-gray-1100: #2f343d; /* n800 */
     --cpd-color-gray-1200: #2f343d; /* n800 */
@@ -69,8 +72,10 @@ body.mx_ClientViewFacelift_rocketchat.cpd-theme-light {
     --cpd-color-red-600: #f98f9d; /* r300 */
     --cpd-color-red-700: #f5455c; /* r400 */
     --cpd-color-red-800: #ec0d2a; /* r500, stroke.error */
-    --cpd-color-red-900: #d40c26; /* r600, font.danger */
-    --cpd-color-red-1000: #bb0b21; /* r700 */
+    /* contrast fix: r600 #d40c26 (font.danger) is 4.36:1 on n400; r700 passes AA on every surface. red-1000 moves one
+       step (was r700) so bg-critical-hovered stays darker than bg-critical-primary. */
+    --cpd-color-red-900: #bb0b21; /* r700 */
+    --cpd-color-red-1000: #9b1325; /* r800 */
     --cpd-color-red-1100: #9b1325; /* r800 */
     --cpd-color-red-1200: #8b0719; /* r900 */
     --cpd-color-red-1300: #6b0513; /* r1000 */
@@ -85,8 +90,11 @@ body.mx_ClientViewFacelift_rocketchat.cpd-theme-light {
     --cpd-color-green-600: #6ce9c0; /* g400 */
     --cpd-color-green-700: #1ecb92; /* g600 */
     --cpd-color-green-800: #19ac7c; /* g700 */
-    --cpd-color-green-900: #148660; /* g800 */
-    --cpd-color-green-1000: #106d4f; /* g900 */
+    /* contrast fix: g800 #148660 is 4.10:1 on n200 and 3.67:1 on n400; g900 passes AA on every surface. green-1000
+       moves one step (was g900) so bg-success-hovered stays darker than bg-success-rest; hovered and pressed are now
+       both g1000 (the darkest Fuselage green). */
+    --cpd-color-green-900: #106d4f; /* g900 */
+    --cpd-color-green-1000: #0d5940; /* g1000 */
     --cpd-color-green-1100: #0d5940; /* g1000 */
     --cpd-color-green-1200: #0d5940; /* g1000 */
     --cpd-color-green-1300: #0d5940; /* g1000 */
@@ -101,7 +109,8 @@ body.mx_ClientViewFacelift_rocketchat.cpd-theme-light {
     --cpd-color-orange-600: #f59b53; /* o400 */
     --cpd-color-orange-700: #f38c39; /* o500 */
     --cpd-color-orange-800: #e26d0e; /* o600 */
-    --cpd-color-orange-900: #bd5a0b; /* o700 */
+    /* contrast fix: o700 #bd5a0b is 4.08:1 on n200 and 3.65:1 on n400; o800 passes AA on every surface. */
+    --cpd-color-orange-900: #974809; /* o800 */
     --cpd-color-orange-1000: #974809; /* o800 */
     --cpd-color-orange-1100: #713607; /* o900 */
     --cpd-color-orange-1200: #5b2c06; /* o1000 */
@@ -160,6 +169,12 @@ body.mx_ClientViewFacelift_rocketchat.cpd-theme-dark {
     --cpd-color-gray-1200: #c1c7d0; /* font.dark.default */
     --cpd-color-gray-1300: #f2f3f5; /* font.dark.titlesLabels */
     --cpd-color-gray-1400: #c1c7d0; /* font.dark.default */
+
+    /* contrast fix (tools/facelift-contrast.mjs): Compound's dark green-900 #129a78 and orange-900 #da670d are both
+       3.71:1 on surface.dark.neutral. The dark solids are set explicitly below, so these two feed only text, icon and
+       border tokens. */
+    --cpd-color-green-900: #19ac7c; /* g700, 4.54:1 on surface.dark.neutral */
+    --cpd-color-orange-900: #f38c39; /* o500, 5.41:1 on surface.dark.neutral */
 
     /* semantic: text and icon colours on the dark surfaces, then the solids (white text on them) */
     --cpd-color-text-link-external: #739ede; /* font.dark.info */
