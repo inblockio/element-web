@@ -5,9 +5,9 @@
  * Please see LICENSE files in the repository root for full details.
  */
 
-import { afterEach, describe, expect, it, vi } from "vitest";
-
 // @vitest-environment happy-dom
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "test-utils-rtl";
 
 import { faceliftClass, useFaceliftClass } from "./facelift";
