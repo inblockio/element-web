@@ -374,9 +374,10 @@ describe("ClientViewGate", () => {
         });
 
         it("takes the look off when the stock view is selected, and puts it back when the kit is selected again", () => {
+            // The gate re-reads the selected view when the "clientView" setting changes.
             const updates: (() => void)[] = [];
-            const watch = vi.spyOn(SettingsStore, "watchSetting").mockImplementation((_name, _room, cb) => {
-                updates.push(cb as () => void);
+            const watch = vi.spyOn(SettingsStore, "watchSetting").mockImplementation((name, _room, cb) => {
+                if (name === "clientView") updates.push(cb as () => void);
                 return "ref";
             });
             const unwatch = vi.spyOn(SettingsStore, "unwatchSetting").mockImplementation(() => {});
